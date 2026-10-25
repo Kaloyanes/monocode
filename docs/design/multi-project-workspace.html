@@ -1,0 +1,1673 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Monocode · Multiple projects in one workspace</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        background: transparent;
+      }
+      body {
+        font:
+          13px/1.5 system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        color: #dedede;
+      }
+      button,
+      input,
+      textarea {
+        font: inherit;
+      }
+      button {
+        cursor: pointer;
+        color: inherit;
+        background: none;
+        border: 0;
+      }
+      button:focus-visible,
+      input:focus-visible,
+      textarea:focus-visible {
+        outline: 2px solid #67aaff;
+        outline-offset: 2px;
+      }
+      button:hover {
+        background: #ffffff0c;
+      }
+      button[aria-selected="true"] {
+        background: #ffffff12;
+      }
+      ::selection {
+        background: #3874a9;
+        color: white;
+      }
+      ::-webkit-scrollbar {
+        width: 5px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #484848;
+        border-radius: 5px;
+      }
+      .muted {
+        color: #aaa;
+      }
+      .icon {
+        width: 16px;
+        height: 16px;
+        flex: none;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.6;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        vertical-align: middle;
+      }
+      .small {
+        width: 13px;
+        height: 13px;
+      }
+      .spacer {
+        flex: 1;
+      }
+      .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #76bfa0;
+        display: inline-block;
+        flex: none;
+      }
+      .blue {
+        color: #8fb9ed;
+      }
+      .green {
+        color: #6ee7b7;
+      }
+      .red {
+        color: #fda4af;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .concept {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin: 0 0 12px;
+        color: var(--foreground, #dedede);
+      }
+      .concept p {
+        margin: 0;
+        flex: 1;
+        font-size: 13px;
+        color: var(--muted-foreground, #aaa);
+        min-width: 190px;
+      }
+      .toggle {
+        display: flex;
+        border: 1px solid var(--border, #383838);
+        padding: 3px;
+        border-radius: 7px;
+      }
+      .toggle button {
+        padding: 5px 9px;
+        border-radius: 4px;
+        font-size: 12px;
+        color: var(--foreground, #dedede);
+      }
+      .toggle button[aria-pressed="true"] {
+        background: var(--secondary, #343434);
+      }
+      .app {
+        --line: #ffffff12;
+        --surface: #1b1b1d;
+        display: flex;
+        flex-direction: column;
+        height: 696px;
+        overflow: hidden;
+        background: #18181a;
+        border: 1px solid #414144;
+        border-radius: 12px;
+        color: #dedede;
+      }
+      .windowbar {
+        height: 39px;
+        display: flex;
+        align-items: center;
+        padding: 0 14px;
+        gap: 17px;
+        border-bottom: 1px solid var(--line);
+        flex: none;
+      }
+      .lights {
+        display: flex;
+        gap: 7px;
+      }
+      .lights i {
+        height: 10px;
+        width: 10px;
+        border-radius: 50%;
+        background: #ff5f57;
+      }
+      .lights i:nth-child(2) {
+        background: #febc2e;
+      }
+      .lights i:nth-child(3) {
+        background: #28c840;
+      }
+      .window-title {
+        font-size: 12px;
+        font-weight: 500;
+        color: #bdbdbf;
+      }
+      .window-title span {
+        color: #9b9b9e;
+        font-weight: 400;
+        margin-left: 7px;
+      }
+      .window-actions {
+        display: flex;
+        gap: 12px;
+        color: #aaa;
+      }
+      .body {
+        display: flex;
+        flex: 1;
+        min-height: 0;
+      }
+      .rail {
+        width: 164px;
+        display: flex;
+        flex-direction: column;
+        flex: none;
+        padding: 10px 8px;
+        border-right: 1px solid var(--line);
+        background: #1b1b1d;
+      }
+      .rail button {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        text-align: left;
+        min-height: 32px;
+        padding: 5px 9px;
+        border-radius: 5px;
+        font-size: 12px;
+        width: 100%;
+        white-space: nowrap;
+      }
+      .rail .section {
+        display: flex;
+        align-items: center;
+        color: #aaa;
+        font-size: 11px;
+        margin: 19px 9px 8px;
+      }
+      .rail .workspace {
+        font-weight: 600;
+      }
+      .rail .workspace .workspace-icon {
+        width: 18px;
+        height: 18px;
+        border-radius: 4px;
+        background: #ffffff13;
+        display: grid;
+        place-items: center;
+      }
+      .rail .repo {
+        padding-left: 18px;
+        color: #aaa;
+      }
+      .rail .repo.active {
+        color: #eee;
+      }
+      .rail .repo svg {
+        width: 13px;
+        height: 13px;
+      }
+      .count {
+        margin-left: auto;
+        color: #aaa;
+        font-size: 10px;
+        font-variant-numeric: tabular-nums;
+      }
+      .rail .rail-bottom {
+        margin-top: auto;
+      }
+      .sidebar {
+        width: 220px;
+        flex: none;
+        display: flex;
+        flex-direction: column;
+        border-right: 1px solid var(--line);
+        background: #1c1c1e;
+      }
+      .sidebar-head {
+        padding: 12px 13px 10px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 600;
+      }
+      .sidebar-head .icon {
+        color: #aaa;
+      }
+      .sidebar-tabs {
+        display: flex;
+        padding: 0 10px 9px;
+        gap: 3px;
+        border-bottom: 1px solid var(--line);
+      }
+      .sidebar-tabs button {
+        min-width: 0;
+        padding: 4px 4px;
+        flex: 1;
+        font-size: 11px;
+        border-radius: 5px;
+        color: #bbb;
+      }
+      .search {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 9px 13px;
+        color: #aaa;
+      }
+      .search input {
+        width: 100%;
+        min-width: 0;
+        color: #ddd;
+        background: none;
+        border: 0;
+        outline: none;
+        font-size: 11px;
+      }
+      .search input::placeholder {
+        color: #aaa;
+      }
+      .project-list {
+        overflow: auto;
+        flex: 1;
+        padding: 0 7px;
+      }
+      .project-group {
+        margin-bottom: 11px;
+      }
+      .project-heading {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 7px 4px;
+        color: #c9c9cc;
+        font-weight: 600;
+        font-size: 12px;
+        text-align: left;
+      }
+      .project-heading .chevron {
+        width: 11px;
+        height: 11px;
+        transition: transform 0.12s;
+      }
+      .project-heading[aria-expanded="false"] .chevron {
+        transform: rotate(-90deg);
+      }
+      .repo-icon {
+        color: var(--project-color);
+        display: inline-flex;
+      }
+      .session {
+        width: 100%;
+        text-align: left;
+        padding: 9px 10px;
+        border-radius: 6px;
+        margin-bottom: 3px;
+        display: block;
+      }
+      .session .meta {
+        display: flex;
+        gap: 5px;
+        align-items: center;
+        color: #aaa;
+        font-size: 10px;
+        margin-bottom: 3px;
+      }
+      .session .title {
+        display: block;
+        font-size: 12px;
+        line-height: 1.4;
+        font-weight: 550;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        overflow: hidden;
+      }
+      .session .branch {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        margin-top: 5px;
+        font-size: 10px;
+        color: #aaa;
+      }
+      .session .time {
+        margin-left: auto;
+      }
+      .session.selected {
+        background: #ffffff10;
+      }
+      .session .status {
+        margin-left: auto;
+        color: #8ec4ad;
+      }
+      .session .waiting {
+        color: #e6c387;
+      }
+      .session-new {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        width: 100%;
+        padding: 6px 10px;
+        font-size: 11px;
+        color: #aaa;
+      }
+      .sidebar-foot {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 11px 13px;
+        border-top: 1px solid var(--line);
+        font-size: 10px;
+        color: #aaa;
+      }
+      .main {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        min-width: 0;
+        background: #171719;
+      }
+      .tabs {
+        height: 40px;
+        display: flex;
+        align-items: stretch;
+        border-bottom: 1px solid var(--line);
+        flex: none;
+        padding: 4px 5px;
+        gap: 4px;
+      }
+      .tab {
+        display: flex;
+        gap: 7px;
+        align-items: center;
+        text-align: left;
+        padding: 3px 10px;
+        border-radius: 5px;
+        min-width: 0;
+        flex: 1;
+        max-width: 245px;
+      }
+      .tab-label {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+      .tab-label strong {
+        font-size: 11px;
+        line-height: 1.35;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        font-weight: 500;
+      }
+      .tab-label small {
+        font-size: 9px;
+        color: #aaa;
+      }
+      .tab .repo-icon {
+        width: 14px;
+      }
+      .tab .close {
+        color: #aaa;
+        margin-left: auto;
+      }
+      .panes {
+        display: flex;
+        min-height: 0;
+        flex: 1;
+      }
+      .pane {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        flex: 1;
+      }
+      .pane + .pane {
+        border-left: 1px solid var(--line);
+      }
+      .pane-head {
+        height: 36px;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 0 13px;
+        border-bottom: 1px solid var(--line);
+        font-size: 11px;
+        flex: none;
+      }
+      .pane-head strong {
+        font-weight: 500;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .repo-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        white-space: nowrap;
+        color: #c2c2c5;
+        font-size: 10px;
+      }
+      .chat {
+        padding: 20px 22px 8px;
+        flex: 1;
+        overflow: auto;
+        min-height: 0;
+        font-size: 12px;
+        line-height: 1.7;
+      }
+      .user-message {
+        padding: 9px 12px;
+        border: 1px solid #ffffff0c;
+        background: #ffffff08;
+        border-radius: 8px;
+        margin-bottom: 23px;
+        color: #dedede;
+      }
+      .agent-label {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 10px;
+        color: #aaa;
+        margin-bottom: 9px;
+      }
+      .agent-mark {
+        font-size: 15px;
+        color: #bda2ed;
+      }
+      .chat p {
+        margin: 0 0 13px;
+      }
+      .chat h3 {
+        font-size: 13px;
+        font-weight: 600;
+        margin: 18px 0 8px;
+      }
+      .chat code {
+        background: #ffffff09;
+        padding: 2px 4px;
+        border-radius: 4px;
+        font:
+          10px ui-monospace,
+          SFMono-Regular,
+          monospace;
+        color: #c5c5c9;
+      }
+      .tool {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        margin: 12px 0;
+        font-size: 11px;
+      }
+      .tool-title {
+        display: flex;
+        gap: 7px;
+        align-items: center;
+        padding: 7px 9px;
+        background: #ffffff03;
+      }
+      .tool-body {
+        padding: 8px 10px;
+        color: #aaa;
+        border-top: 1px solid var(--line);
+        font-size: 10px;
+        line-height: 1.9;
+      }
+      .file-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .file-row span:first-child {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex: 1;
+      }
+      .diff {
+        margin-left: auto;
+        white-space: nowrap;
+        font-size: 10px;
+      }
+      .done {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 10px;
+        color: #aaa;
+        margin-top: 15px;
+      }
+      .composer {
+        border: 1px solid #ffffff17;
+        border-radius: 8px;
+        margin: 10px 12px 12px;
+        padding: 9px 10px;
+        background: #ffffff03;
+      }
+      .scope {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 10px;
+        color: #aaa;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      .scope .path {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .composer textarea {
+        resize: none;
+        width: 100%;
+        height: 44px;
+        padding: 10px 0 0;
+        background: transparent;
+        border: 0;
+        outline: none;
+        color: #eee;
+        font-size: 11px;
+      }
+      .composer textarea::placeholder {
+        color: #aaa;
+      }
+      .composer-bottom {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 10px;
+        color: #c1c1c4;
+      }
+      .model {
+        padding: 3px 6px;
+        border-radius: 4px;
+        background: #ffffff0b;
+        white-space: nowrap;
+      }
+      .send {
+        margin-left: auto;
+        width: 23px;
+        height: 23px;
+        display: grid;
+        place-items: center;
+        background: #4d4d50;
+        border-radius: 5px;
+      }
+      .terminal {
+        height: 102px;
+        border-top: 1px solid var(--line);
+        flex: none;
+        background: #151517;
+      }
+      .terminal-tabs {
+        display: flex;
+        gap: 0;
+        height: 29px;
+        border-bottom: 1px solid var(--line);
+      }
+      .terminal-tabs button {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 10px;
+        padding: 0 12px;
+        border-right: 1px solid var(--line);
+        color: #aaa;
+      }
+      .terminal-tabs button[aria-selected="true"] {
+        color: #dedede;
+      }
+      .terminal-content {
+        padding: 10px 14px;
+        font-size: 10px;
+        line-height: 1.8;
+        white-space: nowrap;
+        overflow: auto;
+      }
+      .terminal-content .prompt {
+        color: #8dbdb4;
+      }
+      .statusbar {
+        height: 25px;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 0 11px;
+        border-top: 1px solid var(--line);
+        font-size: 9px;
+        color: #aaa;
+        flex: none;
+      }
+      .statusbar .scope-status {
+        display: flex;
+        gap: 5px;
+        align-items: center;
+      }
+      .note {
+        display: flex;
+        gap: 9px;
+        align-items: flex-start;
+        margin-top: 12px;
+        color: var(--muted-foreground, #aaa);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+      .note .icon {
+        margin-top: 2px;
+      }
+      .note p {
+        margin: 0;
+      }
+      .empty {
+        color: #aaa;
+        text-align: center;
+        padding: 20px;
+      }
+      .app.focus .pane:nth-child(2) {
+        display: none;
+      }
+      .app.focus .pane:first-child {
+        max-width: 800px;
+        margin: 0 auto;
+        width: 100%;
+      }
+      .app.inset {
+        background: #202022;
+      }
+      .app.inset .main {
+        margin: 6px 6px 6px 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+      }
+      .app.inset .sidebar,
+      .app.inset .rail {
+        background: transparent;
+      }
+      .app.inset .sidebar {
+        border-right: 0;
+      }
+      .app.inset .rail {
+        border-right: 0;
+      }
+      .app.inset .terminal {
+        background: #171719;
+      }
+      .compact-label {
+        display: none;
+      }
+      .mobile-projects {
+        display: none;
+      }
+      .rail .workspace[aria-pressed="true"] {
+        background: #ffffff12;
+      }
+      .layout-controls {
+        display: flex;
+        gap: 7px;
+      }
+      .subtle-button {
+        font-size: 11px;
+        color: var(--muted-foreground, #aaa);
+        padding: 4px 8px;
+        border-radius: 5px;
+      }
+      .guide {
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+        margin: 13px 0 0;
+        font-size: 11px;
+        color: var(--muted-foreground, #aaa);
+      }
+      .guide span {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .guide b {
+        font-weight: 600;
+        color: var(--foreground, #ddd);
+      }
+      .body .icon-button {
+        padding: 3px;
+        display: grid;
+        place-items: center;
+        border-radius: 4px;
+        color: #aaa;
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      .menu {
+        position: absolute;
+        top: 74px;
+        left: 170px;
+        z-index: 2;
+        background: #28282b;
+        border: 1px solid #454549;
+        border-radius: 8px;
+        padding: 7px;
+        min-width: 180px;
+        box-shadow: 0 8px 22px #0005;
+      }
+      .menu button {
+        display: block;
+        width: 100%;
+        text-align: left;
+        padding: 7px;
+        border-radius: 4px;
+      }
+      .app {
+        position: relative;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      @media (max-width: 1100px) {
+        .rail {
+          width: 49px;
+          padding: 10px 5px;
+        }
+        .rail button {
+          padding: 7px;
+          justify-content: center;
+        }
+        .rail .label,
+        .rail .section,
+        .rail .repo,
+        .rail .count {
+          display: none;
+        }
+        .rail .workspace {
+          margin-top: 14px;
+        }
+        .rail .rail-bottom .label {
+          display: none;
+        }
+        .sidebar {
+          width: 194px;
+        }
+        .chat {
+          padding: 16px 15px 6px;
+        }
+        .composer {
+          margin: 8px;
+        }
+        .pane-head {
+          padding: 0 10px;
+        }
+        .repo-badge .badge-text {
+          display: none;
+        }
+        .window-title span {
+          display: none;
+        }
+        .terminal-content {
+          font-size: 9px;
+        }
+      }
+      @media (max-width: 800px) {
+        .sidebar {
+          width: 183px;
+        }
+        .app {
+          height: 735px;
+        }
+        .rail {
+          display: none;
+        }
+        .chat {
+          font-size: 12px;
+        }
+        .panes .pane:nth-child(2) {
+          display: none;
+        }
+        .app.force-split .panes .pane:nth-child(2) {
+          display: flex;
+        }
+        .app.force-split .chat {
+          padding: 12px 10px;
+          font-size: 11px;
+        }
+        .app.force-split .scope .path {
+          max-width: 70px;
+        }
+        .app.force-split .composer-bottom .effort {
+          display: none;
+        }
+        .app.force-split .pane-head .repo-badge {
+          display: none;
+        }
+        .windowbar {
+          gap: 12px;
+        }
+        .tab {
+          padding: 3px 6px;
+        }
+        .tab .close {
+          display: none;
+        }
+        .model {
+          font-size: 9px;
+        }
+        .menu {
+          left: 15px;
+        }
+        .concept {
+          gap: 8px;
+        }
+        .concept p {
+          flex-basis: 100%;
+        }
+      }
+      @media (max-width: 520px) {
+        .sidebar {
+          width: 146px;
+        }
+        .session {
+          padding: 8px 5px;
+        }
+        .session .title {
+          font-size: 10px;
+        }
+        .session .meta {
+          font-size: 9px;
+        }
+        .session .branch {
+          font-size: 9px;
+        }
+        .session .time {
+          display: none;
+        }
+        .sidebar-head {
+          padding: 11px 8px;
+          font-size: 11px;
+        }
+        .sidebar-tabs {
+          padding: 0 6px 8px;
+        }
+        .sidebar-tabs button {
+          padding: 4px 2px;
+          font-size: 10px;
+        }
+        .search {
+          padding: 8px;
+        }
+        .project-heading {
+          font-size: 10px;
+          gap: 4px;
+        }
+        .project-heading .count {
+          font-size: 9px;
+        }
+        .chat {
+          padding: 13px 10px;
+          font-size: 11px;
+        }
+        .composer-bottom .effort {
+          display: none;
+        }
+        .composer {
+          padding: 8px;
+        }
+        .scope {
+          font-size: 9px;
+        }
+        .composer textarea {
+          font-size: 10px;
+        }
+        .pane-head {
+          font-size: 10px;
+          padding: 0 8px;
+        }
+        .window-title {
+          font-size: 10px;
+        }
+        .window-actions {
+          display: none;
+        }
+        .windowbar {
+          gap: 11px;
+          padding: 0 11px;
+        }
+        .lights {
+          gap: 5px;
+        }
+        .lights i {
+          width: 8px;
+          height: 8px;
+        }
+        .statusbar {
+          font-size: 8px;
+          gap: 6px;
+        }
+        .statusbar .scope-status {
+          display: none;
+        }
+        .app {
+          height: 760px;
+        }
+        .terminal {
+          height: 84px;
+        }
+        .terminal-content {
+          font-size: 9px;
+        }
+        .tab-label strong {
+          font-size: 10px;
+        }
+        .tab-label small {
+          font-size: 8px;
+        }
+        .tab .repo-icon {
+          display: none;
+        }
+        .tool-body {
+          padding: 6px;
+          font-size: 9px;
+        }
+        .scope .branch-name {
+          display: none;
+        }
+        .concept .toggle button {
+          font-size: 11px;
+          padding: 5px 7px;
+        }
+        .sidebar-foot {
+          font-size: 9px;
+          padding: 10px 8px;
+        }
+        .guide {
+          gap: 8px;
+        }
+        .guide span {
+          flex-basis: 100%;
+        }
+        .app.force-split .sidebar {
+          display: none;
+        }
+        .app.force-split .model {
+          max-width: 100px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .app.force-split .chat {
+          font-size: 10px;
+        }
+        .app.force-split .pane-head {
+          font-size: 9px;
+        }
+        .app.force-split .repo-badge {
+          display: none;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        * {
+          transition: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+      <defs>
+        <symbol id="icon-folder" viewBox="0 0 24 24">
+          <path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3z" />
+        </symbol>
+        <symbol id="icon-grid" viewBox="0 0 24 24">
+          <rect x="4" y="4" width="6" height="6" rx="1" />
+          <rect x="14" y="4" width="6" height="6" rx="1" />
+          <rect x="4" y="14" width="6" height="6" rx="1" />
+          <rect x="14" y="14" width="6" height="6" rx="1" />
+        </symbol>
+        <symbol id="icon-search" viewBox="0 0 24 24">
+          <circle cx="10.5" cy="10.5" r="6.5" />
+          <path d="m16 16 4 4" />
+        </symbol>
+        <symbol id="icon-inbox" viewBox="0 0 24 24">
+          <path d="M4 4h16l2 12v4H2v-4zM2 15h6l2 3h4l2-3h6" />
+        </symbol>
+        <symbol id="icon-note" viewBox="0 0 24 24">
+          <rect x="5" y="3" width="14" height="18" rx="2" />
+          <path d="M9 8h6M9 12h6M9 16h4" />
+        </symbol>
+        <symbol id="icon-plus" viewBox="0 0 24 24">
+          <path d="M12 5v14M5 12h14" />
+        </symbol>
+        <symbol id="icon-chevron" viewBox="0 0 24 24">
+          <path d="m6 9 6 6 6-6" />
+        </symbol>
+        <symbol id="icon-branch" viewBox="0 0 24 24">
+          <circle cx="6" cy="5" r="2" />
+          <circle cx="6" cy="19" r="2" />
+          <circle cx="18" cy="5" r="2" />
+          <path d="M6 7v10M18 7a8 8 0 0 1-8 8H6" />
+        </symbol>
+        <symbol id="icon-terminal" viewBox="0 0 24 24">
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="m7 9 3 3-3 3m6 0h4" />
+        </symbol>
+        <symbol id="icon-check" viewBox="0 0 24 24">
+          <path d="m5 12 4 4L19 6" />
+        </symbol>
+        <symbol id="icon-arrow" viewBox="0 0 24 24">
+          <path d="M12 19V5m-6 6 6-6 6 6" />
+        </symbol>
+        <symbol id="icon-split" viewBox="0 0 24 24">
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="M12 4v16" />
+        </symbol>
+        <symbol id="icon-settings" viewBox="0 0 24 24">
+          <path
+            d="m9 3-1 3-3 1v4l-2 1 2 2v4l3 1 1 2h6l1-2 3-1v-4l2-2-2-1V7l-3-1-1-3z"
+          />
+          <circle cx="12" cy="12" r="3" />
+        </symbol>
+        <symbol id="icon-info" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 11v6m0-10v.1" />
+        </symbol>
+        <symbol id="icon-close" viewBox="0 0 24 24">
+          <path d="m6 6 12 12M18 6 6 18" />
+        </symbol>
+      </defs>
+    </svg>
+    <div class="concept">
+      <p>One workspace, three repositories. Illustrative sessions.</p>
+      <div class="layout-controls">
+        <div class="toggle" aria-label="Pane layout">
+          <button id="focus" aria-pressed="false">Focus</button
+          ><button id="split" aria-pressed="true">Side by side</button>
+        </div>
+        <div class="toggle" aria-label="App appearance">
+          <button id="classic" aria-pressed="true">Classic</button
+          ><button id="inset" aria-pressed="false">Inset</button>
+        </div>
+      </div>
+    </div>
+    <div class="app" id="app">
+      <header class="windowbar">
+        <div class="lights" aria-hidden="true"><i></i><i></i><i></i></div>
+        <svg class="icon muted"><use href="#icon-split" /></svg
+        ><span class="window-title"
+          >Product workspace <span>3 projects</span></span
+        >
+        <div class="spacer"></div>
+        <div class="window-actions">
+          <svg class="icon"><use href="#icon-search" /></svg
+          ><svg class="icon"><use href="#icon-terminal" /></svg>
+        </div>
+      </header>
+      <div class="body">
+        <nav class="rail" aria-label="Workspace navigation">
+          <button data-nav="Search">
+            <svg class="icon"><use href="#icon-search" /></svg
+            ><span class="label">Search</span></button
+          ><button data-nav="Inbox">
+            <svg class="icon"><use href="#icon-inbox" /></svg
+            ><span class="label">Inbox</span
+            ><span class="count">2</span></button
+          ><button data-nav="Notes">
+            <svg class="icon"><use href="#icon-note" /></svg
+            ><span class="label">Notes</span>
+          </button>
+          <div class="section">Workspaces</div>
+          <button
+            class="workspace"
+            aria-pressed="true"
+            data-workspace="Product"
+          >
+            <span class="workspace-icon"
+              ><svg class="icon small"><use href="#icon-grid" /></svg></span
+            ><span class="label">Product</span><span class="count">3</span>
+          </button>
+          <div id="rail-repos"></div>
+          <button
+            class="workspace"
+            aria-pressed="false"
+            data-workspace="Personal"
+          >
+            <span class="workspace-icon"
+              ><svg class="icon small"><use href="#icon-folder" /></svg></span
+            ><span class="label">Personal</span><span class="count">1</span>
+          </button>
+          <div class="rail-bottom">
+            <button data-nav="Settings">
+              <svg class="icon"><use href="#icon-settings" /></svg
+              ><span class="label">Settings</span>
+            </button>
+          </div>
+        </nav>
+        <aside class="sidebar">
+          <div class="sidebar-head">
+            <button
+              id="workspace-menu"
+              aria-label="Switch workspace"
+              aria-expanded="false"
+              style="
+                padding: 0;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                min-width: 0;
+              "
+            >
+              <span id="workspace-name">Product</span
+              ><svg class="icon small">
+                <use href="#icon-chevron" />
+              </svg></button
+            ><span class="spacer"></span
+            ><span
+              class="muted"
+              id="project-count"
+              style="font-size: 10px; font-weight: 400"
+              >3 projects</span
+            >
+          </div>
+          <div class="sidebar-tabs" role="tablist" aria-label="Workspace views">
+            <button role="tab" aria-selected="true" data-view="Sessions">
+              Sessions</button
+            ><button role="tab" aria-selected="false" data-view="Explorer">
+              Explorer</button
+            ><button role="tab" aria-selected="false" data-view="Changes">
+              Changes
+            </button>
+          </div>
+          <label class="search"
+            ><svg class="icon small"><use href="#icon-search" /></svg
+            ><input
+              id="search"
+              aria-label="Filter projects and sessions"
+              placeholder="Search all projects…"
+          /></label>
+          <div class="project-list" id="project-list"></div>
+          <div class="sidebar-foot">
+            <span class="dot"></span
+            ><span id="activity-count">2 agents running</span
+            ><span class="spacer"></span
+            ><svg class="icon small"><use href="#icon-grid" /></svg>
+          </div>
+        </aside>
+        <main class="main">
+          <div
+            class="tabs"
+            role="tablist"
+            aria-label="Open sessions"
+            id="tabs"
+          ></div>
+          <div class="panes" id="panes"></div>
+          <section class="terminal" aria-label="Project terminals">
+            <div
+              class="terminal-tabs"
+              role="tablist"
+              aria-label="Terminal project"
+              id="terminal-tabs"
+            ></div>
+            <div class="terminal-content mono" id="terminal-content"></div>
+          </section>
+          <footer class="statusbar">
+            <span class="dot"></span
+            ><span id="status-projects">Product · 3 projects</span
+            ><span class="scope-status"
+              ><svg class="icon small"><use href="#icon-branch" /></svg
+              ><span id="status-branch">feat/workspaces</span></span
+            ><span class="spacer"></span><span>Local workspace</span>
+          </footer>
+        </main>
+      </div>
+      <div class="menu" id="workspace-options" hidden>
+        <button data-workspace="Product">
+          Product <span class="muted">· 3 projects</span></button
+        ><button data-workspace="Personal">
+          Personal <span class="muted">· 1 project</span>
+        </button>
+      </div>
+    </div>
+    <div class="guide">
+      <span
+        ><svg class="icon small"><use href="#icon-grid" /></svg
+        ><b>Workspace</b> A saved set of projects and open panes.</span
+      ><span
+        ><svg class="icon small"><use href="#icon-folder" /></svg
+        ><b>Project</b> Its own sessions, branch, files, and terminal.</span
+      >
+    </div>
+    <div class="note">
+      <svg class="icon"><use href="#icon-info" /></svg>
+      <p>
+        Try project groups, session cards, Explorer, and Changes. Switch to
+        Personal to see a separate workspace. The composer and terminal always
+        name the project they belong to. This is a design prototype.
+      </p>
+    </div>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const icon = (name, extra = "") =>
+        `<svg class="icon ${extra}" aria-hidden="true"><use href="#icon-${name}"/></svg>`;
+      const projects = [
+        {
+          id: "monocode",
+          name: "monocode",
+          color: "#a6a8d4",
+          branch: "feat/workspaces",
+          path: "~/Dev/monocode",
+          sessions: [
+            {
+              title: "Multiple projects in one workspace",
+              model: "GPT-6.1-Sol",
+              time: "now",
+              status: "Running",
+            },
+            {
+              title: "Review sidebar interactions",
+              model: "Claude Opus",
+              time: "12m",
+              status: "Ready",
+            },
+          ],
+          files: [
+            "src/app/shell/Sidebar.tsx",
+            "src/features/projects/model/workspaces.ts",
+            "src/features/workspace/model/layout.ts",
+          ],
+          prompt: "Let’s support multiple projects in the same workspace.",
+          reply:
+            "I’ll keep the current layout and give each session an explicit project. You can work on Monocode here while another agent works in roxy beside it.",
+          heading: "A workspace holds the layout",
+          detail:
+            "Projects keep their own Git context and sessions. Switching the focused pane updates Explorer and Changes to that pane’s project.",
+          changes: [
+            ["Sidebar.tsx", "+42", "−8"],
+            ["workspaces.ts", "+64", "−0"],
+          ],
+          terminal: "VITE v7.0.4  ready in 184 ms",
+          port: "http://localhost:1420/",
+        },
+        {
+          id: "roxy",
+          name: "roxy",
+          color: "#75b9b0",
+          branch: "fix/auth-refresh",
+          path: "~/Dev/roxy",
+          sessions: [
+            {
+              title: "Fix token refresh on reconnect",
+              model: "Claude Opus",
+              time: "now",
+              status: "Running",
+            },
+            {
+              title: "Add connection status",
+              model: "GPT-6.1-Sol",
+              time: "38m",
+              status: "Ready",
+            },
+          ],
+          files: [
+            "src/auth/refresh.ts",
+            "src/auth/refresh.test.ts",
+            "src/ui/ConnectionStatus.tsx",
+          ],
+          prompt: "Fix the expired token when the connection comes back.",
+          reply:
+            "The reconnect handler was reusing the previous access token. I’ve moved the refresh ahead of the connection attempt.",
+          heading: "Reconnect uses a fresh token",
+          detail:
+            "The existing session stays active while the token refreshes. If refresh fails, the connection waits for sign-in.",
+          changes: [
+            ["refresh.ts", "+18", "−6"],
+            ["refresh.test.ts", "+29", "−0"],
+          ],
+          terminal: "✓ src/auth/refresh.test.ts (6 tests)",
+          port: "Tests  6 passed (6)",
+        },
+        {
+          id: "docs",
+          name: "monocode-docs",
+          color: "#c8ae81",
+          branch: "main",
+          path: "~/Dev/monocode-docs",
+          sessions: [
+            {
+              title: "Document workspace setup",
+              model: "GPT-6.1-Sol",
+              time: "8m",
+              status: "Needs input",
+            },
+          ],
+          files: ["guides/workspaces.md", "guides/projects.md", "README.md"],
+          prompt: "Draft the setup guide for workspaces.",
+          reply:
+            "The draft covers creating a workspace, adding repositories, and opening sessions from different projects.",
+          heading: "One detail to confirm",
+          detail:
+            "Should opening a folder create a workspace automatically, or add the project to the current workspace?",
+          changes: [["workspaces.md", "+57", "−0"]],
+          terminal: "Docs preview ready",
+          port: "http://localhost:4321/",
+        },
+        {
+          id: "dotfiles",
+          name: "dotfiles",
+          color: "#b69bd0",
+          branch: "main",
+          path: "~/Dev/dotfiles",
+          sessions: [
+            {
+              title: "Clean up shell aliases",
+              model: "GPT-6.1-Sol",
+              time: "1h",
+              status: "Ready",
+            },
+          ],
+          files: [".zshrc", "aliases.zsh", "README.md"],
+          prompt: "Review the shell aliases and remove duplicates.",
+          reply:
+            "I found two aliases for the same directory and a shortcut that points to a folder that no longer exists.",
+          heading: "Aliases are ready to review",
+          detail:
+            "The proposed changes only affect this repository. Your Product workspace keeps its open projects and panes.",
+          changes: [["aliases.zsh", "+2", "−9"]],
+          terminal: "zsh -n aliases.zsh",
+          port: "Syntax check passed",
+        },
+      ];
+      const state = {
+        workspace: "Product",
+        active: "monocode",
+        secondary: "roxy",
+        view: "Sessions",
+        split: true,
+        collapsed: new Set(),
+        sessions: {},
+        terminal: "monocode",
+      };
+      const savedWorkspaces = {};
+      const escapeHtml = (s) =>
+        String(s).replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+      const currentProjects = () =>
+        projects.filter((p) =>
+          state.workspace === "Product"
+            ? p.id !== "dotfiles"
+            : p.id === "dotfiles",
+        );
+      const project = (id) => projects.find((p) => p.id === id);
+      const logo = (p) =>
+        `<span class="repo-icon" style="--project-color:${p.color}">${icon("folder", "small")}</span>`;
+      function session(p) {
+        return p.sessions[state.sessions[p.id] || 0];
+      }
+      function renderSidebar() {
+        const query = $("search").value.toLowerCase();
+        $("rail-repos").innerHTML = currentProjects()
+          .map(
+            (p) =>
+              `<button class="repo ${state.active === p.id ? "active" : ""}" data-project="${p.id}">${logo(p)}<span class="label">${p.name}</span></button>`,
+          )
+          .join("");
+        $("project-list").innerHTML =
+          currentProjects()
+            .map((p) => {
+              const matching = p.sessions
+                .map((s, i) => ({ ...s, index: i }))
+                .filter((s) =>
+                  (p.name + " " + s.title).toLowerCase().includes(query),
+                );
+              if (query && !matching.length) return "";
+              const expanded = !state.collapsed.has(p.id);
+              return `<section class="project-group"><button class="project-heading" data-collapse="${p.id}" aria-expanded="${expanded}" aria-controls="group-${p.id}">${icon("chevron", "chevron")}${logo(p)}${p.name}<span class="count">${state.view === "Sessions" ? p.sessions.length : p.files.length}</span></button><div id="group-${p.id}" ${!expanded ? "hidden" : ""}>${
+                state.view === "Sessions"
+                  ? matching
+                      .map(
+                        (s) =>
+                          `<button class="session ${state.active === p.id && (state.sessions[p.id] || 0) === s.index ? "selected" : ""}" data-project="${p.id}" data-session="${s.index}"><span class="meta">${icon("grid", "small")} ${s.model}<span class="time">${s.time}</span></span><span class="title">${s.title}</span><span class="branch">${icon("branch", "small")}${p.branch}<span class="status ${s.status === "Needs input" ? "waiting" : ""}">${s.status === "Running" ? '<span class="dot"></span>' : s.status === "Ready" ? icon("check", "small") : "Needs input"}</span></span></button>`,
+                      )
+                      .join("")
+                  : p.files
+                      .filter(
+                        (f) =>
+                          !query ||
+                          (p.name + " " + f).toLowerCase().includes(query),
+                      )
+                      .map(
+                        (f, i) =>
+                          `<button class="session" data-file="${p.id}:${i}"><span class="title mono">${escapeHtml(f.split("/").pop())}</span><span class="branch">${state.view === "Changes" ? '<span class="green">Modified</span>' : escapeHtml(f.substring(0, f.lastIndexOf("/")) || "/")}</span></button>`,
+                      )
+                      .join("")
+              }</div></section>`;
+            })
+            .join("") || '<p class="empty">No matching sessions.</p>';
+      }
+      function pane(p, secondary = false) {
+        const s = session(p);
+        return `<section class="pane" aria-label="${p.name} session"><div class="pane-head">${icon("grid", "small muted")}<strong>${escapeHtml(s.title)}</strong><span class="spacer"></span><span class="repo-badge">${logo(p)}<span class="badge-text">${p.name}</span></span></div><div class="chat"><div class="user-message">${escapeHtml(p.prompt)}</div><div class="agent-label">${icon("grid", "small blue")}${s.model}</div><p>${escapeHtml(p.reply)}</p><h3>${escapeHtml(p.heading)}</h3><p>${escapeHtml(p.detail)}</p><div class="tool"><div class="tool-title">${icon("check", "small green")} Updated ${p.changes.length} files<span class="spacer"></span><span class="muted">${p.name}</span></div><div class="tool-body mono">${p.changes.map((c) => `<div class="file-row"><span>${c[0]}</span><span class="diff"><span class="green">${c[1]}</span> <span class="red">${c[2]}</span></span></div>`).join("")}</div></div><div class="done">${icon("check", "small")} ${s.status === "Needs input" ? "Waiting for your answer" : "Worked for " + (secondary ? "1m 24s" : "2m 08s")}</div></div><form class="composer" data-composer="${p.id}"><div class="scope">${logo(p)}<span class="path mono">${p.path}</span>${icon("branch", "small")}<span class="branch-name mono">${p.branch}</span></div><textarea aria-label="Message ${p.name}" placeholder="Ask, build, / for skills…"></textarea><div class="composer-bottom"><span class="model">${s.model}</span><span class="model effort">High</span><span class="spacer"></span><button class="send" aria-label="Send demo message to ${p.name}">${icon("arrow", "small")}</button></div></form></section>`;
+      }
+      function renderMain() {
+        const active = project(state.active),
+          second = state.secondary && project(state.secondary);
+        const open = [
+          active,
+          ...(second && second.id !== active.id ? [second] : []),
+        ];
+        $("tabs").innerHTML = open
+          .map(
+            (p, i) =>
+              `<button class="tab" role="tab" aria-selected="${!i}" data-project="${p.id}">${logo(p)}<span class="tab-label"><strong>${escapeHtml(session(p).title)}</strong><small>${p.name} · ${session(p).model}</small></span></button>`,
+          )
+          .join("");
+        $("panes").innerHTML =
+          pane(active) +
+          (second && second.id !== active.id ? pane(second, true) : "");
+        $("app").classList.toggle("focus", !state.split);
+        $("app").classList.toggle("force-split", state.split);
+        $("status-branch").textContent = active.branch;
+        renderTerminal();
+      }
+      function renderTerminal() {
+        const list = currentProjects();
+        $("terminal-tabs").innerHTML = list
+          .map(
+            (p) =>
+              `<button role="tab" aria-selected="${state.terminal === p.id}" data-terminal="${p.id}">${icon("terminal", "small")}${p.name}</button>`,
+          )
+          .join("");
+        const p = project(state.terminal);
+        $("terminal-content").innerHTML =
+          `<span class="prompt">${p.path}</span> <span class="muted">git:(${p.branch})</span><br>${p.terminal}<span class="muted"> &nbsp; ${p.port}</span>`;
+      }
+      function render() {
+        renderSidebar();
+        renderMain();
+        $("workspace-name").textContent = state.workspace;
+        const n = currentProjects().length;
+        $("project-count").textContent = n + " project" + (n > 1 ? "s" : "");
+        document.querySelector(".window-title").innerHTML =
+          state.workspace + " workspace <span>" + n + " projects</span>";
+        $("status-projects").textContent =
+          state.workspace + " · " + n + " project" + (n > 1 ? "s" : "");
+        $("activity-count").textContent =
+          state.workspace === "Product"
+            ? "2 agents running"
+            : "No agents running";
+        document
+          .querySelectorAll("[data-workspace]")
+          .forEach((b) =>
+            b.setAttribute(
+              "aria-pressed",
+              String(b.dataset.workspace === state.workspace),
+            ),
+          );
+      }
+      function selectProject(id, index) {
+        if (id !== state.active) {
+          state.secondary = state.active;
+          state.active = id;
+        }
+        if (index !== undefined) state.sessions[id] = Number(index);
+        state.terminal = id;
+        render();
+      }
+      document.addEventListener("click", (e) => {
+        const b = e.target.closest("button");
+        if (!b) return;
+        if (b.dataset.project)
+          selectProject(b.dataset.project, b.dataset.session);
+        if (b.dataset.collapse) {
+          const id = b.dataset.collapse;
+          state.collapsed.has(id)
+            ? state.collapsed.delete(id)
+            : state.collapsed.add(id);
+          renderSidebar();
+        }
+        if (b.dataset.view) {
+          state.view = b.dataset.view;
+          document
+            .querySelectorAll("[data-view]")
+            .forEach((x) => x.setAttribute("aria-selected", String(x === b)));
+          $("search").placeholder =
+            state.view === "Sessions"
+              ? "Search all projects…"
+              : "Search project files…";
+          renderSidebar();
+        }
+        if (b.dataset.terminal) {
+          state.terminal = b.dataset.terminal;
+          renderTerminal();
+        }
+        if (b.dataset.workspace) {
+          savedWorkspaces[state.workspace] = {
+            active: state.active,
+            secondary: state.secondary,
+            terminal: state.terminal,
+          };
+          state.workspace = b.dataset.workspace;
+          Object.assign(
+            state,
+            savedWorkspaces[state.workspace] ||
+              (state.workspace === "Product"
+                ? {
+                    active: "monocode",
+                    secondary: "roxy",
+                    terminal: "monocode",
+                  }
+                : {
+                    active: "dotfiles",
+                    secondary: null,
+                    terminal: "dotfiles",
+                  }),
+          );
+          $("search").value = "";
+          $("workspace-options").hidden = true;
+          $("workspace-menu").setAttribute("aria-expanded", "false");
+          render();
+        }
+        if (b.dataset.file) {
+          const [id, index] = b.dataset.file.split(":");
+          selectProject(id);
+          const p = project(id);
+          $("panes").querySelector(".chat").innerHTML =
+            `<div class="agent-label">${logo(p)}${p.name} · ${state.view}</div><h3 class="mono">${escapeHtml(p.files[Number(index)])}</h3><p class="muted">In the app, this opens the file from <code>${p.path}</code>.</p><p>The pane, composer, and terminal are now scoped to ${p.name}.</p>`;
+        }
+        if (b.dataset.nav) {
+          $("panes").innerHTML =
+            `<section class="pane"><div class="pane-head">${icon(b.dataset.nav === "Search" ? "search" : b.dataset.nav === "Inbox" ? "inbox" : b.dataset.nav === "Notes" ? "note" : "settings", "small")}<strong>${b.dataset.nav}</strong><span class="spacer"></span><button data-back="true">Back to sessions</button></div><div class="chat"><h3>${b.dataset.nav} across ${state.workspace}</h3><p class="muted">This design exploration focuses on project navigation and sessions. ${b.dataset.nav} would keep its current interface.</p><p>Current workspace: ${currentProjects()
+              .map((p) => p.name)
+              .join(", ")}.</p></div></section>`;
+        }
+        if (b.dataset.back) renderMain();
+      });
+      $("search").addEventListener("input", renderSidebar);
+      $("workspace-menu").onclick = () => {
+        const hidden = !$("workspace-options").hidden;
+        $("workspace-options").hidden = hidden;
+        $("workspace-menu").setAttribute("aria-expanded", String(!hidden));
+      };
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          $("workspace-options").hidden = true;
+          $("workspace-menu").setAttribute("aria-expanded", "false");
+        }
+      });
+      function setLayout(split) {
+        state.split = split;
+        $("focus").setAttribute("aria-pressed", String(!split));
+        $("split").setAttribute("aria-pressed", String(split));
+        renderMain();
+      }
+      $("focus").onclick = () => setLayout(false);
+      $("split").onclick = () => setLayout(true);
+      $("classic").onclick = () => {
+        $("app").classList.remove("inset");
+        $("classic").setAttribute("aria-pressed", "true");
+        $("inset").setAttribute("aria-pressed", "false");
+      };
+      $("inset").onclick = () => {
+        $("app").classList.add("inset");
+        $("classic").setAttribute("aria-pressed", "false");
+        $("inset").setAttribute("aria-pressed", "true");
+      };
+      document.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const form = e.target;
+        if (!form.matches("[data-composer]")) return;
+        const input = form.querySelector("textarea");
+        if (!input.value.trim()) return;
+        const chat = form.closest(".pane").querySelector(".chat");
+        chat.insertAdjacentHTML(
+          "beforeend",
+          `<div class="user-message">${escapeHtml(input.value)}</div><p class="muted">Demo message scoped to ${form.dataset.composer}. No agent was started.</p>`,
+        );
+        input.value = "";
+        chat.scrollTop = chat.scrollHeight;
+      });
+      if (window.innerWidth < 650) setLayout(false);
+      render();
+    </script>
+  </body>
+</html>
