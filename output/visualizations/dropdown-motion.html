@@ -1,0 +1,122 @@
+<style>
+  .mc-demo-bar { flex-wrap: wrap; }
+  .mc-tabs { flex-wrap: wrap; }
+  .dropdown-demo { width: min(260px, 100%); align-self: start; margin-top: 12px; }
+  .trigger { width: 100%; justify-content: space-between; }
+  .dropdown-panel { margin-top: 8px; transform-origin: top center; padding: 6px; }
+  .menu-heading { padding: 8px 10px 10px; font-size: 12px; color: var(--muted-foreground); }
+  .menu-heading strong { display: block; color: var(--foreground); font-size: 13px; font-weight: 550; margin-bottom: 3px; }
+  .menu-body { position: relative; overflow: hidden; }
+  .dropdown-demo .mc-menu-item { position: relative; width: 100%; height: 34px; border: 0; background: transparent; color: inherit; font-family: inherit; text-align: left; cursor: pointer; }
+  .dropdown-demo .mc-menu-item.danger { color: var(--destructive); }
+  .dropdown-demo .mc-menu-item:focus-visible, .trigger:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+  .selection { position: absolute; inset: 0 0 auto; height: 34px; border-radius: 6px; background: var(--muted); opacity: 0; pointer-events: none; transition: transform 180ms cubic-bezier(.23,1,.32,1), opacity 125ms ease; }
+  .result { display: block; min-height: 20px; margin-top: 12px; font-size: 12px; color: var(--muted-foreground); text-align: center; }
+  @media (hover: hover) and (pointer: fine) { .dropdown-demo:not(.glide) .mc-menu-item:hover { background: var(--muted); } }
+  @media (prefers-reduced-motion: reduce) { .selection { transition: opacity 125ms ease; } }
+  @media (max-width: 460px) { .mc-demo-foot { flex-wrap: wrap; } .dropdown-demo { margin-top: 0; } }
+</style>
+<script>
+(() => {
+  const { h, icon } = mc;
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const ease = 'cubic-bezier(.23,1,.32,1)';
+  const definitions = [
+    ['Soft pop', 'The panel grows from its trigger. 180 ms, scale 0.96 to 1.'],
+    ['Stagger', 'Items arrive 25 ms apart. The menu stays clickable throughout.'],
+    ['Gliding focus', 'Move over the items. One highlight follows your selection.'],
+    ['Sliding submenu', 'Open Move to. The content slides inside the same panel.']
+  ];
+  mc.variants(document.body, definitions.map(([name, note], variant) => ({ name, note, render(stage) {
+    let open = true;
+    let submenu = false;
+    let demoTimer;
+    let disposed = false;
+    const animations = new Set();
+    const animate = (el, frames, duration = 180, delay = 0) => {
+      const animation = el.animate(reduced ? [{ opacity: 0 }, { opacity: 1 }] : frames, { duration: reduced ? 125 : duration, delay: reduced ? 0 : delay, easing: ease, fill: 'backwards' });
+      animations.add(animation);
+      animation.finished.then(() => animations.delete(animation), () => animations.delete(animation));
+      return animation;
+    };
+    const result = h('output', { class: 'result', 'aria-live': 'polite' }, 'Click the trigger to close and reopen');
+    const panel = h('div', { class: 'dropdown-panel mc-surface', id: 'project-actions', 'aria-label': 'Project actions' });
+    const chevron = icon('chevron-down', { size: 14 });
+    const trigger = h('button', { class: 'mc-button trigger', 'aria-expanded': 'true', 'aria-controls': 'project-actions', onclick: () => toggle() }, h('span', { class: 'mc-row' }, icon('folder', { size: 16 }), 'Project actions'), chevron);
+    const demo = h('div', { class: 'dropdown-demo' + (variant === 2 ? ' glide' : '') }, trigger, panel, result);
+    stage.append(demo);
+    const stopDemo = () => clearTimeout(demoTimer);
+    demo.addEventListener('pointerdown', stopDemo);
+    demo.addEventListener('pointermove', stopDemo, { once: true });
+    demo.addEventListener('keydown', event => {
+      stopDemo();
+      if (event.key === 'Escape') { event.stopPropagation(); if (submenu && open) showItems(false); else if (open) toggle(); trigger.focus(); }
+      if (event.key.startsWith('Arrow')) {
+        event.stopPropagation();
+        if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
+        event.preventDefault();
+        if (!open) toggle();
+        const buttons = [...panel.querySelectorAll('button')];
+        const current = buttons.indexOf(document.activeElement);
+        buttons[(current + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus();
+      }
+    });
+    function toggle() {
+      stopDemo();
+      open = !open;
+      trigger.setAttribute('aria-expanded', String(open));
+      chevron.style.transform = open ? 'rotate(180deg)' : '';
+      panel.inert = !open;
+      if (open) {
+        panel.hidden = false;
+        showItems(false);
+        animate(panel, [{ opacity: 0, transform: 'translateY(-4px) scale(.96)' }, { opacity: 1, transform: 'translateY(0) scale(1)' }]);
+      } else {
+        const closing = animate(panel, [{ opacity: 1, transform: 'scale(1)' }, { opacity: 0, transform: 'translateY(-4px) scale(.96)' }], 150);
+        closing.finished.then(() => { if (!open && !disposed) panel.hidden = true; }, () => {});
+      }
+    }
+    function showItems(nested, slide = false) {
+      submenu = nested;
+      const body = h('div', { class: 'menu-body' });
+      const highlight = h('div', { class: 'selection', 'aria-hidden': 'true' });
+      if (variant === 2) body.append(highlight);
+      const rows = nested
+        ? [['arrow-left', 'Back to actions'], ['folder', 'Design'], ['folder', 'Engineering'], ['folder', 'Archive']]
+        : [['edit', 'Rename', '⌘ R'], ['copy', 'Duplicate', '⌘ D'], ['star', 'Add to favorites'], ['folder', 'Move to…', '›'], ['trash', 'Delete project']];
+      const select = index => {
+        highlight.style.opacity = '1';
+        highlight.style.transform = reduced ? 'none' : 'translateY(' + index * 34 + 'px)';
+        if (reduced) highlight.style.top = index * 34 + 'px';
+      };
+      rows.forEach(([symbol, label, shortcut], index) => {
+        const button = h('button', { class: 'mc-menu-item' + (symbol === 'trash' ? ' danger' : ''), onclick: () => {
+          if (nested && index === 0) return showItems(false, true);
+          if (!nested && symbol === 'folder') return showItems(true, true);
+          result.textContent = nested ? 'Preview: moved to ' + label : 'Preview: ' + label;
+          toggle();
+          trigger.focus();
+        } }, icon(symbol, { size: 16 }), label, shortcut ? h('span', { class: 'mc-kbd' }, shortcut) : null);
+        if (variant === 2) {
+          button.addEventListener('pointerenter', () => select(index));
+          button.addEventListener('focus', () => select(index));
+        }
+        body.append(button);
+        if (variant === 1) animate(button, [{ opacity: 0, transform: 'translateY(-6px)' }, { opacity: 1, transform: 'translateY(0)' }], 160, index * 25);
+      });
+      panel.replaceChildren(h('div', { class: 'menu-heading' }, h('strong', {}, nested ? 'Move project' : 'Website redesign'), nested ? 'Choose a destination' : 'Project menu'), body);
+      if (slide) animate(body, [{ opacity: 0, transform: 'translateX(' + (nested ? '16px' : '-16px') + ')' }, { opacity: 1, transform: 'translateX(0)' }], 200);
+      if (variant === 2 && !nested) {
+        select(0);
+        demoTimer = setTimeout(() => { if (!disposed && open) select(2); }, 450 / mc.speed);
+      }
+      if (slide) body.querySelector('button')?.focus({ preventScroll: true });
+    }
+    showItems(false);
+    chevron.style.transform = 'rotate(180deg)';
+    animate(panel, [{ opacity: 0, transform: variant === 0 ? 'translateY(-4px) scale(.96)' : 'translateY(-4px)' }, { opacity: 1, transform: 'translateY(0) scale(1)' }]);
+    if (variant === 3) demoTimer = setTimeout(() => { if (!disposed && open) showItems(true, true); }, 650 / mc.speed);
+    return () => { disposed = true; stopDemo(); for (const animation of animations) animation.cancel(); };
+  } })), { stage: 'dots' });
+})();
+</script>
