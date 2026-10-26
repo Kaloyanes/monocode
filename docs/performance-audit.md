@@ -151,19 +151,16 @@ no stall over 16 ms, and render cost scales with the viewport.
 ## Phase 3: animation
 
 Scope is limited to timing and wasted work; the 30 Hz clock stays.
+Archive animation is outside this performance PR's scope.
 
-1. **Archive exit runs on a 16 ms timer.** `shell/archive_motion.rs:138-158`
-   uses its own `Timer` loop and notifies the sidebar every tick, so the
-   burst can drift off vsync. Drive it from `on_next_frame` /
-   `request_animation_frame`. (This file has uncommitted edits; coordinate.)
-2. **Pulse notifies whole views.** `pulse.rs:169` `cx.notify(view)` re-renders
+1. **Pulse notifies whole views.** `pulse.rs:169` `cx.notify(view)` re-renders
    the entire leased view each tick. Make sure each looping element
    (spinner, mascot) is its own small entity, so a tick doesn't re-render a
    transcript or sidebar.
-3. **Transcript burst** (`transcript.rs:3963-3970`) runs on uncapped
+2. **Transcript burst** (`transcript.rs:3963-3970`) runs on uncapped
    `on_next_frame`. Confirm that `animate_frame` repaints only the burst
    layer and not the whole transcript (unverified).
-4. **Arcade.** `arcade.rs:118` parses JSON per QuickJS step and `:190-213`
+3. **Arcade.** `arcade.rs:118` parses JSON per QuickJS step and `:190-213`
    paints a full grid per frame. Low priority.
 
 ## Phase 4: main-thread stalls and startup
@@ -194,7 +191,7 @@ scenarios, and cold start no longer waits on disk cleanup.
 | 2 | Stream coalescing + rebuild fixes (Phase 1) | M | streaming in long sessions |
 | 3 | Search off-thread + virtualize results (Phase 2.1-2.2) | M | typing hitches |
 | 4 | Startup sweep, store lock, git_cache (Phase 4, A4) | S-M | cold start, stalls |
-| 5 | Archive motion and pulse scoping (Phase 3) | S | animation smoothness |
+| 5 | Pulse scoping (Phase 3) | S | animation smoothness |
 | 6 | Remaining lists, diff-view small items | M | long tail |
 
 Re-run the phase 0 scenarios after each step and record the numbers here.
@@ -204,10 +201,9 @@ Re-run the phase 0 scenarios after each step and record the numbers here.
 
 This report records the investigation in the shared `feat/gpui` checkout. The
 performance PR targets `mc/migrate-monocode-to-gpui` directly and carries only
-its performance changes. The archive frame-callback change depends on the
-archive implementation in PR #1158, and deferred thread-directory cleanup
-depends on local thread-file support that is absent from this upstream base.
-Those two changes remain in the shared checkout and are excluded from this PR.
+its performance changes. Archive animation is outside this PR's scope and is
+not a prerequisite for merging it. Deferred thread-directory cleanup is also
+excluded because thread-file support is absent from this upstream base.
 The implementation table below describes that shared checkout. The live
 capture and benchmark numbers also came from that checkout, not the isolated
 PR branch. Validation of the isolated PR branch is recorded separately below.
@@ -222,7 +218,7 @@ database for the live capture. Existing application databases stayed unopened.
 | A | Review publications batch for 50 ms, with an immediate final flush. They cache the manifest and update only completed file models and their totals. Diff updates replace changed files through `ListState::splice`. Entry metadata indexes the original files. The Git worker prepares status maps and both sidebar layouts. Indices and cached checkout snapshots use `Arc`. Focus reloads respect the existing TTL. Hunk lookup uses binary search, and row anchors search within their file. | Flat row storage still moves later rows and shifts their offsets. Verify the complete window under Instruments before claiming the 16 ms target. |
 | 1 | Incoming updates batch for 16 ms. Source patches retain their order and rebuild once from the earliest changed row. Agent-panel detection is cached at ingestion and follows history offsets. Rebuilds move the old row suffix and compute the last prompt once, only for Mono. | Measure a real stream with one agent and four agents. |
 | 2 | Filename ranking runs in the background with a revision check. `FilenameIndex` prepares lowercase characters when files load. Project search virtualizes headers and matches. The branch picker caches its filtered choices and virtualizes variable-height rows. | Profile notes, automations, and model lists with realistic counts before changing their rendering. |
-| 3 | Archive exits use window frame callbacks. The shared 30 Hz pulse cadence stays unchanged. | A child-entity prototype did not isolate pulse redraws because GPUI dirties ancestor views. The prototype was removed. Transcript animation still traverses rows. Arcade remains low priority. |
+| 3 | The shared 30 Hz pulse cadence stays unchanged. Archive animation is outside this PR's scope. | A child-entity prototype did not isolate pulse redraws because GPUI dirties ancestor views. The prototype was removed. Transcript animation still traverses rows. Arcade remains low priority. |
 | 4 | Native editor analysis waits for a 40 ms typing pause before taking shared text snapshots. The QuickJS fallback retains its 150 ms delay. Usage polling pauses when no window is visible. Thread-directory cleanup starts in the background after the first frame. Context persistence queries the session's provider directly instead of listing all sessions. | Cleanup still holds the shared store lock while it runs. Measure contention with many orphaned thread directories before changing its locking. The automation handler's store lock remains. |
 
 The source checks corrected several assumptions in the original plan:
