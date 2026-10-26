@@ -89,6 +89,11 @@ pub(crate) struct Launch {
     pub worktree_cwd: Option<String>,
     pub foreground: bool,
 }
+/// Pasted images wait here until the launch creates their conversation, which
+/// then adopts them into its own folder.
+pub(crate) fn paste_staging_dir() -> PathBuf {
+    std::env::temp_dir().join("monocode-quick-composer")
+}
 impl Launch {
     pub(crate) fn choice(
         cwd: String,
@@ -730,7 +735,7 @@ impl QuickComposer {
             return false;
         }
         for image in images {
-            let dir = std::env::temp_dir().join("monocode-quick-composer");
+            let dir = paste_staging_dir();
             let path = dir.join(format!(
                 "pasted-{}.{}",
                 monocode_core::mono::new_id(),
