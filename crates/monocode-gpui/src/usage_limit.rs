@@ -1,7 +1,7 @@
 use gpui::{AnyElement, Context, Render, Role, Window, div, prelude::*, px, rgb};
 use monocode_core::usage::{self, Limit};
 
-use crate::theme::{content, icon};
+use crate::theme::content;
 
 pub(crate) fn label(limit: &Limit, now: i64) -> String {
     if !limit.resume_at_reset {
@@ -69,14 +69,16 @@ pub(crate) fn sidebar_status(id: i64, limit: &Limit, narrow: bool) -> AnyElement
         } else {
             rgb(0xffb900)
         })
-        .child(icon(
-            if limit.resume_at_reset {
-                "clock"
-            } else {
-                "circle-alert"
-            },
-            12.,
-        ))
+        .child(
+            gpui::svg()
+                .path(if limit.resume_at_reset {
+                    "clock"
+                } else {
+                    "circle-alert"
+                })
+                .size(px(12.))
+                .flex_shrink_0(),
+        )
         .child(
             div().min_w_0().truncate().child(
                 if narrow
