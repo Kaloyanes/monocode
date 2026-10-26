@@ -1,6 +1,7 @@
 //! FloatingMonoChat.tsx: the menu bar's chat panel. It floats over other
 //! apps without activating MonoCode, and its rail moves between Monos without
 //! touching the workspace window's selection.
+use crate::tooltip::Tip;
 use super::*;
 use gpui::{Bounds, WindowBounds, WindowKind, WindowOptions, point, size};
 /// A 384pt conversation plus the 56pt Mono rail beside it.
@@ -179,6 +180,7 @@ impl Floating {
                     .id("floating-new-mono")
                     .role(Role::Button)
                     .aria_label("New mono")
+                    .tip("New mono")
                     .size(px(32.))
                     .flex_shrink_0()
                     .rounded_lg()

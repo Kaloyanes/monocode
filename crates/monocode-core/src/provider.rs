@@ -49,6 +49,7 @@ pub fn forget_session(kind: Kind, provider_id: &str, account_id: &str, cwd: &Pat
         opencode::forget_session(provider_id, account_id, cwd);
     }
 }
+mod images;
 mod questions;
 mod rewind;
 mod tasks;
@@ -90,12 +91,18 @@ pub enum Event {
     Metrics(TurnMetrics),
     Approval(Approval),
     ApprovalResolved(String),
+    ApprovalSaveFailed {
+        id: String,
+        error: String,
+    },
     Question(crate::agent::Question),
     QuestionResolved(String),
     BeginAssistant,
     Text(String),
     Reasoning(String),
     Tool(ToolCall),
+    /// An image a tool returned, still base64-encoded.
+    Image(ImageOutput),
     Status(String),
     /// What the turn still waits on after the provider yielded; empty clears it.
     Background(Vec<BackgroundTask>),
@@ -110,6 +117,13 @@ pub enum Event {
         model_settings: HashMap<String, String>,
     },
     Done,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageOutput {
+    pub data: String,
+    pub mime_type: String,
+    pub title: String,
 }
 
 /// A command or subagent left running after the provider yielded its answer.
@@ -272,6 +286,7 @@ struct Protocol {
     claude_tools: HashMap<u64, (String, String)>,
     text_key: Option<String>,
     approvals: HashMap<String, (Value, String, Value)>,
+    permissions: crate::permissions::Store,
     metrics: TurnMetrics,
     usage_total: u64,
     acp: acp::State,
@@ -311,6 +326,7 @@ impl Protocol {
             claude_tools: HashMap::new(),
             text_key: None,
             approvals: HashMap::new(),
+            permissions: Default::default(),
             metrics: TurnMetrics::default(),
             usage_total: 0,
             acp: Default::default(),
@@ -487,6 +503,10 @@ impl Protocol {
                     {
                         if self.request.settings.mono.is_some() {
                             return Err("The saved Mono Codex context could not be resumed. Retry to keep its saved context.".into());
+                        }
+                        if self.request.settings.restart_continuation {
+                            // A fresh thread would receive "Continue" with no context.
+                            return Err("The saved Codex thread was not found, so the interrupted turn could not continue. Send your request again to start over.".into());
                         }
                         self.request.provider_id = None;
                         return self.frame(json!({"id":1,"result":{}}), stdin);
@@ -876,6 +896,9 @@ impl Protocol {
                                         ToolState::Completed
                                     };
                                     events.push(Event::Tool(tool.clone()));
+                                    if tool.name.starts_with("mcp__") {
+                                        images::collect(&block["content"], &tool.name, &mut events);
+                                    }
                                 }
                             }
                         }
@@ -1059,6 +1082,7 @@ impl Protocol {
             title,
             detail,
             can_remember: self.request.kind != Kind::Codex && !file_change,
+            remember_scope: None,
         }));
         Ok(())
     }
@@ -1250,6 +1274,9 @@ impl Protocol {
             tool.state = ToolState::Failed;
         }
         events.push(Event::Tool(tool.clone()));
+        if completed && name == "mcpToolCall" {
+            images::collect(&item["result"], &tool.name, events);
+        }
     }
 }
 
@@ -1606,6 +1633,8 @@ fn run_operation(
                                 Ok(events) => pending.extend(events),
                                 Err(error) => pending.push(Event::FollowUpFailed { id, error }),
                             }
+                        } else if matches!(control.decision, Decision::Always) {
+                            pending.extend(protocol.remember_approval(&control.id, &mut stdin)?);
                         } else {
                             protocol.respond(control, &mut stdin)?;
                         }
@@ -1828,6 +1857,22 @@ mod tests {
             model: None,
             settings: Default::default(),
         })
+    }
+    #[test]
+    fn restart_continuation_never_falls_back_to_a_fresh_codex_thread() {
+        let missing = json!({"id":2,"error":{"message":"thread not found: saved"}});
+        let mut p = protocol(Kind::Codex);
+        p.request.provider_id = Some("saved".into());
+        let mut out = Vec::new();
+        assert!(p.frame(missing.clone(), &mut out).is_ok());
+        assert_eq!(p.request.provider_id, None);
+
+        let mut p = protocol(Kind::Codex);
+        p.request.provider_id = Some("saved".into());
+        p.request.settings.restart_continuation = true;
+        let error = p.frame(missing, &mut Vec::new()).unwrap_err();
+        assert!(error.contains("Codex thread was not found"));
+        assert_eq!(p.request.provider_id.as_deref(), Some("saved"));
     }
     #[test]
     fn codex_file_changes_retain_every_edited_path() {
@@ -2080,6 +2125,27 @@ mod tests {
             serde_json::from_str::<Value>(&call.input).unwrap()["command"],
             command
         );
+    }
+    #[test]
+    fn claude_mcp_tool_images_are_captured_but_file_reads_are_not() {
+        let mut p = protocol(Kind::Claude);
+        let mut out = Vec::new();
+        let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAA"}});
+        let mut images = |id: &str, name: &str| {
+            p.frame(json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":id,"name":name,"input":{}}]}}), &mut out).unwrap();
+            p.frame(json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":id,"content":[image.clone()]}]}}), &mut out)
+                .unwrap()
+                .into_iter()
+                .filter_map(|event| match event {
+                    Event::Image(image) => Some(image),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let captured = images("shot", "mcp__browser__screenshot");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].title, "screenshot");
+        assert!(images("read", "Read").is_empty());
     }
     #[test]
     fn claude_tool_input_and_result_keep_identity_and_failure() {

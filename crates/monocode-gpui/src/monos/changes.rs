@@ -1,5 +1,6 @@
 //! MonoChangesView: assigned-project tabs with a retained commit/review surface
 //! per checkout. Only the selected checkout owns a live Git poller.
+use crate::tooltip::Tip;
 use super::*;
 use crate::popover::{MenuAction, MenuItem};
 use std::{path::Path, time::Instant};
@@ -685,6 +686,7 @@ impl Monos {
                                 .id(("mono-changes-checkouts", ix))
                                 .role(Role::Button)
                                 .aria_label("Switch project working copy")
+                                .tip("Switch project working copy")
                                 .size(px(18.))
                                 .mr_1()
                                 .flex()

@@ -11,7 +11,13 @@ import {
   resolveTabGroupLabel,
   resolveTabGroupMascot,
 } from "../../workspace/model/tabGroups";
-import { Check, ChevronDown, ChevronUp, CircleAlert } from "../../../shared/ui/icons";
+import {
+  Check,
+  ChevronDown,
+  ChevronUp,
+  CircleAlert,
+} from "../../../shared/ui/icons";
+import { RevealHeight } from "../../../shared/ui/RevealHeight";
 import { HarnessIcon } from "./HarnessIcon";
 import { ProjectMascot } from "../../projects/ui/ProjectMascot";
 import { TerminalSpinner } from "./TerminalSpinner";
@@ -49,6 +55,7 @@ export function LiveAgentsPreview({
   const groupCustomColors = groupCustomColorsProp ?? loadedGroupCustomColors;
   const groupMascots = groupMascotsProp ?? loadedGroupMascots;
   const [expanded, setExpanded] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const lockList = useLockOverscroll<HTMLDivElement>();
   const ticking =
@@ -64,8 +71,19 @@ export function LiveAgentsPreview({
   if (agents.length < LIVE_AGENT_MIN) return null;
 
   const extra = agents.length - LIVE_AGENT_CAP;
-  const visible =
-    expanded || extra <= 0 ? agents : agents.slice(0, LIVE_AGENT_CAP);
+  const renderCard = (agent: LiveAgent) => (
+    <LiveAgentCard
+      key={agent.id}
+      agent={agent}
+      now={now}
+      selected={agent.id === activeSessionId}
+      onSelect={onSelect}
+      groupLabels={groupLabels}
+      groupColors={groupColors}
+      groupCustomColors={groupCustomColors}
+      groupMascots={groupMascots}
+    />
+  );
 
   return (
     <section
@@ -77,7 +95,12 @@ export function LiveAgentsPreview({
         {agents.length} working agents
       </span>
       <div className="overflow-hidden rounded-lg bg-content/5">
-        <div className="flex items-center gap-2 px-3.5 py-1.5">
+        <button
+          type="button"
+          aria-expanded={!collapsed}
+          onClick={() => setCollapsed((closed) => !closed)}
+          className="group flex w-full items-center gap-2 px-3.5 py-1.5 text-left hover:bg-content/5"
+        >
           <span
             aria-hidden
             className="size-1.5 shrink-0 rounded-full bg-accent shadow-[0_0_8px_var(--color-accent)] motion-safe:animate-pulse"
@@ -85,45 +108,56 @@ export function LiveAgentsPreview({
           <span className="min-w-0 flex-1 truncate text-xs text-content/50">
             Working
           </span>
+          <ChevronDown
+            aria-hidden
+            className={`size-3 shrink-0 text-content/40 opacity-0 transition-[transform,opacity] duration-200 ease-out group-hover:opacity-100 group-focus-visible:opacity-100 ${
+              collapsed ? "-rotate-90" : ""
+            }`}
+            strokeWidth={1.75}
+          />
           <span className="text-[11px] tabular-nums text-content/40">
             {agents.length}
           </span>
-        </div>
-        <div
-          ref={expanded ? lockList : undefined}
-          className={`flex flex-col gap-px px-1 ${
-            extra > 0 ? "" : "pb-1"
-          } ${expanded ? "max-h-[45vh] overflow-y-auto overscroll-none" : ""}`}
-        >
-          {visible.map((agent) => (
-            <LiveAgentCard
-              key={agent.id}
-              agent={agent}
-              now={now}
-              selected={agent.id === activeSessionId}
-              onSelect={onSelect}
-              groupLabels={groupLabels}
-              groupColors={groupColors}
-              groupCustomColors={groupCustomColors}
-              groupMascots={groupMascots}
-            />
-          ))}
-        </div>
-        {extra > 0 ? (
-          <button
-            type="button"
-            aria-expanded={expanded}
-            onClick={() => setExpanded((open) => !open)}
-            className="flex w-full items-center justify-center gap-1 px-2 py-1.5 text-[11px] text-content/50 hover:bg-content/8 hover:text-content"
-          >
-            {expanded ? (
-              <ChevronUp className="size-3" strokeWidth={1.75} />
-            ) : (
-              <ChevronDown className="size-3" strokeWidth={1.75} />
-            )}
-            {expanded ? "Show less" : `${extra} more`}
-          </button>
-        ) : null}
+        </button>
+        {/* Folds the whole group under its header, pushing what follows. */}
+        <RevealHeight open={!collapsed}>
+          <div>
+            <div
+              ref={expanded ? lockList : undefined}
+              className={`flex flex-col px-1 ${extra > 0 ? "" : "pb-1"} ${
+                expanded ? "max-h-[45vh] overflow-y-auto overscroll-none" : ""
+              }`}
+            >
+              <div className="flex flex-col gap-px">
+                {(extra > 0 ? agents.slice(0, LIVE_AGENT_CAP) : agents).map(
+                  renderCard,
+                )}
+              </div>
+              {extra > 0 ? (
+                <RevealHeight open={expanded}>
+                  <div className="flex flex-col gap-px pt-px">
+                    {agents.slice(LIVE_AGENT_CAP).map(renderCard)}
+                  </div>
+                </RevealHeight>
+              ) : null}
+            </div>
+            {extra > 0 ? (
+              <button
+                type="button"
+                aria-expanded={expanded}
+                onClick={() => setExpanded((open) => !open)}
+                className="flex w-full items-center justify-center gap-1 px-2 py-1.5 text-[11px] text-content/50 hover:bg-content/8 hover:text-content"
+              >
+                {expanded ? (
+                  <ChevronUp className="size-3" strokeWidth={1.75} />
+                ) : (
+                  <ChevronDown className="size-3" strokeWidth={1.75} />
+                )}
+                {expanded ? "Show less" : `${extra} more`}
+              </button>
+            ) : null}
+          </div>
+        </RevealHeight>
       </div>
     </section>
   );

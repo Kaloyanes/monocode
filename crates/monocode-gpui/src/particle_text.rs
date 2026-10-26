@@ -349,7 +349,7 @@ impl Element for ParticleText {
                 style: style.clone(),
                 transition: None,
             });
-            let frame = state.prepare(&self.text, style, bounds, Instant::now(), window, cx);
+            let frame = state.prepare(&self.text, style, bounds, now(cx), window, cx);
             (frame, state)
         })
     }
@@ -394,6 +394,21 @@ impl Element for ParticleText {
 
 #[cfg(test)]
 mod tests;
+
+/// Stops every transition's clock, so a slow test run cannot finish it early.
+#[cfg(test)]
+pub(crate) struct FrozenClock(pub Instant);
+#[cfg(test)]
+impl gpui::Global for FrozenClock {}
+
+fn now(cx: &App) -> Instant {
+    #[cfg(test)]
+    if let Some(clock) = cx.try_global::<FrozenClock>() {
+        return clock.0;
+    }
+    let _ = cx;
+    Instant::now()
+}
 
 fn paint_text(
     line: &ShapedLine,

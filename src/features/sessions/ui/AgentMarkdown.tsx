@@ -47,6 +47,7 @@ import { remarkWorkspaceFileLinks } from "../../files/model/markdownFileLinks";
 import { isAtxHeadingLine } from "../../files/model/markdownSource";
 import { useColorScheme } from "../../../shared/hooks/useColorScheme";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
+import { useLockTableWheelAxis } from "../../../shared/hooks/lockTableWheelAxis";
 import { copyText } from "../../../platform/tauri/clipboard";
 import { openPathWithDefaultApp, revealPath } from "../../../platform/tauri/fs";
 import {
@@ -664,6 +665,7 @@ export const AgentMarkdown = memo(function AgentMarkdown({
    */
   documentPath?: string;
 }) {
+  const lockTableAxis = useLockTableWheelAxis<HTMLDivElement>();
   const [fileMenu, setFileMenu] = useState<FileLinkMenu | null>(null);
   const [fileActionError, setFileActionError] = useState<string | null>(null);
   const onFileContextMenu = useCallback(
@@ -807,7 +809,7 @@ export const AgentMarkdown = memo(function AgentMarkdown({
         <FileOpenContext.Provider value={fileOpen}>
           <>
             {/* Streamdown takes no style; a contents box passes the fade timing down. */}
-            <div className="contents" style={fadeStyle}>
+            <div ref={lockTableAxis} className="contents" style={fadeStyle}>
               <MarkdownCommit.Provider value={blockCommitted}>
                 <Streamdown
                   BlockComponent={DirectionalBlock}

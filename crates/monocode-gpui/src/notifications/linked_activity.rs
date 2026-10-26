@@ -1,4 +1,5 @@
 //! LinkedWorkItemUpdateNotice: shell-local card on the active session surface.
+use crate::tooltip::Tip;
 use super::github_activity::Card;
 use crate::theme::*;
 use gpui::{Context, EventEmitter, Render, Role, Window, div, prelude::*, px};
@@ -125,6 +126,7 @@ impl Render for LinkedActivity {
                     .id("dismiss-linked-activity")
                     .role(Role::Button)
                     .aria_label(format!("Dismiss updates for {kind} {number}"))
+                    .tip(format!("Dismiss updates for {kind} {number}"))
                     .cursor_pointer()
                     .size(px(24.))
                     .flex()

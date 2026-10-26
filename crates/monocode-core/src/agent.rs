@@ -117,6 +117,13 @@ pub struct Settings {
     pub internal_message: bool,
     #[serde(skip)]
     pub attachments: Vec<std::path::PathBuf>,
+    /// A relaunch may continue this turn if MonoCode stops while it runs.
+    #[serde(skip)]
+    pub resume_after_restart: bool,
+    /// This turn continues one a restart cut short. It must keep the saved
+    /// provider context rather than start a fresh session without it.
+    #[serde(skip)]
+    pub restart_continuation: bool,
     pub revision: u64,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -153,6 +160,7 @@ pub struct ProviderSwitch {
     pub service_tier: Option<String>,
     pub thinking: Option<bool>,
     pub skip_outgoing_recap: bool,
+    pub usage_limit: Option<crate::usage::Limit>,
     pub account: crate::accounts::Profile,
     pub provider_id: Option<String>,
 }
@@ -218,12 +226,14 @@ pub struct Approval {
     pub title: String,
     pub detail: String,
     pub can_remember: bool,
+    pub remember_scope: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub enum Decision {
     Steer(crate::follow_up::Message),
     Allow,
     Session,
+    Always,
     Deny,
     Answer(Vec<Vec<String>>),
     KeepOpen,

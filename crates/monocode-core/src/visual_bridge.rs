@@ -1,5 +1,6 @@
-//! Ephemeral, session-scoped publication of native visuals. No user MCP settings
-//! are changed. Stable provider capabilities can publish only during a live turn.
+//! Ephemeral, session-scoped publication of native visuals and images. No user
+//! MCP settings are changed. Stable provider capabilities can publish only during
+//! a live turn.
 use crate::visual::{self, VisualDocument};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -77,11 +78,45 @@ struct Wire {
     session: i64,
     token: String,
     request_id: String,
-    document: VisualDocument,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document: Option<VisualDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<ImageRequest>,
+}
+
+/// An image file the agent asked to show. The app copies it into the
+/// conversation's folder; the original is never moved or changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRequest {
+    pub path: std::path::PathBuf,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub enum Content {
+    Visual(VisualDocument),
+    Image(ImageRequest),
+}
+
+impl Wire {
+    fn content(self) -> Result<Content, String> {
+        match (self.document, self.image) {
+            (Some(document), None) => Ok(Content::Visual(document)),
+            (None, Some(image)) => Ok(Content::Image(image)),
+            _ => Err("Invalid visual request".into()),
+        }
+    }
+}
+
+/// The authenticated part of a request, kept after its content moves on.
+struct WireHead {
+    session: i64,
+    token: String,
+    request_id: String,
 }
 
 pub struct Publication {
-    pub document: VisualDocument,
+    pub content: Content,
     pub reply: mpsc::Sender<Result<Value, String>>,
     generation: u64,
 }
@@ -262,6 +297,31 @@ fn valid_document(document: &VisualDocument) -> Result<(), String> {
     Ok(())
 }
 
+fn valid_image(image: &ImageRequest) -> Result<(), String> {
+    if !image.path.is_absolute() {
+        return Err("Image path must be absolute".into());
+    }
+    if image.title.chars().count() > 160 {
+        return Err("Image title exceeds 160 characters".into());
+    }
+    let metadata = std::fs::metadata(&image.path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("Image path must be a file".into());
+    }
+    if metadata.len() > crate::transcript::images::MAX_BYTES {
+        return Err("Image is larger than 20 MB".into());
+    }
+    let bytes = std::fs::read(&image.path).map_err(|e| e.to_string())?;
+    crate::transcript::images::inspect(&bytes).map(|_| ())
+}
+
+fn valid_content(content: &Content) -> Result<(), String> {
+    match content {
+        Content::Visual(document) => valid_document(document),
+        Content::Image(image) => valid_image(image),
+    }
+}
+
 fn active_generation(hub: &Hub, session: i64) -> Option<u64> {
     hub.sessions
         .lock()
@@ -287,6 +347,13 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
         return Err("Invalid visual request".into());
     }
     let wire: Wire = serde_json::from_str(&line).map_err(|_| "Invalid visual request")?;
+    let (session, token, request_id) = (wire.session, wire.token.clone(), wire.request_id.clone());
+    let content = wire.content();
+    let wire = WireHead {
+        session,
+        token,
+        request_id,
+    };
     // Authenticate and capture the active generation before executing source.
     let generation = {
         let sessions = hub
@@ -313,11 +380,11 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
         if wire.request_id.is_empty() || wire.request_id.len() > 128 {
             return Err("Invalid request id".into());
         }
-        let signature =
-            Sha256::digest(serde_json::to_vec(&wire.document).map_err(|e| e.to_string())?)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
+        let content = content?;
+        let signature = Sha256::digest(serde_json::to_vec(&content).map_err(|e| e.to_string())?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         {
             let sessions = hub
                 .sessions
@@ -336,7 +403,7 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
             }
         }
         let generation = generation.ok_or("Visual publication requires an active session turn")?;
-        valid_document(&wire.document)?;
+        valid_content(&content)?;
         let (reply, result) = mpsc::channel();
         {
             let mut sessions = hub
@@ -375,7 +442,7 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
             active
                 .send
                 .try_send(Publication {
-                    document: wire.document,
+                    content,
                     reply,
                     generation,
                 })
@@ -467,6 +534,44 @@ fn publish_with_environment(
         source: source.to_owned(),
     };
     valid_document(&document)?;
+    send(Content::Visual(document), request_id, environment)
+}
+
+fn publish_image_with_environment(
+    input: Value,
+    environment: &HashMap<String, String>,
+) -> Result<Value, String> {
+    if !input.is_object() {
+        return Err("Image input must be an object".into());
+    }
+    for field in ["title", "requestId"] {
+        if input.get(field).is_some_and(|value| !value.is_string()) {
+            return Err(format!("{field} must be a string"));
+        }
+    }
+    let path = input["path"].as_str().ok_or("path must be a string")?;
+    // The MCP server runs in the agent's working directory.
+    let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+    let request_id = input["requestId"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err("Request id must contain 1–128 bytes".into());
+    }
+    let image = ImageRequest {
+        title: input["title"].as_str().unwrap_or("").trim().to_owned(),
+        path,
+    };
+    valid_image(&image)?;
+    send(Content::Image(image), request_id, environment)
+}
+
+fn send(
+    content: Content,
+    request_id: String,
+    environment: &HashMap<String, String>,
+) -> Result<Value, String> {
     let get = |key| {
         environment
             .get(key)
@@ -484,7 +589,18 @@ fn publish_with_environment(
             .map_err(|_| "Invalid visual session")?,
         token: get(ENV_TOKEN)?.clone(),
         request_id,
-        document,
+        document: None,
+        image: None,
+    };
+    let wire = match content {
+        Content::Visual(document) => Wire {
+            document: Some(document),
+            ..wire
+        },
+        Content::Image(image) => Wire {
+            image: Some(image),
+            ..wire
+        },
     };
     let mut stream =
         TcpStream::connect_timeout(&endpoint, Duration::from_secs(3)).map_err(|e| e.to_string())?;
@@ -528,7 +644,7 @@ pub fn client(args: &[String]) -> Result<Value, String> {
         .filter(|a| !matches!(a.as_str(), "help" | "--help" | "-h"))
     else {
         return Ok(
-            json!({"help":format!("Usage: monocode-gpui visual docs\n       monocode-gpui visual check|show --input FILE [--title TITLE] [--id ID]\nFILE is JavaScript source, or JSON with source/title/id/requestId. Use - for stdin.\n{DOCUMENTATION}")}),
+            json!({"help":format!("Usage: monocode-gpui visual docs\n       monocode-gpui visual check|show --input FILE [--title TITLE] [--id ID]\n       monocode-gpui visual image --path IMAGE [--title TITLE]\nFILE is JavaScript source, or JSON with source/title/id/requestId. Use - for stdin.\nIMAGE is a PNG, JPEG, GIF or WebP file to show in the conversation.\n{DOCUMENTATION}")}),
         );
     };
     if action == "docs" {
@@ -537,8 +653,26 @@ pub fn client(args: &[String]) -> Result<Value, String> {
         }
         return Ok(documentation());
     }
+    if action == "image" {
+        let mut input = json!({});
+        let mut args = args[1..].iter();
+        while let Some(arg) = args.next() {
+            let field = match arg.as_str() {
+                "--path" => "path",
+                "--title" => "title",
+                "--request-id" => "requestId",
+                _ => return Err(format!("Unknown visual image argument: {arg}")),
+            };
+            input[field] = args
+                .next()
+                .ok_or(format!("{arg} needs a value"))?
+                .clone()
+                .into();
+        }
+        return publish_image_with_environment(input, &current_environment());
+    }
     if !matches!(action.as_str(), "check" | "show") {
-        return Err("Expected visual docs, visual check or visual show".into());
+        return Err("Expected visual docs, visual check, visual show or visual image".into());
     }
     let mut input = None;
     let mut title = None;
@@ -612,7 +746,8 @@ fn documentation() -> Value {
         "documentation": DOCUMENTATION,
         "cli": {
             "check": "monocode-gpui visual check --input FILE",
-            "show": "monocode-gpui visual show --input FILE --title TITLE"
+            "show": "monocode-gpui visual show --input FILE --title TITLE",
+            "image": "monocode-gpui visual image --path IMAGE --title TITLE"
         }
     })
 }
@@ -674,6 +809,7 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({"name":"visual_docs","description":"Read the native visual SDK reference, examples and styling rules when preparing an inline visual. Does not publish.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
         json!({"name":"visual_check","description":"Validate a native visual program and representative controls without publishing. Returns its component tree. Read visual_docs for the SDK reference.","inputSchema":{"type":"object","properties":properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
         json!({"name":"visual_show","description":"Publish an interactive native visual into the current conversation and save it with the transcript. Read visual_docs for the SDK reference; validate with visual_check before publishing.","inputSchema":{"type":"object","properties":show_properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
+        json!({"name":"image_show","description":"Show a PNG, JPEG, GIF or WebP image file you created, such as a rendered chart, screenshot or generated image, in the current conversation. The app keeps its own copy with the conversation; the file is left in place.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Image file path, absolute or relative to the working directory"},"title":{"type":"string","maxLength":160},"requestId":{"type":"string","maxLength":128,"description":"Reuse when retrying an uncertain publication"}},"required":["path"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
     ]
 }
 
@@ -694,6 +830,7 @@ fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option
                     .ok_or("source must be a JavaScript string".into())
                     .and_then(check),
                 "visual_show" => publish_with_environment(input, environment),
+                "image_show" => publish_image_with_environment(input, environment),
                 _ => Err("Unknown native visual tool".into()),
             };
             Ok(match result {
@@ -761,7 +898,9 @@ mod tests {
             .publications
             .recv_timeout(Duration::from_secs(3))
             .unwrap();
-        assert_eq!(publication.document.title, "Hello");
+        assert!(
+            matches!(&publication.content, Content::Visual(document) if document.title == "Hello")
+        );
         assert!(!worker.is_finished());
         publication.reply.send(Ok(json!({"id":"hello"}))).unwrap();
         assert_eq!(worker.join().unwrap().unwrap()["result"]["id"], "hello");
@@ -772,6 +911,35 @@ mod tests {
         assert!(publish_with_environment(changed, &environment)
             .unwrap_err()
             .contains("already used"));
+    }
+
+    #[test]
+    fn images_publish_by_path_and_non_images_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let png = temp.path().join("chart.png");
+        std::fs::write(&png, crate::transcript::images::tests::png(2, 2)).unwrap();
+        let text = temp.path().join("notes.png");
+        std::fs::write(&text, "not an image").unwrap();
+        let server = Server::start(51).unwrap();
+        let environment = server.environment(std::path::Path::new("/test/app"));
+        assert!(publish_image_with_environment(json!({"path":text}), &environment).is_err());
+        assert!(
+            publish_image_with_environment(json!({"path":"/missing.png"}), &environment).is_err()
+        );
+        let worker = std::thread::spawn(move || {
+            publish_image_with_environment(json!({"path":png,"title":"Chart"}), &environment)
+        });
+        let publication = server
+            .publications
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let Content::Image(image) = &publication.content else {
+            panic!("expected an image publication");
+        };
+        assert_eq!(image.title, "Chart");
+        assert!(image.path.ends_with("chart.png"));
+        publication.reply.send(Ok(json!({"saved":true}))).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap()["result"]["saved"], true);
     }
 
     #[test]
@@ -815,7 +983,7 @@ mod tests {
         );
         let response = mcp_response(json!({"id":2,"method":"tools/call","params":{"name":"visual_show","arguments":input()}}), &environment).unwrap();
         assert_eq!(response["result"]["isError"], true);
-        assert_eq!(tool_definitions().len(), 3);
+        assert_eq!(tool_definitions().len(), 4);
         assert_eq!(acp_servers(&environment), json!([]));
     }
 

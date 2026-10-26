@@ -1,4 +1,5 @@
 use super::*;
+use crate::tooltip::Tip;
 use crate::search::{Event, SearchView, Sources};
 use monocode_core::search::Target;
 
@@ -66,6 +67,7 @@ impl Shell {
                         .debug_selector(|| "close-search-tab".into())
                         .role(Role::Button)
                         .aria_label("Close Search")
+                        .tip("Close Search")
                         .absolute()
                         .right_1()
                         .top(px(10.))

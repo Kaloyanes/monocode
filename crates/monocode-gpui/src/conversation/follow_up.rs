@@ -1,4 +1,5 @@
 //! Composer.tsx / MessageQueue.tsx's durable follow-ups and saved user draft.
+use crate::tooltip::Tip;
 use super::*;
 use monocode_core::follow_up::{Message, State};
 
@@ -98,17 +99,31 @@ impl Conversation {
         mode: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let attachments = std::mem::take(&mut self.attachments);
-        let mut message = self.message(prompt, attachments, mode, cx);
+        self.enqueue_follow_up_inverted(prompt, mode, false, cx);
+    }
+    /// Whether a plain follow-up sent now steers the turn rather than queuing;
+    /// `invert` flips the preference, as Cmd+Enter does.
+    pub(super) fn steers_follow_up(&self, invert: bool, cx: &gpui::App) -> bool {
+        let prefers_steer = cx
+            .try_global::<crate::settings::Preferences>()
+            .is_none_or(|prefs| prefs.follow_up == "steer");
         // Once the agent has answered and only background work is left, which
         // may never end (a dev server), queuing would park the message behind
         // it, so hand it to the agent now.
-        message.steer = (cx
-            .try_global::<crate::settings::Preferences>()
-            .is_none_or(|prefs| prefs.follow_up == "steer")
-            || !self.background.tasks.is_empty())
+        (prefers_steer != invert || !self.background.tasks.is_empty())
             && Kind::from_id(&self.summary.provider).can_steer()
-            && message.can_steer();
+    }
+    /// `invert` flips the follow-up preference for this message (Cmd+Enter).
+    pub(super) fn enqueue_follow_up_inverted(
+        &mut self,
+        prompt: String,
+        mode: Option<String>,
+        invert: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let attachments = std::mem::take(&mut self.attachments);
+        let mut message = self.message(prompt, attachments, mode, cx);
+        message.steer = message.can_steer() && self.steers_follow_up(invert, cx);
         self.follow_ups.motion.insert(
             &message.id,
             self.follow_ups.state.messages.is_empty(),
@@ -116,6 +131,39 @@ impl Conversation {
         );
         self.follow_ups.state.messages.push(message);
         self.save_follow_ups(cx);
+    }
+    /// The plan rail's request to reorder, skip or write the plan. It leaves
+    /// the composer and its attachments alone, and steers wherever the
+    /// provider can take a message mid-turn.
+    pub(crate) fn send_plan_steer(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.is_remote() || !self.responding() {
+            return;
+        }
+        let mut message = self.message(prompt, Vec::new(), None, cx);
+        message.steer = Kind::from_id(&self.summary.provider).can_steer() && message.can_steer();
+        self.follow_ups.motion.insert(
+            &message.id,
+            self.follow_ups.state.messages.is_empty(),
+            !cx.reduce_motion(),
+        );
+        self.follow_ups.state.messages.push(message);
+        self.save_follow_ups(cx);
+    }
+    /// The plan rail's Build: leave Plan mode and build the proposal the
+    /// agent just wrote, starting from its todo list so the rail can follow.
+    /// The draft and its attachments stay in the composer.
+    pub(crate) fn build_proposed_plan(&mut self, cx: &mut Context<Self>) {
+        if self.is_remote() || self.busy || !self.loaded {
+            return;
+        }
+        if !self.history_ready() || self.stopping {
+            self.defer_history_action(|this, cx| this.build_proposed_plan(cx), cx);
+            return;
+        }
+        self.settings.plan = false;
+        let attachments = std::mem::take(&mut self.attachments);
+        self.launch_prompt(BUILD_PROPOSED_PLAN.into(), cx);
+        self.attachments = attachments;
     }
     pub(super) fn save_message_draft(&mut self, cx: &mut Context<Self>) {
         if self.is_remote() {
@@ -268,7 +316,11 @@ impl Conversation {
         }
     }
     pub(super) fn pump_follow_ups(&mut self, cx: &mut Context<Self>) {
-        if self.editing_last_turn.pending() || self.stopping {
+        // A quit cancels running turns; the queue must survive it untouched.
+        if self.editing_last_turn.pending()
+            || self.stopping
+            || monocode_core::process::shutting_down()
+        {
             return;
         }
         if !self.history_ready() {
@@ -549,6 +601,7 @@ fn queue_button(
         .id(id)
         .role(Role::Button)
         .aria_label(label)
+        .tip(label)
         .size(px(24.))
         .flex_shrink_0()
         .rounded_md()
@@ -560,6 +613,10 @@ fn queue_button(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(icon(glyph, 14.))
 }
+
+/// Sent when the plan rail's Build is pressed. The agent already holds the
+/// plan it proposed, so only the hand-off and the todo list are asked for.
+pub(crate) const BUILD_PROPOSED_PLAN: &str = "Build the plan you proposed. First turn it into your todo list, one item per step, then keep that list updated as you work.";
 
 #[cfg(test)]
 mod tests {
@@ -871,6 +928,85 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    fn alternate_send(cx: &mut TestAppContext, follow_up: &str, text: &str) -> bool {
+        let window = conversation(cx);
+        cx.update(|cx| {
+            cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
+                prefs.follow_up = follow_up.into()
+            })
+        });
+        window
+            .update(cx, |view, window, cx| {
+                view.busy = true;
+                view.input
+                    .update(cx, |input, cx| input.set_text(text.into(), cx));
+                window.focus(&view.input.focus_handle(cx), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(window.into(), &format!("{modifier}-enter"));
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.input.read(cx).content.is_empty());
+                let messages = &view.follow_ups.state.messages;
+                assert_eq!(messages.len(), 1);
+                assert!(text.ends_with(messages[0].text.as_str()));
+                messages[0].steer
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn the_submit_icon_shows_whether_enter_steers_or_queues(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        let action = |cx: &mut TestAppContext, follow_up: &str, alternate: bool| {
+            cx.update(|cx| {
+                cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
+                    prefs.follow_up = follow_up.into()
+                })
+            });
+            window
+                .update(cx, |view, _, cx| view.follow_up_action(alternate, cx))
+                .unwrap()
+                .map(|(label, _)| label)
+        };
+        assert_eq!(action(cx, "steer", false), None, "idle sends start a turn");
+        window.update(cx, |view, _, _| view.busy = true).unwrap();
+        assert_eq!(action(cx, "steer", false), Some("Steer"));
+        assert_eq!(action(cx, "steer", true), Some("Queue"));
+        assert_eq!(action(cx, "queue", false), Some("Queue"));
+        assert_eq!(action(cx, "queue", true), Some("Steer"));
+        window
+            .update(cx, |view, _, _| view.settings.plan = true)
+            .unwrap();
+        assert_eq!(
+            action(cx, "queue", true),
+            Some("Queue"),
+            "modes always queue"
+        );
+    }
+
+    #[gpui::test]
+    fn cmd_enter_queues_when_follow_ups_steer(cx: &mut TestAppContext) {
+        assert!(!alternate_send(cx, "steer", "after this turn"));
+    }
+
+    #[gpui::test]
+    fn cmd_enter_steers_when_follow_ups_queue(cx: &mut TestAppContext) {
+        assert!(alternate_send(cx, "queue", "change course"));
+    }
+
+    #[gpui::test]
+    fn cmd_enter_cannot_steer_a_mode_turn(cx: &mut TestAppContext) {
+        assert!(!alternate_send(cx, "queue", "/plan sketch it first"));
     }
 
     #[gpui::test]

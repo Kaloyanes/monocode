@@ -52,7 +52,10 @@ mod notifications;
 mod pane_layout;
 mod pane_motion;
 mod particle_text;
+#[cfg(feature = "perf-trace")]
+mod performance_probe;
 mod pickers;
+mod plan_rail;
 mod popover;
 mod project_background;
 mod project_search;
@@ -65,6 +68,7 @@ mod quick_open;
 mod reflow_motion;
 mod resource_pressure;
 mod response_actions;
+mod restart_resume;
 mod reveal;
 mod review;
 mod right_panel;
@@ -80,6 +84,7 @@ mod tab_label;
 mod tab_motion;
 mod terminal;
 mod theme;
+mod tooltip;
 #[cfg(target_os = "macos")]
 mod traffic_lights;
 mod transcript;
@@ -109,6 +114,7 @@ fn quit(cx: &mut App) {
     if notifications::updater::defer_quit(cx) {
         return;
     }
+    hide_while_shutting_down(cx);
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
@@ -119,8 +125,22 @@ fn quit(cx: &mut App) {
     .detach();
 }
 
+/// Shutdown gives running turns a moment to stop and save. Get out of the way
+/// at once so the quit feels immediate. Only macOS can hide an application;
+/// elsewhere minimize its windows.
+fn hide_while_shutting_down(cx: &mut App) {
+    if cfg!(target_os = "macos") {
+        cx.hide();
+        return;
+    }
+    for window in cx.windows() {
+        let _ = window.update(cx, |_, window, _| window.minimize_window());
+    }
+}
+
 /// Quit, then relaunch the same app once this process has exited.
 fn restart(cx: &mut App) {
+    hide_while_shutting_down(cx);
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
@@ -170,6 +190,8 @@ fn plist_data_mode(plist: &str) -> Option<bool> {
     }
 }
 fn main() {
+    #[cfg(feature = "perf-trace")]
+    let launched = Instant::now();
     if let Some(code) = monocode_core::remote::ssh_askpass::maybe_run() {
         std::process::exit(code);
     }
@@ -222,6 +244,7 @@ fn main() {
     let mut fixture = false;
     let mut chat_fixture = false;
     let mut visual_fixture = false;
+    let mut plan_fixture = false;
     // Development stays separate; release builds use the installed app's data.
     let mut use_monocode = bundle_uses_monocode_data().unwrap_or(!cfg!(debug_assertions));
     let mut monocode_db = monocode_core::store::monocode_database();
@@ -233,6 +256,7 @@ fn main() {
             "--fixture" => fixture = true,
             "--chat-fixture" => chat_fixture = true,
             "--visual-fixture" => visual_fixture = true,
+            "--plan-fixture" => plan_fixture = true,
             "--dev-data" => use_monocode = false,
             "--monocode-data" => use_monocode = true,
             "--monocode-db" => {
@@ -246,7 +270,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "monocode-gpui [--cwd PATH] [--dev-data | --monocode-data | --monocode-db PATH]\nDevelopment builds use a separate database; release builds use the installed MonoCode database.\n--dev-data opens an isolated development database using Monocode's existing schema.\n--monocode-data opens the existing desktop monocode.db directly.\n--monocode-db PATH opens a specific desktop database.\n--fixture, --chat-fixture and --visual-fixture add local samples to isolated development data only.\nvisual docs prints the native visual SDK reference.\nvisual check/show --input FILE validates or publishes native session visuals.\nvisual-mcp runs the session visual tool server over standard input/output.\n--check-data validates and lists the selected store read-only, then exits."
+                    "monocode-gpui [--cwd PATH] [--dev-data | --monocode-data | --monocode-db PATH]\nDevelopment builds use a separate database; release builds use the installed MonoCode database.\n--dev-data opens an isolated development database using Monocode's existing schema.\n--monocode-data opens the existing desktop monocode.db directly.\n--monocode-db PATH opens a specific desktop database.\n--fixture, --chat-fixture, --visual-fixture and --plan-fixture add local samples to isolated development data only.\nvisual docs prints the native visual SDK reference.\nvisual check/show --input FILE validates or publishes native session visuals.\nvisual-mcp runs the session visual tool server over standard input/output.\n--check-data validates and lists the selected store read-only, then exits."
                 );
                 return;
             }
@@ -256,7 +280,7 @@ fn main() {
             }
         }
     }
-    if use_monocode && (fixture || chat_fixture || visual_fixture) {
+    if use_monocode && (fixture || chat_fixture || visual_fixture || plan_fixture) {
         eprintln!(
             "Fixtures require --dev-data; they cannot be written into your Monocode database."
         );
@@ -317,9 +341,6 @@ fn main() {
             .unwrap_or(std::path::Path::new("."))
             .join("checkpoints"),
     );
-    if let Err(error) = db.sweep_thread_dirs() {
-        eprintln!("Cannot clean up deleted conversations' files: {error}");
-    }
     let saved = db.ui_state().unwrap_or_else(|e| {
         eprintln!("Cannot read workspace settings: {e}");
         None
@@ -377,7 +398,15 @@ fn main() {
             .unwrap();
         db.write_rows(s.id, 0, &fixtures::visuals().rows).unwrap();
     }
+    if plan_fixture {
+        for (provider, title, transcript) in fixtures::plans() {
+            let s = db.create(provider, &cwd).expect("create plan fixture");
+            db.title(s.id, title).unwrap();
+            db.write_rows(s.id, 0, &transcript.rows).unwrap();
+        }
+    }
     let mut sessions = db.sessions().expect("read native sessions");
+    restart_resume::prepare(&mut db, &sessions);
     if sessions.is_empty() {
         sessions.push(db.create("codex", &cwd).expect("create initial session"));
     }
@@ -399,6 +428,8 @@ fn main() {
     gpui::Application::with_platform(platform)
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
+            #[cfg(feature = "perf-trace")]
+            performance_probe::start(launched, cx);
             #[cfg(debug_assertions)]
             dev_reload::install(cx);
             cx.set_global(title_raster);
@@ -466,6 +497,22 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
+                    let cleanup = db.clone();
+                    window.on_next_frame(move |_, cx| {
+                        cx.background_executor()
+                            .spawn(async move {
+                                let result = cleanup
+                                    .lock()
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|store| store.sweep_thread_dirs());
+                                if let Err(error) = result {
+                                    eprintln!(
+                                        "Cannot clean up deleted conversations' files: {error}"
+                                    );
+                                }
+                            })
+                            .detach();
+                    });
                     let shell = cx.new(|cx| {
                         shell::Shell::new_with_metadata(
                             db,

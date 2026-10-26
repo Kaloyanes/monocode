@@ -2,6 +2,7 @@
 //! and the menu bar. It floats over other apps without activating MonoCode,
 //! keeps its draft across a dismiss, and opens its pickers below the toolbar
 //! so the prompt never moves.
+use crate::tooltip::Tip;
 use crate::{
     git_picker::{GitPicker, Mode as GitMode, Picked as GitPicked},
     input::{self, Command, Input},
@@ -17,7 +18,7 @@ use gpui::{
 use monocode_core::{
     agent::AccessMode, git::Snapshot, project_appearance::ProjectAppearance, provider::Kind,
 };
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 #[cfg(all(target_os = "macos", not(test)))]
 mod hotkey;
 
@@ -194,7 +195,7 @@ pub(crate) struct QuickComposer {
     fast: bool,
     access: AccessMode,
     workspace: Workspace,
-    git: Option<Snapshot>,
+    git: Option<Arc<Snapshot>>,
     git_settled: bool,
     git_epoch: usize,
     attachments: Vec<PathBuf>,
@@ -1123,6 +1124,7 @@ impl QuickComposer {
                         .id(("quick-remove-attachment", ix))
                         .role(Role::Button)
                         .aria_label(format!("Remove {label}"))
+                        .tip(format!("Remove {label}"))
                         .cursor_pointer()
                         .flex_shrink_0()
                         .size(px(16.))
@@ -1725,6 +1727,7 @@ impl QuickComposer {
                                 .id("quick-effort-reset")
                                 .role(Role::Button)
                                 .aria_label("Reset to saved defaults")
+                                .tip("Reset to saved defaults")
                                 .group("quick-effort-reset")
                                 .cursor_pointer()
                                 .size(px(28.))

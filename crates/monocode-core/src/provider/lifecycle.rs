@@ -18,7 +18,15 @@ impl Protocol {
                 json!({"id":wire,"result":{"action":"cancel","content":null,"_meta":null}}),
             );
         };
-        if !self.request.settings.plan && self.request.settings.access == AccessMode::FullAccess {
+        let grant = self.mcp_grant(&request);
+        let restricted =
+            self.request.settings.plan || self.request.settings.access == AccessMode::ReadOnly;
+        if !restricted
+            && (self.request.settings.access == AccessMode::FullAccess
+                || grant
+                    .as_ref()
+                    .is_some_and(|grant| self.permissions.contains(&grant.key)))
+        {
             return write_json(
                 stdin,
                 json!({"id":wire,"result":{"action":"accept","content":content,"_meta":null}}),
@@ -33,8 +41,84 @@ impl Protocol {
             title,
             detail: String::new(),
             can_remember: false,
+            remember_scope: (!restricted && grant.is_some())
+                .then(|| "Remember this exact confirmation in this project, across chats and restarts. Remove it in Settings → MCP connections.".into()),
         }));
         Ok(())
+    }
+
+    fn mcp_grant(&self, request: &Value) -> Option<crate::permissions::Grant> {
+        let (label, _) = mcp_confirmation(request)?;
+        let server = request["serverName"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())?;
+        request["message"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())?;
+        let mut confirmation = request.as_object()?.clone();
+        for field in ["threadId", "turnId", "serverName", "nativeContent"] {
+            confirmation.remove(field);
+        }
+        let settings = &self.request.settings;
+        let mut account_home = settings.account.home(self.request.kind).ok()?;
+        if settings.account.id == crate::accounts::DEFAULT {
+            if let Some(home) = settings
+                .environment
+                .get("CODEX_HOME")
+                .filter(|s| !s.is_empty())
+            {
+                account_home = home.into();
+            }
+        }
+        if let Some(mono) = &settings.mono {
+            if let Some(home) = crate::mono::codex_home(&mono.root, &settings.account.id).ok()? {
+                account_home = home;
+            }
+        }
+        Some(crate::permissions::Grant {
+            label,
+            key: crate::permissions::Key {
+                provider: self.request.kind.id().into(),
+                account: self.request.settings.account.id.clone(),
+                account_home: crate::permissions::project(&account_home),
+                binary: crate::permissions::project(&self.request.binary),
+                project: crate::permissions::project(&self.request.cwd),
+                server: server.into(),
+                confirmation: confirmation.into(),
+            },
+        })
+    }
+
+    pub(super) fn remember_approval(
+        &mut self,
+        id: &str,
+        stdin: &mut impl Write,
+    ) -> Result<Vec<Event>, String> {
+        let Some((_, kind, request)) = self.approvals.get(id) else {
+            return Ok(Vec::new());
+        };
+        let grant = (kind == "codex-mcp"
+            && !self.request.settings.plan
+            && self.request.settings.access != AccessMode::ReadOnly)
+            .then(|| self.mcp_grant(request))
+            .flatten();
+        let result = grant
+            .ok_or_else(|| "This request cannot be remembered".to_owned())
+            .and_then(|grant| self.permissions.allow(grant));
+        if let Err(error) = result {
+            return Ok(vec![Event::ApprovalSaveFailed {
+                id: id.into(),
+                error: format!("{error}. The request is still waiting for your decision."),
+            }]);
+        }
+        self.respond(
+            Control {
+                id: id.into(),
+                decision: Decision::Allow,
+            },
+            stdin,
+        )?;
+        Ok(vec![Event::ApprovalResolved(id.into())])
     }
 
     pub(super) fn claude_prompt(&mut self, stdin: &mut impl Write) -> Result<(), String> {
@@ -242,6 +326,228 @@ fn mcp_confirmation(request: &Value) -> Option<(String, Value)> {
         title.push_str(&detail);
     }
     Some((title, content.into()))
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    fn protocol(path: &Path) -> Protocol {
+        let mut p = Protocol::new(Request {
+            kind: Kind::Codex,
+            binary: "unused".into(),
+            cwd: "/tmp".into(),
+            prompt: String::new(),
+            provider_id: None,
+            model: None,
+            settings: Settings::default(),
+        });
+        p.permissions = crate::permissions::Store::new(path.into());
+        p
+    }
+
+    fn request() -> Value {
+        json!({"serverName":"cua_repl", "threadId":"first", "turnId":"turn-1",
+            "mode":"form", "message":"Allow Computer Use to use \"Monocode Native\"?",
+            "requestedSchema":{"type":"object", "properties":{"approved":{"type":"boolean"}}, "required":["approved"]}})
+    }
+
+    fn ask(p: &mut Protocol, request: Value, out: &mut Vec<u8>) -> Vec<Event> {
+        let mut events = Vec::new();
+        p.codex_elicitation(json!(17), request, &mut events, out)
+            .unwrap();
+        events
+    }
+
+    #[test]
+    fn always_allow_survives_restart_and_revocation_restores_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut p = protocol(&path);
+        let mut out = Vec::new();
+        let events = ask(&mut p, request(), &mut out);
+        let [Event::Approval(approval)] = events.as_slice() else {
+            panic!("expected approval");
+        };
+        assert!(approval.remember_scope.is_some());
+        assert!(out.is_empty());
+        assert_eq!(
+            p.remember_approval(&approval.id, &mut out).unwrap(),
+            vec![Event::ApprovalResolved(approval.id.clone())]
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap()["result"],
+            json!({"action":"accept", "content":{"approved":true}, "_meta":null})
+        );
+        assert!(p.approvals.is_empty());
+
+        let mut restarted = protocol(&path);
+        let mut next = request();
+        next["threadId"] = json!("another-chat");
+        next["turnId"] = json!("another-turn");
+        out.clear();
+        assert!(ask(&mut restarted, next, &mut out).is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap()["result"]["action"],
+            "accept"
+        );
+        let grant = p.permissions.list().unwrap().pop().unwrap();
+        p.permissions.remove(&grant.key).unwrap();
+        out.clear();
+        assert!(matches!(
+            ask(&mut restarted, request(), &mut out).as_slice(),
+            [Event::Approval(_)]
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn one_time_and_denied_decisions_do_not_create_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        for decision in [Decision::Allow, Decision::Deny] {
+            let mut p = protocol(&path);
+            ask(&mut p, request(), &mut Vec::new());
+            p.respond(
+                Control {
+                    id: "17".into(),
+                    decision,
+                },
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert!(!path.exists());
+            assert!(matches!(
+                ask(&mut p, request(), &mut Vec::new()).as_slice(),
+                [Event::Approval(_)]
+            ));
+        }
+    }
+
+    #[test]
+    fn changed_targets_schemas_metadata_accounts_and_projects_prompt_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut original = protocol(&path);
+        ask(&mut original, request(), &mut Vec::new());
+        original.remember_approval("17", &mut Vec::new()).unwrap();
+        for field in [
+            "message",
+            "requestedSchema",
+            "_meta",
+            "serverName",
+            "resource",
+        ] {
+            let mut p = protocol(&path);
+            let mut changed = request();
+            changed[field] = if field == "requestedSchema" {
+                json!({"type":"object", "properties":{}})
+            } else {
+                json!("different")
+            };
+            let mut out = Vec::new();
+            assert!(
+                matches!(
+                    ask(&mut p, changed, &mut out).as_slice(),
+                    [Event::Approval(_)]
+                ),
+                "{field}"
+            );
+            assert!(out.is_empty());
+        }
+        let mut p = protocol(&path);
+        p.request.cwd = dir.path().into();
+        assert!(matches!(
+            ask(&mut p, request(), &mut Vec::new()).as_slice(),
+            [Event::Approval(_)]
+        ));
+        let mut p = protocol(&path);
+        p.request.settings.account = crate::accounts::Profile::new("other", dir.path());
+        assert!(matches!(
+            ask(&mut p, request(), &mut Vec::new()).as_slice(),
+            [Event::Approval(_)]
+        ));
+        let mut p = protocol(&path);
+        p.request
+            .settings
+            .environment
+            .insert("CODEX_HOME".into(), dir.path().display().to_string());
+        assert!(matches!(
+            ask(&mut p, request(), &mut Vec::new()).as_slice(),
+            [Event::Approval(_)]
+        ));
+    }
+
+    #[test]
+    fn restricted_modes_never_reuse_or_create_saved_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut p = protocol(&path);
+        ask(&mut p, request(), &mut Vec::new());
+        p.remember_approval("17", &mut Vec::new()).unwrap();
+        for plan in [true, false] {
+            let mut p = protocol(&path);
+            p.request.settings.plan = plan;
+            p.request.settings.access = if plan {
+                AccessMode::FullAccess
+            } else {
+                AccessMode::ReadOnly
+            };
+            let mut out = Vec::new();
+            let events = ask(&mut p, request(), &mut out);
+            let [Event::Approval(approval)] = events.as_slice() else {
+                panic!("expected prompt");
+            };
+            assert!(approval.remember_scope.is_none());
+            assert!(matches!(
+                p.remember_approval("17", &mut out).unwrap().as_slice(),
+                [Event::ApprovalSaveFailed { .. }]
+            ));
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn save_failure_keeps_request_open_and_stale_requests_cannot_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        std::fs::create_dir(&path).unwrap();
+        let mut p = protocol(&path);
+        let mut out = Vec::new();
+        ask(&mut p, request(), &mut out);
+        assert!(matches!(
+            p.remember_approval("17", &mut out).unwrap().as_slice(),
+            [Event::ApprovalSaveFailed { .. }]
+        ));
+        assert!(out.is_empty());
+        assert!(p.approvals.contains_key("17"));
+        p.respond(
+            Control {
+                id: "17".into(),
+                decision: Decision::Deny,
+            },
+            &mut out,
+        )
+        .unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        assert!(p.remember_approval("17", &mut out).unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn arbitrary_forms_and_missing_server_identity_cannot_be_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = protocol(&dir.path().join("permissions.json"));
+        let mut form = request();
+        form["requestedSchema"]["properties"]["secret"] = json!({"type":"string"});
+        assert!(p.mcp_grant(&form).is_none());
+        let mut missing = request();
+        missing.as_object_mut().unwrap().remove("serverName");
+        assert!(p.mcp_grant(&missing).is_none());
+        assert!(ask(&mut p, form, &mut Vec::new())
+            .iter()
+            .all(|e| !matches!(e, Event::Approval(_))));
+    }
 }
 
 pub(super) fn recoverable_codex_resume(error: &str) -> bool {

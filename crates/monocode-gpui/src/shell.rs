@@ -2,6 +2,7 @@ mod accounts;
 mod actions;
 mod app_commands;
 mod app_views;
+mod archive_motion;
 mod automation_runs;
 mod classic_sidebar;
 #[cfg(test)]
@@ -9,9 +10,11 @@ mod classic_surface_tests;
 mod classic_surfaces;
 mod file_panes;
 mod idle_agents;
+mod interrupted_turns;
 #[cfg(test)]
 mod image_lightbox_tests;
 mod layout;
+mod list_cascade;
 mod live_agents;
 mod mobile_host;
 mod mono_panes;
@@ -19,12 +22,13 @@ pub(crate) mod monos;
 mod notifications;
 mod orchestration;
 mod picker_preferences;
+#[cfg(all(test, target_os = "macos"))]
+mod plan_rail_shots;
 mod project_rail;
 mod project_removal;
 mod project_settings;
 mod quick_composer;
 mod quick_open;
-mod archive_motion;
 mod rails;
 mod remote_projects;
 mod remote_sessions;
@@ -157,7 +161,10 @@ impl Render for Chrome {
             .update(cx, |shell, cx| match kind {
                 ChromeKind::Sidebar => {
                     let sidebar = shell.sidebar(cx);
-                    if shell.spaces_nudge.is_some() || shell.classic_tabs.animating() {
+                    if shell.spaces_nudge.is_some()
+                        || shell.classic_tabs.animating()
+                        || shell.sidebar_list.cascade.active()
+                    {
                         window.request_animation_frame();
                     }
                     sidebar
@@ -598,6 +605,8 @@ pub(crate) struct Shell {
     #[cfg(target_os = "linux")]
     client_decorations: bool,
     tabs_frame: Entity<Chrome>,
+    plan_rail: Entity<crate::plan_rail::PlanRail>,
+    plan_sidebar: Entity<crate::plan_rail::PlanSidebar>,
     store: Database,
     remote: Arc<monocode_core::remote::Connections>,
     remote_project_picker: Option<remote_projects::Open>,
@@ -643,6 +652,7 @@ pub(crate) struct Shell {
     session_row_bounds: HashMap<i64, AnchorSlot>,
     folder_bounds: HashMap<String, AnchorSlot>,
     sidebar_drop: Option<session_groups::ListDrop>,
+    sidebar_arming: Option<session_groups::Arming>,
     folder_drag: Option<session_groups::FolderDrag>,
     skip_folder_click: bool,
     filter_anchor: AnchorSlot,
@@ -706,6 +716,9 @@ pub(crate) struct Shell {
     /// Tabs sliding between slots: neighbours making room for a drag and,
     /// after a drop, every tab gliding from where it was drawn into place.
     tab_shifts: HashMap<TitleTab, TabShift>,
+    /// A test's frozen clock for `tab_shifts`, so draws cannot settle them.
+    #[cfg(test)]
+    tab_clock: Option<std::time::Instant>,
     pane_ticks: HashMap<i64, PaneTick>,
     skip_tab_click: bool,
     spaces_start: usize,
@@ -922,6 +935,8 @@ impl Shell {
             .get(&workspace.project)
             .map(|id| classic_sidebar::ClassicSidebarTab::from_id(id))
             .unwrap_or_default();
+        let plan_rail = cx.new(|_| crate::plan_rail::PlanRail::new());
+        let plan_sidebar = cx.new(|cx| crate::plan_rail::PlanSidebar::new(plan_rail.clone(), cx));
         let mut this = Self {
             monos: None,
             quick_open: None,
@@ -957,6 +972,8 @@ impl Shell {
             #[cfg(target_os = "linux")]
             client_decorations: false,
             tabs_frame,
+            plan_rail,
+            plan_sidebar,
             store,
             remote,
             remote_project_picker: None,
@@ -997,6 +1014,7 @@ impl Shell {
             session_row_bounds: HashMap::new(),
             folder_bounds: HashMap::new(),
             sidebar_drop: None,
+            sidebar_arming: None,
             folder_drag: None,
             skip_folder_click: false,
             filter_anchor: AnchorSlot::default(),
@@ -1051,6 +1069,8 @@ impl Shell {
             worktree_returns: HashMap::new(),
             tab_drag: None,
             tab_shifts: HashMap::new(),
+            #[cfg(test)]
+            tab_clock: None,
             pane_ticks: HashMap::new(),
             skip_tab_click: false,
             spaces_start: 0,
@@ -1206,6 +1226,7 @@ impl Shell {
         this.apply_preferences(cx);
         this.poll_reminders(cx);
         this.initialize_automations(cx);
+        this.resume_interrupted_turns(cx);
         if this.workspace.active.is_none() {
             cx.spawn(async move |this, cx| {
                 let _ = this.update_in(cx, |this, window, cx| {
@@ -1426,7 +1447,7 @@ impl Shell {
                         }
                         this.refresh_session_mark(id, cx);
                         if archived {
-                            this.start_archive_exit(id, cx);
+                            this.start_archive_exit(id, window, cx);
                         }
                         if archived && this.workspace.tab_of(id).is_some() {
                             this.close_pane(id, window, cx);
@@ -1569,7 +1590,11 @@ impl Shell {
     /// project, and not covered by an app view.
     fn right_panel_shown(&self, cx: &App) -> bool {
         (self.workspace.right_panel_open || self.right_slide.is_some())
-            && (!self.workspace.classic_layout || self.mono_active(cx))
+            && (!self.workspace.classic_layout
+                || self.mono_active(cx)
+                || self.right_panel.as_ref().is_some_and(|panel| {
+                    panel.read(cx).tab() == crate::right_panel::RightTab::Plan
+                }))
             && !self.app_view_open()
             && self.settings.is_none()
             && self.app_search.is_none()
@@ -1644,6 +1669,16 @@ impl Shell {
     fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_right_panel_open(!self.workspace.right_panel_open, window, cx);
     }
+    fn open_plan_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_right_panel(window, cx);
+        self.right_panel.as_ref().unwrap().update(cx, |panel, cx| {
+            panel.select(crate::right_panel::RightTab::Plan, cx)
+        });
+        self.workspace.right_panel_width = self.workspace.right_panel_width.max(420.);
+        self.set_right_panel_open(true, window, cx);
+        self.invalidate_chrome(cx);
+        cx.notify();
+    }
     fn set_right_panel_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.app_view_open()
             || (!self.mono_active(cx) && !self.git.read(cx).available())
@@ -1687,6 +1722,16 @@ impl Shell {
         if self.right_panel.is_some() {
             return;
         }
+        self.observations.push(cx.subscribe_in(
+            &self.plan_rail,
+            window,
+            |this, _, event: &crate::plan_rail::PreviewEvent, window, cx| match event {
+                crate::plan_rail::PreviewEvent::Open => this.open_plan_preview(window, cx),
+                crate::plan_rail::PreviewEvent::Close => {
+                    this.set_right_panel_open(false, window, cx)
+                }
+            },
+        ));
         let git = self.git.clone();
         let (tab, order, view) = (
             self.workspace.right_panel_tab,
@@ -1852,17 +1897,17 @@ impl Shell {
         });
     }
     /// The native stand-in for the web app's Reload: restart the process.
-    /// Unlike a webview reload this stops running agents and terminals, so it
-    /// always asks first.
+    /// Unlike a webview reload this interrupts running agents and stops
+    /// terminals, so it always asks first.
     fn request_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.quit_prompted {
             return;
         }
         self.quit_prompted = true;
         let detail = if self.unsaved_files(cx) {
-            "Running agents and terminals will stop, and unsaved file edits will be lost."
+            "Running chats will continue after the reload. Terminals will stop, and unsaved file edits will be lost."
         } else {
-            "Running agents and terminals will stop."
+            "Running chats will continue after the reload. Terminals will stop."
         };
         let answer = window.prompt(
             gpui::PromptLevel::Warning,
@@ -1883,7 +1928,18 @@ impl Shell {
         .detach();
     }
     fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.unsaved_files(cx) {
+        let unsaved = self.unsaved_files(cx);
+        // Automation runs and orchestration workers are recovered by their
+        // owners, not continued, so they do not ask.
+        let running = self
+            .sessions
+            .values()
+            .filter(|view| {
+                let view = view.read(cx);
+                view.busy && !view.managed
+            })
+            .count();
+        if !unsaved && running == 0 {
             crate::quit(cx);
             return;
         }
@@ -1891,11 +1947,30 @@ impl Shell {
             return;
         }
         self.quit_prompted = true;
+        let resume = match running {
+            0 => String::new(),
+            1 => "1 chat is still running. It will continue when you reopen MonoCode.".into(),
+            n => format!("{n} chats are still running. They will continue when you reopen MonoCode."),
+        };
+        let (message, detail, confirm) = if unsaved {
+            let detail = "Save your files before quitting to keep your changes.";
+            (
+                "Quit with unsaved file edits?",
+                if resume.is_empty() {
+                    detail.to_owned()
+                } else {
+                    format!("{detail} {resume}")
+                },
+                "Quit Without Saving",
+            )
+        } else {
+            ("Quit MonoCode?", resume, "Quit")
+        };
         let answer = window.prompt(
             gpui::PromptLevel::Warning,
-            "Quit with unsaved file edits?",
-            Some("Save your files before quitting to keep your changes."),
-            &["Quit Without Saving", "Cancel"],
+            message,
+            Some(&detail),
+            &[confirm, "Cancel"],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -3588,17 +3663,12 @@ impl Shell {
             drag.insert = insert;
             self.tabs_frame.update(cx, |_, cx| cx.notify());
         }
-        let drop = matches!(source, DragSource::Session(_))
-            .then(|| self.sidebar_drop_at(event.position, source.session(), cx))
-            .flatten();
-        if self.sidebar_drop != drop {
-            self.sidebar_drop = drop;
-            self.notify_sidebar(cx);
-        }
+        let position = matches!(source, DragSource::Session(_)).then_some(event.position);
+        self.update_sidebar_drop(position, source.session(), cx);
         cx.notify();
     }
     fn cancel_pane_drag(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_drop.take().is_some() {
+        if self.sidebar_drop.take().is_some() | self.sidebar_arming.take().is_some() {
             self.notify_sidebar(cx);
         }
         if let Some(drag) = self.pane_drag.take() {
@@ -3616,6 +3686,9 @@ impl Shell {
         cx.notify();
         if !drag.active {
             return;
+        }
+        if self.sidebar_arming.take().is_some() {
+            self.notify_sidebar(cx);
         }
         if let Some(target) = self.sidebar_drop.take() {
             self.apply_sidebar_drop(drag.source.session(), target, window, cx);
@@ -4042,6 +4115,14 @@ impl Shell {
         self.close_title_tabs(&tabs, preferred, window, cx);
     }
     fn visit(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        // Settings sit over the history: Back leaves them, and Forward
+        // leaves them on its way to the next visit.
+        if self.settings.is_some() {
+            self.close_settings(window, cx);
+            if step < 0 {
+                return;
+            }
+        }
         if let Some(id) = self.history.step(step) {
             self.open(id, window, cx);
         }
@@ -4429,28 +4510,15 @@ impl Shell {
                     .w(px(self.traffic_lights()))
                     .flex_shrink_0(),
             )
-            .child(
-                icon_button("toggle-sidebar", TOGGLE_SIDEBAR_LABEL, "sidebar")
-                    .debug_selector(|| "toggle-sidebar".into())
-                    .child(self.peek_toggle_bounds.probe())
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    // Hovering the toggle peeks a collapsed sidebar out.
-                    .on_hover(cx.listener(|this, hovered, _, cx| {
-                        if !this.workspace.classic_layout {
-                            this.hover_peek_toggle(*hovered, cx)
-                        }
-                    }))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.toggle_primary_sidebar(window, cx)),
-                    ),
-            )
+            .child(self.sidebar_toggle(cx))
             .child(titlebar_drag_area().flex_1())
             .child(
                 icon_button_enabled(
                     "visit-back",
                     BACK_LABEL,
                     "chevron-left",
-                    (self.workspace.classic_layout && self.mono_active(cx))
+                    self.settings.is_some()
+                        || (self.workspace.classic_layout && self.mono_active(cx))
                         || !self.history.back.is_empty(),
                 )
                 .debug_selector(|| "visit-back".into())
@@ -4474,6 +4542,29 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, window, cx| this.visit(1, window, cx))),
             )
+    }
+    /// Settings fill the sidebar's place, so its toggle steps aside. Its
+    /// slot stays, so nothing beside it moves.
+    fn sidebar_toggle(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        if self.settings.is_some() {
+            return div()
+                .id("toggle-sidebar")
+                .debug_selector(|| "toggle-sidebar".into())
+                .flex_shrink_0()
+                .size(px(24.))
+                .child(self.peek_toggle_bounds.probe());
+        }
+        icon_button("toggle-sidebar", TOGGLE_SIDEBAR_LABEL, "sidebar")
+            .debug_selector(|| "toggle-sidebar".into())
+            .child(self.peek_toggle_bounds.probe())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // Hovering the toggle peeks a collapsed sidebar out.
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                if !this.workspace.classic_layout {
+                    this.hover_peek_toggle(*hovered, cx)
+                }
+            }))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_primary_sidebar(window, cx)))
     }
     /// Part of the card: the project tools beside the workspace, behind a
     /// hairline. Its contents keep their full width while it slides.
@@ -4499,6 +4590,16 @@ impl Shell {
                         .cached(StyleRefinement::default().size_full())
                         .into_any_element()
                 }
+            } else if panel.read(cx).tab() == crate::right_panel::RightTab::Plan {
+                div()
+                    .size_full()
+                    .pt(px(if self.workspace.boxy_layout() {
+                        TITLE_BAR_HEIGHT
+                    } else {
+                        0.
+                    }))
+                    .child(self.plan_sidebar.clone())
+                    .into_any_element()
             } else if self.terminal_in_panel(cx)
                 && panel.read(cx).tab() == crate::right_panel::RightTab::Terminal
             {
@@ -5821,6 +5922,7 @@ impl Shell {
             (model, branch, workspace_label)
         };
         let pinned = session.summary.pinned;
+        let archived = session.summary.archived;
         let mark = {
             let mark = match self.session_marks.get(&id) {
                 Some(mark) if self.sidebar_uncached() => div()
@@ -6040,13 +6142,19 @@ impl Shell {
             .items_center()
             .when(active, |d| d.bg(content(0.1)))
             .when(started_in_view && !active, |d| d.bg(content(0.05)))
-            .hover(|s| s.bg(content(if active { 0.1 } else { 0.05 })))
+            .hover(|s| {
+                let s = s.bg(content(if active { 0.1 } else { 0.05 }));
+                if archived { s.opacity(0.9) } else { s }
+            })
             .when(
                 self.sidebar_drop == Some(session_groups::ListDrop::Session(id)),
                 |d| d.bg(content(0.14)),
             )
             .when(self.deleting.contains(&id), |d| d.opacity(0.5))
+            // Archived threads recede, and come back to full strength on hover.
+            .when(session.summary.archived, |d| d.opacity(0.55))
             .child(body)
+            .children(self.sidebar_drop_mark(id))
             .child(anchor.probe())
             .relative()
             .on_hover(cx.listener(move |this, hovered, window, cx| {
@@ -6097,17 +6205,14 @@ impl Shell {
         session: &session_loading::Metadata<'_>,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let archived = session.summary.archived;
         div()
             .id(("archive-session", id as usize))
             .debug_selector(move || format!("archive-session-{id}"))
             .role(Role::Button)
             .aria_label(format!(
                 "{} {}",
-                if session.summary.archived {
-                    "Unarchive"
-                } else {
-                    "Archive"
-                },
+                if archived { "Unarchive" } else { "Archive" },
                 session.display_title()
             ))
             .group("session-archive")
@@ -6125,7 +6230,8 @@ impl Shell {
             })
             .hover(|s| s.bg(content(0.1)))
             .child(
-                icon("archive", 12.).group_hover("session-archive", |s| s.text_color(content(1.))),
+                icon(if archived { "archive-off" } else { "archive" }, 12.)
+                    .group_hover("session-archive", |s| s.text_color(content(1.))),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -6260,8 +6366,14 @@ impl Shell {
                         })
             })
             .collect();
+        // With archived threads shown they sit last, under their own heading.
+        let archived_last = self.workspace.preferences.show_archived;
         ids.sort_by_key(|id| {
-            std::cmp::Reverse((self.session_metadata(*id, cx).summary.updated_at, *id))
+            let summary = self.session_metadata(*id, cx).summary;
+            (
+                archived_last && summary.archived,
+                std::cmp::Reverse((summary.updated_at, *id)),
+            )
         });
         ids
     }
@@ -7010,6 +7122,15 @@ impl Shell {
                     provider_icon(&session.summary.provider, 14.).into_any_element()
                 })
                 .child(div().min_w_0().truncate().child(title))
+                .children(self.sidebar_drop_intent().map(|intent| {
+                    div()
+                        .flex_shrink_0()
+                        .pl(px(6.))
+                        .border_l_1()
+                        .border_color(content(0.1))
+                        .text_color(content(0.55))
+                        .child(intent)
+                }))
                 .into_any_element(),
         )
     }
@@ -7161,7 +7282,7 @@ impl Shell {
             } else if drag.active {
                 self.cancel_pane_drag(cx);
                 // Each tab glides from where it is drawn into its new slot.
-                let now = std::time::Instant::now();
+                let now = self.tab_now();
                 let visible = self.visible_tabs(cx);
                 let drawn: Vec<(TitleTab, f32)> = visible
                     .iter()
@@ -7202,6 +7323,13 @@ impl Shell {
             self.tabs_frame.update(cx, |_, cx| cx.notify());
         }
     }
+    fn tab_now(&self) -> std::time::Instant {
+        #[cfg(test)]
+        if let Some(now) = self.tab_clock {
+            return now;
+        }
+        std::time::Instant::now()
+    }
     /// Where tab `id` is drawn now, easing toward `target`.
     fn eased_shift(
         &mut self,
@@ -7210,7 +7338,7 @@ impl Shell {
         follow: bool,
         reduced: bool,
     ) -> (f32, bool) {
-        let now = std::time::Instant::now();
+        let now = self.tab_now();
         // The dragged tab rides the pointer; it eases only into a slot.
         if follow || reduced {
             self.tab_shifts.remove(&id);
@@ -7281,8 +7409,40 @@ impl Shell {
         (window.viewport_size().width.as_f32() - lead - trailing - client_controls_width(window))
             .max(0.)
     }
+    /// The title strip as the active session's plan rail, in place of tabs.
+    fn plan_strip(&mut self, viewport: f32, cx: &mut Context<Self>) -> AnyElement {
+        let session = self.workspace.active.and_then(|id| {
+            let id = self.workspace.session_for_pane(id);
+            self.sessions.get(&id).map(|view| (id, view.clone()))
+        });
+        let session = session.filter(|_| !self.app_view_open());
+        self.plan_rail
+            .update(cx, |rail, cx| rail.follow(session, cx));
+        div()
+            .id("title-plan-strip")
+            .debug_selector(|| "title-plan-strip".into())
+            .w(px(viewport))
+            .min_w_0()
+            .h(px(TITLE_BAR_HEIGHT))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .pl(px(STRIP_LEAD))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .child(self.plan_rail.clone()),
+            )
+            .into_any()
+    }
     fn tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let viewport = self.tabs_width(window, cx);
+        if self.workspace.preferences.title_plan {
+            return self.plan_strip(viewport, cx);
+        }
         let tabs = self.visible_tabs(cx);
         let count = tabs.len();
         let insert = self.pane_drag.as_ref().and_then(|d| d.insert);
@@ -8593,7 +8753,7 @@ mod tests {
         visual.simulate_click(archive.center(), Default::default());
         visual.run_until_parked();
         window
-            .update(visual, |shell, window, cx| {
+            .update(visual, |shell, _, cx| {
                 assert_eq!(
                     shell.workspace.active,
                     Some(b),
@@ -8601,6 +8761,15 @@ mod tests {
                 );
                 assert!(!shell.workspace.tabs.contains(&a));
                 assert!(shell.sessions[&a].read(cx).summary.archived);
+                // The row stays listed while it slides and folds away.
+                assert!(shell.archive_exits.exiting(a));
+                assert!(shell.sidebar_session_ids(cx).contains(&a));
+                shell.archive_exits.finish();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, window, cx| {
                 assert!(!shell.sidebar_session_ids(cx).contains(&a));
                 assert!(
                     !locked(&shell.store)
@@ -8611,7 +8780,13 @@ mod tests {
                         .is_empty()
                 );
                 shell.run_menu(MenuTarget::SessionFilter, "archived", None, window, cx);
-                assert!(shell.sidebar_session_ids(cx).contains(&a));
+                let listed = shell.sidebar_session_ids(cx);
+                assert!(listed.contains(&a));
+                assert_eq!(
+                    listed.last(),
+                    Some(&a),
+                    "archived threads sort after active ones when shown"
+                );
                 shell.toggle_archive(a, cx);
             })
             .unwrap();
@@ -11814,13 +11989,20 @@ mod tests {
             .unwrap();
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
+        let before = window
+            .update(cx, |shell, _, _| shell.active_leaves())
+            .unwrap();
         cx.simulate_keystrokes("cmd-d");
+        // The new session is created off the main thread, and parking paints
+        // the slide to its end, so replay the split's motion and hold it.
+        cx.run_until_parked();
         window
-            .update(cx, |shell, _, _| {
+            .update(cx, |shell, _, cx| {
+                shell.begin_pane_motion(before, cx);
                 shell
                     .pane_motion
                     .as_ref()
-                    .unwrap()
+                    .expect("the split animates")
                     .slide
                     .freeze_elapsed(std::time::Duration::from_millis(16));
             })
@@ -11894,6 +12076,10 @@ mod tests {
                 let new = shell.workspace.active.unwrap();
                 shell.close_pane(new, w, cx);
                 let motion = shell.pane_motion.as_ref().expect("closing animates");
+                // Held mid-slide until the test releases it below.
+                motion
+                    .slide
+                    .freeze_elapsed(std::time::Duration::from_millis(16));
                 assert_eq!(motion.header, Some(false));
                 assert_eq!(motion.leaving.len(), 1);
                 assert_eq!(
@@ -12097,6 +12283,12 @@ mod tests {
     fn reordered_tabs_slide_into_place_instead_of_jumping(cx: &mut TestAppContext) {
         use gpui::{Modifiers, point};
         let (window, a, b) = same_project_window(cx);
+        // Stop the clock so the draws below cannot settle the shifts first.
+        window
+            .update(cx, |shell, _, _| {
+                shell.tab_clock = Some(std::time::Instant::now())
+            })
+            .unwrap();
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
         let first = cx
@@ -12386,7 +12578,11 @@ mod tests {
     #[gpui::test]
     fn title_particle_frames_only_invalidate_the_sidebar(cx: &mut TestAppContext) {
         let (window, _, id) = window(cx);
-        cx.update(|cx| cx.set_reduce_motion(false));
+        cx.update(|cx| {
+            cx.set_reduce_motion(false);
+            // Held mid-effect, however long the frames below take to draw.
+            cx.set_global(crate::particle_text::FrozenClock(std::time::Instant::now()));
+        });
         // Blank tabs deliberately have no sidebar card. Mount a conversation
         // before changing its title, so this exercises an existing label.
         window

@@ -4,6 +4,7 @@
 //! alone. The agent, not MonoCode's edit log, decides which changes are its.
 //! Once a step lands the pill moves on: staged work offers Commit, and an
 //! unpushed commit offers Push.
+use crate::tooltip::Tip;
 use super::*;
 
 /// Read older pages without installing their transcript payload in the UI.
@@ -315,6 +316,7 @@ impl Conversation {
         };
         let main = segment("git-action-run")
             .aria_label(SharedString::from(current.message()))
+            .tip(SharedString::from(current.message()))
             .pl(px(10.))
             .pr(px(if has_menu { 8. } else { 10. }))
             .gap(px(6.))

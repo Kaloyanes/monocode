@@ -1,4 +1,5 @@
 use super::*;
+use crate::tooltip::Tip;
 use crate::popover::{Align, Anchor, popover};
 use gpui::{
     AnyElement, ClipboardItem, CursorStyle, Div, FontWeight, Hsla, MouseButton, Pixels, Role,
@@ -1093,6 +1094,7 @@ impl Inbox {
                                 .id("inbox-merge-options")
                                 .role(Role::Button)
                                 .aria_label("Merge options")
+                                .tip("Merge options")
                                 .h_full()
                                 .w(px(28.))
                                 .flex()

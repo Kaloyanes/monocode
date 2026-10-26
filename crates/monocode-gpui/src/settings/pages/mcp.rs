@@ -80,6 +80,7 @@ impl SettingsView {
                 )
                 .into_any_element(),
         ];
+        page.push(self.saved_permissions(cx));
         let filter = self.mcp_filter.clone();
         let counts = std::iter::once(("all", "All"))
             .chain(
@@ -380,6 +381,93 @@ impl SettingsView {
             });
         }));
     }
+    fn saved_permissions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let project =
+            monocode_core::permissions::project(std::path::Path::new(&self.selected_project));
+        let grants = self.mcp_grants.iter().filter(|g| g.key.project == project);
+        let mut section = div()
+            .mt_6()
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Saved permissions"),
+            )
+            .child(note(
+                "Exact MCP confirmations allowed for this project across chats and restarts.",
+            ));
+        if let Some(error) = &self.mcp_grants_error {
+            section = section.child(
+                div()
+                    .id("saved-permissions-error")
+                    .role(gpui::Role::Alert)
+                    .text_size(px(12.))
+                    .text_color(gpui::rgb(0xf87171))
+                    .child(error.clone()),
+            );
+        }
+        let mut count = 0;
+        for (index, grant) in grants.enumerate() {
+            count += 1;
+            let key = grant.key.clone();
+            section = section.child(
+                self.row(
+                    None,
+                    index == 0,
+                    grant.label.clone(),
+                    Some(
+                        format!(
+                            "{} · Account {} · {}",
+                            grant.key.provider, grant.key.account, grant.key.server
+                        )
+                        .into(),
+                    ),
+                    vec![
+                        secondary_button(
+                            SharedString::from(format!("remove-permission-{index}")),
+                            "Remove",
+                            false,
+                            self.mcp_busy,
+                        )
+                        .debug_selector(move || format!("remove-permission-{index}"))
+                        .child("Remove")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.mcp_busy {
+                                return;
+                            }
+                            this.mcp_busy = true;
+                            let key = key.clone();
+                            let work = cx.background_executor().spawn(async move {
+                                let store = monocode_core::permissions::Store::default();
+                                store.remove(&key)?;
+                                store.list()
+                            });
+                            this.mcp_grants_task = Some(cx.spawn(async move |this, cx| {
+                                let result = work.await;
+                                let _ = this.update(cx, |this, cx| {
+                                    this.mcp_busy = false;
+                                    match result {
+                                        Ok(grants) => {
+                                            this.mcp_grants = grants;
+                                            this.mcp_grants_error = None;
+                                        }
+                                        Err(error) => this.mcp_grants_error = Some(error),
+                                    }
+                                    cx.notify();
+                                });
+                            }));
+                        }))
+                        .into_any_element(),
+                    ],
+                ),
+            );
+        }
+        if count == 0 {
+            section = section.child(note("No saved permissions for this project."));
+        }
+        section.into_any_element()
+    }
+
     fn mcp_action(
         &mut self,
         server: super::super::data::McpServer,

@@ -222,7 +222,11 @@ mod tests {
             .update(visual, |view, _, _| view.document.lines.len())
             .unwrap();
         let pane = visual.debug_bounds("visual-source-pane").unwrap();
-        assert_eq!(pane.size.height, px(lines as f32 * LINE_HEIGHT), "No fixed height");
+        assert_eq!(
+            pane.size.height,
+            px(lines as f32 * LINE_HEIGHT),
+            "No fixed height"
+        );
         assert!(visual.debug_bounds("visual-source-line-0").is_some());
     }
 }

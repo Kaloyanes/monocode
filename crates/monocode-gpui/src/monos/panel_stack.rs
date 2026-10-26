@@ -83,6 +83,9 @@ pub(super) struct PanelStack {
     route: Option<Route>,
     base: Motion,
     layers: Vec<Layer>,
+    /// A test's frozen clock, so a frame drawn later still samples `elapsed`.
+    #[cfg(test)]
+    frozen: Option<Instant>,
 }
 impl Default for PanelStack {
     fn default() -> Self {
@@ -91,12 +94,18 @@ impl Default for PanelStack {
             route: None,
             base: Motion::still(Pose::SHOWN),
             layers: Vec::new(),
+            #[cfg(test)]
+            frozen: None,
         }
     }
 }
 impl PanelStack {
     pub fn sync(&mut self, mono: &str, route: Option<Route>, now: Instant, reduced: bool) -> bool {
         let changed = self.mono.as_deref() != Some(mono) || self.route != route;
+        #[cfg(test)]
+        if changed {
+            self.frozen = None;
+        }
         if self.mono.as_deref() != Some(mono) {
             *self = Self {
                 mono: Some(mono.into()),
@@ -146,6 +155,8 @@ impl PanelStack {
     }
 
     pub fn frame(&mut self, now: Instant) -> Frame {
+        #[cfg(test)]
+        let now = self.frozen.unwrap_or(now);
         let (base, done) = self.base.sample(now);
         let mut frame = Frame {
             base,
@@ -171,11 +182,13 @@ impl PanelStack {
 
     #[cfg(test)]
     pub(super) fn elapsed(&mut self, elapsed: std::time::Duration) {
-        let start = Instant::now() - elapsed;
+        let now = Instant::now();
+        let start = now - elapsed;
         self.base.start = Some(start);
         for page in &mut self.layers {
             page.motion.start = Some(start);
         }
+        self.frozen = Some(now);
     }
 }
 

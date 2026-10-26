@@ -81,7 +81,8 @@ pub fn terminate(child: &mut std::process::Child) {
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 /// A provider child that belongs to a session, for the running-work list.
 #[derive(Clone, Debug)]
 pub struct Agent {
@@ -159,6 +160,61 @@ impl Drop for Registration {
 /// Explicit native-app quit hook. Run off the UI thread and wait briefly for the
 /// workers to reap their children, rather than leaving isolated provider groups.
 pub fn shutdown_all() {
+    QUITTING.store(true, Ordering::SeqCst);
+    // Cancel first so providers can abort their remote turn (OpenCode's managed
+    // service outlives MonoCode) and workers can settle their rows.
+    for cancel in turns().lock().unwrap_or_else(|e| e.into_inner()).values() {
+        cancel.store(true, Ordering::SeqCst);
+    }
+    // Most providers stop well within this. A slower one is killed below; the
+    // next launch still settles and continues its turn.
+    drain_turns(std::time::Duration::from_millis(750));
+    kill_children();
+    drain_turns(std::time::Duration::from_secs(1));
+}
+
+static QUITTING: AtomicBool = AtomicBool::new(false);
+/// True once the app has begun quitting. A provider that fails now was killed
+/// by the quit, so its turn is interrupted rather than failed or finished.
+pub fn shutting_down() -> bool {
+    QUITTING.load(Ordering::SeqCst)
+}
+fn turns() -> &'static Mutex<HashMap<u64, Arc<AtomicBool>>> {
+    static TURNS: OnceLock<Mutex<HashMap<u64, Arc<AtomicBool>>>> = OnceLock::new();
+    TURNS.get_or_init(Default::default)
+}
+/// A running turn's cancel flag, raised when the app quits.
+pub struct TurnRegistration(u64);
+pub fn register_turn(cancel: Arc<AtomicBool>) -> TurnRegistration {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    if shutting_down() {
+        cancel.store(true, Ordering::SeqCst);
+    }
+    turns()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, cancel);
+    TurnRegistration(id)
+}
+impl Drop for TurnRegistration {
+    fn drop(&mut self) {
+        turns()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+fn drain_turns(limit: std::time::Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    while !turns().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn kill_children() {
     let pids: Vec<_> = active()
         .lock()
         .unwrap_or_else(|e| e.into_inner())

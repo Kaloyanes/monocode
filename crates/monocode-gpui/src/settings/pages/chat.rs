@@ -54,7 +54,14 @@ impl SettingsView {
                 Some("follow-up"),
                 true,
                 "Follow-up behavior",
-                Some("Queue follow-ups until the active turn finishes, or steer the active turn immediately.".into()),
+                Some(
+                    if cfg!(target_os = "macos") {
+                        "Queue follow-ups until the active turn finishes, or steer the active turn immediately. Press ⌘↵ to send the other way."
+                    } else {
+                        "Queue follow-ups until the active turn finishes, or steer the active turn immediately. Press Ctrl+Enter to send the other way."
+                    }
+                    .into(),
+                ),
                 vec![self.segmented(
                     "follow-up",
                     "Follow-up behavior",

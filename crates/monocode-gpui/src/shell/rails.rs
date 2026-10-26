@@ -552,6 +552,7 @@ impl Shell {
             )
             .when(self.deleting.contains(&id), |d| d.opacity(0.5))
             .child(body)
+            .children(self.sidebar_drop_mark(id))
             .child(anchor.probe())
             .on_hover(cx.listener(move |this, hovered, window, cx| {
                 // Original cards carry their details inline, so hovering only

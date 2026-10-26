@@ -32,7 +32,7 @@
             root.style.setProperty("--sidebar-opacity", String(o));
           }
           var scheme = localStorage.getItem("monocode.colorScheme");
-          if (scheme === "system") {
+          if (scheme !== "dark" && scheme !== "light") {
             scheme = window.matchMedia("(prefers-color-scheme: light)").matches
               ? "light"
               : "dark";

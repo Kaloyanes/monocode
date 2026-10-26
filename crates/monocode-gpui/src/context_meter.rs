@@ -10,6 +10,10 @@ pub(crate) fn ring(ratio: f32) -> impl IntoElement {
     } else {
         content(0.45)
     };
+    progress_ring(ratio, color)
+}
+
+pub(crate) fn progress_ring(ratio: f32, color: gpui::Hsla) -> impl IntoElement {
     div().size(px(14.)).child(
         canvas(
             |_, _, _| (),

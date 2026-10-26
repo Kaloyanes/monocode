@@ -122,4 +122,36 @@ describe("LiveAgentsPreview", () => {
     expect(liveRegion.textContent).not.toMatch(/\d+s/);
     expect(container.querySelector("[role=status]")).toBeNull();
   });
+
+  it("folds the list away under its header and opens it again", () => {
+    render({
+      agents: [agent("a", "/repo/a"), agent("b", "/repo/b")],
+      groupLabels: {},
+      groupColors: {},
+      groupCustomColors: {},
+      groupMascots: {},
+    });
+
+    const header = container.querySelector<HTMLButtonElement>(
+      "button[aria-expanded]",
+    )!;
+    expect(header.textContent).toContain("Working");
+    act(() => header.click());
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+    const folding = container
+      .querySelector('[data-live-agent-card="a"]')!
+      .closest(".reveal-height-out");
+    expect(folding?.hasAttribute("inert")).toBe(true);
+
+    act(() =>
+      folding!.dispatchEvent(new Event("animationend", { bubbles: true })),
+    );
+    expect(container.querySelector("[data-live-agent-card]")).toBeNull();
+
+    act(() => header.click());
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    expect(container.querySelectorAll("[data-live-agent-card]")).toHaveLength(
+      2,
+    );
+  });
 });

@@ -18,6 +18,8 @@ pub(crate) struct Preferences {
     pub notes: bool,
     pub quick_composer: bool,
     pub working_agents: bool,
+    /// The title bar shows the active session's agent plan instead of tabs.
+    pub title_plan: bool,
     pub close_to_tray: bool,
     /// Running an action shows the terminal it runs in.
     pub action_opens_terminal: bool,
@@ -106,6 +108,7 @@ impl Default for Preferences {
             notes: true,
             quick_composer: true,
             working_agents: true,
+            title_plan: false,
             close_to_tray: true,
             action_opens_terminal: true,
             terminal_in_panel: false,

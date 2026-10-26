@@ -1,4 +1,5 @@
 //! The three application destinations share one navigation and focus boundary.
+use crate::tooltip::Tip;
 use super::*;
 use crate::{automations, inbox, notes};
 
@@ -73,6 +74,7 @@ impl Shell {
                         .debug_selector(move || format!("close-app-tab-{}", view.label()))
                         .role(Role::Button)
                         .aria_label(format!("Close {}", view.label()))
+                        .tip(format!("Close {}", view.label()))
                         .absolute()
                         .right_1()
                         .top(px(10.))

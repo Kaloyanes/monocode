@@ -259,6 +259,17 @@ fn notice(rows: &[Row], at: usize, end: usize) -> Option<Value> {
                 json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to interact")}),
             )
         }
+        monocode_core::transcript::images::ROLE => {
+            let title =
+                serde_json::from_str::<monocode_core::transcript::images::ImageDocument>(&text)
+                    .ok()
+                    .filter(|document| document.validate().is_ok())
+                    .map(|document| document.title)
+                    .unwrap_or_else(|| "Image".into());
+            Some(
+                json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to view")}),
+            )
+        }
         "system" if !text.trim().is_empty() => {
             Some(json!({"type": "notice", "id": id, "text": text}))
         }
@@ -456,7 +467,7 @@ fn agent_turn(source: &Source, turn: &Turn, live: bool) -> Value {
             continue;
         }
         responded = true;
-        if role == "visual" {
+        if role == "visual" || role == monocode_core::transcript::images::ROLE {
             close(&mut work, &mut items);
             if let Some(notice) = notice(rows, at, end) {
                 items.push(notice);

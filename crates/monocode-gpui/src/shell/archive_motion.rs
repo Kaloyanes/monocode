@@ -24,7 +24,7 @@ struct Exit {
 #[derive(Default)]
 pub(crate) struct ArchiveExits {
     exits: HashMap<i64, Exit>,
-    frames: Option<gpui::Task<()>>,
+    frame_scheduled: bool,
 }
 
 impl ArchiveExits {
@@ -53,6 +53,14 @@ impl ArchiveExits {
 
     pub(super) fn exiting(&self, id: i64) -> bool {
         self.row(id).is_some()
+    }
+
+    /// Ages every exit past its fold so the next frame drops the rows.
+    #[cfg(test)]
+    pub(super) fn finish(&mut self) {
+        for exit in self.exits.values_mut() {
+            exit.start = Instant::now() - ROW;
+        }
     }
 }
 
@@ -86,9 +94,9 @@ fn particles(id: i64, origin: Point<Pixels>, elapsed: Duration) -> Vec<Particle>
             let angle = std::f32::consts::PI * (0.55 + 0.9 * jitter(id, k, 1));
             let reach = 26. + 34. * jitter(id, k, 2);
             let fall = 18. * t * t * (0.6 + jitter(id, k, 3));
-            let mut color: Hsla = rgb(PALETTE[(jitter(id, k, 4) * PALETTE.len() as f32) as usize
-                % PALETTE.len()])
-            .into();
+            let mut color: Hsla =
+                rgb(PALETTE[(jitter(id, k, 4) * PALETTE.len() as f32) as usize % PALETTE.len()])
+                    .into();
             color.a = fade;
             Particle {
                 center: point(
@@ -105,7 +113,12 @@ fn particles(id: i64, origin: Point<Pixels>, elapsed: Duration) -> Vec<Particle>
 impl Shell {
     /// Starts the exit for a thread that was just archived. Rows that are not
     /// on screen, or a reduced-motion setting, simply drop out of the list.
-    pub(super) fn start_archive_exit(&mut self, id: i64, cx: &mut Context<Self>) {
+    pub(super) fn start_archive_exit(
+        &mut self,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if cx.reduce_motion() || self.workspace.preferences.show_archived {
             return;
         }
@@ -120,19 +133,18 @@ impl Shell {
                 dropped: false,
             },
         );
-        self.tick_archive_exits(cx);
+        self.tick_archive_exits(window, cx);
     }
 
-    fn tick_archive_exits(&mut self, cx: &mut Context<Self>) {
-        if self.archive_exits.frames.is_some() {
+    fn tick_archive_exits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.archive_exits.frame_scheduled {
             return;
         }
-        self.archive_exits.frames = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(16))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.archive_exits.frames = None;
+        self.archive_exits.frame_scheduled = true;
+        let weak = cx.weak_entity();
+        window.on_next_frame(move |window, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                this.archive_exits.frame_scheduled = false;
                 let mut dropped = false;
                 for exit in this.archive_exits.exits.values_mut() {
                     if !exit.dropped && exit.start.elapsed() >= ROW {
@@ -149,10 +161,10 @@ impl Shell {
                 }
                 this.sidebar_frame.update(cx, |_, cx| cx.notify());
                 if !this.archive_exits.exits.is_empty() {
-                    this.tick_archive_exits(cx);
+                    this.tick_archive_exits(window, cx);
                 }
             });
-        }));
+        });
     }
 
     /// The row at `ix` as the list shows it, slid and folded while its thread
@@ -255,10 +267,6 @@ mod tests {
         assert_eq!(a.len(), PARTICLES);
         assert!(a.iter().zip(&b).all(|(x, y)| x.center == y.center));
         assert!(a.iter().all(|p| p.color.a > 0.));
-        assert!(
-            particles(7, origin, BURST)
-                .iter()
-                .all(|p| p.color.a < 0.01)
-        );
+        assert!(particles(7, origin, BURST).iter().all(|p| p.color.a < 0.01));
     }
 }

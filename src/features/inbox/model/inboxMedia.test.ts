@@ -1,11 +1,46 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   INBOX_MEDIA_PREFIXES,
+  inboxMediaSourceUrl,
   isInboxMediaUrl,
   sniffInboxMedia,
 } from "./inboxMedia";
 
+describe("inboxMediaSourceUrl", () => {
+  it("maps blob image and video links to their raw file", () => {
+    expect(
+      inboxMediaSourceUrl(
+        "  https://github.com/acme/web/blob/main/docs/shot.png?raw=true#top ",
+      ),
+    ).toBe("https://raw.githubusercontent.com/acme/web/main/docs/shot.png");
+    expect(
+      inboxMediaSourceUrl("https://www.github.com/acme/web/blob/v2/clip.MP4"),
+    ).toBe("https://raw.githubusercontent.com/acme/web/v2/clip.MP4");
+  });
+
+  it("leaves blob links to code and other URLs unchanged", () => {
+    const code = "https://github.com/acme/web/blob/main/src/lib.rs";
+    expect(inboxMediaSourceUrl(code)).toBe(code);
+    const page = "https://github.com/acme/web/issues/1";
+    expect(inboxMediaSourceUrl(page)).toBe(page);
+    const other = "https://evil.example/blob/main/shot.png";
+    expect(inboxMediaSourceUrl(other)).toBe(other);
+  });
+});
+
 describe("isInboxMediaUrl", () => {
+  it("allows GitHub blob image links through their raw file", () => {
+    expect(
+      isInboxMediaUrl("https://github.com/acme/web/blob/main/docs/shot.png"),
+    ).toBe(true);
+    expect(
+      isInboxMediaUrl("https://github.com/acme/web/blob/main/src/lib.rs"),
+    ).toBe(false);
+    expect(
+      isInboxMediaUrl("https://github.com/acme/web/blob/main/../x.png"),
+    ).toBe(false);
+  });
+
   it("allows GitHub and Linear attachment hosts", () => {
     expect(
       isInboxMediaUrl(

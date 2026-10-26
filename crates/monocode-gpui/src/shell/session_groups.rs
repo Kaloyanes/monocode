@@ -2,7 +2,7 @@
 //! folders and deletion, and the grouped list they shape.
 use super::*;
 use chrono::{Local, NaiveDateTime, TimeZone};
-use gpui::EventEmitter;
+use gpui::{Animation, AnimationExt, EventEmitter, Task};
 use monocode_core::{
     session_groups::{
         Entry, Groups, build_list, format_reminder, navigation_ids, parse_github_work_item,
@@ -10,6 +10,7 @@ use monocode_core::{
     },
     store::Reminder,
 };
+use std::time::{Duration, Instant};
 
 actions!(
     session_groups,
@@ -83,7 +84,27 @@ pub(super) fn reminder_caption(ms: u64) -> String {
 #[derive(Clone, PartialEq)]
 pub(super) enum ListDrop {
     Folder(String),
+    /// Make a new folder with this session.
     Session(i64),
+    /// Take the dragged session out of its folder.
+    Unfile,
+}
+/// How long the pointer rests on the middle of a session row before dropping
+/// there makes a folder, so dragging across rows never makes one by accident.
+const ARM_FOLDER: Duration = Duration::from_millis(300);
+/// The middle of a session row being held to make a folder.
+pub(super) struct Arming {
+    id: i64,
+    since: Instant,
+    _task: Task<()>,
+}
+enum SidebarHit {
+    Drop(ListDrop),
+    /// The middle of a session outside any folder; `rest` applies until it arms.
+    Combine {
+        id: i64,
+        rest: Option<ListDrop>,
+    },
 }
 pub(super) struct FolderDrag {
     id: String,
@@ -178,17 +199,17 @@ impl Shell {
             self.delete_session(id, window, cx);
         }
     }
-    pub(super) fn sidebar_drop_at(
-        &self,
-        position: Point<Pixels>,
-        source: i64,
-        cx: &App,
-    ) -> Option<ListDrop> {
+    fn sidebar_hit(&self, position: Point<Pixels>, source: i64, cx: &App) -> Option<SidebarHit> {
         if !self.workspace.sidebar_visible || self.reminders.iter().any(|r| r.session_id == source)
         {
             return None;
         }
         let groups = self.project_groups();
+        let from = groups.folder_of(source).map(|f| f.id.clone());
+        let into = |folder: &str| {
+            (from.as_deref() != Some(folder))
+                .then(|| SidebarHit::Drop(ListDrop::Folder(folder.into())))
+        };
         for folder in &groups.folders {
             if self
                 .folder_bounds
@@ -196,26 +217,159 @@ impl Shell {
                 .and_then(AnchorSlot::get)
                 .is_some_and(|b| b.contains(&position))
             {
-                return Some(ListDrop::Folder(folder.id.clone()));
+                return into(&folder.id);
             }
         }
+        let unfile = from.is_some().then_some(ListDrop::Unfile);
         for id in self.sidebar_navigation_ids(cx) {
-            if id == source || self.reminders.iter().any(|r| r.session_id == id) {
+            if self.reminders.iter().any(|r| r.session_id == id) {
                 continue;
             }
-            if self
+            let Some(bounds) = self
                 .session_row_bounds
                 .get(&id)
                 .and_then(AnchorSlot::get)
-                .is_some_and(|b| b.contains(&position))
-            {
-                return Some(match groups.folder_of(id) {
-                    Some(folder) => ListDrop::Folder(folder.id.clone()),
-                    None => ListDrop::Session(id),
-                });
+                .filter(|b| b.contains(&position))
+            else {
+                continue;
+            };
+            if let Some(folder) = groups.folder_of(id) {
+                return into(&folder.id);
             }
+            // A row's edges send the session back to the list; its middle
+            // half makes a folder once the pointer rests there.
+            let along = (position.y - bounds.top()) / bounds.size.height;
+            return if id != source && (0.25..0.75).contains(&along) {
+                Some(SidebarHit::Combine { id, rest: unfile })
+            } else {
+                unfile.map(SidebarHit::Drop)
+            };
         }
         None
+    }
+    /// Re-targets a sidebar drop; `None` clears it.
+    pub(super) fn update_sidebar_drop(
+        &mut self,
+        position: Option<Point<Pixels>>,
+        source: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let hit = position.and_then(|p| self.sidebar_hit(p, source, cx));
+        let arming = self.sidebar_arming.as_ref().map(|a| a.id);
+        let drop = match hit {
+            Some(SidebarHit::Combine { id, rest }) => {
+                let now = cx.background_executor().now();
+                if arming != Some(id) {
+                    self.sidebar_arming = Some(Arming {
+                        id,
+                        since: now,
+                        _task: cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(ARM_FOLDER).await;
+                            let _ = this.update(cx, |this, cx| {
+                                let Some(drag) = this.pane_drag.as_ref().filter(|d| d.active)
+                                else {
+                                    return;
+                                };
+                                if let DragSource::Session(source) = drag.source {
+                                    let position = drag.position;
+                                    this.update_sidebar_drop(Some(position), source, cx);
+                                }
+                            });
+                        }),
+                    });
+                }
+                let since = self.sidebar_arming.as_ref().map_or(now, |a| a.since);
+                if now.saturating_duration_since(since) >= ARM_FOLDER {
+                    Some(ListDrop::Session(id))
+                } else {
+                    rest
+                }
+            }
+            Some(SidebarHit::Drop(drop)) => {
+                self.sidebar_arming = None;
+                Some(drop)
+            }
+            None => {
+                self.sidebar_arming = None;
+                None
+            }
+        };
+        if self.sidebar_drop != drop || arming != self.sidebar_arming.as_ref().map(|a| a.id) {
+            self.sidebar_drop = drop;
+            self.notify_sidebar(cx);
+        }
+    }
+    /// What releasing the dragged session does, beside its title.
+    pub(super) fn sidebar_drop_intent(&self) -> Option<SharedString> {
+        let groups = self.project_groups();
+        let folder = |id: &str| {
+            groups
+                .folder(id)
+                .map(|f| f.name.clone())
+                .unwrap_or_default()
+        };
+        Some(match self.sidebar_drop.as_ref()? {
+            ListDrop::Folder(id) => format!("Into {}", folder(id)).into(),
+            ListDrop::Session(_) => "New folder".into(),
+            ListDrop::Unfile => {
+                let source = self.pane_drag.as_ref()?.source.session();
+                format!("Out of {}", groups.folder_of(source)?.name).into()
+            }
+        })
+    }
+    /// The ring that fills while a row arms, or the outline once dropping
+    /// there makes a folder. It overlays the session card.
+    pub(super) fn sidebar_drop_mark(&self, id: i64) -> Option<AnyElement> {
+        let accent = crate::theme::accent_color();
+        let armed = self.sidebar_drop == Some(ListDrop::Session(id));
+        if !armed && self.sidebar_arming.as_ref().is_none_or(|a| a.id != id) {
+            return None;
+        }
+        let mark = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .rounded_md()
+            .flex()
+            .items_center()
+            .justify_end()
+            .pr(px(8.));
+        Some(if armed {
+            mark.border_1()
+                .border_color(accent)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(3.))
+                        .h(px(18.))
+                        .px(px(6.))
+                        .rounded(px(5.))
+                        .bg(accent)
+                        .text_size(px(11.))
+                        .text_color(gpui::white())
+                        .child(icon("folder-add", 11.).text_color(gpui::white()))
+                        .child("Folder"),
+                )
+                .into_any_element()
+        } else {
+            mark.child(
+                div()
+                    .size(px(18.))
+                    .rounded_full()
+                    .bg(shell_fill())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(div().with_animation(
+                        ("sidebar-arm", id as u64),
+                        Animation::new(ARM_FOLDER),
+                        move |d, delta| d.child(crate::context_meter::progress_ring(delta, accent)),
+                    )),
+            )
+            .into_any_element()
+        })
     }
     pub(super) fn apply_sidebar_drop(
         &mut self,
@@ -235,6 +389,7 @@ impl Shell {
                 });
                 self.start_rename(RenameTarget::Folder(folder), window, cx);
             }
+            ListDrop::Unfile => self.update_groups(cx, |g| g.remove_sessions(&[source])),
             _ => {}
         }
     }
@@ -2340,6 +2495,17 @@ mod tests {
             .unwrap();
         visual.simulate_mouse_down(a_row.center(), MouseButton::Left, Default::default());
         visual.simulate_mouse_move(b_row.center(), Some(MouseButton::Left), Default::default());
+        window
+            .update(visual, |shell, _, _| {
+                assert!(
+                    shell.sidebar_drop.is_none(),
+                    "a folder waits for the row to arm"
+                );
+                assert_eq!(shell.sidebar_arming.as_ref().map(|a| a.id), Some(b));
+            })
+            .unwrap();
+        visual.executor().advance_clock(ARM_FOLDER);
+        visual.run_until_parked();
         visual.simulate_mouse_up(b_row.center(), MouseButton::Left, Default::default());
         visual.run_until_parked();
         window
@@ -2382,6 +2548,62 @@ mod tests {
                 )
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn dropping_on_a_rows_edge_or_before_it_arms_takes_a_session_out_of_its_folder(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, a, b) = setup(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let bounds = |visual: &mut VisualTestContext, id: i64| {
+            visual
+                .debug_bounds(Box::leak(format!("sidebar-session-{id}").into_boxed_str()))
+                .unwrap()
+        };
+        // A quick drop on the middle of another loose session changes nothing.
+        let (a_row, b_row) = (bounds(visual, a), bounds(visual, b));
+        visual.simulate_mouse_down(a_row.center(), MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(b_row.center(), Some(MouseButton::Left), Default::default());
+        visual.simulate_mouse_up(b_row.center(), MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.project_groups().folders.is_empty());
+                shell.update_groups(cx, |g| {
+                    g.create_folder(&[a], "solo".into());
+                });
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        for at in [
+            |b: Bounds<Pixels>| gpui::point(b.center().x, b.top() + px(2.)),
+            |b: Bounds<Pixels>| b.center(),
+        ] {
+            let (a_row, b_row) = (bounds(visual, a), bounds(visual, b));
+            visual.simulate_mouse_down(a_row.center(), MouseButton::Left, Default::default());
+            visual.simulate_mouse_move(at(b_row), Some(MouseButton::Left), Default::default());
+            window
+                .update(visual, |shell, _, _| {
+                    assert!(shell.sidebar_drop == Some(ListDrop::Unfile));
+                    assert_eq!(
+                        shell.sidebar_drop_intent().as_deref(),
+                        Some("Out of New folder")
+                    );
+                })
+                .unwrap();
+            visual.simulate_mouse_up(at(b_row), MouseButton::Left, Default::default());
+            visual.run_until_parked();
+            window
+                .update(visual, |shell, _, cx| {
+                    assert!(shell.project_groups().folder_of(a).is_none());
+                    shell.update_groups(cx, |g| {
+                        g.create_folder(&[a], "solo".into());
+                    });
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+        }
     }
 
     #[gpui::test]

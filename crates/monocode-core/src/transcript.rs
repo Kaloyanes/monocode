@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod attachments;
+pub mod images;
 
 pub const ROW_BYTES: usize = 2048;
 

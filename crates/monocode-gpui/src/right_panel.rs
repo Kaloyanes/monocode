@@ -61,6 +61,7 @@ pub(crate) enum RightTab {
     #[default]
     Files,
     Changes,
+    Plan,
     Graph,
     /// The project's terminal, when it opens in the panel. Always last and
     /// never part of the saved order.
@@ -71,6 +72,7 @@ impl RightTab {
         match self {
             Self::Files => "Explorer",
             Self::Changes => "Changes",
+            Self::Plan => "Plan",
             Self::Graph => "History",
             Self::Terminal => "Terminal",
         }
@@ -80,7 +82,7 @@ impl RightTab {
     pub(crate) fn normalize(order: &[RightTab]) -> Vec<RightTab> {
         let mut out = Vec::new();
         for tab in order.iter().chain(&[Self::Files, Self::Graph]) {
-            if !matches!(tab, Self::Terminal | Self::Changes) && !out.contains(tab) {
+            if !matches!(tab, Self::Terminal | Self::Changes | Self::Plan) && !out.contains(tab) {
                 out.push(*tab);
             }
         }
@@ -509,6 +511,7 @@ impl RightPanel {
                 let (id, path) = match tab {
                     RightTab::Files => ("right-panel-tab-Explorer", "file-script"),
                     RightTab::Changes => ("right-panel-tab-Changes", "git-branch"),
+                    RightTab::Plan => ("right-panel-tab-Plan", "list-bullet"),
                     RightTab::Graph => ("right-panel-tab-History", "clock"),
                     RightTab::Terminal => ("right-panel-tab-Terminal", "terminal"),
                 };
@@ -608,7 +611,7 @@ impl Render for RightPanel {
                 .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
                 .into_any_element(),
             // The shell paints the terminal over this pane.
-            RightTab::Terminal => div().into_any_element(),
+            RightTab::Terminal | RightTab::Plan => div().into_any_element(),
         };
         div()
             .id("right-panel")

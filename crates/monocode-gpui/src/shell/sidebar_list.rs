@@ -1,4 +1,5 @@
 //! Only construct and lay out sidebar cards near the viewport.
+use super::list_cascade::ListCascade;
 use super::*;
 use gpui::{ListAlignment, ListState, list};
 use monocode_core::session_groups::Entry;
@@ -44,6 +45,17 @@ pub(super) struct SidebarList {
     /// Only anchors constructed for the last viewport, including nested rails.
     visible_anchors: RefCell<Vec<AnchorSlot>>,
     visible_rows: RefCell<Vec<usize>>,
+    pub(super) cascade: ListCascade,
+    reduce_motion: bool,
+}
+
+fn row_session(row: &Row) -> Option<i64> {
+    match row {
+        Row::Session(id) | Row::GroupedSession { id, .. } | Row::ClassicGroupMember { id, .. } => {
+            Some(*id)
+        }
+        _ => None,
+    }
 }
 
 impl SidebarList {
@@ -70,6 +82,8 @@ impl SidebarList {
             structural_rebuilds: 0,
             visible_anchors: RefCell::new(Vec::new()),
             visible_rows: RefCell::new(Vec::new()),
+            cascade: ListCascade::default(),
+            reduce_motion: false,
         }
     }
 
@@ -94,6 +108,7 @@ impl SidebarList {
 
     fn update(&mut self, scope: String, rows: Vec<Row>) {
         if self.scope != scope {
+            self.cascade.cancel();
             self.state.reset_with_uniform_height(rows.len(), px(33.));
             self.scope = scope;
         } else if self.rows != rows {
@@ -111,6 +126,7 @@ impl SidebarList {
                 .zip(rows[prefix..].iter().rev())
                 .take_while(|(a, b)| a == b)
                 .count();
+            self.start_cascade(&rows, prefix);
             self.state.splice(
                 prefix..self.rows.len() - suffix,
                 rows.len() - prefix - suffix,
@@ -119,6 +135,41 @@ impl SidebarList {
         self.rows = rows;
         // Navigation and the Mono overview can change height independently.
         self.state.remeasure_items(0..self.rows.len().min(2));
+    }
+
+    /// When exactly one session joined or left, records where the rows after
+    /// it were painted so they can travel from there. Must run before the
+    /// list state forgets the old layout.
+    fn start_cascade(&self, rows: &[Row], prefix: usize) {
+        self.cascade.cancel();
+        if self.reduce_motion {
+            return;
+        }
+        let old: HashSet<i64> = self.rows.iter().filter_map(row_session).collect();
+        let new: HashSet<i64> = rows.iter().filter_map(row_session).collect();
+        let added: Vec<_> = new.difference(&old).copied().collect();
+        let entering = match (added.as_slice(), old.difference(&new).count()) {
+            ([id], 0) => rows.iter().position(|row| row_session(row) == Some(*id)),
+            ([], 1) => None,
+            _ => return,
+        };
+        // Far below the viewport nothing is seen moving.
+        const REACH: usize = 64;
+        let painted: Vec<_> = (prefix..self.rows.len().min(prefix + REACH))
+            .filter_map(|ix| Some((&self.rows[ix], self.state.bounds_for_item(ix)?.top())))
+            .collect();
+        let mut moved = HashMap::default();
+        let mut rank = 0;
+        for (ix, row) in rows.iter().enumerate().skip(prefix).take(REACH) {
+            if Some(ix) == entering || matches!(row, Row::Gap | Row::ClassicGap(_)) {
+                continue;
+            }
+            if let Some((_, top)) = painted.iter().find(|(old, _)| *old == row) {
+                moved.insert(ix, (*top, rank));
+                rank += 1;
+            }
+        }
+        self.cascade.start(entering, moved);
     }
 }
 
@@ -147,7 +198,9 @@ fn sidebar_edge_mask(
         |_, _, _| {},
         move |bounds, _, window, _| {
             let offset = state.logical_scroll_top();
-            let bottom_height = px(40.).min(bounds.size.height);
+            let remaining =
+                state.max_offset_for_scrollbar().y + state.scroll_px_offset_for_scrollbar().y;
+            let bottom_height = px(40.).min(remaining.max(px(0.))).min(bounds.size.height);
             let top_height = if top_fade && (offset.item_ix > 0 || offset.offset_in_item > px(0.)) {
                 px(28.).min((bounds.size.height - bottom_height).max(px(0.)))
             } else {
@@ -254,6 +307,7 @@ impl Shell {
             for id in folders {
                 self.folder_bounds.entry(id).or_default();
             }
+            self.sidebar_list.reduce_motion = cx.reduce_motion();
             self.prepare_sidebar_list(&entries, cx);
         }
         self.sync_sidebar_list_visibility();
@@ -336,6 +390,7 @@ impl Shell {
         if folders {
             rows.push(Row::Gap);
         }
+        let archived_listed = self.workspace.preferences.show_archived;
         let mut previous = None;
         let mut first = true;
         for entry in entries {
@@ -345,7 +400,12 @@ impl Shell {
             if self.rails.children.contains(id) {
                 continue;
             }
-            let label = age_label(self.session_metadata(*id, cx).summary.updated_at, now);
+            let summary = self.session_metadata(*id, cx).summary;
+            let label = if archived_listed && summary.archived {
+                "Archived"
+            } else {
+                age_label(summary.updated_at, now)
+            };
             if previous != Some(label) {
                 rows.push(Row::Heading { label, first });
                 previous = Some(label);
@@ -459,6 +519,7 @@ impl Shell {
                 )
                 .size_full(),
             )
+            .children(self.unfile_zone())
             .child(sidebar_edge_mask(
                 self.sidebar_list.state.clone(),
                 !self.workspace.classic_layout,
@@ -467,6 +528,71 @@ impl Shell {
             ))
             .children(self.archive_burst_overlay())
             .into_any()
+    }
+
+    /// While a session is dragged out of its folder, outlines the sessions
+    /// outside folders, where it will land.
+    fn unfile_zone(&self) -> Option<AnyElement> {
+        if self.sidebar_drop != Some(session_groups::ListDrop::Unfile) {
+            return None;
+        }
+        let mut pinned = false;
+        let anchors: Vec<_> = self
+            .sidebar_list
+            .rows
+            .iter()
+            .filter_map(|row| {
+                match row {
+                    Row::Pinned => pinned = true,
+                    Row::Gap => pinned = false,
+                    Row::Session(id) if !pinned => return self.session_row_bounds.get(id).cloned(),
+                    _ => {}
+                }
+                None
+            })
+            .collect();
+        let mut fill = crate::theme::accent_color();
+        let stroke = fill;
+        fill.a = 0.06;
+        Some(
+            gpui::canvas(
+                |_, _, _| {},
+                move |area, _, window, _| {
+                    let mut rows: Vec<_> = anchors.iter().filter_map(AnchorSlot::get).collect();
+                    rows.sort_by(|a, b| a.top().as_f32().total_cmp(&b.top().as_f32()));
+                    // Contiguous cards share one zone; a heading between
+                    // two dated runs does not split it.
+                    let mut runs: Vec<Bounds<Pixels>> = Vec::new();
+                    for row in rows {
+                        match runs.last_mut() {
+                            Some(run) if row.top() - run.bottom() < px(40.) => {
+                                *run = run.union(&row)
+                            }
+                            _ => runs.push(row),
+                        }
+                    }
+                    for run in runs {
+                        let zone = run.dilate(px(3.)).intersect(&area);
+                        if zone.size.height <= px(0.) {
+                            continue;
+                        }
+                        window.paint_quad(gpui::PaintQuad {
+                            bounds: zone,
+                            corner_radii: px(8.).into(),
+                            background: fill.into(),
+                            border_widths: px(1.).into(),
+                            border_color: stroke,
+                            border_style: gpui::BorderStyle::Dashed,
+                        });
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .into_any_element(),
+        )
     }
 
     fn sidebar_list_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -479,10 +605,23 @@ impl Shell {
             _ => None,
         };
         let element = self.sidebar_list_row_content(ix, cx);
-        match exiting {
+        let element = match exiting {
             Some(id) => self.archive_exit_row(id, element, cx),
             None => element,
+        };
+        let cascade = &self.sidebar_list.cascade;
+        if !cascade.active() {
+            return element;
         }
+        let opacity = cascade.opacity(ix);
+        cascade.wrap(
+            ix,
+            if opacity < 1. {
+                div().opacity(opacity).child(element).into_any()
+            } else {
+                element
+            },
+        )
     }
 
     fn sidebar_list_row_content(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1193,6 +1332,94 @@ mod tests {
     }
 
     #[gpui::test]
+    fn added_and_deleted_sessions_cascade_the_rows_below(cx: &mut TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        super::super::list_cascade::freeze(true);
+        let older = window
+            .update(cx, |shell, window, cx| {
+                let mut ids = Vec::new();
+                for i in 0..3 {
+                    let mut summary = locked(&shell.store)
+                        .unwrap()
+                        .create("codex", "/work/cascade")
+                        .unwrap();
+                    summary.title = format!("Session {i}");
+                    summary.has_messages = true;
+                    ids.push(summary.id);
+                    shell.order.push(summary.id);
+                    shell.session_summaries.insert(summary.id, summary);
+                }
+                shell.select_project("/work/cascade".into(), window, cx);
+                ids
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let top = |shell: &Shell, id| shell.session_row_bounds[&id].get().unwrap().top();
+        let (before, added) = window
+            .update(cx, |shell, _, cx| {
+                let before: Vec<_> = older.iter().map(|id| top(shell, *id)).collect();
+                let mut summary = locked(&shell.store)
+                    .unwrap()
+                    .create("codex", "/work/cascade")
+                    .unwrap();
+                summary.title = "New session".into();
+                summary.has_messages = true;
+                summary.updated_at = u64::MAX / 2;
+                let added = summary.id;
+                shell.order.insert(0, added);
+                shell.session_summaries.insert(added, summary);
+                shell.sidebar_list.invalidate_structure();
+                shell.sidebar_frame.update(cx, |_, cx| cx.notify());
+                (before, added)
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.sidebar_list.cascade.active());
+                let entering = shell
+                    .sidebar_list
+                    .rows
+                    .iter()
+                    .position(|row| super::row_session(row) == Some(added))
+                    .unwrap();
+                assert!(shell.sidebar_list.cascade.opacity(entering) < 0.5);
+                // The new row took the top, but on the first frame every row
+                // below is still painted where it was.
+                for (id, was) in older.iter().zip(&before) {
+                    assert!((top(shell, *id) - *was).abs() < px(1.), "{id} jumped");
+                }
+                shell.order.retain(|id| *id != added);
+                shell.session_summaries.remove(&added);
+                shell.sidebar_list.invalidate_structure();
+                shell.sidebar_frame.update(cx, |_, cx| cx.notify());
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.sidebar_list.cascade.active());
+                assert!(
+                    top(shell, older[0]) > before[0] + px(1.),
+                    "rows slide up from below"
+                );
+            })
+            .unwrap();
+        super::super::list_cascade::freeze(false);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sidebar_list.cascade.cancel();
+                shell.order.retain(|id| *id != older[2]);
+                shell.session_summaries.remove(&older[2]);
+                shell.sidebar_list.invalidate_structure();
+                shell.refresh_sidebar_structure(cx);
+                assert!(!shell.sidebar_list.cascade.active());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn large_project_only_lays_out_nearby_session_cards(cx: &mut TestAppContext) {
         let (window, _, _) = super::super::tests::window(cx);
         let started = std::time::Instant::now();
@@ -1311,6 +1538,60 @@ mod tests {
                 assert!(shell.session_row_bounds[&(first - 1)].get().is_none());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn wheel_scrolls_the_session_list(cx: &mut TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                let mut summaries = Vec::new();
+                {
+                    let store = locked(&shell.store).unwrap();
+                    for i in 0..20 {
+                        let mut summary = store.create("codex", "/work/wheel").unwrap();
+                        summary.title = format!("Session {i}");
+                        summary.has_messages = true;
+                        summaries.push(summary);
+                    }
+                }
+                let first = summaries.last().unwrap().id;
+                for summary in summaries {
+                    shell.order.push(summary.id);
+                    shell.session_summaries.insert(summary.id, summary);
+                }
+                shell.workspace.compact_session_cards = false;
+                shell.workspace.project_rail_open = true;
+                shell.workspace.open(first);
+                shell.select_project("/work/wheel".into(), window, cx);
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let list = visual.debug_bounds("sidebar-sessions").unwrap();
+        let scroll_px = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |shell, _, _| {
+                    -shell.sidebar_list.state.scroll_px_offset_for_scrollbar().y
+                })
+                .unwrap()
+        };
+        let mut last = scroll_px(visual);
+        for step in 0..6 {
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: list.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-30.))),
+                ..Default::default()
+            });
+            // Working agents refresh the sidebar between wheel ticks.
+            window
+                .update(visual, |shell, _, cx| shell.notify_sidebar(cx))
+                .unwrap();
+            visual.run_until_parked();
+            let now = scroll_px(visual);
+            assert!(now > last, "wheel tick {step} must scroll the session list");
+            last = now;
+        }
     }
 
     #[test]

@@ -81,6 +81,7 @@ impl AssetSource for Assets {
    "ai-idea"=>include_bytes!("../assets/hugeicons/ai-idea.svg"),
    "app-window"=>include_bytes!("../assets/hugeicons/app-window.svg"),
    "archive"=>include_bytes!("../assets/hugeicons/archive.svg"),
+   "archive-off"=>include_bytes!("../assets/hugeicons/archive-off.svg"),
    "bell-off"=>include_bytes!("../assets/hugeicons/bell-off.svg"),
    "check"=>include_bytes!("../assets/hugeicons/check.svg"),
    "check-2"=>include_bytes!("../assets/hugeicons/check-2.svg"),

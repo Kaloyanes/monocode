@@ -1,5 +1,6 @@
 //! BtwSheet.tsx's isolated side threads. Their transcript and cancellation never
 //! share the parent provider session, turn queue, or main transcript rows.
+use crate::tooltip::Tip;
 use super::*;
 use crate::transcript::burst::{self as fx, Bubble, Halo};
 use gpui::{
@@ -1066,6 +1067,7 @@ fn header_button(
         .id(id)
         .role(Role::Button)
         .aria_label(label)
+        .tip(label)
         .cursor_pointer()
         .flex_shrink_0()
         .size(px(28.))
@@ -1209,6 +1211,11 @@ impl Btw {
                             .id(format!("btw-remove-{remove_id}"))
                             .role(Role::Button)
                             .aria_label(if persisted {
+                                format!("Delete “{label}”")
+                            } else {
+                                "Discard new question".into()
+                            })
+                            .tip(if persisted {
                                 format!("Delete “{label}”")
                             } else {
                                 "Discard new question".into()
@@ -1440,6 +1447,7 @@ impl Btw {
                                 "btw-send",
                                 if running { "Stop" } else { "Send" },
                                 running,
+                                "send",
                                 running || can_submit,
                             )
                             .on_click(cx.listener(|this, _, _, cx| {

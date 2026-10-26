@@ -288,6 +288,7 @@ impl Conversation {
                                 service_tier: this.settings.service_tier.clone(),
                                 thinking: this.settings.thinking,
                                 skip_outgoing_recap: limited,
+                                usage_limit: this.settings.usage_limit.clone(),
                                 account: this.settings.account.clone(),
                                 provider_id: this.summary.provider_id.clone(),
                             });
@@ -477,13 +478,10 @@ impl Conversation {
                 )
                 .when(mono && !(waiting && armed), |d| d.text_color(content(0.6)))
                 .child(
-                    icon(if waiting { "clock" } else { "play" }, 14.)
-                        .text_color(if waiting && armed {
-                            gpui::rgb(AMBER_400).into()
-                        } else {
-                            content(if mono { 0.6 } else { 0.55 })
-                        })
-                        .group_hover("resume-usage-limit", |s| s.text_color(content(1.))),
+                    gpui::svg()
+                        .path(if waiting { "clock" } else { "play" })
+                        .size(px(14.))
+                        .flex_shrink_0(),
                 )
                 .child(resume)
                 .when(!switching, |d| {
@@ -696,6 +694,43 @@ mod tests {
             view.settings.usage_limit = Some(reported.clone());
             view.detect_usage_limit(cx);
             assert_eq!(view.settings.usage_limit, Some(reported));
+        });
+    }
+
+    #[gpui::test]
+    fn provider_round_trip_restores_the_usage_limit(cx: &mut gpui::TestAppContext) {
+        let store = Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let summary = locked(&store)
+            .unwrap()
+            .create("claude", "/fixture")
+            .unwrap();
+        let view = cx.new(|cx| Conversation::new(summary, store, cx));
+        view.update(cx, |view, cx| {
+            let limit = Limit {
+                resets_at: Some(usage::now_ms() + 3_600_000),
+                resume_at_reset: true,
+            };
+            view.settings.usage_limit = Some(limit.clone());
+            view.transcript.update(cx, |transcript, cx| {
+                transcript.patch(
+                    0,
+                    vec![monocode_core::transcript::Row {
+                        role: "user".into(),
+                        text: "Keep going".into(),
+                        first: true,
+                        sent_at: None,
+                    }],
+                    cx,
+                );
+            });
+            view.apply_model_pick(&ModelPicked(Kind::Codex, None), cx);
+            assert!(view.settings.usage_limit.is_none());
+            view.apply_model_pick(&ModelPicked(Kind::Claude, None), cx);
+            assert_eq!(view.settings.usage_limit, Some(limit));
+            assert!(view.follow_ups.state.paused);
+            assert!(view.usage_notice(false, cx).is_some());
         });
     }
 

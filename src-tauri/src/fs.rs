@@ -2099,6 +2099,13 @@ fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>) {
     }
 }
 
+/// Line counts of untracked files keyed by path, size and mtime. The Changes
+/// pane polls every few seconds; without this, a checkout with thousands of
+/// untracked files re-reads all of them on every poll.
+static LINE_COUNTS: std::sync::OnceLock<Mutex<HashMap<PathBuf, (u64, SystemTime, i64)>>> =
+    std::sync::OnceLock::new();
+const MAX_LINE_COUNT_ENTRIES: usize = 200_000;
+
 fn text_line_count(path: &Path) -> i64 {
     let Ok(meta) = std::fs::metadata(path) else {
         return 0;
@@ -2106,6 +2113,28 @@ fn text_line_count(path: &Path) -> i64 {
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_UNTRACKED_BYTES {
         return 0;
     }
+    let Ok(modified) = meta.modified() else {
+        return read_line_count(path);
+    };
+    let cache = LINE_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(&(len, mtime, lines)) = cache.get(path) {
+            if len == meta.len() && mtime == modified {
+                return lines;
+            }
+        }
+    }
+    let lines = read_line_count(path);
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= MAX_LINE_COUNT_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (meta.len(), modified, lines));
+    }
+    lines
+}
+
+fn read_line_count(path: &Path) -> i64 {
     let Ok(bytes) = std::fs::read(path) else {
         return 0;
     };

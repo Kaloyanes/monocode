@@ -1,4 +1,5 @@
 //! Session visuals are a bounded native component tree, with no browser surface.
+use crate::tooltip::Tip;
 use crate::theme::{accent_color, content};
 use gpui::{
     AnyElement, Bounds, ClipboardItem, Context, Div, EventEmitter, FontWeight, Hsla, IntoElement,
@@ -153,7 +154,7 @@ fn action_button(
         .when(active, |d| d.bg(content(0.06)))
         .hover(|s| s.bg(content(0.08)))
         .focus(|s| s.bg(content(0.1)))
-        .tooltip(move |_, cx| cx.new(|_| ActionTooltip(label)).into())
+        .tip(label)
         .child(
             crate::theme::icon(glyph, 14.)
                 .text_color(if active {
@@ -165,24 +166,6 @@ fn action_button(
         )
 }
 
-struct ActionTooltip(&'static str);
-impl Render for ActionTooltip {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let mut background = crate::theme::shell_fill();
-        background.a = 1.;
-        div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(background)
-            .border_1()
-            .border_color(content(0.12))
-            .text_size(px(11.))
-            .line_height(px(16.))
-            .text_color(content(0.85))
-            .child(self.0)
-    }
-}
 fn activated(event: &gpui::KeyDownEvent) -> bool {
     matches!(event.keystroke.key.as_str(), "enter" | "space" | " ")
 }

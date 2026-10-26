@@ -3,10 +3,12 @@
 //! Files the user attached from elsewhere on disk are only referenced, never
 //! copied here, and never deleted.
 use super::Store;
+use crate::transcript::images::{self, ImageDocument};
 use std::path::{Path, PathBuf};
 
 const ROOT: &str = "threads";
 const ATTACHMENTS: &str = "attachments";
+const IMAGES: &str = "images";
 const REMOTE_PREFIX: &str = "remote:";
 /// Encoded names start with this so they never collide with a plain id.
 const ENCODED_PREFIX: &str = "x-";
@@ -51,11 +53,49 @@ impl Store {
         let Some(root) = self.threads_root() else {
             return Ok(None);
         };
-        Ok(Some(root.join(folder_name(&self.persisted_session_id(id)?))))
+        Ok(Some(
+            root.join(folder_name(&self.persisted_session_id(id)?)),
+        ))
     }
     /// Where pasted images and other app-made attachments for `id` are written.
     pub fn thread_attachments_dir(&self, id: i64) -> Result<Option<PathBuf>, String> {
         Ok(self.thread_dir(id)?.map(|dir| dir.join(ATTACHMENTS)))
+    }
+    /// Writes an image the agent produced or published into the conversation's
+    /// folder, named by content so a repeated image is stored once.
+    pub fn save_thread_image(
+        &self,
+        id: i64,
+        bytes: &[u8],
+        title: &str,
+    ) -> Result<ImageDocument, String> {
+        use sha2::{Digest, Sha256};
+        let found = images::inspect(bytes)?;
+        let dir = match self.thread_dir(id)? {
+            Some(dir) => dir.join(IMAGES),
+            None => std::env::temp_dir().join("monocode-images"),
+        };
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let hash: String = Sha256::digest(bytes)
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let path = dir.join(format!("{hash}.{}", found.extension));
+        if !path.exists() {
+            // Write beside the target first so a crash never leaves half an image.
+            let partial = dir.join(format!(".{hash}.partial"));
+            std::fs::write(&partial, bytes)
+                .and_then(|_| std::fs::rename(&partial, &path))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(ImageDocument {
+            title: images::title(title),
+            path,
+            mime_type: found.mime_type.into(),
+            width: found.width,
+            height: found.height,
+        })
     }
     /// Moves files from `staging` into the conversation's attachment folder and
     /// returns the updated paths. Paths outside `staging` belong to the user and
@@ -128,7 +168,10 @@ impl Store {
             ("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)", &id)
         } else {
             match id.parse::<i64>() {
-                Ok(_) => ("SELECT EXISTS(SELECT 1 FROM native_sessions WHERE id=?1)", &id),
+                Ok(_) => (
+                    "SELECT EXISTS(SELECT 1 FROM native_sessions WHERE id=?1)",
+                    &id,
+                ),
                 // Not a native id; keep the folder rather than guess.
                 Err(_) => return Ok(true),
             }
@@ -156,7 +199,16 @@ mod tests {
 
     #[test]
     fn folder_names_round_trip_and_stay_inside_the_root() {
-        for id in ["42", "abc-DEF_9", "remote:env:7", "../etc", ".hidden", "x-41", "a/b", ""] {
+        for id in [
+            "42",
+            "abc-DEF_9",
+            "remote:env:7",
+            "../etc",
+            ".hidden",
+            "x-41",
+            "a/b",
+            "",
+        ] {
             let name = folder_name(id);
             assert!(!name.contains('/') && !name.contains('\\') && !name.starts_with('.'));
             assert_eq!(session_id(&name).as_deref(), Some(id), "{id}");
@@ -189,6 +241,29 @@ mod tests {
         assert!(!orphan.exists());
         assert!(remote.exists());
         assert!(kept_dir.exists());
+    }
+
+    #[test]
+    fn images_are_saved_once_inside_the_thread_and_removed_with_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_monocode(&temp.path().join("sessions.db")).unwrap();
+        let id = store.create("claude", "/tmp").unwrap().id;
+        let png = crate::transcript::images::tests::png(4, 3);
+        let first = store.save_thread_image(id, &png, "  Chart ").unwrap();
+        let again = store.save_thread_image(id, &png, "").unwrap();
+        let dir = store.thread_dir(id).unwrap().unwrap();
+        assert_eq!(first.path, again.path);
+        assert!(first.path.starts_with(dir.join(IMAGES)));
+        assert_eq!(
+            (first.title.as_str(), again.title.as_str()),
+            ("Chart", "Image")
+        );
+        assert_eq!((first.width, first.height), (4, 3));
+        assert_eq!(std::fs::read(&first.path).unwrap(), png);
+        assert!(store.save_thread_image(id, b"text", "x").is_err());
+
+        store.delete(id).unwrap();
+        assert!(!dir.exists());
     }
 
     #[test]

@@ -94,6 +94,15 @@ Each interpreter has a 16 MiB memory budget and a 60 ms execution deadline per c
 
 Programs have no filesystem, network, process, DOM, module loading, or timer bindings. Controls change only their visual's local state. Publication is scoped to the calling session and requires an active turn; it cannot target another conversation.
 
+## Images
+
+Agents can also put images in the conversation. Each image is copied into the conversation's own folder, `<data dir>/threads/<session>/images/`, and is deleted with the conversation. Files in the project are never moved or changed.
+
+- **Publishing:** `image_show` with `{ "path": "...", "title": "..." }`, or `monocode-gpui visual image --path FILE --title TITLE`, shows a PNG, JPEG, GIF or WebP file the agent created. Relative paths resolve against the agent's working directory. Images are limited to 20 MB.
+- **Capture:** images returned by MCP tools, such as browser screenshots or image generators, are saved and shown automatically for Claude, Codex and ACP agents. Built-in file reads are skipped, because the agent only looked at an existing file. A repeated image is shown once per turn and stored once.
+
+An image keeps its own aspect ratio, up to 560 points wide, stays visible when tool activity folds, and opens full screen when clicked. The phone shows its title with an instruction to open it on desktop.
+
 ## Local examples
 
 The [dashboard example](examples/visual-dashboard.js) exercises charts, tabs, stats, sliders, switches, and tables. The [geometry example](examples/visual-scene.js) exercises 3D primitives, orbiting, geometry controls, and 2D drawing. Both examples are checked against the real interpreter in tests.

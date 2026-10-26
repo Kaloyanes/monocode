@@ -160,6 +160,7 @@ fn project_content(block: &Value) -> Result<Vec<Row>, String> {
         t.begin(match role {
             "user" if block["internal"] == true => "mono-system",
             "user" | "assistant" | "reasoning" | "error" | "mono-card" | "visual" => role,
+            crate::transcript::images::ROLE => role,
             "system" if block["notice"] == "error" => "error",
             "plan" | "tasks" => "assistant",
             _ => "system",
@@ -558,6 +559,23 @@ mod notice_tests {
 mod panel_tests {
     use super::*;
     use crate::tool::tasks::{AgentRun, AgentStep, Panel, TaskList};
+    #[test]
+    fn agent_images_survive_storage() {
+        let document = crate::transcript::images::ImageDocument {
+            title: "Screenshot".into(),
+            path: "/data/threads/1/images/abc.png".into(),
+            mime_type: "image/png".into(),
+            width: 800,
+            height: 600,
+        };
+        let mut transcript = Transcript::default();
+        transcript.begin(crate::transcript::images::ROLE);
+        transcript.append(&serde_json::to_string(&document).unwrap());
+        let saved = merge(&[], 0, &transcript.rows).unwrap();
+        assert_eq!(saved[0]["role"], crate::transcript::images::ROLE);
+        assert_eq!(project(&saved).unwrap(), transcript.rows);
+    }
+
     #[test]
     fn native_visuals_survive_chunking_storage_and_later_messages() {
         let document = crate::visual::VisualDocument {

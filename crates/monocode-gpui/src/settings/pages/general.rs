@@ -135,6 +135,20 @@ impl SettingsView {
             )],
         ));
         workspace.push(self.row(
+            Some("title-plan"),
+            false,
+            "Plan in title bar",
+            Some("Show the agent's plan for the open chat in place of session tabs.".into()),
+            vec![self.toggle(
+                "title-plan",
+                "Plan in title bar",
+                p.title_plan,
+                false,
+                cx,
+                |this, on, cx| this.update(cx, |p| p.title_plan = on),
+            )],
+        ));
+        workspace.push(self.row(
             Some("action-opens-terminal"),
             false,
             "Show terminal for actions",

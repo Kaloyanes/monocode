@@ -1,6 +1,7 @@
 // Navigation and frame style are independent. The original layout adds a
 // project rail beside the sessions sidebar. The new layout keeps one sidebar
 // and offers either an inset rounded card or the existing full-height boxy frame.
+use crate::tooltip::Tip;
 use super::{CORNER_BUTTONS_WIDTH, CORNER_CONTROL_GAP, Shell, titlebar_drag_area};
 use crate::{
     popover::{Anchor, popover},
@@ -102,6 +103,7 @@ fn panel_button(enabled: bool, dot: bool) -> gpui::Stateful<gpui::Div> {
         .debug_selector(move || id.into())
         .role(Role::Button)
         .aria_label(super::TOGGLE_RIGHT_PANEL_LABEL)
+        .tip(super::TOGGLE_RIGHT_PANEL_LABEL)
         .group(id)
         .cursor_pointer()
         .size(px(24.))
@@ -1119,7 +1121,8 @@ mod tests {
             window
                 .update(cx, |shell, w, cx| {
                     let slide = shell.right_slide.as_ref().unwrap();
-                    slide.elapsed(Duration::from_millis(ms));
+                    // Frozen, so the frame drawn below still samples `ms`.
+                    slide.freeze_elapsed(Duration::from_millis(ms));
                     let now = Instant::now();
                     let before = slide.at(now);
                     if shell.mono_active(cx) {

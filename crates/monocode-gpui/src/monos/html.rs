@@ -1,16 +1,14 @@
 //! Generated HTML lives in an opaque sandbox with no app bridge or network.
-#[cfg(not(target_os = "macos"))]
-use gpui::div;
-use gpui::{Context, Window, canvas, prelude::*};
+use gpui::{Context, Window, canvas, div, prelude::*};
 #[cfg(target_os = "macos")]
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
     runtime::ProtocolObject,
 };
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSBitmapFormat, NSBitmapImageRep, NSImage, NSView, NSWindowOrderingMode};
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSObject, NSObjectProtocol};
+use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 #[cfg(target_os = "macos")]
@@ -88,6 +86,16 @@ struct Hosted {
     _guard: Retained<NavigationGuard>,
     markup: Arc<str>,
 }
+/// The page can't sit under GPUI's popovers, so while one covers it a still
+/// of the page is painted in its place and the native view steps aside.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct Cover {
+    snapshot: Option<Arc<gpui::RenderImage>>,
+    pending: bool,
+    /// Set once nothing covers the page, so the next render frees the still.
+    retired: bool,
+}
 #[cfg(target_os = "macos")]
 struct Markup {
     ink: gpui::Hsla,
@@ -101,6 +109,8 @@ pub(super) struct Html {
     markup: Option<Markup>,
     #[cfg(target_os = "macos")]
     view: Rc<RefCell<Option<Hosted>>>,
+    #[cfg(target_os = "macos")]
+    cover: Rc<RefCell<Cover>>,
 }
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -144,6 +154,8 @@ impl Html {
             markup: None,
             #[cfg(target_os = "macos")]
             view: Rc::new(RefCell::new(None)),
+            #[cfg(target_os = "macos")]
+            cover: Rc::default(),
         }
     }
     #[cfg(target_os = "macos")]
@@ -176,16 +188,29 @@ impl Html {
     }
 }
 impl gpui::Render for Html {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(target_os = "macos")]
         {
             let view = self.view.clone();
             let html = self.markup();
             let app = cx.to_async();
             let interactive = self.interactive;
-            canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| {
+            let this = cx.entity().downgrade();
+            let cover = self.cover.clone();
+            let snapshot = {
+                let mut state = cover.borrow_mut();
+                if std::mem::take(&mut state.retired)
+                    && let Some(image) = state.snapshot.take()
+                {
+                    cx.drop_image(image, Some(window));
+                }
+                state.snapshot.clone()
+            };
+            let still = snapshot.is_some();
+            let host = canvas(
+                |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+                move |bounds, hitbox, window, _| {
+                    let covered = window.is_hitbox_covered(&hitbox);
                     let Ok(handle) = HasWindowHandle::window_handle(window) else {
                         return;
                     };
@@ -286,19 +311,97 @@ impl gpui::Render for Html {
                         view.clip.setFrame(rect);
                         view.web.setFrame(web_rect);
                         unsafe { view.web.setPageZoom(f64::from(zoom)) };
-                        view.clip.setHidden(false);
+                        let mut state = cover.borrow_mut();
+                        if !covered {
+                            state.pending = false;
+                            if state.snapshot.is_some() {
+                                state.retired = true;
+                                window.request_animation_frame();
+                            }
+                        } else if !still && !state.pending {
+                            // The page stays up until its still arrives, a
+                            // frame or two, rather than leaving a hole.
+                            state.pending = true;
+                            snapshot_page(&view.web, cover.clone(), app.clone(), this.clone());
+                        }
+                        view.clip.setHidden(covered && still);
                     }
                 },
             )
-            .size_full()
-            .into_any_element()
+            .absolute()
+            .size_full();
+            div()
+                .relative()
+                .size_full()
+                .children(snapshot.map(|image| gpui::img(image).absolute().size_full()))
+                .child(host)
+                .into_any_element()
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = cx;
+            let _ = (window, cx);
             div().p_4().child(self.body.clone()).into_any_element()
         }
     }
+}
+#[cfg(target_os = "macos")]
+fn snapshot_page(
+    web: &WKWebView,
+    cover: Rc<RefCell<Cover>>,
+    app: gpui::AsyncApp,
+    this: gpui::WeakEntity<Html>,
+) {
+    let done = block2::RcBlock::new(move |image: *mut NSImage, _: *mut NSError| {
+        let mut state = cover.borrow_mut();
+        if !std::mem::take(&mut state.pending) {
+            return;
+        }
+        // SAFETY: WebKit passes a live image or null for the duration of the call.
+        state.snapshot = unsafe { image.as_ref() }.and_then(pixels).map(Arc::new);
+        drop(state);
+        let _ = app.update(|cx| this.update(cx, |_, cx| cx.notify()));
+    });
+    unsafe { web.takeSnapshotWithConfiguration_completionHandler(None, &done) };
+}
+/// Copies an 8-bit RGB(A) snapshot into the BGRA layout GPUI's sprites use.
+#[cfg(target_os = "macos")]
+fn pixels(image: &NSImage) -> Option<gpui::RenderImage> {
+    let tiff = image.TIFFRepresentation()?;
+    let rep = NSBitmapImageRep::imageRepWithData(&tiff)?;
+    let format = rep.bitmapFormat();
+    let samples = rep.samplesPerPixel() as usize;
+    let step = rep.bitsPerPixel() as usize / 8;
+    if rep.isPlanar()
+        || rep.bitsPerSample() != 8
+        || !(samples == 3 || samples == 4)
+        || step < samples
+        || format.contains(NSBitmapFormat::FloatingPointSamples)
+    {
+        return None;
+    }
+    let (width, height) = (rep.pixelsWide() as usize, rep.pixelsHigh() as usize);
+    let stride = rep.bytesPerRow() as usize;
+    let data = rep.bitmapData();
+    if data.is_null() || width == 0 || height == 0 || stride < width * step {
+        return None;
+    }
+    // SAFETY: the rep owns `bytesPerRow * pixelsHigh` bytes while it lives.
+    let bytes = unsafe { std::slice::from_raw_parts(data, stride * height) };
+    let alpha_first = format.contains(NSBitmapFormat::AlphaFirst);
+    let mut out = image::RgbaImage::new(width as u32, height as u32);
+    for (y, row) in out.rows_mut().enumerate() {
+        let source = &bytes[y * stride..];
+        for (x, pixel) in row.enumerate() {
+            let p = &source[x * step..];
+            let [r, g, b, a] = match (samples, alpha_first) {
+                (4, true) => [p[1], p[2], p[3], p[0]],
+                (4, false) => [p[0], p[1], p[2], p[3]],
+                _ => [p[0], p[1], p[2], 255],
+            };
+            pixel.0 = [b, g, r, a];
+        }
+    }
+    Some(gpui::RenderImage::new(vec![image::Frame::new(out)]))
 }
 #[cfg(target_os = "macos")]
 impl Drop for Html {
@@ -319,5 +422,69 @@ mod tests {
         assert!(!html.contains("allow-same-origin"));
         assert!(html.contains("connect-src 'none'"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    struct Page {
+        popover: Option<gpui::Bounds<gpui::Pixels>>,
+        covered: Rc<std::cell::Cell<bool>>,
+    }
+    impl gpui::Render for Page {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let covered = self.covered.clone();
+            div()
+                .size_full()
+                .child(
+                    canvas(
+                        |bounds, window, _| {
+                            window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+                        },
+                        move |_, hitbox, window, _| covered.set(window.is_hitbox_covered(&hitbox)),
+                    )
+                    .size(gpui::px(200.)),
+                )
+                // A later sibling that doesn't overlap must not count.
+                .child(div().id("after").size(gpui::px(20.)).on_click(|_, _, _| {}))
+                // The app's dropdown card, as used by the model picker and menus.
+                .children(self.popover.map(|bounds| {
+                    crate::popover::popover(
+                        "dropdown",
+                        crate::popover::Anchor::Point(bounds.origin),
+                    )
+                    .width(f32::from(bounds.size.width))
+                    .child(div().h(bounds.size.height).child("Opus"))
+                }))
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(|_, _, _, _| {}))
+        }
+    }
+
+    #[gpui::test]
+    fn only_overlays_that_overlap_the_page_cover_it(cx: &mut gpui::TestAppContext) {
+        let covered = Rc::new(std::cell::Cell::new(false));
+        let window = cx.update(|cx| {
+            let covered = covered.clone();
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| Page {
+                    popover: None,
+                    covered,
+                })
+            })
+            .unwrap()
+        });
+        let page = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        page.run_until_parked();
+        assert!(!covered.get());
+        for (left, expected) in [(100., true), (400., false)] {
+            window
+                .update(page, |view, _, cx| {
+                    view.popover = Some(gpui::Bounds::new(
+                        gpui::point(gpui::px(left), gpui::px(50.)),
+                        gpui::size(gpui::px(80.), gpui::px(80.)),
+                    ));
+                    cx.notify();
+                })
+                .unwrap();
+            page.run_until_parked();
+            assert_eq!(covered.get(), expected);
+        }
     }
 }

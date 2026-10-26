@@ -200,7 +200,9 @@ impl Monos {
             let run = std::rc::Rc::new(move |id: &str| {
                 let _ = entity.update(&mut *app.borrow_mut(), |this, cx| {
                     if id == "quit" {
-                        cx.quit();
+                        // The shared quit stops providers and keeps running
+                        // chats resumable; a bare quit would orphan them.
+                        crate::quit(cx);
                     } else if id == "composer" {
                         // The composer is its own panel: the workspace window
                         // stays where it is, as in the Tauri menu.

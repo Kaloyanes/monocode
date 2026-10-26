@@ -6,6 +6,7 @@ mod drafts;
 mod follow_tests;
 pub(crate) mod git_turns;
 mod history;
+mod images;
 pub(crate) use history::{HistoryPager, PreparedHistory};
 mod links;
 mod live_phase;
@@ -39,10 +40,12 @@ use monocode_core::tool::{ToolCall, ToolState, tasks::Panel};
 use monocode_core::transcript::Row;
 use monocode_core::user_links::{UserMessageLink, parse_user_message_link};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Instant,
 };
+/// The longest sent message rendered as markdown; larger ones stay plain text.
+const PROSE_BYTES: usize = 8000;
 /// Where a launched session stands, for its card in the chat.
 #[derive(Clone, PartialEq)]
 pub(crate) struct LaunchView {
@@ -120,6 +123,8 @@ struct Message {
     /// the text chunk that holds it.
     user_link: Option<(usize, Arc<UserMessageLink>)>,
 }
+type UserProse = (SharedString, Arc<[Arc<MarkdownRow>]>);
+
 struct RenderedBlock {
     source: Arc<crate::markdown_model::TopBlock>,
     rows: Vec<Arc<MarkdownRow>>,
@@ -131,6 +136,7 @@ enum Body {
     SavedDraft,
     Markdown(Arc<MarkdownRow>),
     Visual(Arc<monocode_core::visual::VisualDocument>),
+    Image(Arc<monocode_core::transcript::images::ImageDocument>),
     Plain(SharedString),
     Interjection(monocode_core::transcript::Interjection),
     MonoCard(serde_json::Value),
@@ -470,9 +476,13 @@ pub(crate) struct TranscriptView {
     links: links::State,
     work_item_cards: user_links::Cards,
     source: Vec<Row>,
+    agent_panel_rows: BTreeSet<usize>,
+    batching_updates: bool,
+    pending_rebuild: Option<usize>,
     source_bytes: usize,
     attachment_images: HashMap<String, gpui::Entity<attachments::Photo>>,
     visuals: HashMap<usize, visuals::CachedVisual>,
+    pictures: HashMap<std::path::PathBuf, images::CachedPicture>,
     history_position: Option<history::HistoryPosition>,
     history_start: usize,
     history_loading: bool,
@@ -527,6 +537,8 @@ pub(crate) struct TranscriptView {
     frame_now: Instant,
     measurements: measurements::Measurements,
     markdown_cache: markdown::RenderCache,
+    /// A sent message's parsed markdown, by message start, for the text it was parsed from.
+    user_prose: HashMap<usize, UserProse>,
     messages: Vec<Message>,
     rows: Vec<UiRow>,
     streaming: bool,
@@ -2301,9 +2313,13 @@ impl TranscriptView {
             links: Default::default(),
             work_item_cards: Default::default(),
             source: Vec::new(),
+            agent_panel_rows: BTreeSet::new(),
+            batching_updates: false,
+            pending_rebuild: None,
             source_bytes: 0,
             attachment_images: HashMap::new(),
             visuals: HashMap::new(),
+            pictures: HashMap::new(),
             history_position: None,
             history_start: 0,
             history_loading: false,
@@ -2336,6 +2352,7 @@ impl TranscriptView {
             frame_now: Instant::now(),
             measurements: Default::default(),
             markdown_cache: Default::default(),
+            user_prose: HashMap::new(),
             messages: Vec::new(),
             rows: Vec::new(),
             streaming: false,
@@ -2712,6 +2729,14 @@ impl TranscriptView {
         let known = self.source.len();
         for (ix, row) in rows.into_iter().enumerate() {
             let ix = start + ix;
+            self.agent_panel_rows.remove(&ix);
+            if row.role == "tool"
+                && row.first
+                && serde_json::from_str::<ToolCall>(&row.text)
+                    .is_ok_and(|call| matches!(call.panel(), Some(Panel::Agent(_))))
+            {
+                self.agent_panel_rows.insert(ix);
+            }
             let bytes = row.text.capacity().saturating_add(row.role.capacity());
             if ix < self.source.len() {
                 let old = &self.source[ix];
@@ -2861,7 +2886,20 @@ impl TranscriptView {
         self.outline.patched(&self.source, start);
         self.rebuild(start, cx);
     }
+    pub(crate) fn begin_update_batch(&mut self) {
+        self.batching_updates = true;
+    }
+    pub(crate) fn end_update_batch(&mut self, cx: &mut Context<Self>) {
+        self.batching_updates = false;
+        if let Some(start) = self.pending_rebuild.take() {
+            self.rebuild(start, cx);
+        }
+    }
     fn rebuild(&mut self, start: usize, cx: &mut Context<Self>) {
+        if self.batching_updates {
+            self.pending_rebuild = Some(self.pending_rebuild.map_or(start, |old| old.min(start)));
+            return;
+        }
         #[cfg(test)]
         {
             self.rebuild_passes += 1;
@@ -2947,20 +2985,20 @@ impl TranscriptView {
             }
         }
         if !self.mono
-            && (self.source[current_turn..current_end].iter().any(|row| {
-                row.role == "tool"
-                    && row.first
-                    && serde_json::from_str::<ToolCall>(&row.text)
-                        .is_ok_and(|call| matches!(call.panel(), Some(Panel::Agent(_))))
-            }) || self.rows.iter().any(|row| {
-                self.messages
-                    .get(row.message)
-                    .is_some_and(|message| message.turn == current_turn)
-                    && matches!(
-                        &row.body,
-                        Body::Tool { call, .. } if matches!(call.panel(), Some(Panel::Agent(_)))
-                    )
-            }))
+            && (self
+                .agent_panel_rows
+                .range(current_turn..current_end)
+                .next()
+                .is_some()
+                || self.rows.iter().any(|row| {
+                    self.messages
+                        .get(row.message)
+                        .is_some_and(|message| message.turn == current_turn)
+                        && matches!(
+                            &row.body,
+                            Body::Tool { call, .. } if matches!(call.panel(), Some(Panel::Agent(_)))
+                        )
+                }))
         {
             // Pinned runs sit below the fold's work rather than at their
             // original source offset. Rebuild the whole turn so a suffix
@@ -3003,8 +3041,7 @@ impl TranscriptView {
                 .unwrap_or(self.rows.len())
         };
         let old_count = self.rows.len();
-        let old_rows = self.rows[display_start..].to_vec();
-        let old_layouts: Vec<_> = old_rows
+        let old_layouts: Vec<_> = self.rows[display_start..]
             .iter()
             .enumerate()
             .map(|(ix, row)| {
@@ -3020,7 +3057,7 @@ impl TranscriptView {
             .into_iter()
             .map(|m| (m.start, m))
             .collect();
-        self.rows.truncate(display_start);
+        let old_rows = self.rows.split_off(display_start);
         let activity = if self.mono {
             phases::Phases::default()
         } else {
@@ -3035,6 +3072,10 @@ impl TranscriptView {
         let mut ready = false;
         let mut git_card: Option<Arc<git_turns::GitCard>> = None;
         let mut git_live_shown = false;
+        let last_prompt = self
+            .mono
+            .then(|| self.source.iter().rposition(Row::is_prompt))
+            .flatten();
         while at < self.source.len() {
             let mut end = at + 1;
             while end < self.source.len() && !self.source[end].first {
@@ -3113,6 +3154,7 @@ impl TranscriptView {
                     "mono-card"
                         | "remote-plan"
                         | "visual"
+                        | monocode_core::transcript::images::ROLE
                         | "mono-document"
                         | "mono-note"
                         | "mono-launch"
@@ -3241,6 +3283,25 @@ impl TranscriptView {
                         thought_phase: None,
                     });
                 }
+            } else if role == monocode_core::transcript::images::ROLE {
+                let document =
+                    serde_json::from_str::<monocode_core::transcript::images::ImageDocument>(&text)
+                        .ok()
+                        .filter(|document| document.validate().is_ok());
+                let body = match document {
+                    Some(document) => Body::Image(Arc::new(document)),
+                    None => Body::Plain("This image could not be loaded.".into()),
+                };
+                self.rows.push(UiRow {
+                    key: (0, 0),
+                    body,
+                    message,
+                    first: false,
+                    last: false,
+                    work: false,
+                    work_tail: false,
+                    thought_phase: None,
+                });
             } else if role == "visual" {
                 let document = serde_json::from_str::<monocode_core::visual::VisualDocument>(&text)
                     .ok()
@@ -3425,6 +3486,18 @@ impl TranscriptView {
                         .map(|row| row.text.clone())
                         .collect()
                 };
+                // Markdown spans chunks (a fence can straddle two), so a
+                // message that uses it is rendered whole.
+                let text_rows = if role == "user" {
+                    let joined = text_rows.concat();
+                    if joined.len() <= PROSE_BYTES && markdown::looks_like_markdown(&joined) {
+                        vec![joined]
+                    } else {
+                        text_rows
+                    }
+                } else {
+                    text_rows
+                };
                 if role == "user" {
                     user_link = text_rows.iter().enumerate().find_map(|(chunk, text)| {
                         parse_user_message_link(text).map(|link| (chunk, Arc::new(link)))
@@ -3477,6 +3550,7 @@ impl TranscriptView {
                 row.work = has_work
                     && ready
                     && role != "visual"
+                    && role != monocode_core::transcript::images::ROLE
                     && !activity.pinned.contains(&at)
                     && final_answer.is_some_and(|answer| at < answer)
                     && !matches!(row.body, Body::WorkLine { .. });
@@ -3508,7 +3582,6 @@ impl TranscriptView {
                 attachments,
                 prompt_fingerprint,
             });
-            let last_prompt = self.source.iter().rposition(|r| r.is_prompt());
             if self.mono
                 && is_prompt
                 && self.mono_pending_joins_live_turn()
@@ -4159,6 +4232,77 @@ impl TranscriptView {
         })
         .detach();
     }
+    /// A sent message's markdown rows, parsed once per text.
+    fn user_prose_rows(
+        &mut self,
+        message_start: usize,
+        text: &SharedString,
+    ) -> Option<Arc<[Arc<MarkdownRow>]>> {
+        if text.len() > PROSE_BYTES || !markdown::looks_like_markdown(text) {
+            return None;
+        }
+        if let Some((parsed, rows)) = self.user_prose.get(&message_start)
+            && parsed == text
+        {
+            return Some(rows.clone());
+        }
+        let mut parser = MarkdownParser::new();
+        parser.set_text(text);
+        parser.finish_display();
+        let mut words = 0;
+        let rows: Arc<[Arc<MarkdownRow>]> = parser
+            .tree()
+            .blocks
+            .iter()
+            .flat_map(|block| markdown::rows(&block.block))
+            .map(|mut row| {
+                row.word_start = words;
+                words += markdown::word_count(&row);
+                Arc::new(row)
+            })
+            .collect();
+        self.user_prose
+            .insert(message_start, (text.clone(), rows.clone()));
+        Some(rows)
+    }
+    /// One block of a sent message, drawn as an assistant's would be.
+    fn user_prose_row(
+        &mut self,
+        md: &Arc<MarkdownRow>,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let body = if let Part::Code { fence, lines } = &md.part {
+            self.code(fence.clone(), lines.clone(), ix, cx)
+        } else {
+            markdown::body(
+                md,
+                format!("user-md-{ix}").into(),
+                markdown::Tone::Normal,
+                None,
+                self.frame_now,
+            )
+        };
+        div()
+            .w_full()
+            .flex()
+            .pt(px(md.gap))
+            .pl(px(md.indent.saturating_sub(1) as f32 * 24.))
+            .when(md.quote > 0, |d| {
+                d.ml(px(4.)).pl_4().border_l_4().border_color(content(0.2))
+            })
+            .when(md.indent > 0, |d| {
+                d.child(
+                    div()
+                        .w(px(24.))
+                        .flex_shrink_0()
+                        .text_color(content(0.78))
+                        .child(md.marker.clone().unwrap_or_default()),
+                )
+            })
+            .child(body)
+            .into_any_element()
+    }
     fn code(
         &mut self,
         fence: Arc<Fence>,
@@ -4477,6 +4621,7 @@ impl TranscriptView {
             Body::GitAction(card) => self.git_card_row(&card, message_start, cx),
             Body::RemotePlan(plan) => self.remote_plan_card(&plan, cx),
             Body::Visual(document) => self.visual_row(message_start, document, cx),
+            Body::Image(document) => self.image_row(document, cx),
             Body::Interjection(ref note) => {
                 let open = self.expanded.contains(&message_start);
                 let long = note.text.lines().count() > 4 || note.text.len() > 300;
@@ -4926,6 +5071,15 @@ impl TranscriptView {
                     && (!first
                         || self.clamped_prompts.contains(&message_start)
                         || self.prompt_lines(&text, window) > 4);
+                let prose = (user && link.is_none())
+                    .then(|| self.user_prose_rows(message_start, &text))
+                    .flatten();
+                let prose = prose.map(|rows| {
+                    rows.iter()
+                        .map(|md| self.user_prose_row(md, ix, cx))
+                        .collect::<Vec<_>>()
+                });
+                let has_prose = prose.is_some();
                 div()
                     .w_full()
                     .relative()
@@ -5002,8 +5156,15 @@ impl TranscriptView {
                         .when(link.is_none(), |d| {
                             d.child(
                                 div()
-                                    .when(clamp, |d| d.line_clamp(4).text_ellipsis())
-                                    .child({
+                                    .when(clamp && prose.is_none(), |d| {
+                                        d.line_clamp(4).text_ellipsis()
+                                    })
+                                    .when(clamp && prose.is_some(), |d| {
+                                        d.max_h(px(96.)).overflow_hidden()
+                                    })
+                                    .when_some(prose, |d, rows| d.flex().flex_col().children(rows))
+                                    .when(!has_prose, |d| {
+                                        d.child({
                                         let styled = gpui::StyledText::new(text.clone())
                                             .with_highlights(markdown::mark_styles(
                                                 &text,
@@ -5024,6 +5185,7 @@ impl TranscriptView {
                                         } else {
                                             child
                                         }
+                                        })
                                     }),
                             )
                         })
@@ -5793,6 +5955,148 @@ mod scroll_tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn overlapping_stream_updates_rebuild_once(cx: &mut TestAppContext) {
+        let view = cx.new(|_| TranscriptView::new());
+        let reference = cx.new(|_| TranscriptView::new());
+        for entity in [&view, &reference] {
+            entity.update(cx, |view, cx| {
+                view.visible(false, cx);
+                view.streaming(true, cx);
+                view.patch(0, vec![row("user", "Prompt"), row("assistant", "a")], cx);
+            });
+        }
+        let patches = vec![
+            (1, vec![row("assistant", "ab")]),
+            (1, vec![row("assistant", "abc"), row("assistant", "final")]),
+            (0, vec![row("user", "Updated prompt")]),
+        ];
+        reference.update(cx, |view, cx| {
+            for (start, rows) in patches.clone() {
+                view.patch(start, rows, cx);
+            }
+            view.streaming(false, cx);
+        });
+        view.update(cx, |view, cx| {
+            let before = view.rebuild_passes;
+            view.begin_update_batch();
+            for (start, rows) in patches {
+                view.patch(start, rows, cx);
+            }
+            view.streaming(false, cx);
+            assert_eq!(view.rebuild_passes, before);
+            view.end_update_batch(cx);
+            assert_eq!(view.rebuild_passes, before + 1);
+            assert_eq!(view.source[1].text, "abc");
+            assert_eq!(view.source[2].text, "final");
+        });
+        cx.update(|cx| {
+            let actual = view.read(cx);
+            let reference = reference.read(cx);
+            assert_eq!(
+                actual.rows.len(),
+                reference.rows.len(),
+                "batch={:?} sequential={:?}",
+                actual
+                    .rows
+                    .iter()
+                    .map(|r| (r.key, std::mem::discriminant(&r.body)))
+                    .collect::<Vec<_>>(),
+                reference
+                    .rows
+                    .iter()
+                    .map(|r| (r.key, std::mem::discriminant(&r.body)))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                actual
+                    .rows
+                    .iter()
+                    .zip(&reference.rows)
+                    .all(|(a, b)| a.key == b.key
+                        && match (&a.body, &b.body) {
+                            (Body::Plain(a), Body::Plain(b)) => a == b,
+                            (Body::Markdown(a), Body::Markdown(b)) => a == b,
+                            (
+                                Body::WorkLine {
+                                    turn: a,
+                                    expandable: x,
+                                },
+                                Body::WorkLine {
+                                    turn: b,
+                                    expandable: y,
+                                },
+                            ) => a == b && x == y,
+                            (
+                                Body::Actions {
+                                    turn: a,
+                                    complete: x,
+                                },
+                                Body::Actions {
+                                    turn: b,
+                                    complete: y,
+                                },
+                            ) => a == b && x == y,
+                            _ => false,
+                        })
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn agent_panel_index_tracks_replaced_tool_rows(cx: &mut TestAppContext) {
+        let view = cx.new(|_| TranscriptView::new());
+        view.update(cx, |view, cx| {
+            let call = ToolCall::new("agent-1", "agent");
+            view.patch(
+                0,
+                vec![
+                    row("user", "Prompt"),
+                    row("tool", &serde_json::to_string(&call).unwrap()),
+                ],
+                cx,
+            );
+            assert!(view.agent_panel_rows.contains(&1));
+            let call = ToolCall::new("read-1", "read_file");
+            view.patch(
+                1,
+                vec![row("tool", &serde_json::to_string(&call).unwrap())],
+                cx,
+            );
+            assert!(view.agent_panel_rows.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    #[ignore]
+    fn long_tool_turn_rebuild_timing(cx: &mut TestAppContext) {
+        let mut source = vec![row("user", "Inspect the files")];
+        source.extend((0..1_999).map(|i| {
+            let mut call = ToolCall::new(&i.to_string(), "read_file");
+            call.output = "file contents\n".repeat(8);
+            call.state = monocode_core::tool::ToolState::Completed;
+            row("tool", &serde_json::to_string(&call).unwrap())
+        }));
+        for trial in 0..5 {
+            let view = cx.new(|_| TranscriptView::new());
+            view.update(cx, |view, cx| view.patch(0, source.clone(), cx));
+            let start = Instant::now();
+            for _ in 0..20 {
+                view.update(cx, |view, cx| view.rebuild(1_999, cx));
+            }
+            let elapsed = start.elapsed();
+            view.update(cx, |view, _| {
+                assert_eq!(view.source.len(), 2_000);
+                assert!(!view.rows.is_empty());
+                assert!(view.messages.iter().any(|message| message.role == "tool"));
+            });
+            eprintln!(
+                "tool-turn trial={trial} rebuilds=20 elapsed_ms={:.3}",
+                elapsed.as_secs_f64() * 1000.
+            );
+        }
     }
 
     #[gpui::test]

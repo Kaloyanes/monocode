@@ -1,4 +1,5 @@
 use super::*;
+use crate::tooltip::Tip;
 use crate::{
     pickers::{ModelList, ModelPicked},
     popover::{MenuAction, MenuItem, MenuStyle, Side},
@@ -823,6 +824,7 @@ impl Monos {
                     .debug_selector(|| "original-hide-mono-overview".into())
                     .role(Role::Button)
                     .aria_label("Hide overview")
+                    .tip("Hide overview")
                     .aria_toggled(gpui::Toggled::True)
                     .size(px(24.))
                     .flex_shrink_0()
@@ -1676,7 +1678,7 @@ impl Monos {
                             })).into_any_element()).border_t_1().border_color(content(0.04)))
                 }))
                 .child(setting("Permissions",Some("What it may do without asking."),
-                    div().id("mono-settings-access").role(Role::Button).aria_label(format!("Permissions, {}",mode.label()))
+                    div().id("mono-settings-access").role(Role::Button).aria_label(format!("Permissions, {}",mode.label())).tip(format!("Permissions, {}",mode.label()))
                         .h(px(28.)).max_w(px(208.)).px_1p5().mx(px(-6.)).rounded_md().flex().items_center().gap_2()
                         .text_size(px(12.)).text_color(content(0.85)).hover(|s|s.bg(content(0.06)))
                         .child(self.access_anchor.probe()).child(icon(access_icon,14.).when(mode==AccessMode::FullAccess,|i|i.text_color(rgb(0xffb900))))

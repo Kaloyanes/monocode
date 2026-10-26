@@ -1,6 +1,7 @@
 // The dock's tab strip (ProjectTerminalDock.tsx over SurfaceTabs.tsx) and the
 // footer's terminal controls (UsageFooter.tsx's Terminal button and
 // RunningTerminalChip).
+use crate::tooltip::Tip;
 use super::{MenuTarget, Shell, TabShift};
 use crate::{
     popover::{Anchor, MenuAction, MenuItem, MenuStyle},
@@ -749,6 +750,9 @@ impl Shell {
                                             .id(("terminal-tab-close", ix))
                                             .role(Role::Button)
                                             .aria_label(SharedString::from(format!(
+                                                "Close {label}"
+                                            )))
+                                            .tip(SharedString::from(format!(
                                                 "Close {label}"
                                             )))
                                             .group("terminal-tab-close")

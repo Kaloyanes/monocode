@@ -2,7 +2,8 @@ use monocode_core::agent::{Approval, Control, Settings};
 use monocode_core::{
     provider::{self, Event, Kind, Request},
     store::{Session, Store},
-    transcript::{Row, Transcript},
+    transcript::{Row, Transcript, images},
+    visual_bridge::Content,
 };
 use std::sync::{
     Arc, Mutex,
@@ -11,6 +12,8 @@ use std::sync::{
 use std::time::Duration;
 #[cfg(all(test, unix))]
 mod follow_up_tests;
+#[cfg(all(test, unix))]
+mod in_flight_tests;
 mod handoff;
 #[cfg(all(test, unix))]
 mod handoff_tests;
@@ -47,6 +50,7 @@ pub(crate) struct Update {
     pub(crate) background: Option<Vec<provider::BackgroundTask>>,
     pub(crate) approvals: Vec<Approval>,
     pub(crate) approvals_resolved: Vec<String>,
+    pub(crate) approvals_save_failed: Vec<(String, String)>,
     pub(crate) questions: Vec<monocode_core::agent::Question>,
     pub(crate) questions_resolved: Vec<String>,
     pub(crate) handoff: Option<Option<monocode_core::agent::Handoff>>,
@@ -116,6 +120,7 @@ fn run_turn_using(
         prompt,
         mut settings,
     } = input;
+    let _registration = monocode_core::process::register_turn(cancel.clone());
     if settings.account.root.is_none() && settings.account.id != monocode_core::accounts::DEFAULT {
         settings.account.root = locked(&store)
             .ok()
@@ -204,6 +209,21 @@ fn run_turn_using(
             &transcript.rows[start..],
             settings.mono_message_id.as_deref(),
         )?;
+        if !settings.text_only {
+            let marker = monocode_core::store::InFlight {
+                cwd: summary.cwd.clone(),
+                started_at: monocode_core::time::now_ms(),
+                plan: settings.plan,
+                orchestrator: settings.orchestrator,
+                operator: settings.operator,
+                access: settings.access,
+                resume: settings.resume_after_restart && settings.mono.is_none(),
+            };
+            // Resume is best effort; a failed marker must not fail the turn.
+            if let Err(error) = locked(&store)?.mark_in_flight(summary.id, &marker) {
+                eprintln!("Could not record running turn {}: {error}", summary.id);
+            }
+        }
         let mut info =
             settings
                 .turn_model
@@ -247,6 +267,7 @@ fn run_turn_using(
                 background: None,
                 approvals: Vec::new(),
                 approvals_resolved: Vec::new(),
+                approvals_save_failed: Vec::new(),
                 questions: Vec::new(),
                 questions_resolved: Vec::new(),
                 handoff: None,
@@ -301,6 +322,7 @@ fn run_turn_using(
                     background: None,
                     approvals: Vec::new(),
                     approvals_resolved: Vec::new(),
+                    approvals_save_failed: Vec::new(),
                     questions: Vec::new(),
                     questions_resolved: Vec::new(),
                     handoff: None,
@@ -348,6 +370,7 @@ fn run_turn_using(
                     background: None,
                     approvals: Vec::new(),
                     approvals_resolved: Vec::new(),
+                    approvals_save_failed: Vec::new(),
                     questions: Vec::new(),
                     questions_resolved: Vec::new(),
                     handoff: None,
@@ -407,6 +430,7 @@ fn run_turn_using(
                     background: None,
                     approvals: Vec::new(),
                     approvals_resolved: Vec::new(),
+                    approvals_save_failed: Vec::new(),
                     questions: Vec::new(),
                     questions_resolved: Vec::new(),
                     handoff: Some(Some(prepared)),
@@ -568,6 +592,8 @@ fn run_turn_using(
             settings,
         };
         let mut tool_rows = std::collections::HashMap::new();
+        // Agents may resend a tool's content; show each captured image once.
+        let mut captured_images = std::collections::HashSet::new();
         // The running-work list attributes the provider and its tools to this session.
         let result = monocode_core::process::owned_by(summary.id, || {
             provider::run_with_controls(request, cancel.clone(), Some(controls), |events| {
@@ -594,6 +620,7 @@ fn run_turn_using(
                 let mut background = None;
                 let mut approvals = Vec::new();
                 let mut approvals_resolved = Vec::new();
+                let mut approvals_save_failed = Vec::new();
                 let mut questions = Vec::new();
                 let mut questions_resolved = Vec::new();
                 let mut handoff = None;
@@ -807,6 +834,11 @@ fn run_turn_using(
                             approvals_resolved.push(id);
                             boundary = true;
                         }
+                        Event::ApprovalSaveFailed { id, error } => {
+                            status = error.clone();
+                            approvals_save_failed.push((id, error));
+                            boundary = true;
+                        }
                         Event::Question(question) => {
                             status = "Waiting for your answer".into();
                             questions.push(question);
@@ -815,6 +847,33 @@ fn run_turn_using(
                         Event::QuestionResolved(id) => {
                             questions_resolved.push(id);
                             boundary = true;
+                        }
+                        Event::Image(image) => {
+                            // A screenshot that cannot be saved must not end the turn.
+                            let saved = monocode_core::composer::decode_image_data(&image.data)
+                                .and_then(|bytes| {
+                                    locked(&store)?.save_thread_image(
+                                        summary.id,
+                                        &bytes,
+                                        &image.title,
+                                    )
+                                });
+                            match saved {
+                                Ok(document) if captured_images.insert(document.path.clone()) => {
+                                    let at = transcript.begin(images::ROLE);
+                                    transcript.append(
+                                        &serde_json::to_string(&document)
+                                            .map_err(|e| e.to_string())?,
+                                    );
+                                    start = start.min(at);
+                                    pending.changed(at);
+                                }
+                                Ok(_) => {}
+                                Err(error) => eprintln!(
+                                    "Could not keep a {} image from {}: {error}",
+                                    image.mime_type, image.title
+                                ),
+                            }
                         }
                         Event::Status(text) => status = text,
                         Event::Background(tasks) => background = Some(tasks),
@@ -825,14 +884,38 @@ fn run_turn_using(
                         }
                     }
                 }
+                // An image that cannot be copied fails only its own request.
+                let mut refused = Vec::with_capacity(publications.len());
                 for publication in &publications {
-                    let document =
-                        serde_json::to_string(&publication.document).map_err(|e| e.to_string())?;
-                    let at = transcript.begin("visual");
-                    transcript.append(&document);
-                    start = start.min(at);
-                    pending.changed(at);
-                    boundary = true;
+                    let row = match &publication.content {
+                        Content::Visual(document) => serde_json::to_string(document)
+                            .map(|text| ("visual", text))
+                            .map_err(|e| e.to_string()),
+                        Content::Image(request) => std::fs::read(&request.path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|bytes| {
+                                locked(&store)?.save_thread_image(
+                                    summary.id,
+                                    &bytes,
+                                    &request.title,
+                                )
+                            })
+                            .and_then(|document| {
+                                serde_json::to_string(&document).map_err(|e| e.to_string())
+                            })
+                            .map(|text| (images::ROLE, text)),
+                    };
+                    match row {
+                        Ok((role, text)) => {
+                            let at = transcript.begin(role);
+                            transcript.append(&text);
+                            start = start.min(at);
+                            pending.changed(at);
+                            boundary = true;
+                            refused.push(None);
+                        }
+                        Err(error) => refused.push(Some(error)),
+                    }
                 }
                 let now = std::time::Instant::now();
                 let publication_result = (|| {
@@ -862,6 +945,7 @@ fn run_turn_using(
                             background,
                             approvals,
                             approvals_resolved,
+                            approvals_save_failed,
                             questions,
                             questions_resolved,
                             handoff,
@@ -872,10 +956,14 @@ fn run_turn_using(
                 })();
                 // A tool succeeds only after both durable storage and the live
                 // transcript update have accepted the visual.
-                for publication in publications {
-                    let result = publication_result.as_ref().map(|_| {
-                        serde_json::json!({"id":publication.document.id,"title":publication.document.title,"saved":true})
-                    }).map_err(Clone::clone);
+                for (publication, refused) in publications.into_iter().zip(refused) {
+                    let result = match refused {
+                        Some(error) => Err(error),
+                        None => publication_result.as_ref().map(|_| match &publication.content {
+                            Content::Visual(document) => serde_json::json!({"id":document.id,"title":document.title,"saved":true}),
+                            Content::Image(request) => serde_json::json!({"title":request.title,"saved":true}),
+                        }).map_err(Clone::clone),
+                    };
                     let _ = publication.reply.send(result);
                 }
                 publication_result
@@ -897,8 +985,13 @@ fn run_turn_using(
         }
         result
     })();
-    let cancelled =
-        cancel.load(Ordering::Relaxed) || result.as_ref().is_err_and(|error| error == "Stopped");
+    // A provider killed or cancelled by the quit was interrupted, not failed.
+    // Its marker stays so the next launch can settle and continue it; a turn
+    // that completed while the app was quitting is simply done.
+    let quitting = monocode_core::process::shutting_down() && result.is_err();
+    let cancelled = quitting
+        || cancel.load(Ordering::Relaxed)
+        || result.as_ref().is_err_and(|error| error == "Stopped");
     let handoff = prepared_handoff.map(|mut ready| {
         if handoff_accepted {
             None
@@ -945,7 +1038,9 @@ fn run_turn_using(
                 monocode_core::tool::ToolState::Failed
             };
             if tool.output.is_empty() {
-                tool.output = if cancelled {
+                tool.output = if quitting {
+                    monocode_core::store::INTERRUPTED_BY_QUIT.into()
+                } else if cancelled {
                     "Cancelled".into()
                 } else {
                     result.as_ref().err().cloned().unwrap_or_else(|| {
@@ -1028,6 +1123,9 @@ fn run_turn_using(
     if let Err(error) = handoff_save {
         status = format!("{status} · Saving handoff failed: {error}");
     }
+    if !quitting && let Err(error) = locked(&store).and_then(|s| s.clear_in_flight(summary.id)) {
+        eprintln!("Could not clear running turn {}: {error}", summary.id);
+    }
     // Final status must still arrive after cancellation. Dropping a window closes
     // the receiver, so the worker never keeps a closed viewport alive.
     let _ = tx.send_blocking(Update {
@@ -1052,6 +1150,7 @@ fn run_turn_using(
         background: None,
         approvals: Vec::new(),
         approvals_resolved: Vec::new(),
+        approvals_save_failed: Vec::new(),
         questions: Vec::new(),
         questions_resolved: Vec::new(),
         handoff,

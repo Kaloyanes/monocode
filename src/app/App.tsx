@@ -13118,6 +13118,34 @@ function Workspace({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [run]);
 
+  const railNavigation = useRef({ back: onRailBack, forward: onRailForward });
+  railNavigation.current = { back: onRailBack, forward: onRailForward };
+
+  useEffect(() => {
+    // Mouse buttons 3 and 4 are the side "back" and "forward" buttons. Listen
+    // on window in the capture phase so no panel, the sidebar included, can
+    // swallow them.
+    const onMouseUp = (e: MouseEvent) => {
+      if (e.button !== 3 && e.button !== 4) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const delta = e.button === 3 ? -1 : 1;
+      // Over the project strip the side buttons page through projects.
+      if (
+        e.target instanceof Element &&
+        e.target.closest("[data-project-spaces]")
+      ) {
+        run("project-step", () => actions.current.onNavigateProjectList(delta));
+        return;
+      }
+      const nav = railNavigation.current;
+      if (delta < 0) run("back", nav.back);
+      else run("forward", nav.forward);
+    };
+    window.addEventListener("mouseup", onMouseUp, true);
+    return () => window.removeEventListener("mouseup", onMouseUp, true);
+  }, [run]);
+
   useEffect(() => {
     const unlisten: Array<Promise<() => void>> = [
       listen("new_tab", () => run("new", actions.current.onNewFocused)),
