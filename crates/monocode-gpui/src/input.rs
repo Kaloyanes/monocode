@@ -72,6 +72,8 @@ actions!(
     ]
 );
 pub struct Submitted;
+/// Enter on a composer draft that opens with `!`.
+pub struct ShellSubmitted;
 pub struct Changed;
 pub(crate) enum CodeAction {
     Stage(usize),
@@ -218,6 +220,8 @@ pub struct Input {
     marked: Option<Range<usize>>,
     composer_tokens: Vec<Range<usize>>,
     inline_commands: bool,
+    /// `!command` drafts submit as `ShellSubmitted`; only a thread's composer runs them.
+    shell_commands: bool,
     selected_command: Option<Command>,
     lines: Vec<WrappedLine>,
     bounds: Option<Bounds<Pixels>>,
@@ -231,6 +235,7 @@ pub struct Input {
     autoscroll: Option<gpui::Task<()>>,
 }
 impl EventEmitter<Submitted> for Input {}
+impl EventEmitter<ShellSubmitted> for Input {}
 impl EventEmitter<Changed> for Input {}
 impl EventEmitter<Rejected> for Input {}
 impl EventEmitter<CodeAction> for Input {}
@@ -268,6 +273,7 @@ impl Input {
             marked: None,
             composer_tokens: Vec::new(),
             inline_commands: false,
+            shell_commands: false,
             selected_command: None,
             lines: Vec::new(),
             bounds: None,
@@ -997,14 +1003,14 @@ impl Input {
                 self.replace_text_in_range(None, "\n", w, cx);
             }
         } else if self.marked.is_none() {
-            cx.emit(Submitted);
+            self.emit_submitted(cx);
         }
     }
     fn submit_secondary(&mut self, _: &SubmitSecondary, _: &mut Window, cx: &mut Context<Self>) {
         if !self.secondary_submit {
             cx.propagate();
         } else if self.marked.is_none() {
-            cx.emit(Submitted);
+            self.emit_submitted(cx);
         }
     }
     fn paste(&mut self, _: &Paste, w: &mut Window, cx: &mut Context<Self>) {
@@ -1177,6 +1183,7 @@ impl EntityInputHandler for Input {
         let enabled = !self.secret
             && !self.single_line
             && self.inline_commands
+            && !self.shell_mode()
             && self.code.is_none()
             && cx
                 .try_global::<crate::settings::Preferences>()
@@ -1240,6 +1247,7 @@ impl EntityInputHandler for Input {
             && !self.single_line
             && self.code.is_none()
             && self.marked.is_none()
+            && !self.shell_mode()
             && r.start == r.end
             && text.len() == 1
             && text.chars().all(char::is_whitespace)
@@ -1527,6 +1535,10 @@ impl Element for InputElement {
         if let Some(command) = command {
             boundaries.extend([command.icon_range().end, command.name_range().end]);
         }
+        let shell = !placeholder && i.shell_mode();
+        if shell {
+            boundaries.push(1);
+        }
         boundaries.sort_unstable();
         boundaries.dedup();
         let runs: Vec<_> = boundaries
@@ -1536,6 +1548,8 @@ impl Element for InputElement {
                 let at = pair[0];
                 let color = if command.is_some_and(|c| c.icon_range().contains(&at)) {
                     crate::theme::content(0.)
+                } else if shell && at == 0 {
+                    Input::shell_color()
                 } else if let Some(command) = command.filter(|c| c.name_range().contains(&at)) {
                     command.mode.color()
                 } else if highlights.iter().any(|range| range.contains(&at)) {

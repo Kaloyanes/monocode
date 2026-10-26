@@ -16,6 +16,7 @@ mod notifications;
 mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
+mod shell;
 #[cfg(test)]
 mod submission_tests;
 mod title;
@@ -229,6 +230,8 @@ pub(crate) struct Conversation {
     cancel: Arc<AtomicBool>,
     title_cancel: Option<Arc<AtomicBool>>,
     _submission: Subscription,
+    _shell_submission: Subscription,
+    shell: shell::State,
     response_events: Option<Subscription>,
     response_menu: Option<ResponseMenu>,
     response_request: Option<(usize, monocode_core::response::TransferKind, Instant)>,
@@ -509,6 +512,9 @@ impl Conversation {
             this.open_typed_btw(cx);
         });
         let submission = cx.subscribe(&input, |this, _, _: &input::Submitted, cx| this.send(cx));
+        let shell_submission = cx.subscribe(&input, |this, _, _: &input::ShellSubmitted, cx| {
+            this.submit_shell(cx)
+        });
         let review =
             cx.new(|_| crate::session_review::SessionReview::new(summary.id, summary.cwd.clone()));
         let review_events = cx.subscribe(&review, |this, review, event, cx| match event {
@@ -661,6 +667,8 @@ impl Conversation {
             cancel: Arc::new(AtomicBool::new(false)),
             title_cancel: None,
             _submission: submission,
+            _shell_submission: shell_submission,
+            shell: Default::default(),
             response_events: None,
             response_menu: None,
             response_request: None,
@@ -918,6 +926,11 @@ impl Conversation {
         let raw = monocode_core::composer::consume_command(&raw, "add-to-folder")
             .map(str::to_owned)
             .unwrap_or(raw);
+        // `\!` sends a message that starts with a literal `!`.
+        let raw = match raw.strip_prefix("\\!") {
+            Some(rest) => format!("!{rest}"),
+            None => raw,
+        };
         self.folder_selected = false;
         let prompt = self.consume_mode_command(raw, cx);
         if prompt.trim().is_empty() && self.attachments.is_empty() {
@@ -941,6 +954,7 @@ impl Conversation {
         }
         if self.stopping
             || self.busy
+            || self.shell_busy()
             || self.settings.pending_provider_switch.is_some()
             || (!self.follow_ups.state.messages.is_empty() && !self.follow_ups.state.paused)
         {
@@ -2693,8 +2707,11 @@ impl Conversation {
         } else {
             None
         };
-        self.input
-            .update(cx, |input, cx| input.selected_command(command, cx));
+        let shell_available = self.shell_available();
+        self.input.update(cx, |input, cx| {
+            input.selected_command(command, cx);
+            input.set_shell_commands(shell_available, cx);
+        });
         let runner = self.composer_runner(cx);
         let beside = cx
             .try_global::<crate::settings::Preferences>()
@@ -2707,6 +2724,16 @@ impl Conversation {
         };
         let input = self.input.read(cx);
         let has_value = input.has_message_text() || !self.attachments.is_empty();
+        let shell_mode = input.shell_mode();
+        let (border, fading) = self.shell_border(
+            composer_border(self.input.focus_handle(cx).is_focused(window)),
+            shell_mode,
+            cx,
+        );
+        if fading {
+            window.request_animation_frame();
+        }
+        let shell_progress = self.shell_progress();
         self.completion.update(cx, |completion, cx| {
             completion.set_cwd(
                 self.settings
@@ -2741,6 +2768,7 @@ impl Conversation {
             .children(self.orchestration_card(cx))
             .children(if self.is_remote() { None } else { self.usage_notice(false, cx) })
             .child(self.background_shelf(window, cx))
+            .children(self.shell_queue(cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })
             .when(self.settings.worktree_removed,|d|d.child(div().mb_2().p_3().rounded_lg().border_1().border_color(content(0.1)).flex().items_center().gap_3().text_size(px(12.)).child(div().flex_1().child("Worktree deleted. Select a branch or worktree to continue this conversation.")).child(tool_pill("reattach-worktree","Select worktree").child("Select worktree").on_click(cx.listener(|this,_,window,cx|this.open_git(GitMode::Worktree,window,cx))))))
@@ -2809,7 +2837,7 @@ impl Conversation {
                     .relative()
                     .rounded(px(radius))
                     .border_1()
-                    .border_color(composer_border(self.input.focus_handle(cx).is_focused(window)))
+                    .border_color(border)
                     .shadow(composer_shadow())
                     .when(self.file_drag, |d| d.border_color(accent_color().opacity(0.6)))
                     .flex()
@@ -2858,7 +2886,9 @@ impl Conversation {
                                             }),
                                     ),
                             )
-                            .child(
+                            .child(if shell_mode {
+                                self.shell_chip(shell_progress).into_any_element()
+                            } else {
                                 div()
                                     .flex_1()
                                     .min_w_0()
@@ -2866,8 +2896,10 @@ impl Conversation {
                                     .flex()
                                     .items_center()
                                     .gap_1()
+                                    .when(shell_progress > 0., |d| d.opacity(1. - shell_progress))
                                     .child(
                                         tool_pill("composer-model", "Model")
+                                            .debug_selector(|| "composer-model".into())
                                             .min_w_0()
                                             .max_w(px(220.))
                                             .flex_shrink(1.)
@@ -2942,8 +2974,9 @@ impl Conversation {
                                             )
                                             .child(pill_label(self.settings.access.label()))
                                             .child(icon("chevron-down", 12.)),
-                                    ),
-                            )
+                                    )
+                                    .into_any_element()
+                            })
                             .child(self.action(has_value, cx)),
                     )
                     .children(self.attachment_drop_overlay(12.)),
@@ -3161,16 +3194,19 @@ impl Conversation {
 
     // ComposerAction: a solid submit, dimmed while empty; Stop while busy.
     fn action(&self, has_value: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.responding() && !has_value;
+        let busy = (self.responding() || self.shell_running()) && !has_value;
         let draft = self.draft_active(cx);
         let enabled = !self.attaching
             && (!self.preparing_worktree || self.busy || self.stopping)
             && (busy || (has_value && self.loaded))
             && (busy || !draft || (!self.busy && self.follow_ups.state.draft.is_none()));
+        let shell = !busy && self.input.read(cx).shell_mode();
         send_button(
             "send-or-stop",
             if busy {
                 "Stop"
+            } else if shell {
+                "Run command"
             } else if draft {
                 "Save draft"
             } else {
@@ -3178,13 +3214,18 @@ impl Conversation {
             },
             busy,
             enabled,
+            if shell { "terminal" } else { "send" },
         )
         .on_click(cx.listener(move |this, _, _, cx| {
             if !enabled {
                 return;
             }
-            if busy {
+            if busy && this.shell_running() && !this.busy {
+                this.cancel_shell();
+            } else if busy {
                 this.stop(cx);
+            } else if this.input.read(cx).shell_mode() {
+                this.submit_shell(cx);
             } else {
                 this.send(cx);
             }
@@ -3751,6 +3792,7 @@ fn send_button(
     label: &'static str,
     busy: bool,
     enabled: bool,
+    glyph: &'static str,
 ) -> gpui::Stateful<gpui::Div> {
     let accent = primary_action(enabled);
     div()
@@ -3777,7 +3819,7 @@ fn send_button(
             if busy {
                 d.child(div().size(px(10.)).rounded(px(2.)).bg(ink))
             } else {
-                d.child(icon("send", 14.).text_color(ink))
+                d.child(icon(glyph, 14.).text_color(ink))
             }
         })
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
