@@ -2,6 +2,7 @@ mod accounts;
 mod actions;
 mod app_commands;
 mod app_views;
+mod archive_motion;
 mod automation_runs;
 mod classic_sidebar;
 #[cfg(test)]
@@ -621,6 +622,7 @@ pub(crate) struct Shell {
     quick: crate::quick_composer::Controller,
     unseen_finished: HashSet<i64>,
     archiving: HashSet<i64>,
+    archive_exits: archive_motion::ArchiveExits,
     archive_shortcut_held: bool,
     /// Editors offered by a project's "Open in editor"; `None` while scanning.
     external_editors: Option<Vec<monocode_core::external_editor::ExternalEditor>>,
@@ -976,6 +978,7 @@ impl Shell {
             quick: Default::default(),
             unseen_finished: HashSet::new(),
             archiving: HashSet::new(),
+            archive_exits: Default::default(),
             archive_shortcut_held: false,
             external_editors: None,
             groups: sidebar_metadata.groups,
@@ -1422,6 +1425,9 @@ impl Shell {
                             });
                         }
                         this.refresh_session_mark(id, cx);
+                        if archived {
+                            this.start_archive_exit(id, cx);
+                        }
                         if archived && this.workspace.tab_of(id).is_some() {
                             this.close_pane(id, window, cx);
                         } else {
@@ -6217,7 +6223,7 @@ impl Shell {
                             .started_by
                             .get(id)
                             .is_some_and(|caller| shown.contains(caller)))
-                    && self.filter_session(*id, start, cx)
+                    && (self.filter_session(*id, start, cx) || self.archive_exits.listed(*id))
                     && (self.query.is_empty()
                         || if self.workspace.classic_layout {
                             self.classic_session_matches_query(*id, cx)
@@ -8539,6 +8545,8 @@ mod tests {
     #[gpui::test]
     fn hovering_archive_preserves_history_and_does_not_select_the_row(cx: &mut TestAppContext) {
         let (window, a, b) = window(cx);
+        // The row would otherwise stay listed while it slides out.
+        cx.update(|cx| cx.set_reduce_motion(true));
         window
             .update(cx, |shell, _, cx| {
                 shell.sessions[&a].update(cx, |session, _| {
