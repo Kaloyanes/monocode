@@ -1002,9 +1002,11 @@ impl Input {
     fn insert_newline(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let at = self.selection.start;
         if self.selection.is_empty()
+            && self.markdown
             && self.code.is_none()
             && !self.secret
             && self.marked.is_none()
+            && !markdown::in_fence(&self.content, at)
             && let Some(step) = list_step(&self.content, at)
         {
             match step {
@@ -1577,12 +1579,13 @@ impl Element for InputElement {
         }
         boundaries.sort_unstable();
         boundaries.dedup();
+        let mut sweep = markdown::Sweep::new(&spans);
         let runs: Vec<_> = boundaries
             .windows(2)
             .filter(|pair| pair[0] < pair[1])
             .map(|pair| {
                 let at = pair[0];
-                let md = style_at(&spans, at);
+                let md = sweep.at(at);
                 let color = if command.is_some_and(|c| c.icon_range().contains(&at)) {
                     crate::theme::content(0.)
                 } else if let Some(command) = command.filter(|c| c.name_range().contains(&at)) {
@@ -1893,6 +1896,7 @@ impl Render for Input {
     }
 }
 
+#[cfg(test)]
 fn style_at(spans: &markdown::Spans, at: usize) -> markdown::Style {
     spans
         .iter()
@@ -1937,11 +1941,12 @@ fn markdown_runs(base: &TextRun, spans: &markdown::Spans) -> Vec<TextRun> {
     }
     boundaries.sort_unstable();
     boundaries.dedup();
+    let mut sweep = markdown::Sweep::new(spans);
     boundaries
         .windows(2)
         .map(|pair| TextRun {
             len: pair[1] - pair[0],
-            font: markdown_font(style_at(spans, pair[0]), &base.font),
+            font: markdown_font(sweep.at(pair[0]), &base.font),
             ..base.clone()
         })
         .collect()
@@ -2167,6 +2172,67 @@ mod native_input_tests {
         input.read_with(cx, |i, _| assert_eq!(i.content, "1. one\n2. two\n3. "));
         cx.simulate_keystrokes(window.into(), "shift-enter");
         input.read_with(cx, |i, _| assert_eq!(i.content, "1. one\n2. two\n"));
+    }
+    #[gpui::test]
+    fn plain_multiline_fields_do_not_continue_markdown_markers(cx: &mut TestAppContext) {
+        let window = field(cx, false);
+        let input = window.root(cx).unwrap();
+        for text in ["> output.txt", "- item", "1. step"] {
+            replace(window, text, cx);
+            cx.simulate_keystrokes(window.into(), "shift-enter");
+            input.read_with(cx, |i, _| assert_eq!(i.content, format!("{text}\n")));
+        }
+    }
+    #[gpui::test]
+    fn fenced_code_in_the_composer_gets_plain_newlines(cx: &mut TestAppContext) {
+        let window = field(cx, false);
+        let input = window.root(cx).unwrap();
+        window
+            .update(cx, |i, _, cx| i.enable_inline_commands(cx))
+            .unwrap();
+        for (text, expected) in [
+            ("```yaml\n- a", "```yaml\n- a\n"),
+            (
+                "```sh\necho hi > out.txt\n> log",
+                "```sh\necho hi > out.txt\n> log\n",
+            ),
+            ("~~~\n1. one", "~~~\n1. one\n"),
+            // A closed fence is prose again.
+            ("```\ncode\n```\n- a", "```\ncode\n```\n- a\n- "),
+        ] {
+            replace(window, text, cx);
+            cx.simulate_keystrokes(window.into(), "shift-enter");
+            input.read_with(cx, |i, _| assert_eq!(i.content, expected));
+        }
+    }
+    #[gpui::test]
+    fn long_formatted_drafts_stay_responsive(cx: &mut TestAppContext) {
+        let window = field(cx, false);
+        let input = window.root(cx).unwrap();
+        window
+            .update(cx, |i, _, cx| i.enable_inline_commands(cx))
+            .unwrap();
+        let text =
+            "## Heading\n- **bold** item with `code` and [a link](http://x.y)\n> *quoted* text\n"
+                .repeat(1500);
+        let started = std::time::Instant::now();
+        replace(window, &text, cx);
+        cx.simulate_keystrokes(window.into(), "a b c");
+        let elapsed = started.elapsed();
+        input.read_with(cx, |i, _| {
+            let (_, command) = i.display_text();
+            let spans = i.markdown_display_spans(command);
+            assert!(spans.len() > 10_000);
+            let mut sweep = markdown::Sweep::new(&spans);
+            for at in (0..i.content.len()).step_by(97) {
+                assert_eq!(sweep.at(at), style_at(&spans, at), "offset {at}");
+            }
+        });
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "styling a {}-byte draft took {elapsed:?}",
+            text.len()
+        );
     }
     #[gpui::test]
     fn inline_commands_preserve_text_geometry_wrapping_and_clipboard(cx: &mut TestAppContext) {

@@ -56,6 +56,60 @@ pub(super) fn spans(text: &str) -> Spans {
     out
 }
 
+/// Styles at ascending offsets in one pass. Looking each offset up against
+/// every span is quadratic in the draft's length, which long drafts feel on
+/// every layout and paint.
+pub(super) struct Sweep {
+    pending: std::vec::IntoIter<(Range<usize>, Style)>,
+    active: Vec<(usize, Style)>,
+}
+
+impl Sweep {
+    pub fn new(spans: &Spans) -> Self {
+        let mut sorted = spans.clone();
+        sorted.sort_by_key(|(range, _)| range.start);
+        Sweep {
+            pending: sorted.into_iter(),
+            active: Vec::new(),
+        }
+    }
+    /// The merged style at `at`; offsets must not decrease between calls.
+    pub fn at(&mut self, at: usize) -> Style {
+        self.active.retain(|(end, _)| *end > at);
+        while let Some((range, style)) = self.pending.as_slice().first().cloned() {
+            if range.start > at {
+                break;
+            }
+            self.pending.next();
+            if range.end > at {
+                self.active.push((range.end, style));
+            }
+        }
+        self.active
+            .iter()
+            .fold(Style::default(), |all, (_, style)| all.merge(*style))
+    }
+}
+
+/// Whether `at` sits on a line inside an open fenced code block, using the
+/// same fence rules as [`spans`].
+pub(super) fn in_fence(text: &str, at: usize) -> bool {
+    let line_start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+    let mut fence: Option<char> = None;
+    for line in text[..line_start].split('\n') {
+        let body = line.trim_start_matches([' ', '\t']);
+        if let Some(mark) = ["```", "~~~"].iter().find(|m| body.starts_with(**m)) {
+            let ch = mark.chars().next().unwrap();
+            match fence {
+                None => fence = Some(ch),
+                Some(open) if open == ch => fence = None,
+                Some(_) => {}
+            }
+        }
+    }
+    fence.is_some()
+}
+
 fn block(line: &str, base: usize, fence: &mut Option<char>, out: &mut Spans) {
     let body = line.trim_start_matches([' ', '\t']);
     let indent = line.len() - body.len();
