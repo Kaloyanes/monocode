@@ -1,7 +1,7 @@
 // The pickers that open as flyouts beside a menu row: ModelPicker.tsx's
 // ModelFlyout and SearchableProjectPicker.tsx's ProjectPickerPopover. Each
 // owns a search field; arrows and Enter in it move and pick in the list.
-use crate::{input, pane_motion::PaneSlide, theme::*, workspace::project_name};
+use crate::{input, theme::*, workspace::project_name};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Role, SharedString,
     Subscription, Window, div, prelude::*, px,
@@ -355,23 +355,13 @@ pub(crate) struct ModelList {
     tab: ModelTab,
     highlighted: usize,
     search: Entity<input::Input>,
-    /// The list's height as shown, easing toward what its rows need so the
-    /// flyout hugs its content instead of leaving a fixed card half empty.
-    fit: Option<PaneSlide>,
     _changed: Subscription,
 }
-/// The flyout card's cap; the list scrolls past it.
+/// The flyout card's fixed height; the list scrolls inside it.
 const FLYOUT_MAX: f32 = 442.;
 const ROW: f32 = 48.;
-/// The list never fits shorter than this many rows, so a flyout that opens
-/// while models load, or filters down, doesn't collapse into a sliver.
-const MIN_ROWS: f32 = 5.;
 /// The search field's row, with its rule.
 const SEARCH: f32 = 41.;
-/// What the provider rail needs: 32px tabs, 4px gaps, 6px padding.
-fn rail_height(tabs: usize) -> f32 {
-    tabs as f32 * 32. + tabs.saturating_sub(1) as f32 * 4. + 12.
-}
 impl EventEmitter<ModelPicked> for ModelList {}
 impl ModelList {
     pub(crate) fn new_for(
@@ -423,7 +413,6 @@ impl ModelList {
                 .unwrap_or(ModelTab::Harness(provider)),
             highlighted: 0,
             search,
-            fit: None,
             _changed: changed,
         };
         list.highlighted = list.current_index(cx);
@@ -876,12 +865,11 @@ impl ModelList {
     }
 }
 impl Render for ModelList {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.quick {
             return self.render_quick(cx);
         }
         let entries = self.entries(cx);
-        let rows_height = entries.len() as f32 * ROW;
         let kind = match self.tab {
             ModelTab::Harness(kind) => Some(kind),
             _ => None,
@@ -1018,27 +1006,7 @@ impl Render for ModelList {
                     .into_any()
             })
             .collect();
-        let providers: Vec<ModelTab> = std::iter::once(ModelTab::Favorites)
-            .chain(
-                Kind::ALL
-                    .into_iter()
-                    .filter(|kind| self.shows_provider(*kind))
-                    .map(ModelTab::Harness),
-            )
-            .collect();
-        let extras = match (empty.is_some(), loading, error.is_some()) {
-            (false, false, false) => 0.,
-            (empty, loading, error) => {
-                (if empty { 40. } else { 0. })
-                    + (if loading { 32. } else { 0. })
-                    + (if error { 72. } else { 0. })
-            }
-        };
-        let wanted = (rows_height + extras + 8.)
-            .max(rail_height(providers.len()) - SEARCH)
-            .max(MIN_ROWS * ROW + 8.)
-            .min(FLYOUT_MAX - SEARCH - 2.);
-        let list_height = self.fitted(wanted, window, cx);
+        let list_height = FLYOUT_MAX - SEARCH - 2.;
         div()
             .id("model-flyout")
             .role(Role::Dialog)
@@ -1176,27 +1144,6 @@ impl ModelList {
             kind == self.provider
                 || (!self.hidden.iter().any(|id| id == kind.id()) && !self.missing.contains(&kind))
         }
-    }
-    /// Eases the list toward `wanted` and returns the height to paint now.
-    /// The first frame snaps, since the popover's own entrance covers opening.
-    fn fitted(&mut self, wanted: f32, window: &mut Window, cx: &mut Context<Self>) -> f32 {
-        let now = std::time::Instant::now();
-        let Some(slide) = self.fit.as_ref() else {
-            self.fit = Some(PaneSlide::new(wanted, wanted, 0.));
-            return wanted;
-        };
-        if cx.reduce_motion() {
-            self.fit = Some(PaneSlide::new(wanted, wanted, 0.));
-            return wanted;
-        }
-        if (slide.to - wanted).abs() > 0.5 {
-            self.fit = Some(slide.retarget(wanted, now));
-        }
-        let (height, done) = self.fit.as_ref().map_or((wanted, true), |s| s.at(now));
-        if !done {
-            window.request_animation_frame();
-        }
-        height
     }
     fn render_quick(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let entries = self.entries(cx);

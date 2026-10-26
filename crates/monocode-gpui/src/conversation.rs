@@ -2584,8 +2584,8 @@ impl Conversation {
                             view: list.into(),
                             width: 310.,
                             padding: 0.,
-                            height: None,
-                            max_height: Some(442.),
+                            height: Some(442.),
+                            max_height: None,
                             focus: Some(focus),
                             surface: None,
                         })

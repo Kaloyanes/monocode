@@ -3116,7 +3116,11 @@ mod tests {
         let mut cx = HeadlessAppContext::with_platform(
             Arc::new(gpui_apple::AppleTextSystem::new()),
             Arc::new(crate::assets::Assets),
-            || Ok(Some(Box::new(gpui_apple::metal_renderer::MetalHeadlessRenderer::new()))),
+            || {
+                Ok(Some(Box::new(
+                    gpui_apple::metal_renderer::MetalHeadlessRenderer::new(),
+                )))
+            },
         );
         let pr = |number: i64, title: &str, state: &str| Item {
             provider: "github".into(),
@@ -3139,7 +3143,8 @@ mod tests {
             .open_window(size(px(1100.), px(700.)), |_, cx| {
                 cx.new(|cx| {
                     let store = Arc::new(Mutex::new(
-                        monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+                        monocode_core::store::Store::open(std::path::Path::new(":memory:"))
+                            .unwrap(),
                     ));
                     let mut view = Inbox::new_inner(
                         store,
@@ -3151,7 +3156,10 @@ mod tests {
                     view.snapshot.items = vec![first.clone(), second.clone()];
                     view.snapshot.connections.insert(
                         "github".into(),
-                        model::Status { connected: true, ..Default::default() },
+                        model::Status {
+                            connected: true,
+                            ..Default::default()
+                        },
                     );
                     view.state.source = "github".into();
                     view.selected = Some(first.key());
@@ -3178,12 +3186,7 @@ mod tests {
                         ..Default::default()
                     });
                     view.document = Some(cx.new(|cx| {
-                        document::InboxDocument::linked(
-                            body,
-                            PathBuf::from("/repo"),
-                            weak,
-                            cx,
-                        )
+                        document::InboxDocument::linked(body, PathBuf::from("/repo"), weak, cx)
                     }));
                     view.detail_loading = false;
                     cx.notify();
@@ -3200,7 +3203,9 @@ mod tests {
         show(&mut cx, "Refreshes the token before it expires.");
         shoot(&mut cx, "2-listed-link-with-back");
         window
-            .update(&mut cx, |view, _, cx| view.go_to(outside.clone(), Tab::Summary, cx))
+            .update(&mut cx, |view, _, cx| {
+                view.go_to(outside.clone(), Tab::Summary, cx)
+            })
             .unwrap();
         show(&mut cx, "Moves the retry policy into its own crate.");
         shoot(&mut cx, "3-unlisted-pinned-row");
@@ -3208,7 +3213,9 @@ mod tests {
             .update(&mut cx, |view, _, cx| {
                 view.link_notice = Some(LinkNotice::Failed {
                     url: "https://github.com/acme/private/pull/3".into(),
-                    message: "GraphQL: Could not resolve to a Repository with the name 'acme/private'.".into(),
+                    message:
+                        "GraphQL: Could not resolve to a Repository with the name 'acme/private'."
+                            .into(),
                 });
                 cx.notify();
             })
@@ -3232,18 +3239,18 @@ mod tests {
             div()
                 .size_full()
                 .track_focus(&self.focus)
-                .on_action(cx.listener(|this, event: &crate::inbox::OpenWorkLink, _, cx| {
-                    this.opened.push(event.0.clone());
-                    cx.notify();
-                }))
+                .on_action(
+                    cx.listener(|this, event: &crate::inbox::OpenWorkLink, _, cx| {
+                        this.opened.push(event.0.clone());
+                        cx.notify();
+                    }),
+                )
                 .child("shell")
         }
     }
 
     #[gpui::test]
-    fn work_links_reach_the_shell_from_a_window_and_from_code_without_one(
-        cx: &mut TestAppContext,
-    ) {
+    fn work_links_reach_the_shell_from_a_window_and_from_code_without_one(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
             cx.open_window(WindowOptions::default(), |_, cx| {
                 cx.new(|cx| Shell {
@@ -3358,7 +3365,10 @@ mod tests {
                     assert!(inbox.open_url("https://linear.app/acme/issue/eng-42", cx));
                     assert_eq!(inbox.selected, Some(issue.key()));
                     assert_eq!(inbox.state.source, "linear");
-                    assert!(inbox.back.is_empty(), "the fixture's selection was not an item");
+                    assert!(
+                        inbox.back.is_empty(),
+                        "the fixture's selection was not an item"
+                    );
                 });
             })
             .unwrap();
@@ -3379,7 +3389,10 @@ mod tests {
                         number: 1,
                         ..Default::default()
                     };
-                    let linked = Item { number: 9, ..listed.clone() };
+                    let linked = Item {
+                        number: 9,
+                        ..listed.clone()
+                    };
                     inbox.snapshot.items = vec![listed.clone()];
                     inbox.selected = Some(listed.key());
                     inbox.go_to(linked.clone(), Tab::Summary, cx);

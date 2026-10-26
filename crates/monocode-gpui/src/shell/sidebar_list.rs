@@ -122,6 +122,17 @@ impl SidebarList {
     }
 }
 
+/// ⌘1–8 open the first rows by position and ⌘9 the last, as `ActivateTab`.
+fn shortcut_slots(ids: &[i64]) -> HashMap<i64, usize> {
+    let last = ids.len().saturating_sub(1);
+    ids.iter()
+        .copied()
+        .enumerate()
+        .filter(|(ix, _)| *ix < 8 || *ix == last)
+        .map(|(ix, id)| (id, ix.min(8)))
+        .collect()
+}
+
 fn age_label(updated_at: u64, now: u64) -> &'static str {
     let today = chrono::DateTime::from_timestamp_millis(now.min(i64::MAX as u64) as i64)
         .map(|t| t.with_timezone(&chrono::Local).date_naive());
@@ -147,7 +158,9 @@ fn sidebar_edge_mask(
         |_, _, _| {},
         move |bounds, _, window, _| {
             let offset = state.logical_scroll_top();
-            let bottom_height = px(40.).min(bounds.size.height);
+            let remaining = state.max_offset_for_scrollbar().y
+                + state.scroll_px_offset_for_scrollbar().y;
+            let bottom_height = px(40.).min(remaining.max(px(0.))).min(bounds.size.height);
             let top_height = if top_fade && (offset.item_ix > 0 || offset.offset_in_item > px(0.)) {
                 px(28.).min((bounds.size.height - bottom_height).max(px(0.)))
             } else {
@@ -259,18 +272,10 @@ impl Shell {
                 }
             }
             self.prepare_sidebar_list(&entries, cx);
-            // ⌘9 is the last row; the others name their own position.
             self.shortcut_slots = if self.tab_strip_visible() {
                 HashMap::new()
             } else {
-                let ids = self.sidebar_navigation_ids(cx);
-                let last = ids.len().saturating_sub(1);
-                ids.into_iter()
-                    .enumerate()
-                    .take(8)
-                    .filter(|(ix, _)| *ix < last)
-                    .map(|(ix, id)| (id, ix))
-                    .collect()
+                shortcut_slots(&self.sidebar_navigation_ids(cx))
             };
         }
         self.sync_sidebar_list_visibility();
@@ -903,7 +908,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use super::age_label;
+    use super::{age_label, shortcut_slots};
     use chrono::TimeZone;
     use gpui::TestAppContext;
 
@@ -1406,5 +1411,16 @@ mod tests {
         assert_eq!(age_label(0, now), "Older");
         // A local calendar day remains Yesterday across daylight-saving changes.
         assert_eq!(age_label(ms(25, 0, 1), ms(26, 0, 5)), "Yesterday");
+    }
+
+    #[test]
+    fn shortcut_slots_reach_the_first_eight_rows_and_the_last() {
+        let few = shortcut_slots(&[10, 11, 12]);
+        assert_eq!((few[&10], few[&12]), (0, 2));
+        let many: Vec<i64> = (0..12).collect();
+        let slots = shortcut_slots(&many);
+        assert_eq!(slots.len(), 9);
+        assert_eq!((slots[&7], slots[&11]), (7, 8));
+        assert!(!slots.contains_key(&8));
     }
 }

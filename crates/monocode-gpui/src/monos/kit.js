@@ -53,6 +53,13 @@ const stagger=(els,start=0)=>{[...els].forEach((el,i)=>el.style.setProperty('--i
 const variants=(target,list,o={})=>{let index=Math.min(o.initial||0,list.length-1),cleanup=null;
 const stage=h('div',{class:'mc-stage'+(o.stage?' '+o.stage:'')});
 if(o.stageHeight)stage.style.minHeight=o.stageHeight+'px';
+// The stage keeps the tallest height its content reached, so a replay or tab
+// that starts smaller doesn't shrink it and move everything below. A new width
+// reflows the content, so the floor starts over.
+const base=stage.style.minHeight;let floorWidth=0;
+const natural=()=>{const c=getComputedStyle(stage);return stage.clientHeight-parseFloat(c.paddingTop)-parseFloat(c.paddingBottom)};
+new ResizeObserver(([e])=>{const r=e.contentRect;if(Math.abs(r.width-floorWidth)>1){floorWidth=r.width;stage.style.minHeight=base;stage.style.minHeight=natural()+'px';return}
+if(r.height>(parseFloat(stage.style.minHeight)||0))stage.style.minHeight=r.height+'px'}).observe(stage);
 const note=h('span',{class:'mc-note'});
 const show=i=>{index=(i+list.length)%list.length;bar.select(index);if(typeof cleanup==='function'){try{cleanup()}catch(e){console.error(e)}}
 cleanup=null;stage.replaceChildren();const v=list[index];note.textContent=v.note||'';

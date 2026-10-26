@@ -105,8 +105,10 @@ than a drawing, give every image alt text, and size them with CSS (width:100%,
 aspect-ratio, object-fit). data: URLs and inline SVG work too.
 {height} is the frame height in points while the page loads, 120–900 (default
 480); pass the preview's contentHeight. Once loaded, the frame fits the page's
-content and follows it as it grows or shrinks (up to 900), so let content set the
-page height: never use 100vh, or height:100% on html or body. The page never
+content and follows it as it grows (up to 900). It never drops below the first
+height it measured, and it shrinks only after a smaller height lasts a second,
+so a demo that rebuilds smaller and grows back doesn't move the conversation.
+Let content set the page height: never use 100vh, or height:100% on html or body. The page never
 scrolls inside its frame. Let wide layouts shrink with the thread width (use %,
 flex, grid and an SVG viewBox, not fixed pixel widths).
 The app theme is injected as CSS variables on :root and follows light and dark:
@@ -224,7 +226,10 @@ Treat each request as a small product demo:
   reader advances through the story while the diagram highlights each part; add
   mc.code for the lines that matter.
 Size by content: mc-variants has a stage of at least 320 points; pass
-{stageHeight} to change it. Respect
+{stageHeight} to change it. The stage keeps the tallest height its content
+reaches, so a replay or tab switch that starts smaller doesn't move what's below
+it. Hand-built demos that reset should do the same: give their stage a
+min-height at least as tall as their largest state. Respect
 prefers-reduced-motion (the kit already shortens CSS motion). A script error
 leaves a blank page, so preview every time.
 "#;

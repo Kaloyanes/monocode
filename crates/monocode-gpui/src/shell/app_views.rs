@@ -250,7 +250,12 @@ impl Shell {
 
     /// A link to a work item: shown in the Inbox when it can show it, otherwise
     /// in the browser.
-    pub(super) fn open_work_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_work_link(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.ensure_background_inbox(window, cx);
         let Some(inbox) = self
             .inbox

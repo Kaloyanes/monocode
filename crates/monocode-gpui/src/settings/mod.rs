@@ -217,6 +217,7 @@ pub(crate) struct SettingsView {
     select_active: usize,
     select_focus: FocusHandle,
     select_anchors: RefCell<HashMap<&'static str, AnchorSlot>>,
+    text_model_menu: Option<pages::TextModelMenu>,
     search: Entity<Input>,
     search_query: String,
     search_active: usize,
@@ -369,6 +370,7 @@ impl SettingsView {
             select_active: 0,
             select_focus: cx.focus_handle(),
             select_anchors: Default::default(),
+            text_model_menu: None,
             search,
             search_query: String::new(),
             search_active: 0,
@@ -524,6 +526,7 @@ impl SettingsView {
                 self.refresh_mcp_health(cx);
             }
             self.select_open = None;
+            self.text_model_menu = None;
             self.recording = None;
             self.scroll.set_offset(gpui::point(px(0.), px(0.)));
             cx.notify();
@@ -548,6 +551,10 @@ impl SettingsView {
             self.recording_preview.clear();
             window.focus(&self.focus, cx);
             cx.notify();
+            return true;
+        }
+        if self.text_model_menu.is_some() {
+            self.close_text_model_menu(window, cx);
             return true;
         }
         if self.select_open.take().is_some() {
@@ -1081,6 +1088,7 @@ impl Render for SettingsView {
             })
             .children(self.management_overlay(window, cx))
             .children(self.notification_overlay(cx))
+            .children(self.text_model_overlay(cx))
     }
 }
 

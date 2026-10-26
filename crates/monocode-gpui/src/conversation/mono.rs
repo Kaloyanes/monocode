@@ -732,7 +732,7 @@ impl Conversation {
                 .side(Side::Top)
                 .align(Align::End)
                 .width(310.)
-                .max_height(442.)
+                .height(442.)
                 .on_dismiss(move |window, cx| {
                     let _ = this.update(cx, |this, cx| this.close_mono_models(window, cx));
                 })
@@ -901,9 +901,10 @@ impl Conversation {
                 .flex()
                 .items_center()
                 .text_size(px(12.))
-                .text_color(content(if open { 1. } else { 0.55 }))
-                .when(open, |d| d.bg(content(0.08)))
-                .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+                .cursor_pointer()
+                .text_color(content(1.))
+                .bg(content(if open { 0.15 } else { 0.1 }))
+                .hover(|s| s.bg(content(0.15)))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         };
         let model = self.model_info().cloned();
@@ -939,7 +940,7 @@ impl Conversation {
                         .aria_label(format!("{label}: {value}"))
                         .aria_expanded(open)
                         .child(self.mono_ui.setting_anchors[0].probe())
-                        .child(icon(glyph, 14.).text_color(content(if open { 1. } else { 0.55 })))
+                        .child(icon(glyph, 14.))
                         .child(div().min_w_0().truncate().child(value))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.toggle_menu(ComposerMenu::Setting(0), window, cx)

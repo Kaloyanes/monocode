@@ -409,6 +409,7 @@ const TOGGLE_RIGHT_PANEL_DOT_LABEL: &str = if cfg!(target_os = "macos") {
 } else {
     "Toggle right sidebar (Ctrl+Shift+B, uncommitted changes)"
 };
+const SHORTCUT_HINT_FADE: std::time::Duration = std::time::Duration::from_millis(140);
 const MOD: &str = if cfg!(target_os = "macos") {
     "⌘"
 } else {
@@ -779,6 +780,10 @@ pub(crate) struct Shell {
     sidebar_auto_hidden: bool,
     /// With the tab bar hidden, the sidebar rows ⌘1–8 reach, by session.
     shortcut_slots: HashMap<i64, usize>,
+    /// ⌘ is held, so those rows show their shortcut instead of a status.
+    shortcut_hints: bool,
+    /// Bumped on each ⌘ press or release to restart the hint crossfade.
+    shortcut_hint_flips: usize,
     viewport_width: f32,
     viewport_height: f32,
     observations: Vec<Subscription>,
@@ -1103,6 +1108,8 @@ impl Shell {
             skip_session_click: false,
             sidebar_auto_hidden: false,
             shortcut_slots: HashMap::new(),
+            shortcut_hints: false,
+            shortcut_hint_flips: 0,
             terminals: HashMap::new(),
             dock_slide: None,
             dock_resize: None,
@@ -6249,6 +6256,17 @@ impl Shell {
             .into_any()
     }
 
+    fn set_shortcut_hints(&mut self, held: bool, cx: &mut Context<Self>) {
+        if self.shortcut_hints == held {
+            return;
+        }
+        self.shortcut_hints = held;
+        self.shortcut_hint_flips += 1;
+        if !self.shortcut_slots.is_empty() {
+            cx.notify();
+        }
+    }
+
     fn session_suffix(
         &self,
         id: i64,
@@ -6270,7 +6288,7 @@ impl Shell {
         if self.session_hover == Some(id) {
             return self.session_archive_button(id, session, cx);
         }
-        div()
+        let status = div()
             .flex_shrink_0()
             .text_size(px(11.))
             .line_height(px(16.))
@@ -6326,21 +6344,59 @@ impl Shell {
                     .into_any()
             } else {
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .children(self.shortcut_slots.get(&id).map(|slot| {
-                        div()
-                            .debug_selector(move || format!("session-shortcut-{id}"))
-                            .text_color(content(0.3))
-                            .child(format!("{MOD}{}", slot + 1))
-                    }))
                     .child(monocode_core::time::relative(
                         session.summary.updated_at,
                         monocode_core::time::now_ms(),
                     ))
                     .into_any()
-            })
+            });
+        let Some(slot) = self.shortcut_slots.get(&id) else {
+            return status.into_any();
+        };
+        let shortcut = div()
+            .debug_selector(move || format!("session-shortcut-{id}"))
+            .flex_shrink_0()
+            .text_size(px(11.))
+            .line_height(px(16.))
+            .text_color(content(0.4))
+            .child(format!("{MOD}{}", slot + 1));
+        // Holding ⌘ swaps the status for the row's shortcut. The incoming
+        // label keeps the layout; the outgoing one fades out over it.
+        let (shown, hidden) = if self.shortcut_hints {
+            (shortcut.into_any_element(), status.into_any_element())
+        } else {
+            (status.into_any_element(), shortcut.into_any_element())
+        };
+        let flip = self.shortcut_hint_flips;
+        let animate = flip > 0 && !cx.reduce_motion();
+        let fade = |el: AnyElement, name: &'static str, entering: bool| {
+            let el = div().child(el);
+            if animate {
+                gpui::AnimationExt::with_animation(
+                    el,
+                    (name, flip),
+                    gpui::Animation::new(SHORTCUT_HINT_FADE).with_easing(gpui::ease_out_quint()),
+                    move |el, t| el.opacity(if entering { t } else { 1. - t }),
+                )
+                .into_any_element()
+            } else {
+                el.opacity(if entering { 1. } else { 0. }).into_any_element()
+            }
+        };
+        div()
+            .relative()
+            .flex_shrink_0()
+            .flex()
+            .justify_end()
+            .child(fade(shown, "shortcut-hint-in", true))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .whitespace_nowrap()
+                    .child(fade(hidden, "shortcut-hint-out", false)),
+            )
             .into_any()
     }
 
@@ -8258,6 +8314,7 @@ impl Render for Shell {
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     if !window.is_window_active() {
                         this.close_preview(cx);
+                        this.set_shortcut_hints(false, cx);
                     } else {
                         this.resume_git(cx);
                     }
@@ -8338,6 +8395,9 @@ impl Render for Shell {
             .key_context("Workspace")
             .track_focus(&self.focus)
             .capture_key_up(cx.listener(|this, _, _, _| this.archive_shortcut_held = false))
+            .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                this.set_shortcut_hints(event.modifiers.secondary(), cx);
+            }))
             .on_action(cx.listener(|this, _: &ArchiveSession, window, cx| {
                 this.archive_active_session(window, cx)
             }))

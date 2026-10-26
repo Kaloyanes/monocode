@@ -494,7 +494,10 @@ mod tests {
         assert_eq!(command("!ls -la"), Some("ls -la"));
         assert_eq!(command("\\!important"), None);
         assert_eq!(command(" !ls"), None);
-        assert_eq!(split("!cargo test\nwhy does it fail?"), Some(("cargo test", "why does it fail?")));
+        assert_eq!(
+            split("!cargo test\nwhy does it fail?"),
+            Some(("cargo test", "why does it fail?"))
+        );
         assert_eq!(split("! ls -la "), Some(("ls -la", "")));
     }
 }

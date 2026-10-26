@@ -182,12 +182,10 @@ mod tests {
             store
                 .save_agent_settings(armed.id, &crate::agent::Settings::default())
                 .unwrap();
-            assert!(
-                !store
-                    .session_usage_limits()
-                    .unwrap()
-                    .contains_key(&armed.id)
-            );
+            assert!(!store
+                .session_usage_limits()
+                .unwrap()
+                .contains_key(&armed.id));
         }
     }
 

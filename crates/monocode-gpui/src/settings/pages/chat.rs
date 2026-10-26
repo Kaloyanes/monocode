@@ -1,6 +1,25 @@
 //! ChatPage.
-use crate::settings::{ModelChoice, Preferences, SettingsView};
-use gpui::{AnyElement, Context, SharedString};
+use crate::{
+    pickers::{ModelList, ModelPicked, model_name},
+    popover::{
+        Align, Anchor, AnchorSlot, Flyout, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle,
+        menu_popover,
+    },
+    settings::{ModelChoice, Preferences, SettingsView},
+    theme::*,
+};
+use gpui::{
+    AnyElement, Context, Entity, Role, SharedString, Subscription, Window, div, prelude::*, px,
+};
+use monocode_core::provider::Kind;
+
+/// The open Text generation model menu, under the trigger it belongs to.
+pub(in crate::settings) struct TextModelMenu {
+    id: &'static str,
+    menu: Entity<Menu>,
+    anchor: AnchorSlot,
+    _events: Vec<Subscription>,
+}
 
 impl SettingsView {
     pub(super) fn chat_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -222,6 +241,8 @@ impl SettingsView {
 
 impl SettingsView {
     /// A select over every provider's models, with `none` for no choice.
+    /// The composer's model menu: a "Default" row, then the "Model" row
+    /// whose flyout is the composer's ModelList.
     fn text_model_select(
         &self,
         id: &'static str,
@@ -231,59 +252,192 @@ impl SettingsView {
         cx: &mut Context<Self>,
         set: fn(&mut Preferences, Option<ModelChoice>),
     ) -> AnyElement {
-        let value = current
+        let open = self.text_model_menu.as_ref().is_some_and(|m| m.id == id);
+        let slot: AnchorSlot = self
+            .select_anchors
+            .borrow_mut()
+            .entry(id)
+            .or_default()
+            .clone();
+        let picked = current
             .as_ref()
-            .map(|c| format!("{}:{}", c.provider, c.model.as_deref().unwrap_or_default()))
-            .unwrap_or_default();
-        let mut options: Vec<(String, SharedString, Option<AnyElement>)> =
-            vec![(String::new(), none.into(), None)];
-        // The model picker's own rules: installed CLIs, and the providers and
-        // models the Providers page leaves visible.
-        for kind in monocode_core::provider::Kind::ALL {
-            let installed = self
-                .discovery
-                .binaries
-                .iter()
-                .any(|(k, path)| *k == kind && path.is_some());
-            if !installed || self.prefs.hidden_providers.iter().any(|id| id == kind.id()) {
-                continue;
-            }
-            let models = self
-                .ctx
-                .catalogs
-                .get(kind.id())
-                .filter(|models| !models.is_empty())
-                .or_else(|| self.model_catalogs.get(&kind));
-            for (model, name) in models.into_iter().flatten() {
-                let hidden = self
-                    .prefs
-                    .hidden_models
-                    .iter()
-                    .any(|c| c.provider == kind.id() && c.model.as_deref() == Some(model));
-                if hidden {
-                    continue;
+            .map(|c| (Kind::from_id(&c.provider), c.model.clone()));
+        let trigger_label = picked
+            .as_ref()
+            .map_or(SharedString::from(none), |(kind, model)| {
+                model_name(*kind, model.as_deref())
+            });
+        let current = current.clone();
+        div()
+            .id(SharedString::from(format!("select-{id}")))
+            .debug_selector(move || format!("settings-select-{id}"))
+            .role(Role::ComboBox)
+            .aria_label(format!("{label}: {trigger_label}"))
+            .aria_expanded(open)
+            .relative()
+            .w(px(240.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(content(0.1))
+            .bg(content(0.05))
+            .px_2()
+            .py_1()
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .text_color(content(1.))
+            .cursor_pointer()
+            .hover(|s| s.border_color(content(0.2)))
+            .child(slot.probe())
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .when_some(picked.as_ref(), |d, (kind, _)| {
+                        d.child(provider_icon(kind.id(), 16.).flex_shrink_0())
+                    })
+                    .child(div().min_w_0().truncate().child(trigger_label)),
+            )
+            .child(
+                icon("chevron-down-hi", 14.)
+                    .text_color(content(0.5))
+                    .when(open, |s| {
+                        s.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.5)))
+                    }),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.text_model_menu.take().is_none() {
+                    this.open_text_model_menu(
+                        id,
+                        slot.clone(),
+                        none,
+                        current.clone(),
+                        set,
+                        window,
+                        cx,
+                    );
                 }
-                options.push((
-                    format!("{}:{model}", kind.id()),
-                    format!("{} · {name}", kind.label()).into(),
-                    None,
-                ));
-            }
-        }
-        self.select(
-            id,
-            label,
-            &value,
-            options,
-            Some(240.),
-            cx,
-            move |this, v, cx| {
-                let choice = v.split_once(':').map(|(provider, model)| ModelChoice {
-                    provider: provider.into(),
-                    model: (!model.is_empty()).then(|| model.into()),
-                });
-                this.update(cx, |p| set(p, choice))
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_text_model_menu(
+        &mut self,
+        id: &'static str,
+        anchor: AnchorSlot,
+        none: &'static str,
+        current: Option<ModelChoice>,
+        set: fn(&mut Preferences, Option<ModelChoice>),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_open = None;
+        let project = self.ctx.cwd.clone();
+        let provider = current
+            .as_ref()
+            .map(|c| Kind::from_id(&c.provider))
+            .or_else(|| self.prefs.default_provider.as_deref().and_then(Kind::parse))
+            .unwrap_or(Kind::ALL[0]);
+        let model = current.as_ref().and_then(|c| c.model.clone());
+        let profile = crate::accounts::get(cx)
+            .map(|a| a.read(cx).selected(provider, &project))
+            .unwrap_or_default();
+        let hidden = self.prefs.hidden_for(&project);
+        let list = cx.new(|cx| {
+            ModelList::new_for(provider, model.clone(), &project, profile, cx)
+                .hide_providers(hidden)
+                .allow_provider_switch(true)
+        });
+        let picked = cx.subscribe_in(
+            &list,
+            window,
+            move |this, _, picked: &ModelPicked, window, cx| {
+                let choice = ModelChoice {
+                    provider: picked.0.id().into(),
+                    model: picked.1.clone(),
+                };
+                this.update(cx, |p| set(p, Some(choice)));
+                this.close_text_model_menu(window, cx);
             },
+        );
+        let focus = list.read(cx).search_focus(cx);
+        let items = vec![
+            MenuAction::new("default", none)
+                .checked(current.is_none())
+                .into(),
+            MenuItem::Separator,
+            MenuAction::new("model", "Model")
+                .value_image(provider.id())
+                .value(if current.is_some() {
+                    model_name(provider, model.as_deref())
+                } else {
+                    SharedString::from("Choose")
+                })
+                .flyout(Flyout {
+                    view: list.into(),
+                    width: 310.,
+                    padding: 0.,
+                    height: Some(442.),
+                    max_height: None,
+                    focus: Some(focus),
+                    surface: None,
+                })
+                .into(),
+        ];
+        let menu = cx.new(|cx| {
+            Menu::new("Model and settings", items, window, cx)
+                .width(250.)
+                .style(MenuStyle::Settings)
+        });
+        let events = cx.subscribe_in(
+            &menu,
+            window,
+            move |this, _, event: &MenuEvent, window, cx| match event {
+                MenuEvent::Picked(choice, _) if choice.as_ref() == "default" => {
+                    this.update(cx, |p| set(p, None));
+                    this.close_text_model_menu(window, cx);
+                }
+                MenuEvent::Picked(..) => {}
+                MenuEvent::Dismissed => this.close_text_model_menu(window, cx),
+            },
+        );
+        self.text_model_menu = Some(TextModelMenu {
+            id,
+            menu,
+            anchor,
+            _events: vec![picked, events],
+        });
+    }
+
+    pub(in crate::settings) fn close_text_model_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.text_model_menu.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    pub(in crate::settings) fn text_model_overlay(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let open = self.text_model_menu.as_ref()?;
+        Some(
+            menu_popover(&open.menu, Anchor::Slot(open.anchor.clone()), cx)
+                .align(Align::End)
+                .gap(4.)
+                .into_any_element(),
         )
     }
 }

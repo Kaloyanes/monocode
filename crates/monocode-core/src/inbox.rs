@@ -1251,25 +1251,56 @@ mod link_tests {
 
     #[test]
     fn a_link_finds_its_listed_item_for_every_provider() {
-        let item = |provider: &str, kind: &str, repo: &str, identifier: &str, number, url: &str| Item {
-            provider: provider.into(),
-            kind: kind.into(),
-            repo: repo.into(),
-            identifier: identifier.into(),
-            number,
-            url: url.into(),
-            ..Default::default()
-        };
+        let item =
+            |provider: &str, kind: &str, repo: &str, identifier: &str, number, url: &str| Item {
+                provider: provider.into(),
+                kind: kind.into(),
+                repo: repo.into(),
+                identifier: identifier.into(),
+                number,
+                url: url.into(),
+                ..Default::default()
+            };
         let items = vec![
-            item("github", "pr", "acme/app", "", 12, "https://github.com/acme/app/pull/12"),
-            item("linear", "linear", "ENG", "ENG-42", 42, "https://linear.app/acme/issue/ENG-42/x"),
-            item("jira", "issue", "", "KEY-5", 5, "https://acme.atlassian.net/browse/KEY-5"),
+            item(
+                "github",
+                "pr",
+                "acme/app",
+                "",
+                12,
+                "https://github.com/acme/app/pull/12",
+            ),
+            item(
+                "linear",
+                "linear",
+                "ENG",
+                "ENG-42",
+                42,
+                "https://linear.app/acme/issue/ENG-42/x",
+            ),
+            item(
+                "jira",
+                "issue",
+                "",
+                "KEY-5",
+                5,
+                "https://acme.atlassian.net/browse/KEY-5",
+            ),
         ];
         let found = |url| find_linked(&items, url).map(|item| item.provider.as_str());
-        assert_eq!(found("https://github.com/Acme/App/pull/12/files"), Some("github"));
+        assert_eq!(
+            found("https://github.com/Acme/App/pull/12/files"),
+            Some("github")
+        );
         assert_eq!(found("https://github.com/acme/app/issues/12"), None);
-        assert_eq!(found("https://linear.app/acme/issue/eng-42"), Some("linear"));
-        assert_eq!(found("https://acme.atlassian.net/browse/KEY-5/"), Some("jira"));
+        assert_eq!(
+            found("https://linear.app/acme/issue/eng-42"),
+            Some("linear")
+        );
+        assert_eq!(
+            found("https://acme.atlassian.net/browse/KEY-5/"),
+            Some("jira")
+        );
         assert_eq!(found("https://acme.atlassian.net/browse/KEY-6"), None);
     }
 }

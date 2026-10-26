@@ -15,8 +15,8 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListState, Pixels, Subscription, Window, px,
+    App, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    ListAlignment, ListState, Pixels, Subscription, Window, px,
 };
 use monocode_core::{
     inbox::{self as model, Checks, Details, Diff, Item, Service, Snapshot, Thread, ViewState},

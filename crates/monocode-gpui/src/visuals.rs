@@ -43,6 +43,11 @@ pub(crate) struct VisualView {
     /// The isolated page for an HTML visual; created on the first render.
     html: Option<gpui::Entity<crate::monos::html::Html>>,
     _page_changes: Option<gpui::Subscription>,
+    /// The page's frame eases between the heights the page reports.
+    frame: Option<FrameTween>,
+    hold: FrameHold,
+    /// Wakes the view when a lower height has held long enough to shrink to.
+    shrink: Option<gpui::Task<()>>,
 }
 impl EventEmitter<VisualChanged> for VisualView {}
 struct SliderDrag {
@@ -181,6 +186,107 @@ fn html_frame_height(published: Option<u32>, page: crate::monos::html::Page) -> 
         })
 }
 
+/// How long a lower page height must last before the frame shrinks to it.
+const SHRINK_AFTER: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Keeps a page's frame from dipping. The first height the page reports after
+/// loading is its floor, and a lower height is taken only once it has lasted
+/// [`SHRINK_AFTER`], so a replay that rebuilds smaller and grows back stays put.
+#[derive(Default)]
+struct FrameHold {
+    /// The floor and the width it was measured at; content reflows at a new width.
+    floor: Option<(f32, f32)>,
+    held: f32,
+    /// The latest lower height and when the page first dropped below `held`.
+    lower: Option<(f32, std::time::Instant)>,
+}
+impl FrameHold {
+    /// The height to show for `reported`, and when to check again if a lower
+    /// height is waiting.
+    fn height(
+        &mut self,
+        reported: f32,
+        measured: bool,
+        width: f32,
+        now: std::time::Instant,
+    ) -> (f32, Option<std::time::Duration>) {
+        if !measured {
+            // The published height only holds the place while the page loads.
+            self.held = reported;
+            return (reported, None);
+        }
+        let floor = match self.floor {
+            Some((floor, at)) if (at - width).abs() <= 1. => floor,
+            _ => {
+                // A first measurement or a reflow resets the floor.
+                self.floor = Some((reported, width));
+                self.held = reported;
+                self.lower = None;
+                return (reported, None);
+            }
+        };
+        let target = reported.max(floor);
+        if target >= self.held {
+            self.held = target;
+            self.lower = None;
+            return (target, None);
+        }
+        let since = self.lower.map_or(now, |(_, since)| since);
+        let waited = now.saturating_duration_since(since);
+        if waited >= SHRINK_AFTER {
+            self.held = target;
+            self.lower = None;
+            return (target, None);
+        }
+        self.lower = Some((target, since));
+        (self.held, Some(SHRINK_AFTER - waited))
+    }
+}
+
+const FRAME_TWEEN: std::time::Duration = std::time::Duration::from_millis(240);
+
+/// A frame height easing from one reported page height to the next, so the
+/// transcript around the visual glides instead of jumping.
+#[derive(Clone, Copy)]
+struct FrameTween {
+    from: f32,
+    to: f32,
+    start: std::time::Instant,
+}
+impl FrameTween {
+    fn settled(height: f32) -> Self {
+        Self {
+            from: height,
+            to: height,
+            start: std::time::Instant::now() - FRAME_TWEEN,
+        }
+    }
+    fn at(&self, now: std::time::Instant) -> f32 {
+        let t = (now.saturating_duration_since(self.start).as_secs_f32()
+            / FRAME_TWEEN.as_secs_f32())
+        .min(1.);
+        let eased = 1. - (1. - t).powi(3);
+        self.from + (self.to - self.from) * eased
+    }
+    fn running(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.start) < FRAME_TWEEN
+    }
+    /// Retargets from wherever the frame is painted now.
+    fn toward(self, target: f32, now: std::time::Instant, reduced: bool) -> Self {
+        if reduced {
+            return Self::settled(target);
+        }
+        if self.to == target {
+            return self;
+        }
+        Self {
+            from: self.at(now),
+            to: target,
+            start: now,
+        }
+    }
+}
+
 /// Pulsing bars where a page will appear, painted under its transparent web
 /// view until it loads.
 fn html_placeholder(height: f32) -> impl IntoElement {
@@ -253,6 +359,9 @@ impl VisualView {
             scene_cache: HashMap::new(),
             html: None,
             _page_changes: None,
+            frame: None,
+            hold: FrameHold::default(),
+            shrink: None,
         };
         this.initialize();
         this
@@ -264,6 +373,9 @@ impl VisualView {
         self.runtime = None;
         self.html = None;
         self._page_changes = None;
+        self.frame = None;
+        self.hold = FrameHold::default();
+        self.shrink = None;
         if self.document.format == VisualFormat::Html {
             self.error = self.document.validate().err();
             return;
@@ -1048,7 +1160,7 @@ impl VisualView {
 }
 
 impl Render for VisualView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.document.title.clone();
         let tree = self.tree.clone();
         let width = self.width.clone();
@@ -1083,8 +1195,41 @@ impl Render for VisualView {
             let page = self.html.clone().unwrap();
             let state = page.read(cx).page();
             // The published height holds the place until the page reports
-            // its own; then the frame fits the content.
-            let height = html_frame_height(self.document.height, state);
+            // its own; then the frame fits the content without dipping.
+            let now = std::time::Instant::now();
+            let (target, recheck) = self.hold.height(
+                html_frame_height(self.document.height, state),
+                state.loaded && state.height.is_some(),
+                self.width.get(),
+                now,
+            );
+            // The deadline doesn't move while the page stays lower, so one
+            // pending wake-up is enough.
+            match recheck {
+                None => self.shrink = None,
+                Some(wait) if self.shrink.is_none() => {
+                    self.shrink = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(wait).await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.shrink = None;
+                            this.changed(cx);
+                        });
+                    }));
+                }
+                Some(_) => {}
+            }
+            let tween = self.frame.map_or_else(
+                || FrameTween::settled(target),
+                |tween| tween.toward(target, now, cx.reduce_motion()),
+            );
+            self.frame = Some(tween);
+            let height = tween.at(now);
+            if tween.running(now) {
+                // Each step changes the row's height, so the transcript
+                // remeasures it on every frame of the glide.
+                window.request_animation_frame();
+                cx.emit(VisualChanged);
+            }
             div()
                 .id("visual-html")
                 .debug_selector(|| "visual-html".into())

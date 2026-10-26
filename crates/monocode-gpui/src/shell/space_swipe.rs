@@ -777,6 +777,50 @@ mod tests {
     }
 
     #[gpui::test]
+    fn vertical_trackpad_scrolls_the_session_list(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = spaces(cx, false);
+        let visual = &mut visual;
+        window
+            .update(visual, |shell, _, cx| {
+                let store = super::super::locked(&shell.store).unwrap();
+                let mut made = Vec::new();
+                for i in 0..40 {
+                    let mut summary = store.create("codex", "/work/monocode").unwrap();
+                    summary.title = format!("Session {i}");
+                    summary.has_messages = true;
+                    made.push(summary);
+                }
+                drop(store);
+                for summary in made {
+                    shell.order.push(summary.id);
+                    shell.session_summaries.insert(summary.id, summary);
+                }
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let scrolled = |visual: &mut VisualTestContext| {
+            window
+                .update(visual, |shell, _, _| {
+                    -shell.sidebar_list.state.scroll_px_offset_for_scrollbar().y
+                })
+                .unwrap()
+        };
+        let before = scrolled(visual);
+        swipe(visual, &[(0., -30.), (0., -30.), (0., -30.)], true);
+        let after = scrolled(visual);
+        assert!(after > before, "a vertical swipe scrolls: {before:?} -> {after:?}");
+        // Momentum after the fingers lift keeps scrolling.
+        wheel(visual, TouchPhase::Moved, 0., -30.);
+        visual.run_until_parked();
+        let momentum = scrolled(visual);
+        assert!(momentum > after, "momentum scrolls: {after:?} -> {momentum:?}");
+        // And the next gesture scrolls again.
+        swipe(visual, &[(0., -30.), (0., -30.)], true);
+        assert!(scrolled(visual) > momentum, "a second swipe scrolls");
+    }
+
+    #[gpui::test]
     fn sideways_swipes_step_between_neighbouring_spaces(cx: &mut TestAppContext) {
         let (window, mut visual, _, width) = spaces(cx, true);
         let visual = &mut visual;

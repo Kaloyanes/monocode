@@ -539,3 +539,51 @@ fn html_frames_hold_the_published_height_until_the_page_reports_its_own() {
     assert_eq!(html_frame_height(Some(520), measured(12.)), 80.);
     assert_eq!(html_frame_height(Some(520), measured(5000.)), 900.);
 }
+
+#[test]
+fn html_frames_ease_to_a_new_height_and_retarget_from_where_they_are() {
+    let start = std::time::Instant::now();
+    let tween = FrameTween::settled(300.).toward(500., start, false);
+    assert_eq!(tween.at(start), 300., "A new height starts from the old one");
+    let midway = tween.at(start + FRAME_TWEEN / 2);
+    assert!(midway > 400. && midway < 500., "Eases out: {midway}");
+    assert!(tween.running(start + FRAME_TWEEN / 2));
+    assert_eq!(tween.at(start + FRAME_TWEEN), 500.);
+    assert!(!tween.running(start + FRAME_TWEEN));
+
+    let retarget = start + FRAME_TWEEN / 2;
+    let back = tween.toward(200., retarget, false);
+    assert_eq!(back.at(retarget), midway, "A retarget never jumps");
+    assert_eq!(tween.toward(500., retarget, false).start, start);
+
+    let reduced = tween.toward(200., retarget, true);
+    assert_eq!(reduced.at(retarget), 200., "Reduced motion skips the glide");
+}
+
+#[test]
+fn html_frames_keep_their_first_height_as_a_floor_and_shrink_only_after_a_pause() {
+    let start = std::time::Instant::now();
+    let at = |ms| start + std::time::Duration::from_millis(ms);
+    let mut hold = FrameHold::default();
+    assert_eq!(hold.height(480., false, 600., at(0)), (480., None), "Loading");
+    assert_eq!(hold.height(240., true, 600., at(10)).0, 240., "First measurement");
+
+    assert_eq!(hold.height(180., true, 600., at(20)).0, 240., "Never below the floor");
+    assert_eq!(hold.height(320., true, 600., at(30)).0, 320., "Grows at once");
+
+    let (shown, recheck) = hold.height(260., true, 600., at(100));
+    assert_eq!(shown, 320., "A replay's smaller start doesn't dip");
+    assert_eq!(recheck, Some(SHRINK_AFTER));
+    assert_eq!(hold.height(320., true, 600., at(400)), (320., None), "Grew back");
+
+    hold.height(260., true, 600., at(500));
+    assert_eq!(hold.height(250., true, 600., at(900)).0, 320.);
+    assert_eq!(
+        hold.height(250., true, 600., at(1500)),
+        (250., None),
+        "A lower height that lasts is taken, timed from the first drop"
+    );
+
+    assert_eq!(hold.height(200., true, 420., at(1600)).0, 200., "A reflow resets the floor");
+    assert_eq!(hold.height(150., true, 420., at(1700)).0, 200.);
+}
