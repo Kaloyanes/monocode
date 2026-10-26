@@ -947,6 +947,8 @@ impl Store {
         Ok(used.filter(|u| *u >= 0).map(|used| Usage {
             used: used as u64,
             window: window.filter(|w| *w > 0).map(|w| w as u64),
+            cache_ttl_ms: None,
+            cost_total_usd: None,
         }))
     }
     /// The blocks whose rows this store numbers: an indexed Mono's window, or
