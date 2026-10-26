@@ -19,6 +19,66 @@ use std::{
     process::Command,
 };
 
+/// A link the inbox can open on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkTarget {
+    GitHub(WorkItem),
+    /// A Linear identifier such as `ENG-42`.
+    Linear(String),
+}
+
+/// What `url` points at when it is a GitHub issue or pull request page or a
+/// Linear issue page. Anything else is left to the browser.
+pub fn link_target(url: &str) -> Option<LinkTarget> {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))?;
+    if rest.starts_with("github.com/") {
+        return crate::session_groups::parse_github_work_item(url).map(LinkTarget::GitHub);
+    }
+    let path = rest.strip_prefix("linear.app/")?;
+    let mut parts = path.split(['/', '?', '#']);
+    let (_workspace, kind, identifier) = (parts.next()?, parts.next()?, parts.next()?);
+    let (team, number) = identifier.split_once('-')?;
+    (kind == "issue"
+        && !team.is_empty()
+        && team.chars().all(|c| c.is_ascii_alphanumeric())
+        && !number.is_empty()
+        && number.chars().all(|c| c.is_ascii_digit()))
+    .then(|| LinkTarget::Linear(identifier.to_ascii_uppercase()))
+}
+
+/// The listed item a link points at, whatever the provider.
+pub fn find_linked<'a>(items: &'a [Item], url: &str) -> Option<&'a Item> {
+    let normal = |url: &str| {
+        url.trim()
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    match link_target(url) {
+        Some(LinkTarget::GitHub(work)) => items.iter().find(|item| {
+            item.provider == "github"
+                && item.kind == work.kind
+                && item.number == work.number as i64
+                && item.repo.eq_ignore_ascii_case(&work.repo)
+        }),
+        Some(LinkTarget::Linear(identifier)) => items.iter().find(|item| {
+            item.provider == "linear" && item.identifier.eq_ignore_ascii_case(&identifier)
+        }),
+        None => {
+            let wanted = normal(url);
+            items
+                .iter()
+                .find(|item| !item.url.is_empty() && normal(&item.url) == wanted)
+        }
+    }
+}
+
 pub const PROVIDERS: [&str; 5] = ["github", "linear", "jira", "gitlab", "azuredevops"];
 pub fn provider_label(provider: &str) -> &'static str {
     match provider {
@@ -937,6 +997,42 @@ impl Service {
             item.number,
         )?)
     }
+    /// The item a link names when the list does not hold it.
+    pub fn linked_item(&self, target: &LinkTarget, projects: &[PathBuf]) -> Result<Item, String> {
+        match target {
+            LinkTarget::GitHub(work) => self.linked_github_item(work, projects),
+            LinkTarget::Linear(identifier) => convert(linear::linear_issue_lookup(
+                self.data_dir.clone(),
+                identifier.clone(),
+            )?),
+        }
+    }
+    /// One GitHub issue or pull request named by a link, which the inbox list
+    /// may not hold. It is tied to the first project checked out from that
+    /// repository so later `gh` calls run in a matching working directory.
+    pub fn linked_github_item(
+        &self,
+        work: &WorkItem,
+        projects: &[PathBuf],
+    ) -> Result<Item, String> {
+        let project = projects.iter().find(|project| {
+            github::git_github_repositories_for(project).is_ok_and(|repos| {
+                repos
+                    .iter()
+                    .any(|repo| repo.eq_ignore_ascii_case(&work.repo))
+            })
+        });
+        let root = project.map_or(self.cwd.as_path(), PathBuf::as_path);
+        let mut item: Item = convert(github::git_github_work_item_for(
+            root,
+            &work.repo,
+            &work.kind,
+            i64::try_from(work.number).map_err(|e| e.to_string())?,
+        )?)?;
+        item.provider = "github".into();
+        item.project_path = project.map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+        Ok(item)
+    }
     pub fn action(&self, item: &Item, action: &str) -> Result<Item, String> {
         let mut updated: Item = convert(github::git_github_pr_action_for(
             self.project(item),
@@ -1120,5 +1216,91 @@ mod notification_tests {
         linear.id = "stable-id".into();
         linear.identifier = "MON-7".into();
         assert_eq!(linear.key(), "linear:mon-7");
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn links_to_github_and_linear_issues_are_recognised() {
+        assert!(matches!(
+            link_target("https://github.com/acme/app/pull/12/files"),
+            Some(LinkTarget::GitHub(work)) if work.number == 12 && work.kind == "pr"
+        ));
+        assert_eq!(
+            link_target("https://linear.app/acme/issue/eng-42/fix-the-thing"),
+            Some(LinkTarget::Linear("ENG-42".into()))
+        );
+        assert_eq!(
+            link_target("HTTPS://linear.app/acme/issue/ENG-7?x=1#c"),
+            Some(LinkTarget::Linear("ENG-7".into()))
+        );
+        for other in [
+            "https://linear.app/acme/project/roadmap",
+            "https://linear.app/acme/issue/not-a-number",
+            "https://linear.app/acme/issue/ENG",
+            "https://example.com/?u=https://linear.app/acme/issue/ENG-1",
+            "https://github.com/acme/app",
+            "ENG-42",
+        ] {
+            assert_eq!(link_target(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_link_finds_its_listed_item_for_every_provider() {
+        let item =
+            |provider: &str, kind: &str, repo: &str, identifier: &str, number, url: &str| Item {
+                provider: provider.into(),
+                kind: kind.into(),
+                repo: repo.into(),
+                identifier: identifier.into(),
+                number,
+                url: url.into(),
+                ..Default::default()
+            };
+        let items = vec![
+            item(
+                "github",
+                "pr",
+                "acme/app",
+                "",
+                12,
+                "https://github.com/acme/app/pull/12",
+            ),
+            item(
+                "linear",
+                "linear",
+                "ENG",
+                "ENG-42",
+                42,
+                "https://linear.app/acme/issue/ENG-42/x",
+            ),
+            item(
+                "jira",
+                "issue",
+                "",
+                "KEY-5",
+                5,
+                "https://acme.atlassian.net/browse/KEY-5",
+            ),
+        ];
+        let found = |url| find_linked(&items, url).map(|item| item.provider.as_str());
+        assert_eq!(
+            found("https://github.com/Acme/App/pull/12/files"),
+            Some("github")
+        );
+        assert_eq!(found("https://github.com/acme/app/issues/12"), None);
+        assert_eq!(
+            found("https://linear.app/acme/issue/eng-42"),
+            Some("linear")
+        );
+        assert_eq!(
+            found("https://acme.atlassian.net/browse/KEY-5/"),
+            Some("jira")
+        );
+        assert_eq!(found("https://acme.atlassian.net/browse/KEY-6"), None);
     }
 }
