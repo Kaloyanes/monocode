@@ -44,7 +44,7 @@ return () => visual.column([
 ], { gap: 16 });
 ```
 
-Handlers update local state and the app rerenders the component tree. The script interpreter persists while that view is retained. Reset recreates its initial state. `Math.random()` starts from a repeatable source-based seed, so generated example data is consistent when the program is checked or reopened. The header icons switch to the syntax-highlighted JavaScript source and reset the visual; source mode also offers a copy icon. Visuals grow to their full content height and scroll with the conversation. The source viewer scrolls long programs within its code pane.
+Handlers update local state and the app rerenders the component tree. The script interpreter persists while that view is retained. Reset recreates its initial state. `Math.random()` starts from a repeatable source-based seed, so generated example data is consistent when the program is checked or reopened. The header icons switch to the syntax-highlighted JavaScript source and reset the visual; source mode also offers a copy icon. Visuals grow to their full content height and scroll with the conversation. The source view also shows the whole program at full height; long lines scroll sideways.
 
 | Component | Signature |
 | --- | --- |

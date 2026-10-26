@@ -1,4 +1,5 @@
-//! Immutable JavaScript source, highlighted once and drawn a viewport at a time.
+//! Immutable JavaScript source, highlighted once and drawn at its full height
+//! so the conversation, not the pane, scrolls through it.
 use crate::{
     syntax::{HighlightRequest, HighlightedDocument},
     theme::content,
@@ -10,7 +11,6 @@ use gpui::{
 use std::{ops::Range, sync::Arc};
 
 const LINE_HEIGHT: f32 = 20.;
-const MAX_HEIGHT: f32 = 420.;
 
 struct Document {
     source: SharedString,
@@ -126,7 +126,7 @@ impl Render for SourceView {
             .debug_selector(|| "visual-source-pane".into())
             .w_full()
             .min_w_0()
-            .h(px((count as f32 * LINE_HEIGHT).min(MAX_HEIGHT)))
+            .h(px(count as f32 * LINE_HEIGHT))
             .overflow_hidden()
             .child(
                 uniform_list("visual-source-lines", count, move |range, _, _| {
@@ -178,10 +178,10 @@ impl Render for SourceView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{ScrollStrategy, TestAppContext};
+    use gpui::TestAppContext;
 
     #[gpui::test]
-    fn javascript_source_preserves_unicode_colors_and_virtualizes_lines(cx: &mut TestAppContext) {
+    fn javascript_source_preserves_unicode_colors_and_shows_every_line(cx: &mut TestAppContext) {
         let first = "const greeting = 'Здравей 🌍'; // Unicode stays intact\r\n";
         let source = format!("{first}{}", "return visual.text(greeting);\n".repeat(1000));
         let exact = source.clone();
@@ -218,16 +218,11 @@ mod tests {
                 }
             })
             .unwrap();
-        assert!(visual.debug_bounds("visual-source-line-0").is_some());
-        assert!(visual.debug_bounds("visual-source-line-1000").is_none());
-        window
-            .update(visual, |view, _, cx| {
-                view.scroll.scroll_to_item(1000, ScrollStrategy::Nearest);
-                cx.notify();
-            })
+        let lines = window
+            .update(visual, |view, _, _| view.document.lines.len())
             .unwrap();
-        visual.run_until_parked();
-        assert!(visual.debug_bounds("visual-source-line-1000").is_some());
-        assert!(visual.debug_bounds("visual-source-line-0").is_none());
+        let pane = visual.debug_bounds("visual-source-pane").unwrap();
+        assert_eq!(pane.size.height, px(lines as f32 * LINE_HEIGHT), "No fixed height");
+        assert!(visual.debug_bounds("visual-source-line-0").is_some());
     }
 }
