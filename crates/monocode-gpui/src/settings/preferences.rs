@@ -61,6 +61,12 @@ pub(crate) struct Preferences {
     pub empty_session_games: bool,
     // Providers
     pub show_remaining_usage: bool,
+    /// Writes commit messages, pull requests and session titles with this model instead of the session's.
+    pub text_model: Option<ModelChoice>,
+    /// Per-action overrides of `text_model`.
+    pub commit_model: Option<ModelChoice>,
+    pub pr_model: Option<ModelChoice>,
+    pub title_model: Option<ModelChoice>,
     pub mask_emails: bool,
     pub idle_agents: u32,
     pub claude_hooks: bool,
@@ -148,6 +154,10 @@ impl Default for Preferences {
             composer_mascot: true,
             empty_session_games: true,
             show_remaining_usage: false,
+            text_model: None,
+            commit_model: None,
+            pr_model: None,
+            title_model: None,
             mask_emails: true,
             idle_agents: 3,
             claude_hooks: true,
@@ -175,7 +185,35 @@ impl Default for Preferences {
     }
 }
 
+/// An action that has the CLI write text for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextTask {
+    Commit,
+    PullRequest,
+    Title,
+}
+
 impl Preferences {
+    /// The model chosen for `task`, else the general text model; `None` leaves
+    /// the choice to the caller's default.
+    pub(crate) fn text_model_for(&self, task: TextTask) -> Option<&ModelChoice> {
+        match task {
+            TextTask::Commit => &self.commit_model,
+            TextTask::PullRequest => &self.pr_model,
+            TextTask::Title => &self.title_model,
+        }
+        .as_ref()
+        .or(self.text_model.as_ref())
+    }
+    /// Choose the model that writes `task`'s text.
+    pub(crate) fn set_text_model(&mut self, task: TextTask, choice: Option<ModelChoice>) {
+        match task {
+            TextTask::Commit => self.commit_model = choice,
+            TextTask::PullRequest => self.pr_model = choice,
+            TextTask::Title => self.title_model = choice,
+        }
+    }
+
     pub(crate) fn apply_workspace_theme(&mut self, id: String) {
         let color: gpui::Hsla = gpui::rgb(super::palette(&id, false).surface).into();
         self.theme_hue = (color.h * 360.).round() as u32;
@@ -456,5 +494,41 @@ mod decoration_tests {
         assert!(!restored.wayland_window_decorations);
         restored.restore_appearance();
         assert!(restored.wayland_window_decorations);
+    }
+}
+
+#[cfg(test)]
+mod text_model_tests {
+    use super::*;
+
+    fn choice(provider: &str, model: &str) -> ModelChoice {
+        ModelChoice {
+            provider: provider.into(),
+            model: Some(model.into()),
+        }
+    }
+
+    #[test]
+    fn a_task_model_wins_over_the_general_text_model() {
+        let mut prefs = Preferences::default();
+        assert_eq!(prefs.text_model_for(TextTask::Commit), None);
+        prefs.text_model = Some(choice("claude", "haiku"));
+        for task in [TextTask::Commit, TextTask::PullRequest, TextTask::Title] {
+            assert_eq!(prefs.text_model_for(task), Some(&choice("claude", "haiku")));
+        }
+        prefs.set_text_model(TextTask::Commit, Some(choice("codex", "gpt-mini")));
+        assert_eq!(
+            prefs.text_model_for(TextTask::Commit),
+            Some(&choice("codex", "gpt-mini"))
+        );
+        assert_eq!(
+            prefs.text_model_for(TextTask::PullRequest),
+            Some(&choice("claude", "haiku"))
+        );
+        prefs.set_text_model(TextTask::Commit, None);
+        assert_eq!(
+            prefs.text_model_for(TextTask::Commit),
+            Some(&choice("claude", "haiku"))
+        );
     }
 }

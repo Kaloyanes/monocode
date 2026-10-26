@@ -12,13 +12,14 @@ mod pages;
 mod palettes;
 mod preferences;
 mod skill_document;
+mod text_model;
 pub(crate) use palettes::palette;
 pub(crate) mod widgets;
 
 pub(crate) use keymap::apply as apply_keybindings;
 pub(crate) use model::Section;
 pub(crate) use pages::command_shortcut;
-pub(crate) use preferences::{ModelChoice, Preferences, UI_SCALE_PERCENTS};
+pub(crate) use preferences::{ModelChoice, Preferences, TextTask, UI_SCALE_PERCENTS};
 
 use crate::{
     input::{self, Input},
@@ -213,6 +214,8 @@ pub(crate) struct SettingsView {
     slider_drag: Option<SliderKind>,
     select_open: Option<&'static str>,
     select_active: usize,
+    /// The model picker open from a text-model row.
+    text_picker: Option<(Entity<crate::pickers::ModelList>, Subscription)>,
     select_focus: FocusHandle,
     select_anchors: RefCell<HashMap<&'static str, AnchorSlot>>,
     search: Entity<Input>,
@@ -365,6 +368,7 @@ impl SettingsView {
             slider_drag: None,
             select_open: None,
             select_active: 0,
+            text_picker: None,
             select_focus: cx.focus_handle(),
             select_anchors: Default::default(),
             search,

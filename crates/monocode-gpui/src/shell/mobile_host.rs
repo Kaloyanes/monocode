@@ -646,11 +646,14 @@ impl Shell {
                 let result = Arc::new(Mutex::new(None));
                 let slot = result.clone();
                 let params = request.params.clone();
+                let models = project::TextModels::from_preferences(
+                    cx.try_global::<crate::settings::Preferences>(),
+                );
                 cx.background_executor()
                     .spawn(async move {
                         let cwd = PathBuf::from(cwd);
                         let outcome = project::resolve_root(&cwd, params["worktreePath"].as_str())
-                            .and_then(|root| project::git_action(&root, &params));
+                            .and_then(|root| project::git_action(&root, &params, &models));
                         if let Ok(mut slot) = slot.lock() {
                             *slot = Some(outcome);
                         }

@@ -400,6 +400,30 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "effort thinking reasoning fast service tier model picker composer",
     ),
     (
+        "text-model",
+        Section::Chat,
+        "Text generation model",
+        "commit message pull request title session name cheap haiku mini",
+    ),
+    (
+        "commit-model",
+        Section::Chat,
+        "Commit messages",
+        "commit message model generate git",
+    ),
+    (
+        "pr-model",
+        Section::Chat,
+        "Pull requests",
+        "pull request title description model generate git",
+    ),
+    (
+        "title-model",
+        Section::Chat,
+        "Session titles",
+        "session name title model generate rename",
+    ),
+    (
         "composer-autocorrect",
         Section::Chat,
         "Autocorrect",

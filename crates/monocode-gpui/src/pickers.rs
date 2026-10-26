@@ -88,6 +88,19 @@ pub(crate) fn remember_model(kind: Kind, model: Option<String>, cx: &mut gpui::A
         });
     }
 }
+/// The provider and model that write `task`'s text: the chosen one, else
+/// `fallback`'s default.
+pub(crate) fn text_task_choice(
+    task: crate::settings::TextTask,
+    fallback: Kind,
+    cx: &gpui::App,
+) -> (Kind, Option<String>) {
+    cx.try_global::<crate::settings::Preferences>()
+        .and_then(|prefs| prefs.text_model_for(task))
+        .map_or((fallback, None), |choice| {
+            (Kind::from_id(&choice.provider), choice.model.clone())
+        })
+}
 fn contains_account_id(value: &str) -> bool {
     value.match_indices("account-").any(|(offset, _)| {
         let tail = &value[offset + "account-".len()..];
@@ -138,6 +151,40 @@ mod model_label_tests {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].id, None);
             });
+        });
+    }
+
+    #[gpui::test]
+    fn the_text_model_picker_opens_on_the_chosen_model(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Preferences {
+                commit_model: Some(crate::settings::ModelChoice {
+                    provider: "codex".into(),
+                    model: Some("gpt-mini".into()),
+                }),
+                ..Default::default()
+            });
+            let commit = cx.new(|cx| {
+                ModelList::for_text_task(
+                    crate::settings::TextTask::Commit,
+                    Kind::Claude,
+                    "/work",
+                    cx,
+                )
+            });
+            assert_eq!(commit.read(cx).provider, Kind::Codex);
+            assert_eq!(commit.read(cx).current.as_deref(), Some("gpt-mini"));
+            // Other tasks are unaffected and open on the fallback's default.
+            let title = cx.new(|cx| {
+                ModelList::for_text_task(
+                    crate::settings::TextTask::Title,
+                    Kind::Claude,
+                    "/work",
+                    cx,
+                )
+            });
+            assert_eq!(title.read(cx).provider, Kind::Claude);
+            assert_eq!(title.read(cx).current, None);
         });
     }
 
@@ -423,6 +470,41 @@ impl ModelList {
             cx,
         );
         list
+    }
+    /// The normal model picker, opened on the model that writes `task`'s
+    /// text, or on `fallback`'s default while none is chosen.
+    pub(crate) fn for_text_task(
+        task: crate::settings::TextTask,
+        fallback: Kind,
+        project: &str,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let choice = cx
+            .try_global::<crate::settings::Preferences>()
+            .and_then(|prefs| prefs.text_model_for(task))
+            .cloned();
+        Self::for_choice(choice.as_ref(), fallback, project, cx)
+    }
+    /// The normal model picker, opened on `choice`, or on `fallback`'s default.
+    pub(crate) fn for_choice(
+        choice: Option<&crate::settings::ModelChoice>,
+        fallback: Kind,
+        project: &str,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (kind, model) = choice.map_or((fallback, None), |c| {
+            (Kind::from_id(&c.provider), c.model.clone())
+        });
+        let profile = crate::accounts::get(cx)
+            .map(|center| center.read(cx).selected(kind, project))
+            .unwrap_or_default();
+        let hidden = cx
+            .try_global::<crate::settings::Preferences>()
+            .map(|prefs| prefs.hidden_for(project))
+            .unwrap_or_default();
+        Self::new_for(kind, model, project, profile, cx)
+            .hide_providers(hidden)
+            .allow_provider_switch(true)
     }
     pub(crate) fn hide_providers(mut self, hidden: Vec<String>) -> Self {
         if self.remote_project.is_some() {
