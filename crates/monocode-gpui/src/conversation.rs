@@ -202,11 +202,15 @@ pub(crate) struct Conversation {
     preparing_worktree: bool,
     context: Option<monocode_core::context::Usage>,
     context_hovered: bool,
+    context_hover_generation: u64,
     stats_hovered: bool,
     stats_anchor: AnchorSlot,
     /// A one-second repaint loop runs while the cache countdown is on screen.
     stats_ticker: std::cell::Cell<bool>,
     stats_wanted: std::cell::Cell<bool>,
+    /// The auto-compact button was switched off: messages keep the full
+    /// history even after the cache lapses.
+    keep_full_history: bool,
     menu: Option<OpenMenu>,
     add_anchor: AnchorSlot,
     model_anchor: AnchorSlot,
@@ -644,10 +648,12 @@ impl Conversation {
             preparing_worktree: false,
             context: None,
             context_hovered: false,
+            context_hover_generation: 0,
             stats_hovered: false,
             stats_anchor: AnchorSlot::default(),
             stats_ticker: Default::default(),
             stats_wanted: Default::default(),
+            keep_full_history: false,
             menu: None,
             add_anchor: AnchorSlot::default(),
             model_anchor: AnchorSlot::default(),
@@ -983,7 +989,33 @@ impl Conversation {
             self.clear_submitted_mode(cx);
         }
     }
-    fn launch_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+    /// The tooltip holds a button, so closing waits briefly for the pointer to
+    /// cross from the ring to the tooltip.
+    fn set_context_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.context_hover_generation = self.context_hover_generation.wrapping_add(1);
+        if hovered {
+            if !self.context_hovered {
+                self.context_hovered = true;
+                cx.notify();
+            }
+            return;
+        }
+        let generation = self.context_hover_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(160))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.context_hover_generation == generation && this.context_hovered {
+                    this.context_hovered = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn start_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
         if self.stopping {
             let mode = if self.settings.orchestrator {
                 Some("orchestrator")
@@ -3066,6 +3098,48 @@ impl Conversation {
             .map(|(text, _)| text.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        let compact_button = self.cache_compaction_available().then(|| {
+            let off = self.keep_full_history;
+            let pending = self.cache_compaction_pending();
+            div()
+                .id("compact-next")
+                .role(Role::Button)
+                .aria_label(if off {
+                    "Auto-compact is off. Click to compact a large thread when the Cache expires."
+                } else if pending {
+                    "The next message compacts the thread first because the Cache expired. Click to turn auto-compact off."
+                } else {
+                    "Auto-compact is on. A large thread is compacted when the Cache expires. Click to turn it off."
+                })
+                .h(px(18.))
+                .px(px(6.))
+                .ml(px(4.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .text_color(content(if off {
+                    0.4
+                } else if pending {
+                    0.9
+                } else {
+                    0.55
+                }))
+                .bg(content(if pending && !off { 0.12 } else { 0.05 }))
+                .hover(|s| s.bg(content(0.16)).text_color(content(1.)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(if off {
+                    "Auto-compact off"
+                } else if pending {
+                    "Compacts next"
+                } else {
+                    "Auto-compact"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.keep_full_history = !this.keep_full_history;
+                    cx.notify();
+                }))
+        });
         Some(
             div()
                 .id("session-stats")
@@ -3092,6 +3166,7 @@ impl Conversation {
                                 .chain([div().text_color(color).child(text).into_any_element()])
                         }),
                 )
+                .children(compact_button)
                 .when(self.stats_hovered, |d| {
                     d.child(
                         popover(
@@ -3193,6 +3268,10 @@ impl Conversation {
         };
         let ratio = self.context.and_then(|usage| usage.ratio());
         let show_context = ratio.is_some() || draft;
+        let can_compact = !new
+            && !self.busy
+            && self.summary.provider_id.is_some()
+            && monocode_core::provider::supports_compact(Kind::from_id(&self.summary.provider));
         let headline = ratio
             .map(|r| format!("{:.0}% context used", r * 100.))
             .unwrap_or_else(|| "No context used yet".into());
@@ -3295,8 +3374,7 @@ impl Conversation {
                                 ))
                                 .child(self.context_anchor.probe())
                                 .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                    this.context_hovered = *hovered;
-                                    cx.notify();
+                                    this.set_context_hover(*hovered, cx);
                                 }))
                                 .child(crate::context_meter::ring(ratio.unwrap_or(0.)))
                                 .when(self.context_hovered, |d| {
@@ -3311,6 +3389,12 @@ impl Conversation {
                                         .padding(10.)
                                         .child(
                                             div()
+                                                .id("context-tooltip-body")
+                                                .on_hover(cx.listener(
+                                                    |this, hovered: &bool, _, cx| {
+                                                        this.set_context_hover(*hovered, cx);
+                                                    },
+                                                ))
                                                 .flex()
                                                 .flex_col()
                                                 .text_size(px(12.))
@@ -3323,6 +3407,40 @@ impl Conversation {
                                                             .text_size(px(11.))
                                                             .text_color(content(0.5))
                                                             .child(detail),
+                                                    )
+                                                })
+                                                .when(can_compact, |d| {
+                                                    d.child(
+                                                        div()
+                                                            .id("compact-context")
+                                                            .role(Role::Button)
+                                                            .aria_label("Compact context")
+                                                            .mt(px(8.))
+                                                            .h(px(24.))
+                                                            .px(px(8.))
+                                                            .rounded_md()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .cursor_pointer()
+                                                            .text_size(px(11.))
+                                                            .text_color(content(0.8))
+                                                            .bg(content(0.08))
+                                                            .hover(|s| {
+                                                                s.bg(content(0.14))
+                                                                    .text_color(content(1.))
+                                                            })
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                |_, _, cx| cx.stop_propagation(),
+                                                            )
+                                                            .child("Compact context")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.context_hovered = false;
+                                                                    this.compact_context(cx);
+                                                                },
+                                                            )),
                                                     )
                                                 }),
                                         ),

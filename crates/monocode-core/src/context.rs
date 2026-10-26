@@ -93,6 +93,158 @@ pub fn claude_cache_ttl_ms(usage: &Value) -> Option<u64> {
     }
 }
 
+/// Below this, re-reading the history after the prompt cache expires costs too
+/// little to be worth a summarising turn.
+const CACHE_COMPACT_MIN_TOKENS: u64 = 100_000;
+/// Claude's subscription cache lasts an hour; the extra ten minutes are slack.
+const CLAUDE_CACHE_TTL_MS: u64 = 70 * 60_000;
+/// Claude Code's own auto-compact preferences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaudeAutoCompact {
+    pub enabled: bool,
+    pub window: Option<u64>,
+}
+impl Default for ClaudeAutoCompact {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window: None,
+        }
+    }
+}
+impl ClaudeAutoCompact {
+    /// `read` parses ~/.claude.json, which can be large, so renders share a
+    /// result for a few seconds.
+    pub fn cached(home: &std::path::Path, model: Option<&str>) -> Self {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        type Entry = (Instant, Option<String>, ClaudeAutoCompact);
+        static CACHE: Mutex<Option<Entry>> = Mutex::new(None);
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, cached_model, value)) = cache.as_ref() {
+            if at.elapsed() < Duration::from_secs(5) && cached_model.as_deref() == model {
+                return *value;
+            }
+        }
+        let value = Self::read(home, model);
+        *cache = Some((Instant::now(), model.map(str::to_owned), value));
+        value
+    }
+
+    /// `autoCompactEnabled` lives in ~/.claude.json; `autoCompactWindow` in
+    /// ~/.claude/settings.json, optionally per model.
+    pub fn read(home: &std::path::Path, model: Option<&str>) -> Self {
+        let load = |path: std::path::PathBuf| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        };
+        let enabled = load(home.join(".claude.json"))
+            .and_then(|config| config["autoCompactEnabled"].as_bool())
+            .unwrap_or(true);
+        let window = load(home.join(".claude/settings.json")).and_then(|settings| {
+            model
+                .and_then(|model| settings["modelSettings"][model]["autoCompactWindow"].as_u64())
+                .or_else(|| settings["autoCompactWindow"].as_u64())
+        });
+        Self { enabled, window }
+    }
+}
+
+/// A turn after the prompt cache lapsed re-bills the whole history at the full
+/// input price, so a large thread is summarised first. Claude Code's configured
+/// window can only lower the token floor.
+pub fn compact_before_send(
+    preferences: ClaudeAutoCompact,
+    used: u64,
+    cache_ttl_ms: Option<u64>,
+    last_activity_ms: u64,
+    now_ms: u64,
+) -> bool {
+    // The reported TTL gets a minute of slack, the fallback ten minutes beyond the hour.
+    let ttl = cache_ttl_ms.map_or(CLAUDE_CACHE_TTL_MS, |ttl| ttl + 60_000);
+    let floor = preferences
+        .window
+        .filter(|window| *window > 0)
+        .map_or(CACHE_COMPACT_MIN_TOKENS, |window| {
+            window.min(CACHE_COMPACT_MIN_TOKENS)
+        });
+    preferences.enabled
+        && last_activity_ms > 0
+        && used >= floor
+        && now_ms.saturating_sub(last_activity_ms) >= ttl
+}
+
+#[cfg(test)]
+mod cache_compaction_tests {
+    use super::*;
+
+    const HOUR: u64 = 60 * 60_000;
+
+    #[test]
+    fn waits_for_the_cache_to_lapse_and_the_thread_to_be_large() {
+        let on = ClaudeAutoCompact::default();
+        assert!(compact_before_send(on, 150_000, None, 1, 1 + 71 * 60_000));
+        assert!(!compact_before_send(on, 150_000, None, 1, 1 + HOUR / 2));
+        assert!(!compact_before_send(on, 50_000, None, 1, 1 + 2 * HOUR));
+        assert!(!compact_before_send(on, 150_000, None, 0, 2 * HOUR));
+    }
+
+    #[test]
+    fn a_reported_five_minute_cache_expires_early() {
+        let on = ClaudeAutoCompact::default();
+        assert!(compact_before_send(
+            on,
+            150_000,
+            Some(5 * 60_000),
+            1,
+            1 + 7 * 60_000
+        ));
+        assert!(!compact_before_send(
+            on,
+            150_000,
+            Some(5 * 60_000),
+            1,
+            1 + 3 * 60_000
+        ));
+    }
+
+    #[test]
+    fn honours_claude_codes_switch_and_lower_window() {
+        let off = ClaudeAutoCompact {
+            enabled: false,
+            window: None,
+        };
+        assert!(!compact_before_send(off, 900_000, None, 1, 1 + 2 * HOUR));
+        let low = ClaudeAutoCompact {
+            enabled: true,
+            window: Some(60_000),
+        };
+        assert!(compact_before_send(low, 70_000, None, 1, 1 + 2 * HOUR));
+        let high = ClaudeAutoCompact {
+            enabled: true,
+            window: Some(400_000),
+        };
+        assert!(!compact_before_send(high, 90_000, None, 1, 1 + 2 * HOUR));
+    }
+
+    #[test]
+    fn reads_the_per_model_window_before_the_global_one() {
+        let dir = std::env::temp_dir().join(format!("monocode-acw-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"autoCompactWindow":300000,"modelSettings":{"m":{"autoCompactWindow":120000}}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(".claude.json"), r#"{"autoCompactEnabled":false}"#).unwrap();
+        let read = ClaudeAutoCompact::read(&dir, Some("m"));
+        assert_eq!((read.enabled, read.window), (false, Some(120_000)));
+        assert_eq!(ClaudeAutoCompact::read(&dir, None).window, Some(300_000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// What the next message will cost, from a session's turns (`SessionStatsChip`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SessionStats {
