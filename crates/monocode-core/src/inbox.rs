@@ -23,8 +23,12 @@ use std::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkTarget {
     GitHub(WorkItem),
-    /// A Linear identifier such as `ENG-42`.
-    Linear(String),
+    /// A Linear issue such as `ENG-42` in the workspace whose URL slug is
+    /// `workspace`. Identifiers repeat across workspaces, so both are needed.
+    Linear {
+        workspace: String,
+        identifier: String,
+    },
 }
 
 /// What `url` points at when it is a GitHub issue or pull request page or a
@@ -40,14 +44,39 @@ pub fn link_target(url: &str) -> Option<LinkTarget> {
     }
     let path = rest.strip_prefix("linear.app/")?;
     let mut parts = path.split(['/', '?', '#']);
-    let (_workspace, kind, identifier) = (parts.next()?, parts.next()?, parts.next()?);
+    let (workspace, kind, identifier) = (parts.next()?, parts.next()?, parts.next()?);
     let (team, number) = identifier.split_once('-')?;
     (kind == "issue"
+        && !workspace.is_empty()
         && !team.is_empty()
         && team.chars().all(|c| c.is_ascii_alphanumeric())
         && !number.is_empty()
         && number.chars().all(|c| c.is_ascii_digit()))
-    .then(|| LinkTarget::Linear(identifier.to_ascii_uppercase()))
+    .then(|| LinkTarget::Linear {
+        workspace: workspace.into(),
+        identifier: identifier.to_ascii_uppercase(),
+    })
+}
+
+/// The Linear workspace an issue URL belongs to.
+fn linear_workspace(url: &str) -> Option<String> {
+    match link_target(url)? {
+        LinkTarget::Linear { workspace, .. } => Some(workspace),
+        LinkTarget::GitHub(_) => None,
+    }
+}
+
+/// Rejects a looked-up Linear issue whose URL is in another workspace than the
+/// link, so another workspace's `ENG-42` never opens the connected one's.
+pub fn check_linear_workspace(item: Item, workspace: &str) -> Result<Item, String> {
+    if linear_workspace(&item.url).is_some_and(|found| found.eq_ignore_ascii_case(workspace)) {
+        Ok(item)
+    } else {
+        Err(format!(
+            "{} is in a Linear workspace other than {workspace}",
+            item.identifier
+        ))
+    }
 }
 
 /// The listed item a link points at, whatever the provider.
@@ -67,8 +96,13 @@ pub fn find_linked<'a>(items: &'a [Item], url: &str) -> Option<&'a Item> {
                 && item.number == work.number as i64
                 && item.repo.eq_ignore_ascii_case(&work.repo)
         }),
-        Some(LinkTarget::Linear(identifier)) => items.iter().find(|item| {
-            item.provider == "linear" && item.identifier.eq_ignore_ascii_case(&identifier)
+        Some(LinkTarget::Linear {
+            workspace,
+            identifier,
+        }) => items.iter().find(|item| {
+            item.provider == "linear"
+                && item.identifier.eq_ignore_ascii_case(&identifier)
+                && linear_workspace(&item.url).is_some_and(|w| w.eq_ignore_ascii_case(&workspace))
         }),
         None => {
             let wanted = normal(url);
@@ -1001,10 +1035,16 @@ impl Service {
     pub fn linked_item(&self, target: &LinkTarget, projects: &[PathBuf]) -> Result<Item, String> {
         match target {
             LinkTarget::GitHub(work) => self.linked_github_item(work, projects),
-            LinkTarget::Linear(identifier) => convert(linear::linear_issue_lookup(
-                self.data_dir.clone(),
-                identifier.clone(),
-            )?),
+            LinkTarget::Linear {
+                workspace,
+                identifier,
+            } => check_linear_workspace(
+                convert(linear::linear_issue_lookup(
+                    self.data_dir.clone(),
+                    identifier.clone(),
+                )?)?,
+                workspace,
+            ),
         }
     }
     /// One GitHub issue or pull request named by a link, which the inbox list
@@ -1231,11 +1271,17 @@ mod link_tests {
         ));
         assert_eq!(
             link_target("https://linear.app/acme/issue/eng-42/fix-the-thing"),
-            Some(LinkTarget::Linear("ENG-42".into()))
+            Some(LinkTarget::Linear {
+                workspace: "acme".into(),
+                identifier: "ENG-42".into()
+            })
         );
         assert_eq!(
             link_target("HTTPS://linear.app/acme/issue/ENG-7?x=1#c"),
-            Some(LinkTarget::Linear("ENG-7".into()))
+            Some(LinkTarget::Linear {
+                workspace: "acme".into(),
+                identifier: "ENG-7".into()
+            })
         );
         for other in [
             "https://linear.app/acme/project/roadmap",
@@ -1302,5 +1348,28 @@ mod link_tests {
             Some("jira")
         );
         assert_eq!(found("https://acme.atlassian.net/browse/KEY-6"), None);
+    }
+
+    #[test]
+    fn a_link_to_another_linear_workspace_does_not_match_the_same_identifier() {
+        let issue = Item {
+            provider: "linear".into(),
+            identifier: "ENG-42".into(),
+            url: "https://linear.app/acme/issue/ENG-42/fix".into(),
+            ..Default::default()
+        };
+        let items = [issue.clone()];
+        assert!(find_linked(&items, "https://linear.app/acme/issue/ENG-42").is_some());
+        assert!(find_linked(&items, "https://linear.app/other/issue/ENG-42").is_none());
+        assert_eq!(
+            check_linear_workspace(issue.clone(), "ACME"),
+            Ok(issue.clone())
+        );
+        assert!(check_linear_workspace(issue.clone(), "other").is_err());
+        let unknown = Item {
+            url: String::new(),
+            ..issue
+        };
+        assert!(check_linear_workspace(unknown, "acme").is_err());
     }
 }

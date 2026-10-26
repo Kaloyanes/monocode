@@ -363,6 +363,7 @@ impl Inbox {
             projects.push(cwd.clone());
         }
         if self.projects != projects || self.service.cwd != cwd {
+            self.cancel_link();
             self.projects = projects;
             self.service.cwd = cwd.clone();
             self.start_project = cwd;
@@ -394,8 +395,7 @@ impl Inbox {
                 self.state.seen.mark(&item);
                 self.save();
             } else if let Some(item) = self.visible_items(cx).first() {
-                self.select(item.key(), cx);
-                self.auto_selected = true;
+                self.auto_select(item.key(), cx);
             }
         }
         cx.notify();
@@ -523,8 +523,7 @@ impl Inbox {
                     && this.selected.is_none()
                     && let Some(item) = this.visible_items(cx).first()
                 {
-                    this.select(item.key(), cx);
-                    this.auto_selected = true;
+                    this.auto_select(item.key(), cx);
                 }
                 if std::mem::take(&mut this.refresh_queued) {
                     this.refresh(cx);
@@ -561,8 +560,19 @@ impl Inbox {
                 .filter(|item| Some(item.key()) == self.selected))
             .cloned()
     }
-    /// A row picked from the rail starts a fresh trail of linked items.
+    /// A row the reader picks replaces any link still loading.
     fn select(&mut self, key: String, cx: &mut Context<Self>) {
+        self.cancel_link();
+        self.pick(key, cx);
+    }
+    /// The inbox picks a row itself, such as the first one once the list
+    /// loads. A link still loading replaces it when it arrives.
+    fn auto_select(&mut self, key: String, cx: &mut Context<Self>) {
+        self.pick(key, cx);
+        self.auto_selected = true;
+    }
+    /// A row picked from the rail starts a fresh trail of linked items.
+    fn pick(&mut self, key: String, cx: &mut Context<Self>) {
         if self.selected.as_ref() == Some(&key) {
             return;
         }
@@ -587,6 +597,7 @@ impl Inbox {
     /// GitHub and Linear items it does not hold are fetched and shown without
     /// joining the list. Returns false for links that belong to the browser.
     pub(crate) fn open_url(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
+        self.cancel_link();
         let target = model::link_target(url);
         let tab = match &target {
             Some(model::LinkTarget::GitHub(work)) if work.kind == "pr" => {
@@ -608,26 +619,36 @@ impl Inbox {
                 .filter(|item| model::find_linked(std::slice::from_ref(*item), url).is_some()))
             .cloned();
         if let Some(item) = known {
-            self.link_notice = None;
             self.go_to(item, tab, cx);
             return true;
         }
         let Some(target) = target else {
             return false;
         };
-        self.link_request += 1;
-        let request = self.link_request;
         let label = match &target {
             model::LinkTarget::GitHub(work) => format!("{}#{}", work.repo, work.number),
-            model::LinkTarget::Linear(identifier) => identifier.clone(),
+            model::LinkTarget::Linear { identifier, .. } => identifier.clone(),
         };
-        self.link_notice = Some(LinkNotice::Loading(label));
-        let url = url.to_owned();
         let service = self.service.clone();
         let projects = self.projects.clone();
         let task = cx
             .background_executor()
             .spawn(async move { service.linked_item(&target, &projects) });
+        self.await_link(url.to_owned(), label, tab, task, cx);
+        true
+    }
+    /// Show the item `task` looks up once it arrives, unless the reader has
+    /// moved on by then.
+    fn await_link(
+        &mut self,
+        url: String,
+        label: String,
+        tab: Tab,
+        task: gpui::Task<Result<Item, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let request = self.link_request;
+        self.link_notice = Some(LinkNotice::Loading(label));
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -646,7 +667,12 @@ impl Inbox {
         })
         .detach();
         cx.notify();
-        true
+    }
+    /// Forget any lookup still in flight, so it cannot replace a selection
+    /// made after it started.
+    fn cancel_link(&mut self) {
+        self.link_request += 1;
+        self.link_notice = None;
     }
     fn go_to(&mut self, item: Item, tab: Tab, cx: &mut Context<Self>) {
         if self.selected.as_ref() == Some(&item.key()) {
@@ -663,6 +689,7 @@ impl Inbox {
         self.follow(item, tab, cx);
     }
     fn go_back(&mut self, cx: &mut Context<Self>) {
+        self.cancel_link();
         if let Some(item) = self.back.pop() {
             self.follow(item, Tab::Summary, cx);
         }
@@ -683,7 +710,6 @@ impl Inbox {
         if self.selected.as_ref() == Some(&key) {
             return;
         }
-        self.link_notice = None;
         self.selected = Some(key);
         self.summary_scroll = ListState::new(0, ListAlignment::Top, px(200.));
         self.activity.clear();
@@ -726,11 +752,11 @@ impl Inbox {
         cx.notify();
     }
     fn change_source(&mut self, source: String, cx: &mut Context<Self>) {
+        self.cancel_link();
         self.state.source = source;
         self.selected = None;
         self.pinned = None;
         self.back.clear();
-        self.link_notice = None;
         self.details = None;
         self.document = None;
         self.comments.clear();

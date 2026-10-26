@@ -674,15 +674,23 @@ impl Inbox {
 
     fn detail_view(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(item) = self.item() else {
+            // A link can be loading or have failed with no row to show yet.
             return div()
                 .size_full()
                 .flex()
                 .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(12.))
-                .child(icon("inbox", 24.).text_color(content(0.3)))
-                .child(message("Select an inbox item").text_size(px(13.)))
+                .when_some(self.link_notice_view(cx), |d, notice| d.child(notice))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(12.))
+                        .child(icon("inbox", 24.).text_color(content(0.3)))
+                        .child(message("Select an inbox item").text_size(px(13.))),
+                )
                 .into_any_element();
         };
         let is_pr = item.kind == "pr";
@@ -1074,6 +1082,7 @@ impl Inbox {
                     .child(div().flex_1().min_w_0().child(error(reason.clone())))
                     .child(
                         action("inbox-link-browser", "Open in browser")
+                            .debug_selector(|| "inbox-link-browser".into())
                             .on_click(move |_, _, cx| cx.open_url(&url)),
                     )
                     .child(
@@ -3103,6 +3112,7 @@ mod tests {
     /// Renders the real inbox offscreen with Metal and writes PNGs, for looking
     /// at the link navigation states. Run explicitly:
     /// `cargo test inbox_link_screenshots -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "Requires a Metal device; run explicitly on macOS"]
     fn inbox_link_screenshots() {
@@ -3398,6 +3408,149 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    fn github_pr(number: i64) -> Item {
+        Item {
+            provider: "github".into(),
+            kind: "pr".into(),
+            repo: "acme/app".into(),
+            number,
+            ..Default::default()
+        }
+    }
+
+    /// Starts a lookup the test answers later, as a slow `gh` or Linear call.
+    fn pending_lookup(
+        inbox: &mut Inbox,
+        cx: &mut Context<Inbox>,
+    ) -> async_channel::Sender<Result<Item, String>> {
+        let (send, receive) = async_channel::bounded(1);
+        let task = cx.background_executor().spawn(async move {
+            receive
+                .recv()
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+        });
+        inbox.cancel_link();
+        inbox.await_link(
+            "https://github.com/acme/app/pull/99".into(),
+            "acme/app#99".into(),
+            Tab::Summary,
+            task,
+            cx,
+        );
+        send
+    }
+
+    /// The selection after a lookup for #99 arrives late, once `act` has run.
+    fn selection_after_a_late_lookup(
+        cx: &mut TestAppContext,
+        act: impl FnOnce(&mut Inbox, &mut Context<Inbox>),
+    ) -> Option<String> {
+        let window = fixture(cx);
+        let inbox = window.update(cx, |f, _, _| f.inbox.clone()).unwrap();
+        let send = inbox.update(cx, |inbox, cx| {
+            // Queues refreshes instead of running `gh`.
+            inbox.loading = true;
+            inbox.snapshot.items = vec![github_pr(1), github_pr(2)];
+            inbox.selected = Some(github_pr(1).key());
+            assert!(inbox.open_url("https://github.com/acme/app/pull/2", cx));
+            let send = pending_lookup(inbox, cx);
+            act(inbox, cx);
+            send
+        });
+        send.try_send(Ok(github_pr(99))).unwrap();
+        cx.run_until_parked();
+        inbox.read_with(cx, |inbox, _| inbox.selected.clone())
+    }
+
+    #[gpui::test]
+    fn a_late_link_lookup_does_not_replace_a_newer_selection(cx: &mut TestAppContext) {
+        let linked = Some(github_pr(99).key());
+        assert_eq!(selection_after_a_late_lookup(cx, |_, _| {}), linked);
+        let picked =
+            selection_after_a_late_lookup(cx, |inbox, cx| inbox.select(github_pr(1).key(), cx));
+        assert_eq!(picked, Some(github_pr(1).key()), "a rail pick");
+        let reselected =
+            selection_after_a_late_lookup(cx, |inbox, cx| inbox.select(github_pr(2).key(), cx));
+        assert_eq!(
+            reselected,
+            Some(github_pr(2).key()),
+            "the row already shown"
+        );
+        let known = selection_after_a_late_lookup(cx, |inbox, cx| {
+            assert!(inbox.open_url("https://github.com/acme/app/pull/1", cx));
+        });
+        assert_eq!(known, Some(github_pr(1).key()), "a listed link");
+        let back = selection_after_a_late_lookup(cx, |inbox, cx| inbox.go_back(cx));
+        assert_eq!(back, Some(github_pr(1).key()), "back");
+        let source =
+            selection_after_a_late_lookup(cx, |inbox, cx| inbox.change_source("linear".into(), cx));
+        assert_ne!(source, linked, "another source");
+        let project = selection_after_a_late_lookup(cx, |inbox, cx| {
+            inbox.set_context(vec![], PathBuf::from("/private/tmp/inbox-other"), cx)
+        });
+        assert_ne!(project, linked, "another project");
+    }
+
+    #[gpui::test]
+    fn an_automatic_row_pick_leaves_a_loading_link_to_arrive(cx: &mut TestAppContext) {
+        let linked = selection_after_a_late_lookup(cx, |inbox, cx| {
+            inbox.selected = None;
+            inbox.auto_select(github_pr(1).key(), cx);
+        });
+        assert_eq!(linked, Some(github_pr(99).key()));
+    }
+
+    struct Detail {
+        inbox: Entity<Inbox>,
+    }
+    impl Render for Detail {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.inbox
+                .update(cx, |inbox, cx| inbox.detail_view(window, cx))
+        }
+    }
+
+    #[gpui::test]
+    fn a_failed_link_lookup_shows_its_notice_on_an_empty_inbox(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(WindowOptions::default(), |_, cx| {
+                let inbox = cx.new(|cx| {
+                    let store = Arc::new(Mutex::new(
+                        monocode_core::store::Store::open(std::path::Path::new(":memory:"))
+                            .unwrap(),
+                    ));
+                    Inbox::new_inner(
+                        store,
+                        vec![],
+                        PathBuf::from("/private/tmp/inbox-regression"),
+                        false,
+                        cx,
+                    )
+                });
+                cx.new(|_| Detail { inbox })
+            })
+            .unwrap()
+        });
+        let inbox = window.update(cx, |d, _, _| d.inbox.clone()).unwrap();
+        let send = inbox.update(cx, |inbox, cx| {
+            assert!(inbox.snapshot.items.is_empty() && inbox.selected.is_none());
+            pending_lookup(inbox, cx)
+        });
+        send.try_send(Err("Could not resolve acme/app#99".into()))
+            .unwrap();
+        cx.run_until_parked();
+        inbox.read_with(cx, |inbox, _| {
+            assert!(matches!(inbox.link_notice, Some(LinkNotice::Failed { .. })))
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        assert!(
+            visual.debug_bounds("inbox-link-browser").is_some(),
+            "the browser fallback is drawn"
+        );
     }
 
     #[test]
