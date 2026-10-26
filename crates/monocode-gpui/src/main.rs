@@ -89,6 +89,9 @@ mod tooltip;
 mod traffic_lights;
 mod transcript;
 mod usage_footer;
+mod usage_limit;
+mod visual_expand;
+mod visual_preview;
 mod visuals;
 mod workspace;
 mod worktree_switcher;
@@ -434,12 +437,14 @@ fn main() {
             dev_reload::install(cx);
             cx.set_global(title_raster);
             image_memory::init(cx);
+            visual_preview::start(cx);
             #[cfg(target_os = "macos")]
             memory_log::start(cx);
             #[cfg(target_os = "macos")]
             hang_watchdog::start(database.with_file_name("gpui-hangs"), cx);
             input::bind(cx);
             image_lightbox::bind(cx);
+            visual_expand::bind(cx);
             composer_completion::bind(cx);
             file_editor::bind(cx);
             popover::bind(cx);

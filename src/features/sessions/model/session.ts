@@ -311,6 +311,12 @@ export type TurnMetrics = {
   cacheWriteTokens?: number;
   /** Provider-normalized share of input served from cache, as a percentage. */
   cacheHitPercent?: number;
+  /** API list-price cost of this user turn, in USD. */
+  costUsd?: number;
+  /** Provider's running session cost after this turn; costUsd is its delta. */
+  totalCostUsd?: number;
+  /** Prompt-cache lifetime the provider wrote this turn with, in ms. */
+  cacheTtlMs?: number;
 };
 
 export type Block = {

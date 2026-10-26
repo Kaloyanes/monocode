@@ -1,5 +1,5 @@
-use crate::{popover::AnchorSlot, theme::*};
 use crate::tooltip::Tip;
+use crate::{popover::AnchorSlot, theme::*};
 use gpui::{Role, SharedString, div, prelude::*, px};
 use monocode_core::{
     agent::Settings,

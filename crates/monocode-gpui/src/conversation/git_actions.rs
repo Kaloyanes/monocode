@@ -4,8 +4,8 @@
 //! alone. The agent, not MonoCode's edit log, decides which changes are its.
 //! Once a step lands the pill moves on: staged work offers Commit, and an
 //! unpushed commit offers Push.
-use crate::tooltip::Tip;
 use super::*;
+use crate::tooltip::Tip;
 
 /// Read older pages without installing their transcript payload in the UI.
 pub(super) fn restored_session_edits(

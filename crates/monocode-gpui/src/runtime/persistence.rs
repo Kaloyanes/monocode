@@ -145,6 +145,7 @@ mod tests {
             let usage = monocode_core::context::Usage {
                 used: 123,
                 window: Some(1000),
+                ..Default::default()
             };
             pending.context_changed();
             pending.flush(&store, id, &transcript, &usage, now).unwrap();

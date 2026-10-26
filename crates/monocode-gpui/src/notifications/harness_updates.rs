@@ -1,7 +1,7 @@
 //! Native counterpart of HarnessUpdateNotice.tsx. The parent positions this
 //! entity in the shared top-right notification stack.
-use crate::tooltip::Tip;
 use crate::theme::*;
+use crate::tooltip::Tip;
 use gpui::{Context, EventEmitter, Render, Role, Window, div, prelude::*, px};
 use monocode_core::{
     harness_updates::{self, Update},

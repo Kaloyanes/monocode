@@ -3,6 +3,62 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_NODES: usize = 512;
+const MAX_CODE_BYTES: usize = 32 * 1024;
+const MAX_CODE_LINES: usize = 1500;
+
+/// What `VisualDocument::source` holds.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualFormat {
+    /// A JavaScript program for the native component SDK.
+    #[default]
+    Native,
+    /// One HTML document with inline CSS and JavaScript, shown in an isolated
+    /// web view with no network and no app bridge.
+    Html,
+}
+impl VisualFormat {
+    fn is_native(&self) -> bool {
+        *self == Self::Native
+    }
+}
+
+pub const DEFAULT_HTML_HEIGHT: u32 = 480;
+pub const HTML_HEIGHT_RANGE: std::ops::RangeInclusive<u32> = 120..=900;
+
+/// The only origins an HTML visual may load code from. The page's content
+/// security policy admits exactly these, and `visual_check` reports anything
+/// else before publishing.
+pub const SCRIPT_HOSTS: [&str; 4] = [
+    "cdn.jsdelivr.net",
+    "cdnjs.cloudflare.com",
+    "unpkg.com",
+    "esm.sh",
+];
+pub const STYLE_HOSTS: [&str; 6] = [
+    "cdn.jsdelivr.net",
+    "cdnjs.cloudflare.com",
+    "unpkg.com",
+    "esm.sh",
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+];
+pub const FONT_HOSTS: [&str; 5] = [
+    "cdn.jsdelivr.net",
+    "cdnjs.cloudflare.com",
+    "unpkg.com",
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+];
+
+/// `https://a https://b`, the form a CSP source list takes.
+pub fn csp_sources(hosts: &[&str]) -> String {
+    hosts
+        .iter()
+        .map(|host| format!("https://{host}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -10,6 +66,11 @@ pub struct VisualDocument {
     pub id: String,
     pub title: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "VisualFormat::is_native")]
+    pub format: VisualFormat,
+    /// Frame height in points for `Html`; a page cannot report its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 impl VisualDocument {
@@ -28,7 +89,25 @@ impl VisualDocument {
         if self.title.trim().is_empty() || self.title.chars().count() > 160 {
             return Err("Visual title must contain 1–160 characters".into());
         }
-        validate_source(&self.source)
+        match self.format {
+            VisualFormat::Native => validate_source(&self.source)?,
+            VisualFormat::Html => {
+                if self.source.trim().is_empty()
+                    || self.source.len() > super::images::MAX_HTML_BYTES
+                {
+                    return Err("HTML visual must contain 1 byte to 10 MiB".into());
+                }
+            }
+        }
+        match (self.format, self.height) {
+            (VisualFormat::Native, Some(_)) => Err("Only HTML visuals take a height".into()),
+            (VisualFormat::Html, Some(h)) if !HTML_HEIGHT_RANGE.contains(&h) => Err(format!(
+                "HTML visual height must be {}–{}",
+                HTML_HEIGHT_RANGE.start(),
+                HTML_HEIGHT_RANGE.end()
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -160,6 +239,25 @@ pub enum Node {
         labels: Vec<String>,
         selected: usize,
         handler: String,
+    },
+    /// Syntax-highlighted source, never executed.
+    Code {
+        code: String,
+        language: Option<String>,
+        title: Option<String>,
+    },
+    /// A line diff between two texts, with unchanged runs folded.
+    Diff {
+        before: String,
+        after: String,
+        path: Option<String>,
+        title: Option<String>,
+        context: usize,
+    },
+    Callout {
+        text: String,
+        title: Option<String>,
+        color: ThemeColor,
     },
     Canvas {
         width: f32,
@@ -411,6 +509,41 @@ impl Node {
                 }
                 validate_handler(handler)?;
             }
+            Self::Code {
+                code,
+                language,
+                title,
+            } => {
+                budget.text(code, MAX_CODE_BYTES)?;
+                budget.lines(code)?;
+                for label in [language, title].into_iter().flatten() {
+                    budget.text(label, 256)?;
+                }
+            }
+            Self::Diff {
+                before,
+                after,
+                path,
+                title,
+                context,
+            } => {
+                budget.text(before, MAX_CODE_BYTES)?;
+                budget.text(after, MAX_CODE_BYTES)?;
+                budget.lines(before)?;
+                budget.lines(after)?;
+                if *context > 20 {
+                    return Err("Diff context must be 0–20 lines".into());
+                }
+                for label in [path, title].into_iter().flatten() {
+                    budget.text(label, 256)?;
+                }
+            }
+            Self::Callout { text, title, .. } => {
+                budget.text(text, 2048)?;
+                if let Some(title) = title {
+                    budget.text(title, 256)?;
+                }
+            }
             Self::Canvas {
                 width,
                 height,
@@ -467,8 +600,18 @@ struct Budget {
     primitives: usize,
     vertices: usize,
     triangles: usize,
+    lines: usize,
 }
 impl Budget {
+    fn lines(&mut self, text: &str) -> Result<(), String> {
+        self.lines += text.lines().count();
+        if self.lines > MAX_CODE_LINES {
+            return Err(format!(
+                "Code and diffs are limited to {MAX_CODE_LINES} lines"
+            ));
+        }
+        Ok(())
+    }
     fn text(&mut self, text: &str, max: usize) -> Result<(), String> {
         self.text_bytes += text.len();
         if text.len() > max || self.text_bytes > 128 * 1024 {

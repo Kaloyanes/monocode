@@ -18,7 +18,7 @@ pub(crate) mod widgets;
 pub(crate) use keymap::apply as apply_keybindings;
 pub(crate) use model::Section;
 pub(crate) use pages::command_shortcut;
-pub(crate) use preferences::{ModelChoice, Preferences, UI_SCALE_PERCENTS};
+pub(crate) use preferences::{ModelChoice, Preferences, TextTask, UI_SCALE_PERCENTS};
 
 use crate::{
     input::{self, Input},
@@ -31,6 +31,8 @@ use gpui::{
     px,
 };
 use std::{cell::RefCell, collections::HashMap, time::Duration};
+
+gpui::actions!(settings, [FocusSettingsSearch]);
 
 /// A session the Archive page lists.
 #[derive(Clone, Debug, PartialEq)]
@@ -215,6 +217,7 @@ pub(crate) struct SettingsView {
     select_active: usize,
     select_focus: FocusHandle,
     select_anchors: RefCell<HashMap<&'static str, AnchorSlot>>,
+    text_model_menu: Option<pages::TextModelMenu>,
     search: Entity<Input>,
     search_query: String,
     search_active: usize,
@@ -252,6 +255,13 @@ pub(crate) struct SettingsView {
     skill_surface: AnchorSlot,
     skill_filter: Entity<Input>,
     skill_query: String,
+    /// The Agent CLI whose models are listed for hiding.
+    models_open: Option<monocode_core::provider::Kind>,
+    /// Catalogs for installed CLIs without an open session to borrow from.
+    model_catalogs: HashMap<monocode_core::provider::Kind, Vec<(String, String)>>,
+    catalog_tasks: Vec<Task<()>>,
+    model_filter: Entity<Input>,
+    model_query: String,
     accent_custom: Entity<Input>,
     accent_custom_open: bool,
     accent_anchor: AnchorSlot,
@@ -295,7 +305,16 @@ impl SettingsView {
             input.set_font_size(12.);
             input
         });
+        let model_filter = cx.new(|cx| {
+            let mut input = Input::field("Filter models", "Filter models", content(0.35), cx);
+            input.set_font_size(12.);
+            input
+        });
         let mut subscriptions = vec![
+            cx.subscribe(&model_filter, |this, input, _: &input::Changed, cx| {
+                this.model_query = input.read(cx).content.to_string();
+                cx.notify();
+            }),
             cx.subscribe(&skill_filter, |this, input, _: &input::Changed, cx| {
                 this.skill_query = input.read(cx).content.to_string();
                 cx.notify();
@@ -354,6 +373,7 @@ impl SettingsView {
             select_active: 0,
             select_focus: cx.focus_handle(),
             select_anchors: Default::default(),
+            text_model_menu: None,
             search,
             search_query: String::new(),
             search_active: 0,
@@ -390,6 +410,11 @@ impl SettingsView {
             skill_surface: AnchorSlot::default(),
             skill_filter,
             skill_query: String::new(),
+            models_open: None,
+            model_catalogs: HashMap::new(),
+            catalog_tasks: Vec::new(),
+            model_filter,
+            model_query: String::new(),
             accent_custom,
             accent_custom_open: false,
             accent_anchor: AnchorSlot::default(),
@@ -439,6 +464,7 @@ impl SettingsView {
                         this.mcp_grants_error = Some(error);
                     }
                 }
+                this.discover_catalogs(cx);
                 if this.section == Section::Mcp {
                     this.refresh_mcp_health(cx);
                 }
@@ -446,6 +472,39 @@ impl SettingsView {
             });
         }));
         cx.notify();
+    }
+    /// Ask each installed CLI for its models, as the model picker does.
+    fn discover_catalogs(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let center = crate::accounts::get(cx);
+        self.catalog_tasks = self
+            .discovery
+            .binaries
+            .iter()
+            .filter(|(_, path)| path.is_some())
+            .map(|(kind, _)| {
+                let kind = *kind;
+                let profile = center
+                    .as_ref()
+                    .map(|center| center.read(cx).selected(kind, &self.ctx.cwd))
+                    .unwrap_or_default();
+                let work = cx
+                    .background_executor()
+                    .spawn(async move { monocode_core::catalog::models_for(kind, &profile) });
+                cx.spawn(async move |this, cx| {
+                    let Ok(models) = work.await else {
+                        return;
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        this.model_catalogs
+                            .insert(kind, models.into_iter().map(|m| (m.id, m.name)).collect());
+                        cx.notify();
+                    });
+                })
+            })
+            .collect();
     }
     pub(crate) fn set_context(&mut self, ctx: SettingsContext, cx: &mut Context<Self>) {
         if self.ctx != ctx {
@@ -486,6 +545,7 @@ impl SettingsView {
                 self.refresh_mcp_health(cx);
             }
             self.select_open = None;
+            self.text_model_menu = None;
             self.recording = None;
             self.scroll.set_offset(gpui::point(px(0.), px(0.)));
             cx.notify();
@@ -510,6 +570,10 @@ impl SettingsView {
             self.recording_preview.clear();
             window.focus(&self.focus, cx);
             cx.notify();
+            return true;
+        }
+        if self.text_model_menu.is_some() {
+            self.close_text_model_menu(window, cx);
             return true;
         }
         if self.select_open.take().is_some() {
@@ -988,6 +1052,9 @@ impl Render for SettingsView {
                 &self.focus
             })
             .key_context("SettingsView")
+            .on_action(cx.listener(|this, _: &FocusSettingsSearch, window, cx| {
+                window.focus(&this.search.focus_handle(cx), cx);
+            }))
             .size_full()
             .min_w_0()
             .min_h_0()
@@ -1040,6 +1107,7 @@ impl Render for SettingsView {
             })
             .children(self.management_overlay(window, cx))
             .children(self.notification_overlay(cx))
+            .children(self.text_model_overlay(cx))
     }
 }
 

@@ -1,6 +1,6 @@
 //! The three application destinations share one navigation and focus boundary.
-use crate::tooltip::Tip;
 use super::*;
+use crate::tooltip::Tip;
 use crate::{automations, inbox, notes};
 
 pub(super) use crate::workspace::AppView;
@@ -250,6 +250,28 @@ impl Shell {
         self.show_app_view(AppView::Inbox, window, cx);
     }
 
+    /// A link to a work item: shown in the Inbox when it can show it, otherwise
+    /// in the browser.
+    pub(super) fn open_work_link(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_background_inbox(window, cx);
+        let Some(inbox) = self
+            .inbox
+            .clone()
+            .filter(|inbox| inbox.read(cx).can_open(url))
+        else {
+            cx.open_url(url);
+            return;
+        };
+        // Select before the view activates, so it does not pick a row first.
+        inbox.update(cx, |inbox, cx| inbox.open_url(url, cx));
+        self.open_inbox(window, cx);
+    }
+
     pub(super) fn ensure_background_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.inbox.is_none() {
             let projects = self.workspace.projects.iter().map(Into::into).collect();
@@ -367,9 +389,7 @@ impl Shell {
             model: self
                 .workspace
                 .preferences
-                .default_models
-                .get(kind.id())
-                .cloned(),
+                .model_for_new_chat(kind.id(), &cwd),
             effort: crate::conversation::preferred_effort(kind.id(), cx),
             access: self
                 .workspace
@@ -440,11 +460,7 @@ impl Shell {
             model: self
                 .workspace
                 .preferences
-                .project_providers
-                .get(&cwd)
-                .and_then(|preferences| preferences.models.get(kind.id()))
-                .or(self.workspace.preferences.default_models.get(kind.id()))
-                .cloned(),
+                .model_for_new_chat(kind.id(), &cwd),
             effort: crate::conversation::preferred_effort(kind.id(), cx),
             access: self
                 .workspace

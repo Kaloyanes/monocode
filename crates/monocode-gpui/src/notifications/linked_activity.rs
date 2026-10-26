@@ -1,7 +1,7 @@
 //! LinkedWorkItemUpdateNotice: shell-local card on the active session surface.
-use crate::tooltip::Tip;
 use super::github_activity::Card;
 use crate::theme::*;
+use crate::tooltip::Tip;
 use gpui::{Context, EventEmitter, Render, Role, Window, div, prelude::*, px};
 #[derive(Clone)]
 pub(crate) enum LinkedActivityEvent {

@@ -3,6 +3,8 @@ use gpui::TestAppContext;
 
 fn document(source: &str) -> VisualDocument {
     VisualDocument {
+        format: Default::default(),
+        height: None,
         id: "native-test".into(),
         title: "Native visual".into(),
         source: source.into(),
@@ -456,4 +458,160 @@ fn source_and_reset_emit_row_remeasure_events(cx: &mut TestAppContext) {
         count.get() > 2,
         "Responsive width changes must also remeasure the transcript row"
     );
+}
+
+#[gpui::test]
+fn code_diff_and_callout_blocks_render_natively(cx: &mut TestAppContext) {
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                VisualView::new(
+                    document(
+                        r#"return () => visual.column([
+            visual.code('fn main() {}', {language: 'rust', title: 'main.rs'}),
+            visual.diff('one\ntwo\nthree', 'one\n2\nthree', {path: 'a.txt', context: 1}),
+            visual.callout('Check this', {title: 'Note'})
+        ]);"#,
+                    ),
+                    cx,
+                )
+            })
+        })
+        .unwrap()
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("visual-block-root/0").is_some());
+    assert!(visual.debug_bounds("visual-block-root/1").is_some());
+}
+
+fn html_document(height: Option<u32>) -> VisualDocument {
+    VisualDocument {
+        id: "page".into(),
+        title: "Page".into(),
+        source: "<h1>Hello</h1>".into(),
+        format: VisualFormat::Html,
+        height,
+    }
+}
+
+#[gpui::test]
+fn html_visual_reserves_its_frame_and_skips_the_script_runtime(cx: &mut TestAppContext) {
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| VisualView::new(html_document(Some(300)), cx))
+        })
+        .unwrap()
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let frame = visual
+        .debug_bounds("visual-html")
+        .expect("HTML visual must reserve a frame");
+    assert_eq!(frame.size.height, px(300.));
+    assert!(visual.debug_bounds("visual-reset").is_some());
+}
+
+#[gpui::test]
+fn html_visual_with_an_invalid_height_shows_an_error_instead_of_a_page(cx: &mut TestAppContext) {
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| VisualView::new(html_document(Some(5000)), cx))
+        })
+        .unwrap()
+    });
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("visual-html").is_none());
+}
+
+#[test]
+fn html_frames_hold_the_published_height_until_the_page_reports_its_own() {
+    use crate::monos::html::Page;
+    let waiting = Page::default();
+    assert_eq!(html_frame_height(Some(520), waiting), 520.);
+    assert_eq!(html_frame_height(None, waiting), DEFAULT_HTML_HEIGHT as f32);
+    let measured = |height| Page {
+        loaded: true,
+        height: Some(height),
+    };
+    assert_eq!(html_frame_height(Some(520), measured(311.)), 311.);
+    assert_eq!(html_frame_height(Some(520), measured(12.)), 80.);
+    assert_eq!(html_frame_height(Some(520), measured(5000.)), 900.);
+}
+
+#[test]
+fn html_frames_ease_to_a_new_height_and_retarget_from_where_they_are() {
+    let start = std::time::Instant::now();
+    let tween = FrameTween::settled(300.).toward(500., start, false);
+    assert_eq!(
+        tween.at(start),
+        300.,
+        "A new height starts from the old one"
+    );
+    let midway = tween.at(start + FRAME_TWEEN / 2);
+    assert!(midway > 400. && midway < 500., "Eases out: {midway}");
+    assert!(tween.running(start + FRAME_TWEEN / 2));
+    assert_eq!(tween.at(start + FRAME_TWEEN), 500.);
+    assert!(!tween.running(start + FRAME_TWEEN));
+
+    let retarget = start + FRAME_TWEEN / 2;
+    let back = tween.toward(200., retarget, false);
+    assert_eq!(back.at(retarget), midway, "A retarget never jumps");
+    assert_eq!(tween.toward(500., retarget, false).start, start);
+
+    let reduced = tween.toward(200., retarget, true);
+    assert_eq!(reduced.at(retarget), 200., "Reduced motion skips the glide");
+}
+
+#[test]
+fn html_frames_keep_their_first_height_as_a_floor_and_shrink_only_after_a_pause() {
+    let start = std::time::Instant::now();
+    let at = |ms| start + std::time::Duration::from_millis(ms);
+    let mut hold = FrameHold::default();
+    assert_eq!(
+        hold.height(480., false, 600., at(0)),
+        (480., None),
+        "Loading"
+    );
+    assert_eq!(
+        hold.height(240., true, 600., at(10)).0,
+        240.,
+        "First measurement"
+    );
+
+    assert_eq!(
+        hold.height(180., true, 600., at(20)).0,
+        240.,
+        "Never below the floor"
+    );
+    assert_eq!(
+        hold.height(320., true, 600., at(30)).0,
+        320.,
+        "Grows at once"
+    );
+
+    let (shown, recheck) = hold.height(260., true, 600., at(100));
+    assert_eq!(shown, 320., "A replay's smaller start doesn't dip");
+    assert_eq!(recheck, Some(SHRINK_AFTER));
+    assert_eq!(
+        hold.height(320., true, 600., at(400)),
+        (320., None),
+        "Grew back"
+    );
+
+    hold.height(260., true, 600., at(500));
+    assert_eq!(hold.height(250., true, 600., at(900)).0, 320.);
+    assert_eq!(
+        hold.height(250., true, 600., at(1500)),
+        (250., None),
+        "A lower height that lasts is taken, timed from the first drop"
+    );
+
+    assert_eq!(
+        hold.height(200., true, 420., at(1600)).0,
+        200.,
+        "A reflow resets the floor"
+    );
+    assert_eq!(hold.height(150., true, 420., at(1700)).0, 200.);
 }

@@ -699,17 +699,26 @@ impl Changes {
             }
         }
     }
-    /// pickTextHarness: the conversation's provider when installed, else
-    /// Claude Code, then Codex.
-    fn text_harness(&self) -> Option<(Kind, PathBuf)> {
-        pick_text_harness(self.text_provider)
+    /// The model chosen for `task`, else pickTextHarness: the conversation's
+    /// provider when installed, then Claude Code, then Codex.
+    fn text_harness(
+        &self,
+        task: crate::settings::TextTask,
+        cx: &App,
+    ) -> Option<(Kind, PathBuf, Option<String>)> {
+        let prefs = cx.try_global::<crate::settings::Preferences>();
+        commit_harness(
+            self.text_provider,
+            prefs.and_then(|p| p.text_model_for(task)),
+        )
     }
     fn generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let has_files = self.index(cx).is_some_and(|i| !i.files.is_empty());
         if !has_files || self.busy.is_some() || self.generate_cancel.is_some() {
             return;
         }
-        let Some((kind, binary)) = self.text_harness() else {
+        let Some((kind, binary, model)) = self.text_harness(crate::settings::TextTask::Commit, cx)
+        else {
             Self::fail(
                 "No provider CLI is installed to write a commit message.".into(),
                 window,
@@ -725,7 +734,7 @@ impl Changes {
         let flag = cancel.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { generate_commit_message(kind, binary, cwd, flag) });
+            .spawn(async move { generate_commit_message(kind, binary, cwd, model, flag) });
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -834,7 +843,7 @@ impl Changes {
     ) {
         let message = self.message.read(cx).content.to_string();
         let amend = self.amend.is_some();
-        let pr = create_pr.then(|| self.text_harness());
+        let pr = create_pr.then(|| self.text_harness(crate::settings::TextTask::PullRequest, cx));
         self.run_git(
             if create_pr { "pr" } else { "commit" }.into(),
             move |path| {
@@ -859,7 +868,7 @@ impl Changes {
     /// generatePrContent, `gh pr create`, then the browser.
     fn open_created_pr(
         &mut self,
-        harness: Option<(Kind, PathBuf)>,
+        harness: Option<(Kind, PathBuf, Option<String>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -905,7 +914,7 @@ impl Changes {
                     .unwrap_or_default()
             )
         });
-        let harness = self.text_harness();
+        let harness = self.text_harness(crate::settings::TextTask::PullRequest, cx);
         cx.spawn_in(window, async move |this, cx| {
             if let Some(question) = question {
                 let Ok(ask) = this.update_in(cx, |_, window, cx| {
@@ -1443,7 +1452,11 @@ impl Changes {
                         } else {
                             "View PR".into()
                         }))
-                        .when(enabled, |d| d.on_click(move |_, _, cx| cx.open_url(&url))),
+                        .when(enabled, |d| {
+                            d.on_click(move |event, window, cx| {
+                                crate::inbox::follow_link(&url, event, window, cx)
+                            })
+                        }),
                 )
             })
             .into_any_element()
@@ -1868,18 +1881,33 @@ pub(crate) fn pick_text_harness(preferred: Kind) -> Option<(Kind, PathBuf)> {
         .find_map(|kind| provider::resolve(kind).map(|binary| (kind, binary)))
 }
 
+/// The harness and model that write commit text: the chosen commit model when
+/// its CLI is installed, else `pick_text_harness` with the CLI's own default.
+pub(crate) fn commit_harness(
+    preferred: Kind,
+    choice: Option<&crate::settings::ModelChoice>,
+) -> Option<(Kind, PathBuf, Option<String>)> {
+    choice
+        .and_then(|c| {
+            let kind = Kind::from_id(&c.provider);
+            provider::resolve(kind).map(|binary| (kind, binary, c.model.clone()))
+        })
+        .or_else(|| pick_text_harness(preferred).map(|(kind, binary)| (kind, binary, None)))
+}
+
 /// generateCommitMessage: a message for the staged changes, written by a
 /// read-only turn of `kind`. Blocking.
 pub(crate) fn generate_commit_message(
     kind: Kind,
     binary: PathBuf,
     cwd: PathBuf,
+    model: Option<String>,
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
     let context = scm::staged_context(&cwd)?;
     let prompt =
         scm::commit_message_prompt(context.branch.as_deref(), &context.summary, &context.patch);
-    let output = text_prompt(kind, binary, cwd, prompt, cancel)?;
+    let output = text_prompt(kind, binary, cwd, prompt, model, cancel)?;
     scm::parse_commit_message(&output).ok_or_else(|| {
         let snippet: String = output
             .split_whitespace()
@@ -1902,16 +1930,17 @@ pub(crate) fn generate_commit_message(
 /// generatePrContent, falling back to the commits, then `gh pr create`; the
 /// new pull request's URL. Blocking.
 pub(crate) fn create_pr_blocking(
-    harness: Option<(Kind, PathBuf)>,
+    harness: Option<(Kind, PathBuf, Option<String>)>,
     cwd: &std::path::Path,
 ) -> Result<String, String> {
     let range = scm::range_context(cwd)?;
-    let parsed = harness.and_then(|(kind, binary)| {
+    let parsed = harness.and_then(|(kind, binary, model)| {
         let output = text_prompt(
             kind,
             binary,
             cwd.to_path_buf(),
             scm::pr_content_prompt(&range),
+            model,
             Arc::new(AtomicBool::new(false)),
         )
         .ok()?;
@@ -1938,6 +1967,7 @@ fn text_prompt(
     binary: PathBuf,
     cwd: PathBuf,
     prompt: String,
+    model: Option<String>,
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
     let request = Request {
@@ -1946,7 +1976,7 @@ fn text_prompt(
         cwd,
         prompt,
         provider_id: None,
-        model: None,
+        model,
         settings: Settings {
             access: AccessMode::ReadOnly,
             ..Default::default()

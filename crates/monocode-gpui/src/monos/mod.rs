@@ -8,7 +8,7 @@ mod files;
 mod filters;
 mod floating;
 mod host;
-mod html;
+pub(crate) mod html;
 mod memory_ui;
 mod notifications;
 mod overview;
@@ -684,7 +684,7 @@ impl Monos {
             db.title(summary.id, &summary.title)?;
             let settings = Settings {
                 access: AccessMode::Auto,
-                model: prefs.default_models.get(provider.id()).cloned(),
+                model: prefs.stable_model(provider.id(), &home),
                 ..Default::default()
             };
             db.configure_agent(summary.id, provider.id(), &settings)?;

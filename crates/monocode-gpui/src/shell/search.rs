@@ -1,6 +1,6 @@
 use super::*;
-use crate::tooltip::Tip;
 use crate::search::{Event, SearchView, Sources};
+use crate::tooltip::Tip;
 use monocode_core::search::Target;
 
 pub(super) struct Open {

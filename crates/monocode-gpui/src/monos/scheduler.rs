@@ -1,6 +1,6 @@
 use super::panels::{button, empty_state, matches_query, search_bar};
-use crate::tooltip::Tip;
 use super::*;
+use crate::tooltip::Tip;
 use monocode_core::mono::habits::{Run, Schedule};
 use monocode_core::time::now_ms;
 

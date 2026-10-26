@@ -1,6 +1,6 @@
 //! Native port of `src/shared/ui/ImageLightbox.tsx`.
-use crate::tooltip::Tip;
 use crate::theme::{black, icon, white};
+use crate::tooltip::Tip;
 use gpui::{
     App, Bounds, BoxShadow, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Image,
     ImageFormat, ImgResourceLoader, KeyBinding, MouseButton, Pixels, Point, RenderImage, Role,

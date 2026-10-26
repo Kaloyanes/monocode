@@ -8,6 +8,13 @@ const LIVE_AGENT_CAP: usize = 4;
 const AMBER: u32 = 0xfbbf24;
 const EMERALD: u32 = 0x34d399;
 
+/// The card's list grows and folds with the header's chevron.
+#[derive(Default)]
+pub(super) struct Fold {
+    motion: Option<rails::Motion>,
+    frames: Option<gpui::Task<()>>,
+}
+
 struct LiveAgent {
     id: i64,
     cwd: String,
@@ -89,9 +96,48 @@ impl Shell {
             Vec::new()
         };
         let shown = agents.len() >= LIVE_AGENT_MIN;
+        let collapsed = self.workspace.sidebar_activity_collapsed;
+        let now_at = std::time::Instant::now();
+        let reduced = cx.reduce_motion();
+        let motion = match self.live_fold.motion {
+            None => rails::Motion {
+                open: !collapsed,
+                from: if collapsed { 0. } else { 1. },
+                start: now_at - rails::OPEN,
+            },
+            Some(m) if m.open == collapsed => rails::Motion {
+                open: !collapsed,
+                from: if reduced {
+                    f32::from(!collapsed)
+                } else {
+                    m.value(now_at)
+                },
+                start: if reduced {
+                    now_at - rails::OPEN
+                } else {
+                    now_at
+                },
+            },
+            Some(m) => m,
+        };
+        self.live_fold.motion = Some(motion);
+        let progress = motion.value(now_at);
+        if !motion.settled(now_at) && self.live_fold.frames.is_none() {
+            self.live_fold.frames = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.live_fold.frames = None;
+                    this.notify_sidebar(cx);
+                });
+            }));
+        }
+        let folding = progress > 0.;
         self.live_marks
-            .retain(|id, _| shown && agents.iter().any(|a| a.id == *id && !a.done));
-        let ticking = shown && agents.iter().any(|a| !a.done && a.started_at.is_some());
+            .retain(|id, _| shown && !collapsed && agents.iter().any(|a| a.id == *id && !a.done));
+        let ticking =
+            shown && !collapsed && agents.iter().any(|a| !a.done && a.started_at.is_some());
         if !ticking {
             self.live_tick = None;
         } else if self.live_tick.is_none() {
@@ -106,19 +152,95 @@ impl Shell {
                 }
             }));
         }
+        if !folding {
+            self.live_agents_expanded = false;
+        }
         if !shown {
             self.live_agents_expanded = false;
             return None;
         }
         let count = agents.len();
-        let extra = count.saturating_sub(LIVE_AGENT_CAP);
+        let extra = if !folding {
+            0
+        } else {
+            count.saturating_sub(LIVE_AGENT_CAP)
+        };
         let expanded = self.live_agents_expanded;
         let now = monocode_core::time::now_ms();
         let cards: Vec<_> = agents
             .into_iter()
-            .take(if expanded { count } else { LIVE_AGENT_CAP })
+            .take(match (folding, expanded) {
+                (false, _) => 0,
+                (true, true) => count,
+                (true, false) => LIVE_AGENT_CAP,
+            })
             .map(|agent| self.live_agent_card(agent, now, cx))
             .collect();
+        let width = px((self.workspace.sidebar_width - 16.).max(0.));
+        let body = div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("live-agents-list")
+                    .flex()
+                    .flex_col()
+                    .gap_px()
+                    .px_1()
+                    .when(extra == 0, |d| d.pb_1())
+                    .when(expanded, |d| d.max_h(px(360.)).overflow_y_scroll())
+                    .children(cards),
+            )
+            .when(extra > 0, |d| {
+                d.child(
+                    div()
+                        .id("live-agents-more")
+                        .group("live-agents-more")
+                        .role(Role::Button)
+                        .aria_expanded(expanded)
+                        .cursor_pointer()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .px_2()
+                        .py_1p5()
+                        .text_size(px(11.))
+                        .text_color(content(0.5))
+                        .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+                        .child(
+                            icon(
+                                if expanded {
+                                    "chevron-up"
+                                } else {
+                                    "chevron-down"
+                                },
+                                12.,
+                            )
+                            .text_color(content(0.5))
+                            .group_hover("live-agents-more", |s| s.text_color(content(1.))),
+                        )
+                        .child(if expanded {
+                            "Show less".to_owned()
+                        } else {
+                            format!("{extra} more")
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.live_agents_expanded = !this.live_agents_expanded;
+                            this.notify_sidebar(cx);
+                        })),
+                )
+            });
+        let body = if progress >= 1. {
+            body.into_any_element()
+        } else {
+            div()
+                .overflow_hidden()
+                .opacity(progress)
+                .child(crate::reveal::Disclosure::new(body, width, progress))
+                .into_any_element()
+        };
         Some(
             div()
                 .id("live-agents")
@@ -135,6 +257,14 @@ impl Shell {
                         .bg(content(0.05))
                         .child(
                             div()
+                                .id("live-agents-header")
+                                .debug_selector(|| "live-agents-header".into())
+                                .group("live-agents-header")
+                                .role(Role::Button)
+                                .aria_label("Working agents")
+                                .aria_expanded(!collapsed)
+                                .cursor_pointer()
+                                .relative()
                                 .flex()
                                 .items_center()
                                 .gap_2()
@@ -164,63 +294,41 @@ impl Shell {
                                     div()
                                         .text_size(px(11.))
                                         .text_color(content(0.4))
+                                        .group_hover("live-agents-header", |s| s.invisible())
                                         .child(count.to_string()),
-                                ),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .right(px(12.))
+                                        .flex()
+                                        .items_center()
+                                        .invisible()
+                                        .group_hover("live-agents-header", |s| s.visible())
+                                        .child(
+                                            icon(
+                                                if collapsed {
+                                                    "chevron-down"
+                                                } else {
+                                                    "chevron-up"
+                                                },
+                                                12.,
+                                            )
+                                            .text_color(content(0.7)),
+                                        ),
+                                )
+                                .hover(|s| s.bg(content(0.03)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.workspace.sidebar_activity_collapsed =
+                                        !this.workspace.sidebar_activity_collapsed;
+                                    this.sidebar_list.remeasure();
+                                    this.persist(cx);
+                                    this.notify_sidebar(cx);
+                                })),
                         )
-                        .child(
-                            div()
-                                .id("live-agents-list")
-                                .flex()
-                                .flex_col()
-                                .gap_px()
-                                .px_1()
-                                .when(extra == 0, |d| d.pb_1())
-                                .when(expanded, |d| d.max_h(px(360.)).overflow_y_scroll())
-                                .children(cards),
-                        )
-                        .when(extra > 0, |d| {
-                            d.child(
-                                div()
-                                    .id("live-agents-more")
-                                    .group("live-agents-more")
-                                    .role(Role::Button)
-                                    .aria_expanded(expanded)
-                                    .cursor_pointer()
-                                    .w_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_1()
-                                    .px_2()
-                                    .py_1p5()
-                                    .text_size(px(11.))
-                                    .text_color(content(0.5))
-                                    .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
-                                    .child(
-                                        icon(
-                                            if expanded {
-                                                "chevron-up"
-                                            } else {
-                                                "chevron-down"
-                                            },
-                                            12.,
-                                        )
-                                        .text_color(content(0.5))
-                                        .group_hover("live-agents-more", |s| {
-                                            s.text_color(content(1.))
-                                        }),
-                                    )
-                                    .child(if expanded {
-                                        "Show less".to_owned()
-                                    } else {
-                                        format!("{extra} more")
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.live_agents_expanded = !this.live_agents_expanded;
-                                        this.notify_sidebar(cx);
-                                    })),
-                            )
-                        }),
+                        .when(folding, |d| d.child(body)),
                 )
                 .into_any(),
         )

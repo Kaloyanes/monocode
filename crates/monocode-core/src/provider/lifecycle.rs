@@ -328,6 +328,36 @@ fn mcp_confirmation(request: &Value) -> Option<(String, Value)> {
     Some((title, content.into()))
 }
 
+pub(super) fn recoverable_codex_resume(error: &str) -> bool {
+    let message = error.to_lowercase();
+    message.contains("thread")
+        && [
+            "not found",
+            "unknown thread",
+            "no such thread",
+            "does not exist",
+            "missing thread",
+            "thread id",
+        ]
+        .iter()
+        .any(|part| message.contains(part))
+}
+
+pub(super) fn claude_session_id() -> String {
+    let mut bytes = rand::random::<[u8; 16]>();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = format!("{:032x}", u128::from_be_bytes(bytes));
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
 #[cfg(test)]
 mod permission_tests {
     use super::*;
@@ -548,34 +578,4 @@ mod permission_tests {
             .iter()
             .all(|e| !matches!(e, Event::Approval(_))));
     }
-}
-
-pub(super) fn recoverable_codex_resume(error: &str) -> bool {
-    let message = error.to_lowercase();
-    message.contains("thread")
-        && [
-            "not found",
-            "unknown thread",
-            "no such thread",
-            "does not exist",
-            "missing thread",
-            "thread id",
-        ]
-        .iter()
-        .any(|part| message.contains(part))
-}
-
-pub(super) fn claude_session_id() -> String {
-    let mut bytes = rand::random::<[u8; 16]>();
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex = format!("{:032x}", u128::from_be_bytes(bytes));
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    )
 }

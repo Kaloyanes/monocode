@@ -72,10 +72,12 @@ pub(crate) fn cached_model_name(kind: Kind, id: Option<&str>) -> SharedString {
     id.and_then(|id| catalog::cached_name(kind, id).map(|name| model_display_name(kind, id, &name)))
         .unwrap_or_else(|| model_name(kind, id))
 }
-/// saveRecentModelChoice: the pick moves to the front of the six recents.
+/// saveRecentModelChoice: the pick moves to the front of the six recents,
+/// and becomes the provider's last used model for new chats.
 pub(crate) fn remember_model(kind: Kind, model: Option<String>, cx: &mut gpui::App) {
     if cx.has_global::<crate::settings::Preferences>() {
         cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
+            prefs.last_models.insert(kind.id().into(), model.clone());
             let choice = crate::settings::ModelChoice {
                 provider: kind.id().into(),
                 model,
@@ -132,10 +134,100 @@ mod model_label_tests {
                 assert!(!list.enabled(Kind::Cursor));
                 // Until its host catalog arrives, no local Claude aliases
                 // are advertised as available remote models.
-                let entries = list.entries(cx);
-                assert_eq!(entries.len(), 1);
-                assert_eq!(entries[0].id, None);
+                assert!(list.entries(cx).is_empty());
             });
+        });
+    }
+
+    #[gpui::test]
+    fn a_pick_becomes_the_providers_last_model(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Preferences::default());
+            remember_model(Kind::Claude, Some("sonnet".into()), cx);
+            remember_model(Kind::Codex, Some("gpt-mini".into()), cx);
+            remember_model(Kind::Claude, None, cx);
+            let prefs = cx.global::<crate::settings::Preferences>();
+            assert_eq!(prefs.last_models.get("claude"), Some(&None));
+            assert_eq!(
+                prefs.model_for_new_chat("codex", "/work").as_deref(),
+                Some("gpt-mini")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn hidden_models_leave_the_picker_until_searched(cx: &mut gpui::TestAppContext) {
+        let model = |id: &str| Model {
+            id: id.into(),
+            name: id.into(),
+            alias_target: None,
+            efforts: Vec::new(),
+            default_effort: None,
+            fast: false,
+            thinking: false,
+            default: false,
+            tiers: Vec::new(),
+            controls: Vec::new(),
+        };
+        let choice = |id: &str| crate::settings::ModelChoice {
+            provider: "codex".into(),
+            model: Some(id.into()),
+        };
+        cx.update(|cx| {
+            let mut prefs = crate::settings::Preferences {
+                hidden_models: vec![choice("gpt-global"), choice("gpt-current")],
+                ..Default::default()
+            };
+            prefs
+                .project_providers
+                .entry("/work".into())
+                .or_default()
+                .hidden_models = vec![choice("gpt-project")];
+            cx.set_global(prefs);
+            let list = cx.new(|cx| {
+                ModelList::new_for(
+                    Kind::Codex,
+                    Some("gpt-current".into()),
+                    "/work",
+                    Default::default(),
+                    cx,
+                )
+            });
+            list.update(cx, |list, _| {
+                list.catalogs = vec![(
+                    Kind::Codex,
+                    ["gpt-global", "gpt-project", "gpt-shown", "gpt-current"]
+                        .map(model)
+                        .to_vec(),
+                )];
+            });
+            let ids = |list: &Entity<ModelList>, cx: &gpui::App| {
+                list.read(cx)
+                    .entries(cx)
+                    .into_iter()
+                    .map(|e| (e.id, e.hidden))
+                    .collect::<Vec<_>>()
+            };
+            // The session's own model stays even though it is hidden.
+            assert_eq!(
+                ids(&list, cx),
+                [
+                    (Some("gpt-shown".into()), false),
+                    (Some("gpt-current".into()), true),
+                ]
+            );
+            // A search reveals hidden matches after the visible ones.
+            let search = list.read(cx).search.clone();
+            search.update(cx, |input, cx| input.set_text("gpt".into(), cx));
+            assert_eq!(
+                ids(&list, cx),
+                [
+                    (Some("gpt-shown".into()), false),
+                    (Some("gpt-current".into()), true),
+                    (Some("gpt-global".into()), true),
+                    (Some("gpt-project".into()), true),
+                ]
+            );
         });
     }
 
@@ -208,9 +300,9 @@ mod model_label_tests {
             assert!(!favorites[1].enabled);
             list.update(cx, |list, _| list.tab = ModelTab::Harness(Kind::Codex));
             let rows = list.read(cx).entries(cx);
-            assert_eq!(rows[1].id.as_deref(), Some("gpt-recent"));
-            assert_eq!(rows[2].id.as_deref(), Some("gpt-saved"));
-            assert_eq!(list.read(cx).current_index(cx), 2);
+            assert_eq!(rows[0].id.as_deref(), Some("gpt-recent"));
+            assert_eq!(rows[1].id.as_deref(), Some("gpt-saved"));
+            assert_eq!(list.read(cx).current_index(cx), 1);
         });
     }
 }
@@ -235,6 +327,8 @@ struct ModelEntry {
     id: Option<String>,
     name: SharedString,
     enabled: bool,
+    /// Hidden in Settings; listed only while a search names it.
+    hidden: bool,
 }
 
 /// The model the next turn uses; `None` is the provider's default.
@@ -245,6 +339,7 @@ pub(crate) struct ModelPicked(pub Kind, pub Option<String>);
 /// between turns.
 pub(crate) struct ModelList {
     provider: Kind,
+    project: String,
     remote_project: Option<String>,
     remote_providers: Option<Vec<Kind>>,
     current: Option<String>,
@@ -262,6 +357,11 @@ pub(crate) struct ModelList {
     search: Entity<input::Input>,
     _changed: Subscription,
 }
+/// The flyout card's fixed height; the list scrolls inside it.
+const FLYOUT_MAX: f32 = 442.;
+const ROW: f32 = 48.;
+/// The search field's row, with its rule.
+const SEARCH: f32 = 41.;
 impl EventEmitter<ModelPicked> for ModelList {}
 impl ModelList {
     pub(crate) fn new_for(
@@ -287,6 +387,7 @@ impl ModelList {
         });
         let mut list = Self {
             provider,
+            project: project.to_owned(),
             remote_project: monocode_core::remote::parse_remote_path(project)
                 .map(|_| project.to_owned()),
             remote_providers: None,
@@ -516,7 +617,7 @@ impl ModelList {
     fn entries(&self, cx: &gpui::App) -> Vec<ModelEntry> {
         let ModelTab::Harness(kind) = self.tab else {
             let query = self.query(cx);
-            return cx
+            let entries = cx
                 .try_global::<crate::settings::Preferences>()
                 .into_iter()
                 .flat_map(|prefs| &prefs.favorite_models)
@@ -535,17 +636,14 @@ impl ModelList {
                         id: choice.model.clone(),
                         name,
                         enabled: self.enabled(kind),
+                        hidden: false,
                     })
                 })
                 .collect();
+            return self.without_hidden(entries, &query, cx);
         };
         let enabled = self.enabled(kind);
-        let mut entries = vec![ModelEntry {
-            kind,
-            id: None,
-            name: "Default".into(),
-            enabled,
-        }];
+        let mut entries: Vec<ModelEntry> = Vec::new();
         if let Some(prefs) = cx.try_global::<crate::settings::Preferences>() {
             for choice in &prefs.recent_models {
                 if choice.provider == kind.id()
@@ -557,6 +655,7 @@ impl ModelList {
                         id: choice.model.clone(),
                         name: self.saved_model_name(kind, choice.model.as_deref()),
                         enabled,
+                        hidden: false,
                     });
                 }
             }
@@ -575,6 +674,7 @@ impl ModelList {
                     id: Some(model.id.clone()),
                     name: model_display_name(kind, &model.id, &model.name),
                     enabled,
+                    hidden: false,
                 })
                 .collect();
             entries.extend(additional);
@@ -588,6 +688,7 @@ impl ModelList {
                     id: Some(id.into()),
                     name: name.into(),
                     enabled,
+                    hidden: false,
                 })
                 .collect();
             entries.extend(additional);
@@ -602,10 +703,11 @@ impl ModelList {
                 id: Some(id.clone()),
                 name: model_name(kind, Some(id)),
                 enabled,
+                hidden: false,
             });
         }
         let query = self.query(cx);
-        entries
+        let entries = entries
             .into_iter()
             .filter(|e| {
                 query.is_empty()
@@ -613,7 +715,39 @@ impl ModelList {
                         .to_lowercase()
                         .contains(&query)
             })
-            .collect()
+            .collect();
+        self.without_hidden(entries, &query, cx)
+    }
+    /// Leave hidden models out, except the session's own and, while
+    /// searching, the matches, which follow the visible ones.
+    fn without_hidden(
+        &self,
+        entries: Vec<ModelEntry>,
+        query: &str,
+        cx: &gpui::App,
+    ) -> Vec<ModelEntry> {
+        let Some(prefs) = cx.try_global::<crate::settings::Preferences>() else {
+            return entries;
+        };
+        let hidden = prefs.hidden_models_for(&self.project);
+        if hidden.is_empty() {
+            return entries;
+        }
+        let (mut visible, mut found) = (Vec::new(), Vec::new());
+        for mut entry in entries {
+            entry.hidden = entry.id.is_some()
+                && hidden
+                    .iter()
+                    .any(|c| c.provider == entry.kind.id() && c.model == entry.id);
+            let current = entry.kind == self.provider && entry.id == self.current;
+            if !entry.hidden || current {
+                visible.push(entry);
+            } else if !query.is_empty() {
+                found.push(entry);
+            }
+        }
+        visible.extend(found);
+        visible
     }
     fn enabled(&self, kind: Kind) -> bool {
         (kind == self.provider || self.switch_allowed)
@@ -731,7 +865,7 @@ impl ModelList {
     }
 }
 impl Render for ModelList {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.quick {
             return self.render_quick(cx);
         }
@@ -758,9 +892,18 @@ impl Render for ModelList {
             .map(|(ix, entry)| {
                 let highlighted = self.highlighted == ix && entry.enabled;
                 let current = entry.kind == self.provider && entry.id == self.current;
+                let starred = self.favorite(entry.kind, entry.id.as_deref(), cx);
+                let (star_kind, star_id) = (entry.kind, entry.id.clone());
+                let star_name = entry.name.clone();
+                // The subtitle names the provider, so the label drops its prefix.
+                let name: SharedString = entry
+                    .name
+                    .strip_prefix(&format!("{} · ", entry.kind.label()))
+                    .map(|rest| rest.to_owned().into())
+                    .unwrap_or_else(|| entry.name.clone());
                 div()
                     .id(("model-option", ix))
-                    .role(Role::ListBoxOption)
+                            .role(Role::ListBoxOption)
                     .aria_label(entry.name.clone())
                     .aria_selected(current)
                     .when(!entry.enabled, |d| {
@@ -772,13 +915,17 @@ impl Render for ModelList {
                     })
                     .cursor_pointer()
                     .flex_shrink_0()
-                    .h(px(32.))
+                    .h(px(ROW))
                     .px_1()
                     .rounded(px(8.))
                     .flex()
                     .items_center()
                     .text_size(px(13.))
-                    .text_color(content(if entry.enabled { 1. } else { 0.3 }))
+                    .text_color(content(match (entry.enabled, entry.hidden) {
+                        (false, _) => 0.3,
+                        (true, true) => 0.5,
+                        (true, false) => 1.,
+                    }))
                     .when(highlighted, |d| d.bg(content(0.1)))
                     .when(!highlighted && entry.enabled, |d| {
                         d.hover(|s| s.bg(content(0.05)))
@@ -788,9 +935,31 @@ impl Render for ModelList {
                             .flex_1()
                             .min_w_0()
                             .px(px(6.))
-                            .truncate()
-                            .child(entry.name),
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .child(div().truncate().child(name))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(content(0.45))
+                                    .child(provider_icon(entry.kind.id(), 12.))
+                                    .child(entry.kind.label()),
+                            ),
                     )
+                    .when(entry.hidden, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .px_1()
+                                .text_size(px(11.))
+                                .text_color(content(0.4))
+                                .child("Hidden"),
+                        )
+                    })
                     .when(current, |d| {
                         d.child(
                             div()
@@ -802,6 +971,31 @@ impl Render for ModelList {
                                 .child(icon("check-2", 14.).text_color(content(0.55))),
                         )
                     })
+                    .child(
+                        div()
+                            .id(("model-star", ix))
+                            .role(Role::Button)
+                            .aria_label(format!(
+                                "{} {} {} favorites",
+                                if starred { "Remove" } else { "Add" },
+                                star_name,
+                                if starred { "from" } else { "to" }
+                            ))
+                            .cursor_pointer()
+                            .size(px(24.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                icon(if starred { "star-filled" } else { "star" }, 14.)
+                                    .text_color(content(if starred { 0.8 } else { 0.3 })),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_favorite(star_kind, star_id.clone(), cx)
+                            })),
+                    )
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.highlighted = ix;
@@ -812,12 +1006,12 @@ impl Render for ModelList {
                     .into_any()
             })
             .collect();
+        let list_height = FLYOUT_MAX - SEARCH - 2.;
         div()
             .id("model-flyout")
             .role(Role::Dialog)
             .aria_label("Models")
-            .size_full()
-            .min_h_0()
+            .w_full()
             .flex()
             .capture_action(cx.listener(|this, _: &input::Up, _, cx| {
                 this.step(-1, cx);
@@ -850,19 +1044,7 @@ impl Render for ModelList {
                     .children(
                         Kind::ALL
                             .into_iter()
-                            .filter(|kind| {
-                                if self.remote_project.is_some() {
-                                    *kind == self.provider
-                                        || self
-                                            .remote_providers
-                                            .as_ref()
-                                            .is_some_and(|providers| providers.contains(kind))
-                                } else {
-                                    *kind == self.provider
-                                        || (!self.hidden.iter().any(|id| id == kind.id())
-                                            && !self.missing.contains(kind))
-                                }
-                            })
+                            .filter(|kind| self.shows_provider(*kind))
                             .map(|kind| self.tab(ModelTab::Harness(kind), cx)),
                     ),
             )
@@ -892,8 +1074,8 @@ impl Render for ModelList {
                             .id("model-list")
                             .role(Role::ListBox)
                             .aria_label("Models")
-                            .flex_1()
-                            .min_h_0()
+                            .flex_shrink_0()
+                            .h(px(list_height))
                             .overflow_y_scroll()
                             .p_1()
                             .flex()
@@ -949,6 +1131,20 @@ impl Render for ModelList {
     }
 }
 impl ModelList {
+    /// A provider's tab in the rail: the current one always, others unless
+    /// hidden or not installed (remotely, as the host reports).
+    fn shows_provider(&self, kind: Kind) -> bool {
+        if self.remote_project.is_some() {
+            kind == self.provider
+                || self
+                    .remote_providers
+                    .as_ref()
+                    .is_some_and(|providers| providers.contains(&kind))
+        } else {
+            kind == self.provider
+                || (!self.hidden.iter().any(|id| id == kind.id()) && !self.missing.contains(&kind))
+        }
+    }
     fn render_quick(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let entries = self.entries(cx);
         let kind = match self.tab {
@@ -1009,6 +1205,7 @@ impl ModelList {
                             .text_size(px(13.))
                             .text_color(content(1.))
                             .when(!entry.enabled, |d| d.opacity(0.35))
+                            .when(entry.enabled && entry.hidden, |d| d.opacity(0.5))
                             .when(entry.enabled, |d| d.cursor_pointer())
                             .when(favorites, |d| d.child(provider_icon(entry.kind.id(), 14.)))
                             .child(div().min_w_0().truncate().child(entry.name.clone()))

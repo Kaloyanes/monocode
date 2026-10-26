@@ -1,8 +1,8 @@
 //! Actions: saved project commands the footer runs in a dock terminal with
 //! one click. The button shows the last action run; its chevron lists the
 //! rest and opens the editor.
-use crate::tooltip::Tip;
 use super::*;
+use crate::tooltip::Tip;
 use crate::workspace::{ACTION_ICONS, ProjectAction};
 
 pub(super) struct ActionDialog {

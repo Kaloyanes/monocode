@@ -14,6 +14,7 @@ mod skills;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
+pub(super) use chat::TextModelMenu;
 pub(super) use connections::ConnectionsState;
 pub(crate) use keybindings::command_shortcut;
 pub(super) use mobile::MobileState;

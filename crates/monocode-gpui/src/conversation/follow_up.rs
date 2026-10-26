@@ -1,6 +1,6 @@
 //! Composer.tsx / MessageQueue.tsx's durable follow-ups and saved user draft.
-use crate::tooltip::Tip;
 use super::*;
+use crate::tooltip::Tip;
 use monocode_core::follow_up::{Message, State};
 
 #[derive(Default)]
@@ -326,6 +326,13 @@ impl Conversation {
         if !self.history_ready() {
             // Persistence callbacks can arrive while a hidden history reloads.
             // The load completion pumps the durable queue after restoring rows.
+            return;
+        }
+        // Queued messages carry the output of commands queued before them.
+        if self.shell_busy() {
+            if !self.busy {
+                self.pump_shell(cx);
+            }
             return;
         }
         if self.settings.usage_limit.is_some()

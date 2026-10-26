@@ -10,9 +10,9 @@ mod classic_surface_tests;
 mod classic_surfaces;
 mod file_panes;
 mod idle_agents;
-mod interrupted_turns;
 #[cfg(test)]
 mod image_lightbox_tests;
+mod interrupted_turns;
 mod layout;
 mod list_cascade;
 mod live_agents;
@@ -43,6 +43,7 @@ mod settings;
 mod shortcuts;
 mod sidebar_list;
 mod sidebar_peek;
+mod space_swipe;
 mod terminal_dock;
 mod title_tabs;
 #[cfg(target_os = "linux")]
@@ -160,8 +161,10 @@ impl Render for Chrome {
         self.owner
             .update(cx, |shell, cx| match kind {
                 ChromeKind::Sidebar => {
+                    shell.space_swipe.set_scale(window.scale_factor());
                     let sidebar = shell.sidebar(cx);
-                    if shell.spaces_nudge.is_some()
+                    if shell.space_swipe.animating()
+                        || shell.spaces_nudge.is_some()
                         || shell.classic_tabs.animating()
                         || shell.sidebar_list.cascade.active()
                     {
@@ -221,6 +224,11 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-b"), ToggleSidebar, context),
         KeyBinding::new(&format!("{modifier}-k"), FocusSearch, context),
         KeyBinding::new(&format!("{modifier}-shift-f"), SearchFiles, context),
+        KeyBinding::new(
+            &format!("{modifier}-f"),
+            crate::settings::FocusSettingsSearch,
+            Some("SettingsView"),
+        ),
         KeyBinding::new(&format!("{modifier}-alt-t"), CloseOtherTabs, context),
         KeyBinding::new(&format!("{modifier}-shift-]"), NextTab, context),
         KeyBinding::new(&format!("{modifier}-}}"), NextTab, context),
@@ -406,6 +414,7 @@ const TOGGLE_RIGHT_PANEL_DOT_LABEL: &str = if cfg!(target_os = "macos") {
 } else {
     "Toggle right sidebar (Ctrl+Shift+B, uncommitted changes)"
 };
+const SHORTCUT_HINT_FADE: std::time::Duration = std::time::Duration::from_millis(140);
 const MOD: &str = if cfg!(target_os = "macos") {
     "⌘"
 } else {
@@ -567,6 +576,7 @@ pub(crate) struct Shell {
     monos: Option<Entity<crate::monos::Monos>>,
     quick_open: Option<quick_open::Open>,
     image_lightbox: Option<(Entity<crate::image_lightbox::ImageLightbox>, Subscription)>,
+    visual_expand: Option<(Entity<crate::visual_expand::VisualExpand>, Subscription)>,
     app_bridge: Option<monocode_core::mono::bridge::Server>,
     mobile: mobile_host::Mobile,
     app_results: HashMap<(i64, String), (String, Result<serde_json::Value, String>)>,
@@ -617,6 +627,7 @@ pub(crate) struct Shell {
     /// Lightweight history index; only opened or previewed chats own GPUI entities.
     session_summaries: HashMap<i64, Session>,
     draft_sessions: HashSet<i64>,
+    usage_limits: HashMap<i64, monocode_core::usage::Limit>,
     history_recency: HashMap<i64, u64>,
     history_clock: u64,
     session_marks: HashMap<i64, Entity<SessionMark>>,
@@ -624,6 +635,8 @@ pub(crate) struct Shell {
     /// The live agents card's spinners, apart from the sidebar rows' marks.
     live_marks: HashMap<i64, Entity<SessionMark>>,
     live_agents_expanded: bool,
+    /// The live agents card's list folding open and shut.
+    live_fold: live_agents::Fold,
     /// Repaints the live agents card's elapsed times once a second.
     live_tick: Option<gpui::Task<()>>,
     busy_sessions: HashSet<i64>,
@@ -722,6 +735,8 @@ pub(crate) struct Shell {
     pane_ticks: HashMap<i64, PaneTick>,
     skip_tab_click: bool,
     spaces_start: usize,
+    /// The sidebar's spaces as side-by-side pages, swiped or slid between.
+    space_swipe: space_swipe::SpaceSwipe,
     /// The spaces bar's short nudge after a chevron pages it.
     spaces_nudge: Option<(f32, std::time::Instant)>,
     /// The space under the pointer, whose name and shortcuts show above it.
@@ -774,6 +789,12 @@ pub(crate) struct Shell {
     live_mark: Option<Entity<terminal_dock::LiveMark>>,
     /// The sidebar collapsed itself to make room; it returns with the room.
     sidebar_auto_hidden: bool,
+    /// With the tab bar hidden, the sidebar rows ⌘1–8 reach, by session.
+    shortcut_slots: HashMap<i64, usize>,
+    /// ⌘ is held, so those rows show their shortcut instead of a status.
+    shortcut_hints: bool,
+    /// Bumped on each ⌘ press or release to restart the hint crossfade.
+    shortcut_hint_flips: usize,
     viewport_width: f32,
     viewport_height: f32,
     observations: Vec<Subscription>,
@@ -941,6 +962,7 @@ impl Shell {
             monos: None,
             quick_open: None,
             image_lightbox: None,
+            visual_expand: None,
             app_bridge: None,
             mobile: mobile_host::Mobile::default(),
             app_results: HashMap::new(),
@@ -983,12 +1005,14 @@ impl Shell {
             sessions: HashMap::new(),
             session_summaries: HashMap::new(),
             draft_sessions: sidebar_metadata.drafts,
+            usage_limits: sidebar_metadata.usage_limits,
             history_recency: HashMap::new(),
             history_clock: 0,
             session_marks: HashMap::new(),
             tab_marks: HashMap::new(),
             live_marks: HashMap::new(),
             live_agents_expanded: false,
+            live_fold: Default::default(),
             live_tick: None,
             busy_sessions: HashSet::new(),
             notification_state,
@@ -1074,6 +1098,7 @@ impl Shell {
             pane_ticks: HashMap::new(),
             skip_tab_click: false,
             spaces_start: 0,
+            space_swipe: space_swipe::SpaceSwipe::default(),
             spaces_nudge: None,
             hovered_space: None,
             space_anchor: AnchorSlot::default(),
@@ -1100,6 +1125,9 @@ impl Shell {
             pane_motion: None,
             skip_session_click: false,
             sidebar_auto_hidden: false,
+            shortcut_slots: HashMap::new(),
+            shortcut_hints: false,
+            shortcut_hint_flips: 0,
             terminals: HashMap::new(),
             dock_slide: None,
             dock_resize: None,
@@ -1212,6 +1240,7 @@ impl Shell {
             this.order.push(summary.id);
             this.session_summaries.insert(summary.id, summary);
         }
+        this.restore_usage_continuations(cx);
         this.init_mobile_host(cx);
         if let Some(id) = this.workspace.active {
             this.ensure_session(this.workspace.session_for_pane(id), cx);
@@ -1300,6 +1329,7 @@ impl Shell {
             // the indexed working directory so those events cannot erase it.
             view.restore_worktree(worktree, None, cx);
             view.draft_hint = self.draft_sessions.contains(&id);
+            view.settings.usage_limit = self.usage_limits.get(&id).cloned();
             if let Some(bridge) = &self.app_bridge {
                 view.set_app_environment(bridge.environment(id));
             }
@@ -1315,6 +1345,11 @@ impl Shell {
                 };
                 this.session_worktrees
                     .insert(id, view.read(cx).settings.worktree_cwd.clone());
+                if let Some(limit) = &view.read(cx).settings.usage_limit {
+                    this.usage_limits.insert(id, limit.clone());
+                } else {
+                    this.usage_limits.remove(&id);
+                }
                 // A finished turn may have edited files or moved to a worktree.
                 if this.workspace.active == Some(id) {
                     this.sync_git(cx);
@@ -1397,7 +1432,7 @@ impl Shell {
         } else if self.busy_sessions.remove(&id) && !focused && !session.summary.archived {
             self.unseen_finished.insert(id);
         }
-        if focused || session.summary.archived {
+        if focused || session.summary.archived || session.settings.usage_limit.is_some() {
             self.unseen_finished.remove(&id);
         }
         let state = if busy {
@@ -1442,6 +1477,7 @@ impl Shell {
                                 session.summary.archived = archived;
                                 if archived {
                                     session.stop_if_busy(cx);
+                                    session.cancel_usage_resume(cx);
                                 }
                             });
                         }
@@ -1532,6 +1568,7 @@ impl Shell {
     }
     fn notify_sidebar(&self, cx: &mut Context<Self>) {
         self.sidebar_list.invalidate_structure();
+        self.space_swipe.invalidate_pages();
         self.sidebar_frame.update(cx, |_, cx| cx.notify());
     }
     fn invalidate_chrome(&self, cx: &mut Context<Self>) {
@@ -1950,7 +1987,9 @@ impl Shell {
         let resume = match running {
             0 => String::new(),
             1 => "1 chat is still running. It will continue when you reopen MonoCode.".into(),
-            n => format!("{n} chats are still running. They will continue when you reopen MonoCode."),
+            n => {
+                format!("{n} chats are still running. They will continue when you reopen MonoCode.")
+            }
         };
         let (message, detail, confirm) = if unsaved {
             let detail = "Save your files before quitting to keep your changes.";
@@ -4114,6 +4153,57 @@ impl Shell {
             .map(TitleTab::Session);
         self.close_title_tabs(&tabs, preferred, window, cx);
     }
+    /// A mouse's side buttons that nothing under the pointer took walk the
+    /// visit history, as a browser's do and as `Tab: Back` / `Tab: Forward`.
+    fn history_buttons_watch(&self, cx: &mut Context<Self>) -> AnyElement {
+        let weak = cx.weak_entity();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let weak = weak.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    let step = match event.button {
+                        MouseButton::Navigate(gpui::NavigationDirection::Back) => -1,
+                        MouseButton::Navigate(gpui::NavigationDirection::Forward) => 1,
+                        _ => return,
+                    };
+                    let debug = std::env::var_os("MONOCODE_DEBUG_INPUT").is_some();
+                    if phase != gpui::DispatchPhase::Bubble {
+                        if debug {
+                            eprintln!("[input] {:?} at {:?}", event.button, event.position);
+                        }
+                        return;
+                    }
+                    let _ = weak.update(cx, |this, cx| {
+                        let blocked = this.history_buttons_blocked();
+                        if debug {
+                            eprintln!(
+                                "[input] reached history: {}",
+                                if blocked { "blocked" } else { "stepping" }
+                            );
+                        }
+                        if !blocked {
+                            this.visit(step, window, cx);
+                        }
+                    });
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+        .into_any_element()
+    }
+
+    /// Overlays that own the pointer leave the side buttons alone.
+    fn history_buttons_blocked(&self) -> bool {
+        self.menu.is_some()
+            || self.quick_open.is_some()
+            || self.link_dialog.is_some()
+            || self.action_dialog.is_some()
+            || self.remote_project_picker.is_some()
+            || self.space_swipe.dragging()
+    }
+
     fn visit(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         // Settings sit over the history: Back leaves them, and Forward
         // leaves them on its way to the next visit.
@@ -4128,6 +4218,18 @@ impl Shell {
         }
     }
     fn cycle(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tab_strip_visible() {
+            // The sidebar is the only list on screen, so tab stepping walks it.
+            let ids = self.sidebar_navigation_ids(cx);
+            let current = self.workspace.active.filter(|_| {
+                self.active_title_tab(cx)
+                    .is_some_and(|t| t.session().is_some())
+            });
+            if let Some(next) = adjacent(&ids, current.as_ref(), step) {
+                self.open(next, window, cx);
+            }
+            return;
+        }
         let tabs = self.visible_tabs(cx);
         if tabs.is_empty() {
             return;
@@ -4199,9 +4301,24 @@ impl Shell {
         if let Some(monos) = self.monos.clone() {
             monos.update(cx, |m, cx| m.close(cx));
         }
-        self.workspace.project = path.clone();
+        let from = self
+            .workspace
+            .projects
+            .iter()
+            .position(|p| *p == self.workspace.project);
+        let changed = self.workspace.project != path;
+        let previous = std::mem::replace(&mut self.workspace.project, path.clone());
         self.workspace.active = None;
-        if let Some(ix) = self.workspace.projects.iter().position(|p| p == &path) {
+        let ix = self.workspace.projects.iter().position(|p| p == &path);
+        if changed && !self.workspace.classic_layout {
+            // Switching projects slides the sidebar's pages the way the
+            // spaces run: moving right, the new project comes in from the right.
+            let direction = from
+                .zip(ix)
+                .map(|(from, ix)| if ix > from { 1. } else { -1. });
+            self.hand_over_sidebar_page(previous, direction, cx);
+        }
+        if let Some(ix) = ix {
             if ix < self.spaces_start {
                 self.spaces_start = ix;
             } else if ix >= self.spaces_start + 5 {
@@ -4352,11 +4469,7 @@ impl Shell {
         let model = self
             .workspace
             .preferences
-            .project_providers
-            .get(&cwd)
-            .and_then(|p| p.models.get(kind.id()))
-            .or(self.workspace.preferences.default_models.get(kind.id()))
-            .cloned();
+            .model_for_new_chat(kind.id(), &cwd);
         let navigation_revision = self.navigation_revision;
         let account = crate::accounts::get(cx)
             .map(|center| center.read(cx).selected(kind, &cwd))
@@ -4796,13 +4909,18 @@ impl Shell {
             } else {
                 self.navigation(cx).into_any_element()
             })
-            .child(
-                self.tabs_frame.clone().cached(
-                    StyleRefinement::default()
-                        .w(tabs_width)
-                        .h(px(TITLE_BAR_HEIGHT)),
-                ),
-            )
+            .child(if self.tab_strip_visible() {
+                self.tabs_frame
+                    .clone()
+                    .cached(
+                        StyleRefinement::default()
+                            .w(tabs_width)
+                            .h(px(TITLE_BAR_HEIGHT)),
+                    )
+                    .into_any_element()
+            } else {
+                self.hidden_strip(tabs_width, cx)
+            })
             .child(if classic {
                 // The toggle holds the window's corner (classic_body); the
                 // strip keeps only the part an open panel leaves uncovered.
@@ -5684,7 +5802,10 @@ impl Shell {
         }
     }
     fn schedule_preview(&mut self, id: i64, anchor: AnchorSlot, cx: &mut Context<Self>) {
-        if self.menu.is_some() || self.classic_worktree_picker.is_some() {
+        if self.menu.is_some()
+            || self.classic_worktree_picker.is_some()
+            || self.space_swipe.moving()
+        {
             return;
         }
         let settle = std::time::Duration::from_millis(180);
@@ -6241,6 +6362,17 @@ impl Shell {
             .into_any()
     }
 
+    fn set_shortcut_hints(&mut self, held: bool, cx: &mut Context<Self>) {
+        if self.shortcut_hints == held {
+            return;
+        }
+        self.shortcut_hints = held;
+        self.shortcut_hint_flips += 1;
+        if !self.shortcut_slots.is_empty() {
+            cx.notify();
+        }
+    }
+
     fn session_suffix(
         &self,
         id: i64,
@@ -6249,10 +6381,20 @@ impl Shell {
         cx: &Context<Self>,
     ) -> AnyElement {
         let detailed = !compact;
+        if !session.needs_approval()
+            && !session.responding()
+            && let Some(limit) = session.usage_limit()
+        {
+            return crate::usage_limit::sidebar_status(
+                id,
+                limit,
+                self.workspace.sidebar_width < 250.,
+            );
+        }
         if self.session_hover == Some(id) {
             return self.session_archive_button(id, session, cx);
         }
-        div()
+        let status = div()
             .flex_shrink_0()
             .text_size(px(11.))
             .line_height(px(16.))
@@ -6313,7 +6455,55 @@ impl Shell {
                         monocode_core::time::now_ms(),
                     ))
                     .into_any()
-            })
+            });
+        let Some(slot) = self.shortcut_slots.get(&id) else {
+            return status.into_any();
+        };
+        let shortcut = div()
+            .debug_selector(move || format!("session-shortcut-{id}"))
+            .flex_shrink_0()
+            .text_size(px(11.))
+            .line_height(px(16.))
+            .text_color(content(0.4))
+            .child(format!("{MOD}{}", slot + 1));
+        // Holding ⌘ swaps the status for the row's shortcut. The incoming
+        // label keeps the layout; the outgoing one fades out over it.
+        let (shown, hidden) = if self.shortcut_hints {
+            (shortcut.into_any_element(), status.into_any_element())
+        } else {
+            (status.into_any_element(), shortcut.into_any_element())
+        };
+        let flip = self.shortcut_hint_flips;
+        let animate = flip > 0 && !cx.reduce_motion();
+        let fade = |el: AnyElement, name: &'static str, entering: bool| {
+            let el = div().child(el);
+            if animate {
+                gpui::AnimationExt::with_animation(
+                    el,
+                    (name, flip),
+                    gpui::Animation::new(SHORTCUT_HINT_FADE).with_easing(gpui::ease_out_quint()),
+                    move |el, t| el.opacity(if entering { t } else { 1. - t }),
+                )
+                .into_any_element()
+            } else {
+                el.opacity(if entering { 1. } else { 0. })
+                    .into_any_element()
+            }
+        };
+        div()
+            .relative()
+            .flex_shrink_0()
+            .flex()
+            .justify_end()
+            .child(fade(shown, "shortcut-hint-in", true))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .whitespace_nowrap()
+                    .child(fade(hidden, "shortcut-hint-out", false)),
+            )
             .into_any()
     }
 
@@ -6333,7 +6523,7 @@ impl Shell {
                 .as_ref()
                 .is_some_and(|m| m.read(cx).hidden_session(id))
                 && s.summary.cwd == self.workspace.project
-                && s.summary.has_messages
+                && (s.summary.has_messages || self.is_fresh_session(id, cx))
                 && !self.orchestration_worker(id)
                 && self.in_sidebar_worktree_scope(id, cx)
         };
@@ -6415,10 +6605,13 @@ impl Shell {
             return;
         }
         let projects = self.workspace.projects.clone();
+        let wrapped = self.wraps(step);
         if let Some(next) = adjacent(&projects, Some(&self.workspace.project), step)
             && next != self.workspace.project
         {
             self.select_project(next, window, cx);
+            // A step past either end wraps around but keeps moving the same way.
+            self.point_space_pager(step.signum() as f32, wrapped);
         }
     }
     fn close_other_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6433,6 +6626,18 @@ impl Shell {
         self.close_title_tabs(&tabs, Some(active), window, cx);
     }
     fn activate_tab(&mut self, slot: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tab_strip_visible() {
+            let ids = self.sidebar_navigation_ids(cx);
+            let index = if slot < 0 {
+                ids.len().saturating_sub(1)
+            } else {
+                slot as usize
+            };
+            if let Some(id) = ids.get(index) {
+                self.open(*id, window, cx);
+            }
+            return;
+        }
         let tabs = self.visible_tabs(cx);
         let index = if slot < 0 {
             tabs.len().saturating_sub(1)
@@ -6468,6 +6673,23 @@ impl Shell {
             .debug_selector(|| "sidebar-content".into())
             .track_focus(&self.sidebar_focus)
             .key_context("SessionSidebar")
+            // A mouse's side buttons step between spaces, as a swipe does.
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Back),
+                cx.listener(|this, _, window, cx| {
+                    if this.step_space(-1, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(gpui::NavigationDirection::Forward),
+                cx.listener(|this, _, window, cx| {
+                    if this.step_space(1, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &session_groups::RenameSidebarItem, window, cx| {
                     this.rename_sidebar_item(window, cx)
@@ -6483,133 +6705,11 @@ impl Shell {
             .h_full()
             .flex()
             .flex_col()
-            .child(
-                div().flex_1().min_h_0().child(
-                    div()
-                        .relative()
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .h(px(39.))
-                                .flex_shrink_0()
-                                .px_3()
-                                .pb_px()
-                                .relative()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    div().flex_1().min_w_0().flex().items_center().child(
-                                        div()
-                                            .id("workspace-project")
-                                            .debug_selector(|| "sidebar-project-button".into())
-                                            .relative()
-                                            .role(Role::Button)
-                                            .aria_label(format!(
-                                                "Switch project, {}",
-                                                self.project_label(&self.workspace.project)
-                                            ))
-                                            .aria_description(self.workspace.project.clone())
-                                            .aria_expanded(self.menu_open(&MenuTarget::Header))
-                                            .cursor_pointer()
-                                            .h(px(28.))
-                                            // The whole picker shares Search's left edge.
-                                            .px_1p5()
-                                            .ml(px(-4.))
-                                            .rounded_md()
-                                            .max_w_full()
-                                            .hover(|s| s.bg(content(0.08)))
-                                            .when(self.menu_open(&MenuTarget::Header), |d| {
-                                                d.bg(content(0.08))
-                                            })
-                                            .min_w_0()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(crate::project_settings::header_project_icon(
-                                                &self.appearance(&self.workspace.project),
-                                                &self.workspace.project,
-                                            ))
-                                            .child(
-                                                div().min_w_0().truncate().child(
-                                                    self.project_label(&self.workspace.project),
-                                                ),
-                                            )
-                                            .when_some(
-                                                self.worktree_focus.get(&self.workspace.project),
-                                                |d, focus| {
-                                                    d.child(
-                                                        div()
-                                                            .min_w_0()
-                                                            .truncate()
-                                                            .font_weight(FontWeight::NORMAL)
-                                                            .text_color(content(0.45))
-                                                            .child(
-                                                                focus
-                                                                    .branch
-                                                                    .clone()
-                                                                    .unwrap_or_else(|| {
-                                                                        "detached".into()
-                                                                    }),
-                                                            ),
-                                                    )
-                                                },
-                                            )
-                                            .child(icon("chevron-down", 14.))
-                                            .child(self.project_anchor.probe())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                if this.menu_open(&MenuTarget::Header) {
-                                                    this.close_menu(cx);
-                                                } else {
-                                                    let anchor =
-                                                        Anchor::Slot(this.project_anchor.clone());
-                                                    this.open_menu(
-                                                        MenuTarget::Header,
-                                                        anchor,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            })),
-                                    ),
-                                )
-                                .child(
-                                    icon_button(
-                                        "sidebar-options",
-                                        "Sidebar options",
-                                        "more-horizontal",
-                                    )
-                                    .debug_selector(|| "sidebar-options".into())
-                                    .aria_expanded(self.menu_open(&MenuTarget::SidebarOptions))
-                                    .relative()
-                                    .child(self.sidebar_options_anchor.probe())
-                                    .on_click(cx.listener(
-                                        |this, _, window, cx| {
-                                            if this.menu_open(&MenuTarget::SidebarOptions) {
-                                                this.close_menu(cx);
-                                            } else {
-                                                this.open_menu(
-                                                    MenuTarget::SidebarOptions,
-                                                    Anchor::Slot(
-                                                        this.sidebar_options_anchor.clone(),
-                                                    ),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                        },
-                                    )),
-                                ),
-                        )
-                        .child(self.virtual_sidebar(cx))
-                        .children(live_agents)
-                        .child(self.app_update_footer(cx)),
-                ),
-            )
+            // The spaces' pages. Live agents and updates aren't any one
+            // space's, so they stay put beneath while the pages move.
+            .child(self.space_pager(cx))
+            .children(live_agents)
+            .child(self.app_update_footer(cx))
             .when(!self.workspace.classic_layout, |d| {
                 d.child(self.project_spaces(cx))
             })
@@ -6661,6 +6761,127 @@ impl Shell {
             .into_any()
     }
 
+    /// One space's page: its project header and session list. Only the live
+    /// page owns the header's menu anchors; a neighbour beside it during a
+    /// swipe draws the same thing for its own project.
+    pub(super) fn sidebar_page(
+        &mut self,
+        page: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let live = page.is_none();
+        div()
+            .size_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(self.sidebar_header(live, cx))
+            .child(self.virtual_sidebar_page(page, cx))
+            .into_any()
+    }
+
+    fn sidebar_header(&self, live: bool, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .h(px(39.))
+            .flex_shrink_0()
+            .px_3()
+            .pb_px()
+            .relative()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div().flex_1().min_w_0().flex().items_center().child(
+                    div()
+                        .id("workspace-project")
+                        .when(live, |d| {
+                            d.debug_selector(|| "sidebar-project-button".into())
+                        })
+                        .relative()
+                        .role(Role::Button)
+                        .aria_label(format!(
+                            "Switch project, {}",
+                            self.project_label(&self.workspace.project)
+                        ))
+                        .aria_description(self.workspace.project.clone())
+                        .aria_expanded(self.menu_open(&MenuTarget::Header))
+                        .cursor_pointer()
+                        .h(px(28.))
+                        // The whole picker shares Search's left edge.
+                        .px_1p5()
+                        .ml(px(-4.))
+                        .rounded_md()
+                        .max_w_full()
+                        .hover(|s| s.bg(content(0.08)))
+                        .when(self.menu_open(&MenuTarget::Header), |d| d.bg(content(0.08)))
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(crate::project_settings::header_project_icon(
+                            &self.appearance(&self.workspace.project),
+                            &self.workspace.project,
+                        ))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(self.project_label(&self.workspace.project)),
+                        )
+                        .when_some(
+                            self.worktree_focus.get(&self.workspace.project),
+                            |d, focus| {
+                                d.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_weight(FontWeight::NORMAL)
+                                        .text_color(content(0.45))
+                                        .child(
+                                            focus
+                                                .branch
+                                                .clone()
+                                                .unwrap_or_else(|| "detached".into()),
+                                        ),
+                                )
+                            },
+                        )
+                        .child(icon("chevron-down", 14.))
+                        .when(live, |d| d.child(self.project_anchor.probe()))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if this.menu_open(&MenuTarget::Header) {
+                                this.close_menu(cx);
+                            } else {
+                                let anchor = Anchor::Slot(this.project_anchor.clone());
+                                this.open_menu(MenuTarget::Header, anchor, window, cx);
+                            }
+                        })),
+                ),
+            )
+            .child(
+                icon_button("sidebar-options", "Sidebar options", "more-horizontal")
+                    .when(live, |d| d.debug_selector(|| "sidebar-options".into()))
+                    .aria_expanded(self.menu_open(&MenuTarget::SidebarOptions))
+                    .relative()
+                    .when(live, |d| d.child(self.sidebar_options_anchor.probe()))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.menu_open(&MenuTarget::SidebarOptions) {
+                            this.close_menu(cx);
+                        } else {
+                            this.open_menu(
+                                MenuTarget::SidebarOptions,
+                                Anchor::Slot(this.sidebar_options_anchor.clone()),
+                                window,
+                                cx,
+                            );
+                        }
+                    })),
+            )
+            .into_any()
+    }
+
     fn project_spaces(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // Sidebar.tsx's ProjectSpacesBar: five equal spaces, paged by chevrons.
         let shown = self.workspace.projects.len().min(5);
@@ -6702,6 +6923,63 @@ impl Shell {
                 }
             }
             None => (0., 1.),
+        };
+        // The selection pill rides between the slots with the pages above,
+        // and each mark brightens as the pages bring its space into view.
+        let position = self.space_pager_position(cx);
+        let looping = position.as_ref().is_some_and(|p| p.leaving.is_some());
+        let pills: Vec<_> = position
+            .as_ref()
+            .zip(self.space_swipe.spaces_strip.get())
+            .map(|(position, strip)| {
+                let count = shown as f32;
+                let gap = 4.;
+                let slot = (strip.size.width.as_f32() - gap * (count - 1.)) / count;
+                // Looping, the pill slides off the end it was on while a new
+                // one slides in from the other, both fading with the move.
+                let pill = |id: &'static str, at: f32, opacity: f32| {
+                    let at = at - first as f32;
+                    (at > -1. && at < count || looping).then(|| {
+                        let at = if looping {
+                            at
+                        } else {
+                            at.clamp(0., count - 1.)
+                        };
+                        div()
+                            .debug_selector(move || id.into())
+                            .absolute()
+                            .top_0()
+                            .left(px(at * (slot + gap)))
+                            .w(px(slot))
+                            .h(px(20.))
+                            .rounded_md()
+                            .opacity(opacity)
+                            .bg(content(0.1))
+                    })
+                };
+                match position.leaving {
+                    Some((leaving, arrived)) => vec![
+                        pill("project-space-pill", position.shown, arrived),
+                        pill("project-space-pill-leaving", leaving, 1. - arrived),
+                    ],
+                    None => vec![pill("project-space-pill", position.shown, 1.)],
+                }
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .collect();
+        let item_fill = pills.is_empty();
+        let space_opacity = |ix: usize| {
+            position.as_ref().map_or(0.45, |position| {
+                let near = |at: f32| 1. - (ix as f32 - at).abs();
+                let near = position
+                    .leaving
+                    .map_or(near(position.shown), |(leaving, _)| {
+                        near(position.shown).max(near(leaving))
+                    });
+                0.45 + 0.55 * near.clamp(0., 1.)
+            })
         };
         let tooltip = self.hovered_space.clone().map(|path| {
             popover(
@@ -6764,6 +7042,9 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .when(looping, |d| d.overflow_hidden())
+                    .child(self.space_swipe.spaces_strip.layout_probe())
+                    .children(pills)
                     .children(projects.into_iter().map(|(ix, path)| {
                         let active = path == self.workspace.project;
                         let hovered = self.hovered_space.as_ref() == Some(&path);
@@ -6783,9 +7064,16 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .opacity(if active { 1. } else { 0.45 })
-                            .when(active, |d| d.bg(content(0.1)))
-                            .hover(|s| s.opacity(1.).bg(content(if active { 0.1 } else { 0.05 })))
+                            .opacity(space_opacity(ix))
+                            .when(active && item_fill, |d| d.bg(content(0.1)))
+                            .hover(|s| {
+                                let s = s.opacity(1.);
+                                if active && !item_fill {
+                                    s
+                                } else {
+                                    s.bg(content(if active { 0.1 } else { 0.05 }))
+                                }
+                            })
                             .child(self.project_mark(&path, 12.))
                             .when(hovered, |d| d.child(self.space_anchor.probe()))
                             .on_hover({
@@ -8043,6 +8331,7 @@ fn enter_from(leaf: &LayoutLeaf) -> (Edge, Rect) {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::monos::html::begin_frame(window);
         self.keep_visible_idle_agents(cx);
         self.sync_ui_scale(window, cx);
         if self.mono_panes_unsettled(cx) {
@@ -8186,6 +8475,7 @@ impl Render for Shell {
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     if !window.is_window_active() {
                         this.close_preview(cx);
+                        this.set_shortcut_hints(false, cx);
                     } else {
                         this.resume_git(cx);
                     }
@@ -8266,6 +8556,11 @@ impl Render for Shell {
             .key_context("Workspace")
             .track_focus(&self.focus)
             .capture_key_up(cx.listener(|this, _, _, _| this.archive_shortcut_held = false))
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                    this.set_shortcut_hints(event.modifiers.secondary(), cx);
+                },
+            ))
             .on_action(cx.listener(|this, _: &ArchiveSession, window, cx| {
                 this.archive_active_session(window, cx)
             }))
@@ -8280,6 +8575,20 @@ impl Render for Shell {
                             cx.notify();
                         });
                     this.image_lightbox = Some((view, closed));
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, open: &crate::visual_expand::Open, window, cx| {
+                    let view = cx.new(|cx| {
+                        crate::visual_expand::VisualExpand::new(open.clone(), window, cx)
+                    });
+                    let closed =
+                        cx.subscribe(&view, |this, _, _: &crate::visual_expand::Closed, cx| {
+                            this.visual_expand = None;
+                            cx.notify();
+                        });
+                    this.visual_expand = Some((view, closed));
                     cx.notify();
                 }),
             )
@@ -8299,6 +8608,11 @@ impl Render for Shell {
                     this.close_preview(cx);
                 }
             }))
+            .on_action(
+                cx.listener(|this, event: &crate::inbox::OpenWorkLink, window, cx| {
+                    this.open_work_link(&event.0, window, cx)
+                }),
+            )
             .on_action(
                 cx.listener(|this, event: &crate::file_editor::OpenPath, window, cx| {
                     let cwd = this.git.read(cx).project().to_owned();
@@ -8662,6 +8976,9 @@ impl Render for Shell {
                 }),
             )
             .relative()
+            // First, so it runs last when the press bubbles: whatever else
+            // wanted a mouse's side button has had its turn.
+            .child(self.history_buttons_watch(cx))
             .child(self.right_panel_resize_watch(cx))
             .children(self.layout_body(sidebar_width, right_shown, right_width, full, window, cx))
             .children(self.peek_watch(window, cx))
@@ -8720,6 +9037,12 @@ impl Render for Shell {
                     .children(window_chrome::resize_handles(window));
                 root
             })
+            .children(
+                self.visual_expand
+                    .as_ref()
+                    .map(|(view, _)| crate::visual_expand::overlay(view)),
+            )
+            .child(crate::monos::html::reaper())
     }
 }
 
@@ -8767,6 +9090,11 @@ mod tests {
                 shell.archive_exits.finish();
             })
             .unwrap();
+        // The next frame's tick drops the folded row from the list.
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
         visual.run_until_parked();
         window
             .update(visual, |shell, window, cx| {
@@ -10856,7 +11184,7 @@ mod tests {
         draw(cx);
     }
     #[gpui::test]
-    fn main_pane_covers_a_fixed_sidebar_with_a_clipped_fade(cx: &mut TestAppContext) {
+    fn sidebar_slides_with_the_main_pane_edge_without_fading(cx: &mut TestAppContext) {
         use std::time::Duration;
         let (window, _, active) = window(cx);
         window
@@ -10867,6 +11195,15 @@ mod tests {
                 shell.invalidate_chrome(cx);
                 cx.notify();
             })
+            .unwrap();
+        cx.update_window(window.into(), |_, w, cx| {
+            w.simulate_next_frame(cx);
+            w.draw(cx).clear(cx);
+        })
+        .unwrap();
+        // The row entering the list fades in; this test looks at it settled.
+        window
+            .update(cx, |shell, _, _| shell.sidebar_list.cascade.cancel())
             .unwrap();
         cx.update_window(window.into(), |_, w, cx| {
             w.simulate_next_frame(cx);
@@ -10922,7 +11259,7 @@ mod tests {
                     visual.debug_bounds("toggle-sidebar").unwrap().origin,
                     toggle.origin
                 );
-                assert_eq!(content.left(), px(0.));
+                assert!((content.right() - clip.right()).abs() < px(1.));
                 assert!((clip.right() - main.left()).abs() < px(1.));
                 window
                     .update(visual, |shell, w, _| {
@@ -10934,17 +11271,20 @@ mod tests {
                         });
                         previous = fraction;
                         assert_eq!(content.size.width, px(shell.workspace.sidebar_width));
-                        let quad = w.painted_quads().into_iter().find(|q| q.bounds == row);
-                        if clip.right().as_f32() * w.scale_factor() <= row.left().0 {
-                            assert!(quad.is_none(), "fully covered rows are culled");
+                        // Rows travel with the edge at full opacity.
+                        let shift = content.left().as_f32() * w.scale_factor();
+                        let quad = w.painted_quads().into_iter().find(|q| {
+                            q.bounds.size == row.size
+                                && q.bounds.origin.y == row.origin.y
+                                && (q.bounds.origin.x.0 - (row.origin.x.0 + shift)).abs() < 0.5
+                        });
+                        if row.right().0 + shift <= 0. {
+                            assert!(quad.is_none(), "fully hidden rows are culled");
                             return;
                         }
                         let quad = quad.expect("exposed sidebar row paints at its full size");
                         let alpha = quad.background.as_solid().unwrap().a;
-                        assert!(
-                            (alpha - 0.1 * fraction).abs() < 0.0001,
-                            "painted alpha {alpha} follows {fraction}"
-                        );
+                        assert!((alpha - 0.1).abs() < 0.0001, "painted alpha {alpha}");
                         assert!(
                             (quad.content_mask.bounds.right().0
                                 - main.left().as_f32() * w.scale_factor())

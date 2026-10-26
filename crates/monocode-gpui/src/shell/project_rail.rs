@@ -1,7 +1,7 @@
 //! Original project navigation. Its list and shared image cache stay independent
 //! from streamed conversations; Git counters use one visible-project batch.
-use crate::tooltip::Tip;
 use super::*;
+use crate::tooltip::Tip;
 use crate::{
     right_panel::{DIFF_ADD, DIFF_DEL, format_integer, tabular},
     workspace,

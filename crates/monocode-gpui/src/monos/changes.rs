@@ -1,8 +1,8 @@
 //! MonoChangesView: assigned-project tabs with a retained commit/review surface
 //! per checkout. Only the selected checkout owns a live Git poller.
-use crate::tooltip::Tip;
 use super::*;
 use crate::popover::{MenuAction, MenuItem};
+use crate::tooltip::Tip;
 use std::{path::Path, time::Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

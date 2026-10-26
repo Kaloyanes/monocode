@@ -7,8 +7,8 @@ use crate::reveal::{Disclosure, bezier};
 use std::time::{Duration, Instant};
 
 /// RevealHeight's `reveal-height-in` and `reveal-height-out`.
-const OPEN: Duration = Duration::from_millis(240);
-const CLOSE: Duration = Duration::from_millis(180);
+pub(super) const OPEN: Duration = Duration::from_millis(240);
+pub(super) const CLOSE: Duration = Duration::from_millis(180);
 
 #[derive(Default)]
 pub(crate) struct Rails {
@@ -21,13 +21,13 @@ pub(crate) struct Rails {
     frames: Option<gpui::Task<()>>,
 }
 #[derive(Clone, Copy)]
-struct Motion {
-    open: bool,
-    from: f32,
-    start: Instant,
+pub(super) struct Motion {
+    pub(super) open: bool,
+    pub(super) from: f32,
+    pub(super) start: Instant,
 }
 impl Motion {
-    fn value(&self, now: Instant) -> f32 {
+    pub(super) fn value(&self, now: Instant) -> f32 {
         let (duration, curve) = if self.open {
             (OPEN, (0.2, 0., 0., 1.))
         } else {
@@ -39,7 +39,7 @@ impl Motion {
         let target = if self.open { 1. } else { 0. };
         self.from + (target - self.from) * eased
     }
-    fn settled(&self, now: Instant) -> bool {
+    pub(super) fn settled(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.start) >= if self.open { OPEN } else { CLOSE }
     }
 }
@@ -691,6 +691,8 @@ impl Shell {
                 .children(self.session_marks.get(&id).cloned())
                 .child("Working...")
                 .into_any_element()
+        } else if let Some(limit) = session.usage_limit() {
+            crate::usage_limit::sidebar_status(id, limit, self.workspace.sidebar_width < 250.)
         } else if self.unseen_finished.contains(&id) {
             status
                 .text_color(rgb(0x34d399))

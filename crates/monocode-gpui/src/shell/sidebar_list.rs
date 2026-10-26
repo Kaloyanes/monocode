@@ -173,6 +173,17 @@ impl SidebarList {
     }
 }
 
+/// ⌘1–8 open the first rows by position and ⌘9 the last, as `ActivateTab`.
+fn shortcut_slots(ids: &[i64]) -> HashMap<i64, usize> {
+    let last = ids.len().saturating_sub(1);
+    ids.iter()
+        .copied()
+        .enumerate()
+        .filter(|(ix, _)| *ix < 8 || *ix == last)
+        .map(|(ix, id)| (id, ix.min(8)))
+        .collect()
+}
+
 fn age_label(updated_at: u64, now: u64) -> &'static str {
     let today = chrono::DateTime::from_timestamp_millis(now.min(i64::MAX as u64) as i64)
         .map(|t| t.with_timezone(&chrono::Local).date_naive());
@@ -291,24 +302,33 @@ impl Shell {
             let ids = self.sidebar_session_ids(cx);
             self.sync_rails(&ids, cx);
             let entries = self.session_entries(&ids, cx);
-            let listed: HashSet<_> = ids.iter().copied().collect();
-            self.session_row_bounds.retain(|id, _| listed.contains(id));
-            for id in ids {
-                self.session_row_bounds.entry(id).or_default();
-            }
-            let folders: HashSet<_> = entries
-                .iter()
-                .filter_map(|entry| match entry {
-                    Entry::Folder { id, .. } => Some(id.clone()),
-                    _ => None,
-                })
-                .collect();
-            self.folder_bounds.retain(|id, _| folders.contains(id));
-            for id in folders {
-                self.folder_bounds.entry(id).or_default();
+            // Hit targets belong to the live page only. A neighbour drawing
+            // beside it during a swipe leaves them alone.
+            if !self.space_swipe.drawing_neighbour() {
+                let listed: HashSet<_> = ids.iter().copied().collect();
+                self.session_row_bounds.retain(|id, _| listed.contains(id));
+                for id in ids {
+                    self.session_row_bounds.entry(id).or_default();
+                }
+                let folders: HashSet<_> = entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        Entry::Folder { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                self.folder_bounds.retain(|id, _| folders.contains(id));
+                for id in folders {
+                    self.folder_bounds.entry(id).or_default();
+                }
             }
             self.sidebar_list.reduce_motion = cx.reduce_motion();
             self.prepare_sidebar_list(&entries, cx);
+            self.shortcut_slots = if self.tab_strip_visible() {
+                HashMap::new()
+            } else {
+                shortcut_slots(&self.sidebar_navigation_ids(cx))
+            };
         }
         self.sync_sidebar_list_visibility();
         self.sidebar_list.clear_bounds();
@@ -316,14 +336,15 @@ impl Shell {
 
     fn sidebar_scope(&self) -> String {
         format!(
-            "{}\0{}\0{}\0{:?}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}",
             self.workspace.project,
             self.working_copy(),
             self.query,
             self.workspace.session_filters,
             self.workspace.preferences.show_archived,
             self.workspace.boxy_layout(),
-            self.workspace.classic_layout
+            self.workspace.classic_layout,
+            self.tab_strip_visible()
         )
     }
 
@@ -335,6 +356,17 @@ impl Shell {
         let groups = self.project_groups();
         let now = monocode_core::time::now_ms();
         let mut rows = vec![Row::Navigation, Row::Monos];
+        let fresh: Vec<i64> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Session(id) if self.is_fresh_session(*id, cx) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        if !fresh.is_empty() {
+            rows.extend(fresh.iter().map(|id| Row::Session(*id)));
+            rows.push(Row::Gap);
+        }
         let mut folders = false;
         for entry in entries {
             let (members, collapsed) = match entry {
@@ -397,7 +429,7 @@ impl Shell {
             let Entry::Session(id) = entry else {
                 continue;
             };
-            if self.rails.children.contains(id) {
+            if self.rails.children.contains(id) || fresh.contains(id) {
                 continue;
             }
             let summary = self.session_metadata(*id, cx).summary;
@@ -498,9 +530,20 @@ impl Shell {
     }
 
     pub(super) fn virtual_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.virtual_sidebar_page(None, cx)
+    }
+
+    /// The session list of the live page, or of the neighbouring `page`
+    /// drawing beside it during a swipe.
+    pub(super) fn virtual_sidebar_page(
+        &mut self,
+        page: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let live = page.is_none();
         div()
             .id("sidebar-scroll")
-            .debug_selector(|| "sidebar-sessions".into())
+            .when(live, |d| d.debug_selector(|| "sidebar-sessions".into()))
             .relative()
             .flex_1()
             .min_h_0()
@@ -515,7 +558,9 @@ impl Shell {
             .child(
                 list(
                     self.sidebar_list.state.clone(),
-                    cx.processor(|this, ix, _, cx| this.sidebar_list_row(ix, cx)),
+                    cx.processor(move |this, ix, _, cx| {
+                        this.sidebar_page_row(page.as_deref(), ix, cx)
+                    }),
                 )
                 .size_full(),
             )
@@ -526,7 +571,7 @@ impl Shell {
                 !self.workspace.boxy_layout(),
                 false,
             ))
-            .children(self.archive_burst_overlay())
+            .when(live, |d| d.children(self.archive_burst_overlay()))
             .into_any()
     }
 
@@ -595,7 +640,7 @@ impl Shell {
         )
     }
 
-    fn sidebar_list_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn sidebar_list_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let exiting = match self.sidebar_list.rows.get(ix) {
             Some(
                 Row::Session(id)
@@ -737,6 +782,11 @@ impl Shell {
                 .icon("list-bullet")
                 .toggle(self.workspace.compact_session_cards)
                 .into(),
+            MenuAction::new("hide-tab-bar", "Hide tab bar")
+                .icon("panel-top")
+                .toggle(self.workspace.preferences.hide_tab_bar)
+                .disabled(self.workspace.classic_layout)
+                .into(),
         ]
     }
 
@@ -748,10 +798,11 @@ impl Shell {
             "sidebar-monos" => &mut self.workspace.preferences.monos,
             "sidebar-activity" => &mut self.workspace.sidebar_activity_visible,
             "compact-session-cards" => &mut self.workspace.compact_session_cards,
+            "hide-tab-bar" => &mut self.workspace.preferences.hide_tab_bar,
             _ => return,
         };
         *value = !*value;
-        if action == "sidebar-monos" {
+        if action == "sidebar-monos" || action == "hide-tab-bar" {
             self.apply_preferences(cx);
             self.sync_settings(cx);
         }
@@ -994,7 +1045,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use super::age_label;
+    use super::{age_label, shortcut_slots};
     use chrono::TimeZone;
     use gpui::TestAppContext;
 
@@ -1228,6 +1279,17 @@ mod tests {
             .unwrap();
     }
 
+    /// The card folds over wall-clock time, which the test executor does not
+    /// advance: let it run out, then draw once more.
+    fn settle_live_fold(visual: &mut gpui::VisualTestContext, window: gpui::WindowHandle<Shell>) {
+        std::thread::sleep(super::super::rails::OPEN);
+        window
+            .update(visual, |shell, _, cx| shell.notify_sidebar(cx))
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+    }
+
     #[gpui::test]
     fn activity_visibility_switch_preserves_agents_and_survives_restart(cx: &mut TestAppContext) {
         let (window, a, b) = super::super::tests::window(cx);
@@ -1283,6 +1345,36 @@ mod tests {
             visual.simulate_click(options.center(), Default::default());
             visual.run_until_parked();
         }
+        let row: &'static str = format!("live-agent-{a}").leak();
+        let full = visual.debug_bounds("sidebar-activity-card").unwrap();
+        assert!(visual.debug_bounds(row).is_some());
+        let header = visual.debug_bounds("live-agents-header").unwrap();
+        visual.simulate_click(header.center(), Default::default());
+        visual.run_until_parked();
+        settle_live_fold(visual, window);
+        let collapsed = visual.debug_bounds("sidebar-activity-card").unwrap();
+        assert!(collapsed.size.height < full.size.height);
+        assert!(visual.debug_bounds(row).is_none());
+        window
+            .update(visual, |shell, _, _| {
+                let saved = shell.latest_state.lock().unwrap().clone();
+                let restored = Workspace::restore(Some(&saved), &[], "/work/monocode");
+                assert!(restored.sidebar_activity_collapsed);
+                assert!(restored.sidebar_activity_visible);
+            })
+            .unwrap();
+        let header = visual.debug_bounds("live-agents-header").unwrap();
+        visual.simulate_click(header.center(), Default::default());
+        visual.run_until_parked();
+        settle_live_fold(visual, window);
+        assert!(visual.debug_bounds(row).is_some());
+        assert!(
+            !window
+                .update(visual, |shell, _, _| shell
+                    .workspace
+                    .sidebar_activity_collapsed)
+                .unwrap()
+        );
         window
             .update(visual, |shell, _, cx| {
                 shell.workspace.preferences.working_agents = false;
@@ -1611,5 +1703,16 @@ mod tests {
         assert_eq!(age_label(0, now), "Older");
         // A local calendar day remains Yesterday across daylight-saving changes.
         assert_eq!(age_label(ms(25, 0, 1), ms(26, 0, 5)), "Yesterday");
+    }
+
+    #[test]
+    fn shortcut_slots_reach_the_first_eight_rows_and_the_last() {
+        let few = shortcut_slots(&[10, 11, 12]);
+        assert_eq!((few[&10], few[&12]), (0, 2));
+        let many: Vec<i64> = (0..12).collect();
+        let slots = shortcut_slots(&many);
+        assert_eq!(slots.len(), 9);
+        assert_eq!((slots[&7], slots[&11]), (7, 8));
+        assert!(!slots.contains_key(&8));
     }
 }

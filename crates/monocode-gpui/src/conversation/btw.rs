@@ -1,7 +1,7 @@
 //! BtwSheet.tsx's isolated side threads. Their transcript and cancellation never
 //! share the parent provider session, turn queue, or main transcript rows.
-use crate::tooltip::Tip;
 use super::*;
+use crate::tooltip::Tip;
 use crate::transcript::burst::{self as fx, Bubble, Halo};
 use gpui::{
     AnyElement, App, Bounds, Corners, Hsla, Pixels, Point, Render, Window, point, rgb, size,

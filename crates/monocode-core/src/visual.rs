@@ -3,6 +3,8 @@
 //! Programs are JavaScript function bodies that return a synchronous render
 //! function. The only application capability is the frozen `visual` component
 //! API; there is no filesystem, network, shell, DOM, or module loader.
+pub mod data;
+pub mod images;
 mod model;
 pub use model::*;
 
