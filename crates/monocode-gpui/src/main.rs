@@ -317,6 +317,9 @@ fn main() {
             .unwrap_or(std::path::Path::new("."))
             .join("checkpoints"),
     );
+    if let Err(error) = db.sweep_thread_dirs() {
+        eprintln!("Cannot clean up deleted conversations' files: {error}");
+    }
     let saved = db.ui_state().unwrap_or_else(|e| {
         eprintln!("Cannot read workspace settings: {e}");
         None
