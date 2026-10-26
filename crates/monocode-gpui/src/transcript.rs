@@ -16,6 +16,8 @@ pub(crate) mod phases;
 mod provider_switch;
 mod remote_plans;
 pub(crate) mod selection;
+#[cfg(test)]
+mod shots;
 pub(crate) mod tasks;
 mod tools;
 mod user_links;
@@ -43,6 +45,10 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+/// The longest sent message rendered as markdown; larger ones stay plain text.
+const PROSE_BYTES: usize = 8000;
+/// A sent message's parsed markdown blocks.
+type ProseRows = Arc<[Arc<MarkdownRow>]>;
 /// Where a launched session stands, for its card in the chat.
 #[derive(Clone, PartialEq)]
 pub(crate) struct LaunchView {
@@ -516,6 +522,8 @@ pub(crate) struct TranscriptView {
     frame_now: Instant,
     measurements: measurements::Measurements,
     markdown_cache: markdown::RenderCache,
+    /// A sent message's parsed markdown, by message start, for the text it was parsed from.
+    user_prose: HashMap<usize, (SharedString, ProseRows)>,
     messages: Vec<Message>,
     rows: Vec<UiRow>,
     streaming: bool,
@@ -2325,6 +2333,7 @@ impl TranscriptView {
             frame_now: Instant::now(),
             measurements: Default::default(),
             markdown_cache: Default::default(),
+            user_prose: HashMap::new(),
             messages: Vec::new(),
             rows: Vec::new(),
             streaming: false,
@@ -3419,6 +3428,19 @@ impl TranscriptView {
                         parse_user_message_link(text).map(|link| (chunk, Arc::new(link)))
                     });
                 }
+                // Markdown spans chunks (a fence can straddle two), so a
+                // message that uses it is rendered whole. A link preview
+                // keeps its chunks.
+                let text_rows = if role == "user" && user_link.is_none() {
+                    let joined = text_rows.concat();
+                    if joined.len() <= PROSE_BYTES && markdown::looks_like_markdown(&joined) {
+                        vec![joined]
+                    } else {
+                        text_rows
+                    }
+                } else {
+                    text_rows
+                };
                 // `line-clamp-4`: a collapsed message shows its first lines only.
                 // A message with a link preview is never clamped, as in React.
                 let clamped = role == "user"
@@ -4141,6 +4163,74 @@ impl TranscriptView {
             });
         })
         .detach();
+    }
+    /// A sent message's markdown rows, parsed once per text.
+    fn user_prose_rows(&mut self, message_start: usize, text: &SharedString) -> Option<ProseRows> {
+        if text.len() > PROSE_BYTES || !markdown::looks_like_markdown(text) {
+            return None;
+        }
+        if let Some((parsed, rows)) = self.user_prose.get(&message_start)
+            && parsed == text
+        {
+            return Some(rows.clone());
+        }
+        let mut parser = MarkdownParser::new();
+        parser.set_text(text);
+        parser.finish_display();
+        let mut words = 0;
+        let rows: ProseRows = parser
+            .tree()
+            .blocks
+            .iter()
+            .flat_map(|block| markdown::rows(&block.block))
+            .map(|mut row| {
+                row.word_start = words;
+                words += markdown::word_count(&row);
+                Arc::new(row)
+            })
+            .collect();
+        self.user_prose
+            .insert(message_start, (text.clone(), rows.clone()));
+        Some(rows)
+    }
+    /// One block of a sent message, drawn as an assistant's would be.
+    fn user_prose_row(
+        &mut self,
+        md: &Arc<MarkdownRow>,
+        ix: usize,
+        first: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let body = if let Part::Code { fence, lines } = &md.part {
+            self.code(fence.clone(), lines.clone(), ix, cx)
+        } else {
+            markdown::body(
+                md,
+                format!("user-md-{ix}").into(),
+                markdown::Tone::Normal,
+                None,
+                self.frame_now,
+            )
+        };
+        div()
+            .w_full()
+            .flex()
+            .pt(px(if first { 0. } else { md.gap }))
+            .pl(px(md.indent.saturating_sub(1) as f32 * 24.))
+            .when(md.quote > 0, |d| {
+                d.ml(px(4.)).pl_4().border_l_4().border_color(content(0.2))
+            })
+            .when(md.indent > 0, |d| {
+                d.child(
+                    div()
+                        .w(px(24.))
+                        .flex_shrink_0()
+                        .text_color(content(0.78))
+                        .child(md.marker.clone().unwrap_or_default()),
+                )
+            })
+            .child(body)
+            .into_any_element()
     }
     fn code(
         &mut self,
@@ -4900,6 +4990,12 @@ impl TranscriptView {
                     .map(|(_, link)| link.clone());
                 let collapsed = !self.expanded_prompts.contains(&message_start);
                 let clamp = user && first && collapsed && message_link.is_none();
+                let prose = (user && message_link.is_none())
+                    .then(|| self.user_prose_rows(message_start, &text))
+                    .flatten();
+                let has_prose = prose.is_some();
+                // A collapsed message shows its first four blocks, whole.
+                let hidden_blocks = clamp && prose.as_ref().is_some_and(|rows| rows.len() > 4);
                 // `overflows`: hidden chunks, or more than four wrapped lines.
                 // React never clamps a message that shows a link preview.
                 let overflows = user
@@ -4907,7 +5003,16 @@ impl TranscriptView {
                     && last
                     && (!first
                         || self.clamped_prompts.contains(&message_start)
+                        || hidden_blocks
                         || self.prompt_lines(&text, window) > 4);
+                let shown_blocks = if clamp { 4 } else { usize::MAX };
+                let prose = prose.map(|rows| {
+                    rows.iter()
+                        .take(shown_blocks)
+                        .enumerate()
+                        .map(|(block, md)| self.user_prose_row(md, ix, block == 0, cx))
+                        .collect::<Vec<_>>()
+                });
                 div()
                     .w_full()
                     .relative()
@@ -4981,28 +5086,34 @@ impl TranscriptView {
                         .when(link.is_none(), |d| {
                             d.child(
                                 div()
-                                    .when(clamp, |d| d.line_clamp(4).text_ellipsis())
-                                    .child({
-                                        let styled = gpui::StyledText::new(text.clone())
-                                            .with_highlights(markdown::mark_styles(
-                                                &text,
-                                                vec![],
-                                                self.search_match
-                                                    .as_ref()
-                                                    .map_or("", |(_, q)| q.as_str()),
-                                                self.search_match.as_ref().is_some_and(
-                                                    |(start, _)| *start == message_start,
-                                                ),
-                                            ));
-                                        let layout = styled.layout().clone();
-                                        let child = styled.into_any_element();
-                                        if let Some(selection) =
-                                            self.text_selection(row.key, message_start, false, cx)
-                                        {
-                                            selection.wrap(text.clone(), layout, child)
-                                        } else {
-                                            child
-                                        }
+                                    .when(clamp && !has_prose, |d| d.line_clamp(4).text_ellipsis())
+                                    .when_some(prose, |d, rows| d.flex().flex_col().children(rows))
+                                    .when(!has_prose, |d| {
+                                        d.child({
+                                            let styled = gpui::StyledText::new(text.clone())
+                                                .with_highlights(markdown::mark_styles(
+                                                    &text,
+                                                    vec![],
+                                                    self.search_match
+                                                        .as_ref()
+                                                        .map_or("", |(_, q)| q.as_str()),
+                                                    self.search_match.as_ref().is_some_and(
+                                                        |(start, _)| *start == message_start,
+                                                    ),
+                                                ));
+                                            let layout = styled.layout().clone();
+                                            let child = styled.into_any_element();
+                                            if let Some(selection) = self.text_selection(
+                                                row.key,
+                                                message_start,
+                                                false,
+                                                cx,
+                                            ) {
+                                                selection.wrap(text.clone(), layout, child)
+                                            } else {
+                                                child
+                                            }
+                                        })
                                     }),
                             )
                         })
