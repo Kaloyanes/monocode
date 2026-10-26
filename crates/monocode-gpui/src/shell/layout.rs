@@ -267,9 +267,9 @@ impl Shell {
                 .relative()
                 .when(sidebar_width > 0., |d| {
                     d.child(
-                        // Keep the sidebar still beneath the moving card. Clip
-                        // its covered part so text cannot bleed through the
-                        // translucent workspace or receive covered clicks.
+                        // The full-width sidebar travels with the card's edge,
+                        // like the right panel. Clip its hidden part so text
+                        // cannot bleed through the translucent workspace.
                         div()
                             .id("sidebar-frame")
                             .debug_selector(|| "sidebar-frame".into())
@@ -283,11 +283,10 @@ impl Shell {
                             .child(
                                 div()
                                     .absolute()
-                                    .left_0()
+                                    .left(px(sidebar_width - self.workspace.sidebar_width))
                                     .top_0()
                                     .w(px(self.workspace.sidebar_width))
                                     .h_full()
-                                    .opacity(self.sidebar_fraction)
                                     .child(self.sidebar_contents()),
                             ),
                     )
@@ -401,16 +400,16 @@ impl Shell {
                         })
                         .when(original, |d| d.bg(pane_fill()))
                         .child(
-                            // Full width while it slides; the frame clips it.
+                            // Full width while it slides with the frame's edge,
+                            // which clips it.
                             div()
                                 .absolute()
-                                .left_0()
+                                .left(px(sidebar_width - self.workspace.sidebar_width))
                                 .top_0()
                                 .w(px(self.workspace.sidebar_width))
                                 .h_full()
                                 .flex()
                                 .flex_col()
-                                .opacity(self.sidebar_fraction)
                                 .when(!original, |d| {
                                     d.child(
                                         // The traffic lights head the sidebar, where

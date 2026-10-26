@@ -29,18 +29,16 @@ pub(crate) struct ArchiveExits {
 
 impl ArchiveExits {
     /// Still drawn by the list, so it can slide and fold instead of vanishing.
+    /// Held until the tick drops it, so a frame drawn after the fold but before
+    /// the list is rebuilt keeps the row collapsed instead of showing it again.
     pub(super) fn listed(&self, id: i64) -> bool {
-        self.exits
-            .get(&id)
-            .is_some_and(|exit| exit.start.elapsed() < ROW)
+        self.exits.get(&id).is_some_and(|exit| !exit.dropped)
     }
 
     /// How far the row has slid and how far its height has folded, 0 to 1.
     fn row(&self, id: i64) -> Option<(f32, f32)> {
-        let elapsed = self.exits.get(&id)?.start.elapsed();
-        if elapsed >= ROW {
-            return None;
-        }
+        let exit = self.exits.get(&id).filter(|exit| !exit.dropped)?;
+        let elapsed = exit.start.elapsed().min(ROW);
         let slide = (elapsed.as_secs_f32() / SLIDE.as_secs_f32()).min(1.);
         let fold = (elapsed.saturating_sub(COLLAPSE_AT).as_secs_f32()
             / (ROW - COLLAPSE_AT).as_secs_f32())
@@ -86,9 +84,9 @@ fn particles(id: i64, origin: Point<Pixels>, elapsed: Duration) -> Vec<Particle>
             let angle = std::f32::consts::PI * (0.55 + 0.9 * jitter(id, k, 1));
             let reach = 26. + 34. * jitter(id, k, 2);
             let fall = 18. * t * t * (0.6 + jitter(id, k, 3));
-            let mut color: Hsla = rgb(PALETTE[(jitter(id, k, 4) * PALETTE.len() as f32) as usize
-                % PALETTE.len()])
-            .into();
+            let mut color: Hsla =
+                rgb(PALETTE[(jitter(id, k, 4) * PALETTE.len() as f32) as usize % PALETTE.len()])
+                    .into();
             color.a = fade;
             Particle {
                 center: point(
@@ -242,7 +240,13 @@ mod tests {
         assert!(early.0 > 0. && early.1 == 0.);
         let late = exit_at(Duration::from_millis(250)).row(7).unwrap();
         assert!(late.0 >= 0.99 && late.1 > 0.5);
-        let done = exit_at(ROW + Duration::from_millis(5));
+        // Between the end of the fold and the tick that drops the row, it
+        // stays listed and fully collapsed rather than snapping back.
+        let held = exit_at(ROW + Duration::from_millis(5));
+        assert!(held.listed(7));
+        assert_eq!(held.row(7), Some((1., 1.)));
+        let mut done = held;
+        done.exits.get_mut(&7).unwrap().dropped = true;
         assert!(!done.listed(7) && done.row(7).is_none());
         assert!(!exit_at(Duration::ZERO).listed(8));
     }
@@ -255,10 +259,6 @@ mod tests {
         assert_eq!(a.len(), PARTICLES);
         assert!(a.iter().zip(&b).all(|(x, y)| x.center == y.center));
         assert!(a.iter().all(|p| p.color.a > 0.));
-        assert!(
-            particles(7, origin, BURST)
-                .iter()
-                .all(|p| p.color.a < 0.01)
-        );
+        assert!(particles(7, origin, BURST).iter().all(|p| p.color.a < 0.01));
     }
 }

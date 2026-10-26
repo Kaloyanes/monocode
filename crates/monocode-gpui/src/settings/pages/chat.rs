@@ -1,6 +1,6 @@
 //! ChatPage.
-use crate::settings::SettingsView;
-use gpui::{AnyElement, Context};
+use crate::settings::{ModelChoice, Preferences, SettingsView};
+use gpui::{AnyElement, Context, SharedString};
 
 impl SettingsView {
     pub(super) fn chat_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -93,6 +93,64 @@ impl SettingsView {
                 )],
             ),
         ];
+        let generated = vec![
+            self.row(
+                Some("text-model"),
+                true,
+                "Text generation model",
+                Some("Write commit messages, pull request text and session titles with this model instead of the default.".into()),
+                vec![self.text_model_select(
+                    "text-model",
+                    "Text generation model",
+                    &p.text_model,
+                    "Default",
+                    cx,
+                    |p, choice| p.text_model = choice,
+                )],
+            ),
+            self.row(
+                Some("commit-model"),
+                false,
+                "Commit messages",
+                Some("Use a different model for commit messages.".into()),
+                vec![self.text_model_select(
+                    "commit-model",
+                    "Commit message model",
+                    &p.commit_model,
+                    "Same as above",
+                    cx,
+                    |p, choice| p.commit_model = choice,
+                )],
+            ),
+            self.row(
+                Some("pr-model"),
+                false,
+                "Pull requests",
+                Some("Use a different model for pull request titles and descriptions.".into()),
+                vec![self.text_model_select(
+                    "pr-model",
+                    "Pull request model",
+                    &p.pr_model,
+                    "Same as above",
+                    cx,
+                    |p, choice| p.pr_model = choice,
+                )],
+            ),
+            self.row(
+                Some("title-model"),
+                false,
+                "Session titles",
+                Some("Use a different model for naming sessions.".into()),
+                vec![self.text_model_select(
+                    "title-model",
+                    "Session title model",
+                    &p.title_model,
+                    "Same as above",
+                    cx,
+                    |p, choice| p.title_model = choice,
+                )],
+            ),
+        ];
         let editor = vec![self.row(
             Some("format-on-save"),
             true,
@@ -154,9 +212,78 @@ impl SettingsView {
         vec![
             self.group(None, true, "Transcript", None, None, transcript),
             self.group(None, false, "Composer", None, None, composer),
+            self.group(None, false, "Generated text", None, None, generated),
             self.group(None, false, "Editor", None, None, editor),
             self.group(None, false, "Code review", None, None, review),
             self.group(None, false, "Extras", None, None, extras),
         ]
+    }
+}
+
+impl SettingsView {
+    /// A select over every provider's models, with `none` for no choice.
+    fn text_model_select(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        current: &Option<ModelChoice>,
+        none: &'static str,
+        cx: &mut Context<Self>,
+        set: fn(&mut Preferences, Option<ModelChoice>),
+    ) -> AnyElement {
+        let value = current
+            .as_ref()
+            .map(|c| format!("{}:{}", c.provider, c.model.as_deref().unwrap_or_default()))
+            .unwrap_or_default();
+        let mut options: Vec<(String, SharedString, Option<AnyElement>)> =
+            vec![(String::new(), none.into(), None)];
+        // The model picker's own rules: installed CLIs, and the providers and
+        // models the Providers page leaves visible.
+        for kind in monocode_core::provider::Kind::ALL {
+            let installed = self
+                .discovery
+                .binaries
+                .iter()
+                .any(|(k, path)| *k == kind && path.is_some());
+            if !installed || self.prefs.hidden_providers.iter().any(|id| id == kind.id()) {
+                continue;
+            }
+            let models = self
+                .ctx
+                .catalogs
+                .get(kind.id())
+                .filter(|models| !models.is_empty())
+                .or_else(|| self.model_catalogs.get(&kind));
+            for (model, name) in models.into_iter().flatten() {
+                let hidden = self
+                    .prefs
+                    .hidden_models
+                    .iter()
+                    .any(|c| c.provider == kind.id() && c.model.as_deref() == Some(model));
+                if hidden {
+                    continue;
+                }
+                options.push((
+                    format!("{}:{model}", kind.id()),
+                    format!("{} · {name}", kind.label()).into(),
+                    None,
+                ));
+            }
+        }
+        self.select(
+            id,
+            label,
+            &value,
+            options,
+            Some(240.),
+            cx,
+            move |this, v, cx| {
+                let choice = v.split_once(':').map(|(provider, model)| ModelChoice {
+                    provider: provider.into(),
+                    model: (!model.is_empty()).then(|| model.into()),
+                });
+                this.update(cx, |p| set(p, choice))
+            },
+        )
     }
 }

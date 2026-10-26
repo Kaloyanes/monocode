@@ -194,7 +194,7 @@ fn hunk_range(lines: &[Line]) -> String {
         new.len()
     )
 }
-fn expand_tabs(text: &str) -> Cow<'_, str> {
+pub(crate) fn expand_tabs(text: &str) -> Cow<'_, str> {
     if !text.contains('\t') {
         return Cow::Borrowed(text);
     }
@@ -217,7 +217,7 @@ type Tokens = Arc<Vec<Vec<Vec<HighlightSpan>>>>;
 
 /// highlightDiffFile: the old and new sides as two documents, mapped back
 /// to their lines. Indexed by block, then line.
-fn highlight_file(path: &str, blocks: &[Block]) -> Option<Vec<Vec<Vec<HighlightSpan>>>> {
+pub(crate) fn highlight_file(path: &str, blocks: &[Block]) -> Option<Vec<Vec<Vec<HighlightSpan>>>> {
     let mut old: Vec<(usize, usize, String)> = Vec::new();
     let mut new: Vec<(usize, usize, String)> = Vec::new();
     let (mut old_chars, mut new_chars) = (0, 0);

@@ -2,7 +2,7 @@
 //! folders and deletion, and the grouped list they shape.
 use super::*;
 use chrono::{Local, NaiveDateTime, TimeZone};
-use gpui::EventEmitter;
+use gpui::{ClickEvent, EventEmitter};
 use monocode_core::{
     session_groups::{
         Entry, Groups, build_list, format_reminder, navigation_ids, parse_github_work_item,
@@ -333,12 +333,21 @@ impl Shell {
             .iter()
             .map(|r| (r.session_id, r.due_at))
             .collect();
-        build_list(
-            ids,
-            |id| self.session_metadata(id, cx).summary.pinned,
-            &self.project_groups(),
-            &reminders,
-        )
+        // Chats without messages lead the list, above pins and folders.
+        let (fresh, rest): (Vec<i64>, Vec<i64>) = ids
+            .iter()
+            .copied()
+            .partition(|id| self.is_fresh_session(*id, cx));
+        fresh
+            .into_iter()
+            .map(Entry::Session)
+            .chain(build_list(
+                &rest,
+                |id| self.session_metadata(id, cx).summary.pinned,
+                &self.project_groups(),
+                &reminders,
+            ))
+            .collect()
     }
     /// The sessions in the order the sidebar shows them, for stepping.
     pub(super) fn sidebar_navigation_ids(&self, cx: &App) -> Vec<i64> {
@@ -441,6 +450,14 @@ impl Shell {
         }
         items.push(MenuAction::new("pin", if all_pinned { "Unpin" } else { "Pin" }).into());
         if !multiple {
+            // The sidebar is the only place left to close a hidden tab.
+            if self.is_open_without_strip(id) {
+                items.push(
+                    MenuAction::new("close-tab", "Close tab")
+                        .disabled(!self.tab_can_close(id, cx))
+                        .into(),
+                );
+            }
             items.extend([
                 MenuAction::new("rename", "Rename").shortcut("F2").into(),
                 MenuAction::new("copy-session-id", "Copy session ID")
@@ -536,6 +553,7 @@ impl Shell {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }
+            "close-tab" => self.close(id, window, cx),
             "pin" => {
                 let pinned = !ids
                     .iter()
@@ -822,6 +840,7 @@ impl Shell {
         self.sessions.remove(&id);
         self.session_summaries.remove(&id);
         self.draft_sessions.remove(&id);
+        self.usage_limits.remove(&id);
         self.history_recency.remove(&id);
         self.session_marks.remove(&id);
         self.tab_marks.remove(&id);
@@ -1071,8 +1090,9 @@ impl Shell {
         )
     }
 
-    /// SessionCard's linked issue or PR, opened on GitHub. Hover underlines
-    /// it as a link; with no number shown, the line runs under the icon.
+    /// SessionCard's linked issue or PR, shown in the Inbox when it can be and
+    /// otherwise opened in the browser. Hover underlines it as a link; with no
+    /// number shown, the line runs under the icon.
     pub(super) fn work_item_badge(
         &self,
         id: i64,
@@ -1082,11 +1102,16 @@ impl Shell {
         let item = self.session_metadata(id, cx).summary.work_item.clone()?;
         let noun = if item.kind == "pr" { "PR" } else { "issue" };
         let url = item.url.clone();
+        let reference = if item.kind == "linear" && !item.repo.is_empty() {
+            format!("{}-{}", item.repo, item.number)
+        } else {
+            format!("#{}", item.number)
+        };
         Some(
             div()
                 .id(("work-item", id as usize))
                 .role(Role::Link)
-                .aria_label(format!("Open {noun} #{}", item.number))
+                .aria_label(format!("Open {noun} {reference}"))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
@@ -1106,7 +1131,7 @@ impl Shell {
                     )
                     .text_color(rgb(ACCENT)),
                 )
-                .when(!compact, |d| d.child(format!("#{}", item.number)))
+                .when(!compact, |d| d.child(reference))
                 .cursor_pointer()
                 .when(compact, |d| {
                     d.border_b_1()
@@ -1123,10 +1148,14 @@ impl Shell {
                         cx.open_url(&url);
                     }
                 })
-                .on_click(move |_, _, cx| {
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     cx.stop_propagation();
-                    cx.open_url(&url);
-                })
+                    if event.modifiers().secondary() {
+                        cx.open_url(&url);
+                    } else {
+                        this.open_work_link(&url, window, cx);
+                    }
+                }))
                 .into_any(),
         )
     }

@@ -85,6 +85,8 @@ pub(crate) fn visuals() -> Transcript {
         ),
     ] {
         let document = monocode_core::visual::VisualDocument {
+            format: Default::default(),
+            height: None,
             id: id.into(),
             title: title.into(),
             source: source.into(),

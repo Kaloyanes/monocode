@@ -108,6 +108,7 @@ impl AssetSource for Assets {
    "loader"=>include_bytes!("../assets/hugeicons/loader.svg"),
    "refresh-cw"=>include_bytes!("../assets/hugeicons/refresh-cw.svg"),
    "eye"=>include_bytes!("../assets/hugeicons/eye.svg"),
+   "eye-off"=>include_bytes!("../assets/hugeicons/eye-off.svg"),
    "chevron-down-2"=>include_bytes!("../assets/hugeicons/chevron-down-2.svg"),
    "wand"=>include_bytes!("../assets/hugeicons/wand.svg"),
    "x"=>include_bytes!("../assets/hugeicons/x.svg"),

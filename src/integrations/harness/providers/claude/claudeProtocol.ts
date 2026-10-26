@@ -1143,6 +1143,19 @@ function contextUsedFromUsage(usage: Record<string, unknown> | null): number {
 }
 
 /** Aggregate token accounting for the completed Claude turn. */
+/**
+ * Lifetime of the cache entry a turn wrote. A turn that only reads the cache
+ * writes neither tier, so it reports nothing and the caller keeps the last
+ * known lifetime. The longer tier wins when a turn wrote both.
+ */
+function cacheTtlFromUsage(usage: Record<string, unknown>): number | undefined {
+  const creation = asRecord(usage.cache_creation);
+  if (!creation) return undefined;
+  if (numberField(creation, "ephemeral_1h_input_tokens") > 0) return 3_600_000;
+  if (numberField(creation, "ephemeral_5m_input_tokens") > 0) return 300_000;
+  return undefined;
+}
+
 export function turnMetricsFromResult(
   rec: Record<string, unknown>,
 ): TurnMetrics | undefined {
@@ -1156,8 +1169,16 @@ export function turnMetricsFromResult(
     "cache_read_input_tokens" in usage ||
     "cache_creation_input_tokens" in usage;
   const cacheableInput = inputTokens + cacheReadTokens + cacheWriteTokens;
+  const totalCost = rec.total_cost_usd;
+  const totalCostUsd =
+    typeof totalCost === "number" && Number.isFinite(totalCost) && totalCost >= 0
+      ? totalCost
+      : undefined;
+  const cacheTtlMs = cacheTtlFromUsage(usage);
   if (!inputTokens && !outputTokens && !cacheableInput) return undefined;
   return {
+    ...(totalCostUsd != null ? { totalCostUsd } : {}),
+    ...(cacheTtlMs ? { cacheTtlMs } : {}),
     ...(inputTokens ? { inputTokens } : {}),
     ...(outputTokens ? { outputTokens } : {}),
     ...(cacheReadTokens ? { cacheReadTokens } : {}),

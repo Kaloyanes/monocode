@@ -151,6 +151,20 @@ impl SettingsView {
             )],
         ));
         workspace.push(self.row(
+            Some("hide-tab-bar"),
+            false,
+            "Hide tab bar",
+            Some("Use the sidebar to switch sessions. ⌘1–9 and tab shortcuts follow the sidebar's order, and new sessions appear at its top.".into()),
+            vec![self.toggle(
+                "hide-tab-bar",
+                "Hide tab bar",
+                p.hide_tab_bar,
+                false,
+                cx,
+                |this, on, cx| this.update(cx, |p| p.hide_tab_bar = on),
+            )],
+        ));
+        workspace.push(self.row(
             Some("terminal-in-panel"),
             false,
             "Terminal in side panel",

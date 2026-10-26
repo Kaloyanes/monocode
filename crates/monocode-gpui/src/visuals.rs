@@ -1,13 +1,13 @@
 //! Session visuals are a bounded native component tree, with no browser surface.
 use crate::theme::{accent_color, content};
 use gpui::{
-    AnyElement, Bounds, ClipboardItem, Context, Div, EventEmitter, FontWeight, Hsla, IntoElement,
-    MouseButton, PathBuilder, Pixels, Point, Render, Role, SharedString, Stateful, Window, canvas,
-    div, fill, point, prelude::*, px, relative, size,
+    AnimationExt, AnyElement, Bounds, ClipboardItem, Context, Div, EventEmitter, FontWeight, Hsla,
+    IntoElement, MouseButton, PathBuilder, Pixels, Point, Render, Role, SharedString, Stateful,
+    Window, canvas, div, fill, point, prelude::*, px, relative, size,
 };
 use monocode_core::visual::{
-    Camera, ChartKind, Node, SceneObject, Series, Shape, TextSize, ThemeColor, VisualDocument,
-    VisualRuntime,
+    Camera, ChartKind, DEFAULT_HTML_HEIGHT, Node, SceneObject, Series, Shape, TextSize, ThemeColor,
+    VisualDocument, VisualFormat, VisualRuntime,
 };
 use serde_json::{Value, json};
 use std::{
@@ -16,6 +16,7 @@ use std::{
     rc::Rc,
 };
 
+mod blocks;
 mod scene;
 mod source;
 #[cfg(test)]
@@ -39,6 +40,9 @@ pub(crate) struct VisualView {
     active: HashSet<String>,
     revision: u64,
     scene_cache: HashMap<String, Rc<RefCell<Option<SceneCache>>>>,
+    /// The isolated page for an HTML visual; created on the first render.
+    html: Option<gpui::Entity<crate::monos::html::Html>>,
+    _page_changes: Option<gpui::Subscription>,
 }
 impl EventEmitter<VisualChanged> for VisualView {}
 struct SliderDrag {
@@ -165,6 +169,48 @@ fn action_button(
         )
 }
 
+/// The range a page's own height is held to.
+const FITTED_HTML_HEIGHT: (f32, f32) = (80., 900.);
+
+/// The published height holds the place until the page reports its own; then
+/// the frame fits the content.
+fn html_frame_height(published: Option<u32>, page: crate::monos::html::Page) -> f32 {
+    page.height
+        .map_or(published.unwrap_or(DEFAULT_HTML_HEIGHT) as f32, |height| {
+            height.clamp(FITTED_HTML_HEIGHT.0, FITTED_HTML_HEIGHT.1)
+        })
+}
+
+/// Pulsing bars where a page will appear, painted under its transparent web
+/// view until it loads.
+fn html_placeholder(height: f32) -> impl IntoElement {
+    let rows = ((height - 24.) / 44.).floor().clamp(1., 8.) as usize;
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .flex_col()
+        .gap(px(14.))
+        .py_2()
+        .children((0..rows).map(|row| {
+            let width = [0.92, 0.7, 0.84, 0.58][row % 4];
+            div()
+                .h(px(if row == 0 { 30. } else { 18. }))
+                .w(gpui::relative(width))
+                .rounded_md()
+                .bg(content(0.06))
+        }))
+        .with_animation(
+            "visual-html-placeholder",
+            gpui::Animation::new(std::time::Duration::from_millis(1400))
+                .repeat()
+                .with_easing(gpui::pulsating_between(0.45, 1.)),
+            |d, t| d.opacity(t),
+        )
+}
+
 struct ActionTooltip(&'static str);
 impl Render for ActionTooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -205,6 +251,8 @@ impl VisualView {
             active: HashSet::new(),
             revision: 0,
             scene_cache: HashMap::new(),
+            html: None,
+            _page_changes: None,
         };
         this.initialize();
         this
@@ -214,6 +262,12 @@ impl VisualView {
         self.error = None;
         self.tree = None;
         self.runtime = None;
+        self.html = None;
+        self._page_changes = None;
+        if self.document.format == VisualFormat::Html {
+            self.error = self.document.validate().err();
+            return;
+        }
         match self
             .document
             .validate()
@@ -782,6 +836,26 @@ impl VisualView {
                 labels,
                 height,
             } => chart(*chart_type, series.clone(), labels.clone(), *height),
+            Node::Code {
+                code,
+                language,
+                title,
+            } => blocks::code(&key, code, language.as_deref(), title.as_deref()),
+            Node::Diff {
+                before,
+                after,
+                path,
+                title,
+                context,
+            } => blocks::diff(
+                &key,
+                before,
+                after,
+                path.as_deref(),
+                title.as_deref(),
+                *context,
+            ),
+            Node::Callout { text, title, color } => blocks::callout(text, title.as_deref(), color),
             Node::Canvas {
                 width,
                 height,
@@ -980,12 +1054,46 @@ impl Render for VisualView {
         let width = self.width.clone();
         let entity = cx.entity().downgrade();
         self.active.clear();
+        let is_html = self.document.format == VisualFormat::Html;
+        if is_html && (self.show_source || self.error.is_some()) {
+            // A native view keeps its last position until it is moved.
+            if let Some(html) = &self.html {
+                html.read(cx).hide();
+            }
+        }
         let body = if self.show_source {
             self.source
                 .get_or_insert_with(|| {
                     cx.new(|cx| source::SourceView::new(self.document.source.clone(), cx))
                 })
                 .clone()
+                .into_any_element()
+        } else if is_html && self.error.is_none() {
+            if self.html.is_none() {
+                let body = self.document.source.clone();
+                let page = cx.new(|cx| crate::monos::html::Html::isolated(body, cx));
+                // Loading and new heights change the row's measured size.
+                self._page_changes = Some(
+                    cx.subscribe(&page, |this, _, _: &crate::monos::html::PageChanged, cx| {
+                        this.changed(cx)
+                    }),
+                );
+                self.html = Some(page);
+            }
+            let page = self.html.clone().unwrap();
+            let state = page.read(cx).page();
+            // The published height holds the place until the page reports
+            // its own; then the frame fits the content.
+            let height = html_frame_height(self.document.height, state);
+            div()
+                .id("visual-html")
+                .debug_selector(|| "visual-html".into())
+                .relative()
+                .w_full()
+                .h(px(height))
+                .overflow_hidden()
+                .when(!state.loaded, |d| d.child(html_placeholder(height)))
+                .child(page)
                 .into_any_element()
         } else if let Some(tree) = tree {
             self.node(&tree, "root".into(), cx)
@@ -1038,6 +1146,26 @@ impl Render for VisualView {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
+                    .when(is_html && !self.show_source && self.error.is_none(), |d| {
+                        let open = crate::visual_expand::Open {
+                            title: self.document.title.clone().into(),
+                            body: self.document.source.as_str().into(),
+                        };
+                        let keyboard = open.clone();
+                        d.child(
+                            action_button("visual-expand", "Expand", "maximize-2", false)
+                                .debug_selector(|| "visual-expand".into())
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(Box::new(open.clone()), cx)
+                                })
+                                .on_key_down(move |event, window, cx| {
+                                    if activated(event) {
+                                        window.dispatch_action(Box::new(keyboard.clone()), cx);
+                                        cx.stop_propagation();
+                                    }
+                                }),
+                        )
+                    })
                     .child(
                         action_button(
                             "visual-source",

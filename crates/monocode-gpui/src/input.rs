@@ -13,6 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 mod code;
 mod command;
+mod markdown;
 mod spelling;
 pub(crate) use command::{Command, CommandRemoved};
 
@@ -72,6 +73,8 @@ actions!(
     ]
 );
 pub struct Submitted;
+/// Enter on a composer draft that opens with `!`.
+pub struct ShellSubmitted;
 pub struct Changed;
 pub(crate) enum CodeAction {
     Stage(usize),
@@ -93,6 +96,8 @@ pub fn bind(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some("Composer")),
         KeyBinding::new("delete", Delete, Some("Composer")),
+        KeyBinding::new("shift-backspace", Backspace, Some("Composer")),
+        KeyBinding::new("shift-delete", Delete, Some("Composer")),
         KeyBinding::new("left", Left, Some("Composer")),
         KeyBinding::new("right", Right, Some("Composer")),
         KeyBinding::new("shift-left", SelectLeft, Some("Composer")),
@@ -191,6 +196,16 @@ pub fn bind(cx: &mut App) {
             DeleteWordRight,
             Some("Composer"),
         ),
+        KeyBinding::new(
+            &format!("{word_modifier}-shift-backspace"),
+            DeleteWordLeft,
+            Some("Composer"),
+        ),
+        KeyBinding::new(
+            &format!("{word_modifier}-shift-delete"),
+            DeleteWordRight,
+            Some("Composer"),
+        ),
     ]);
 }
 
@@ -218,6 +233,10 @@ pub struct Input {
     marked: Option<Range<usize>>,
     composer_tokens: Vec<Range<usize>>,
     inline_commands: bool,
+    /// `!command` drafts submit as `ShellSubmitted`; only a thread's composer runs them.
+    shell_commands: bool,
+    /// Draw markdown syntax (headings, emphasis, code) styled while typing.
+    markdown: bool,
     selected_command: Option<Command>,
     lines: Vec<WrappedLine>,
     bounds: Option<Bounds<Pixels>>,
@@ -231,6 +250,7 @@ pub struct Input {
     autoscroll: Option<gpui::Task<()>>,
 }
 impl EventEmitter<Submitted> for Input {}
+impl EventEmitter<ShellSubmitted> for Input {}
 impl EventEmitter<Changed> for Input {}
 impl EventEmitter<Rejected> for Input {}
 impl EventEmitter<CodeAction> for Input {}
@@ -268,6 +288,8 @@ impl Input {
             marked: None,
             composer_tokens: Vec::new(),
             inline_commands: false,
+            shell_commands: false,
+            markdown: false,
             selected_command: None,
             lines: Vec::new(),
             bounds: None,
@@ -406,6 +428,7 @@ impl Input {
     pub(crate) fn markdown_editor(label: &str, cx: &mut Context<Self>) -> Self {
         let mut input = Self::commit_message(cx);
         input.label = label.to_string().into();
+        input.markdown = true;
         input.min_height = 120.;
         input.max_height = 2000.;
         input.height = 120.;
@@ -421,6 +444,24 @@ impl Input {
             self.placeholder = text;
             cx.notify();
         }
+    }
+    /// Markdown spans mapped into the displayed text (after any command prefix).
+    fn markdown_display_spans(&self, command: Option<command::CommandLayout>) -> markdown::Spans {
+        if !self.markdown
+            || self.secret
+            || self.single_line
+            || self.code.is_some()
+            || self.shell_mode()
+        {
+            return Vec::new();
+        }
+        markdown::spans(&self.content)
+            .into_iter()
+            .map(|(range, style)| {
+                let map = |at| command.map_or(at, |command| command.to_display(at));
+                (map(range.start)..map(range.end), style)
+            })
+            .collect()
     }
     pub(crate) fn set_read_only(&mut self, value: bool) {
         self.read_only = value;
@@ -977,8 +1018,29 @@ impl Input {
     }
     fn newline(&mut self, _: &Newline, w: &mut Window, cx: &mut Context<Self>) {
         if !self.single_line {
-            self.replace_text_in_range(None, "\n", w, cx);
+            self.insert_newline(w, cx);
         }
+    }
+    /// Enter in a markdown list continues it (`1.` → `2.`); Enter on an empty item ends it.
+    fn insert_newline(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let at = self.selection.start;
+        if self.selection.is_empty()
+            && self.code.is_none()
+            && !self.secret
+            && self.marked.is_none()
+            && !self.shell_mode()
+            && let Some(step) = list_step(&self.content, at)
+        {
+            match step {
+                ListStep::Continue(text) => self.replace_text_in_range(None, &text, w, cx),
+                ListStep::End(start) => {
+                    self.selection = start..at;
+                    self.replace_text_in_range(None, "", w, cx);
+                }
+            }
+            return;
+        }
+        self.replace_text_in_range(None, "\n", w, cx);
     }
     fn submit(&mut self, _: &Submit, w: &mut Window, cx: &mut Context<Self>) {
         if self.accept_completion(cx) {
@@ -994,17 +1056,17 @@ impl Input {
                     .collect();
                 self.replace_text_in_range(None, &format!("\n{indent}"), w, cx);
             } else {
-                self.replace_text_in_range(None, "\n", w, cx);
+                self.insert_newline(w, cx);
             }
         } else if self.marked.is_none() {
-            cx.emit(Submitted);
+            self.emit_submitted(cx);
         }
     }
     fn submit_secondary(&mut self, _: &SubmitSecondary, _: &mut Window, cx: &mut Context<Self>) {
         if !self.secondary_submit {
             cx.propagate();
         } else if self.marked.is_none() {
-            cx.emit(Submitted);
+            self.emit_submitted(cx);
         }
     }
     fn paste(&mut self, _: &Paste, w: &mut Window, cx: &mut Context<Self>) {
@@ -1177,6 +1239,7 @@ impl EntityInputHandler for Input {
         let enabled = !self.secret
             && !self.single_line
             && self.inline_commands
+            && !self.shell_mode()
             && self.code.is_none()
             && cx
                 .try_global::<crate::settings::Preferences>()
@@ -1240,6 +1303,7 @@ impl EntityInputHandler for Input {
             && !self.single_line
             && self.code.is_none()
             && self.marked.is_none()
+            && !self.shell_mode()
             && r.start == r.end
             && text.len() == 1
             && text.chars().all(char::is_whitespace)
@@ -1440,7 +1504,8 @@ impl Element for InputElement {
             return (w.request_layout(style, [], cx), ());
         }
         // Grow with the wrapped draft, like the auto-resizing textarea.
-        let (text, _) = i.display_text();
+        let (text, command) = i.display_text();
+        let spans = i.markdown_display_spans(command);
         let font_size = px(i.font_size);
         let (line_height, min_height, max_height) = (i.line_height, i.min_height, i.max_height);
         let font = w.text_style().font();
@@ -1457,9 +1522,10 @@ impl Element for InputElement {
                 underline: None,
                 strikethrough: None,
             };
+            let runs = markdown_runs(&run, &spans);
             let height = w
                 .text_system()
-                .shape_text(text.clone(), font_size, &[run], width, None)
+                .shape_text(text.clone(), font_size, &runs, width, None)
                 .map(|lines| {
                     lines
                         .iter()
@@ -1520,12 +1586,24 @@ impl Element for InputElement {
             .marked
             .as_ref()
             .map(|range| to_display(range.start)..to_display(range.end));
+        let spans = if placeholder {
+            Vec::new()
+        } else {
+            i.markdown_display_spans(command)
+        };
         let mut boundaries = vec![0, text.len()];
+        for (range, _) in &spans {
+            boundaries.extend([range.start, range.end]);
+        }
         for range in highlights.iter().chain(marked.iter()) {
             boundaries.extend([range.start, range.end]);
         }
         if let Some(command) = command {
             boundaries.extend([command.icon_range().end, command.name_range().end]);
+        }
+        let shell = !placeholder && i.shell_mode();
+        if shell {
+            boundaries.push(1);
         }
         boundaries.sort_unstable();
         boundaries.dedup();
@@ -1534,18 +1612,27 @@ impl Element for InputElement {
             .filter(|pair| pair[0] < pair[1])
             .map(|pair| {
                 let at = pair[0];
+                let md = style_at(&spans, at);
                 let color = if command.is_some_and(|c| c.icon_range().contains(&at)) {
                     crate::theme::content(0.)
+                } else if shell && at == 0 {
+                    Input::shell_color()
                 } else if let Some(command) = command.filter(|c| c.name_range().contains(&at)) {
                     command.mode.color()
                 } else if highlights.iter().any(|range| range.contains(&at)) {
                     crate::theme::accent_color()
                 } else {
-                    run.color
+                    markdown_color(md, run.color)
                 };
                 TextRun {
                     len: pair[1] - at,
                     color,
+                    font: markdown_font(md, &run.font),
+                    background_color: md.code.then(|| crate::theme::content(0.08)),
+                    strikethrough: md.strike.then(|| gpui::StrikethroughStyle {
+                        thickness: px(1.),
+                        color: Some(color),
+                    }),
                     underline: marked
                         .as_ref()
                         .filter(|range| range.contains(&at))
@@ -1553,8 +1640,14 @@ impl Element for InputElement {
                             color: Some(style.color),
                             thickness: px(1.),
                             wavy: false,
+                        })
+                        .or_else(|| {
+                            md.link.then(|| UnderlineStyle {
+                                color: Some(crate::theme::accent_color()),
+                                thickness: px(1.),
+                                wavy: false,
+                            })
                         }),
-                    ..run.clone()
                 }
             })
             .collect();
@@ -1832,9 +1925,133 @@ impl Render for Input {
     }
 }
 
+fn style_at(spans: &markdown::Spans, at: usize) -> markdown::Style {
+    spans
+        .iter()
+        .filter(|(range, _)| range.contains(&at))
+        .fold(markdown::Style::default(), |all, (_, style)| {
+            all.merge(*style)
+        })
+}
+
+fn markdown_font(style: markdown::Style, base: &gpui::Font) -> gpui::Font {
+    let mut font = if style.code {
+        gpui::font(crate::markdown::MONO)
+    } else {
+        base.clone()
+    };
+    if style.bold {
+        font.weight = gpui::FontWeight::BOLD;
+    }
+    if style.italic {
+        font.style = gpui::FontStyle::Italic;
+    }
+    font
+}
+
+fn markdown_color(style: markdown::Style, base: Hsla) -> Hsla {
+    if style.dim {
+        crate::theme::content(0.4)
+    } else if style.accent || style.link {
+        crate::theme::accent_color()
+    } else if style.quote {
+        crate::theme::content(0.65)
+    } else {
+        base
+    }
+}
+
+/// Font-only runs, enough to measure how markdown styling changes wrapping.
+fn markdown_runs(base: &TextRun, spans: &markdown::Spans) -> Vec<TextRun> {
+    let mut boundaries = vec![0, base.len];
+    for (range, _) in spans {
+        boundaries.extend([range.start.min(base.len), range.end.min(base.len)]);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries
+        .windows(2)
+        .map(|pair| TextRun {
+            len: pair[1] - pair[0],
+            font: markdown_font(style_at(spans, pair[0]), &base.font),
+            ..base.clone()
+        })
+        .collect()
+}
+
+enum ListStep {
+    /// Text to insert instead of a bare newline.
+    Continue(String),
+    /// The item is empty: drop its marker, back to this line start.
+    End(usize),
+}
+
+/// What Enter should do at `at` when the line is a markdown list item or quote.
+fn list_step(content: &str, at: usize) -> Option<ListStep> {
+    let start = content[..at].rfind('\n').map_or(0, |n| n + 1);
+    let before = &content[start..at];
+    let body = before.trim_start_matches([' ', '\t']);
+    let indent = &before[..before.len() - body.len()];
+    let (marker, rest) = if let Some(rest) = body.strip_prefix("> ") {
+        ("> ".to_string(), rest)
+    } else if let Some(rest) = ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|bullet| body.strip_prefix(bullet))
+    {
+        (body[..2].to_string(), rest)
+    } else {
+        let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+        let (number, tail) = body.split_at(digits);
+        let delimiter = tail.chars().next().filter(|c| matches!(c, '.' | ')'))?;
+        let rest = tail[1..].strip_prefix(' ')?;
+        if number.is_empty() || number.len() > 9 {
+            return None;
+        }
+        (
+            format!("{}{delimiter} ", number.parse::<u64>().ok()? + 1),
+            rest,
+        )
+    };
+    let checkbox = ["[ ]", "[x]", "[X]"];
+    let (text, task) = match checkbox.iter().find_map(|c| rest.strip_prefix(c)) {
+        Some(text) if marker != "> " && (text.is_empty() || text.starts_with(' ')) => {
+            (text, "[ ] ")
+        }
+        _ => (rest, ""),
+    };
+    if text.trim().is_empty() {
+        return Some(ListStep::End(start));
+    }
+    Some(ListStep::Continue(format!("\n{indent}{marker}{task}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn press(text: &str) -> String {
+        match list_step(text, text.len()) {
+            Some(ListStep::Continue(next)) => format!("{text}{next}"),
+            Some(ListStep::End(start)) => text[..start].to_string(),
+            None => format!("{text}\n"),
+        }
+    }
+    #[::core::prelude::v1::test]
+    fn enter_continues_and_ends_markdown_lists() {
+        assert_eq!(press("1. one"), "1. one\n2. ");
+        assert_eq!(press("9) nine"), "9) nine\n10) ");
+        assert_eq!(press("- a"), "- a\n- ");
+        assert_eq!(press("intro\n  * a"), "intro\n  * a\n  * ");
+        assert_eq!(press("- [x] done"), "- [x] done\n- [ ] ");
+        assert_eq!(press("> quoted"), "> quoted\n> ");
+        assert_eq!(press("1. one\n2. "), "1. one\n");
+        assert_eq!(press("- "), "");
+        assert_eq!(press("- [ ]"), "");
+        assert_eq!(press("plain"), "plain\n");
+        assert_eq!(press("2024. was a year"), "2024. was a year\n2025. ");
+        assert_eq!(press("-dash"), "-dash\n");
+        assert_eq!(press("1.5 liters"), "1.5 liters\n");
+    }
     #[::core::prelude::v1::test]
     fn utf16_and_bounded_paste_respect_unicode() {
         assert_eq!(from16("a🙂漢", 1), 1);
@@ -1959,6 +2176,30 @@ mod native_input_tests {
         input.read_with(cx, |i, _| i.content[i.selection.clone()].to_string())
     }
 
+    #[gpui::test]
+    fn markdown_styling_keeps_geometry_and_shift_enter_continues_lists(cx: &mut TestAppContext) {
+        let window = field(cx, false);
+        let input = window.root(cx).unwrap();
+        window
+            .update(cx, |i, _, cx| i.enable_inline_commands(cx))
+            .unwrap();
+        let text = "## Plan\n**bold** and `code` with [a link](http://x.y) that wraps around the narrow field";
+        replace(window, text, cx);
+        input.read_with(cx, |i, _| {
+            let (display, command) = i.display_text();
+            assert_eq!(display.as_ref(), text);
+            let spans = i.markdown_display_spans(command);
+            assert!(style_at(&spans, 3).bold);
+            for (at, _) in text.char_indices() {
+                assert_eq!(i.index(i.position(at)), at, "offset {at}");
+            }
+        });
+        replace(window, "1. one", cx);
+        cx.simulate_keystrokes(window.into(), "shift-enter t w o shift-enter");
+        input.read_with(cx, |i, _| assert_eq!(i.content, "1. one\n2. two\n3. "));
+        cx.simulate_keystrokes(window.into(), "shift-enter");
+        input.read_with(cx, |i, _| assert_eq!(i.content, "1. one\n2. two\n"));
+    }
     #[gpui::test]
     fn inline_commands_preserve_text_geometry_wrapping_and_clipboard(cx: &mut TestAppContext) {
         let window = field(cx, false);

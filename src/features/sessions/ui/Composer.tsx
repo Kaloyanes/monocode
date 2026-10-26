@@ -99,6 +99,8 @@ import {
 import { AccessPicker } from "./AccessPicker";
 import { ComposerRunner } from "./ComposerRunner";
 import { ContextMeter } from "./ContextMeter";
+import { SessionStatsChip } from "./SessionStatsChip";
+import type { SessionStats } from "../model/sessionStats";
 import { AttachmentChip } from "./AttachmentChip";
 import { BranchPicker } from "../../source-control/ui/BranchPicker";
 import { WorktreePicker } from "../../source-control/ui/WorktreePicker";
@@ -232,6 +234,7 @@ type Props = {
   remoteSession?: boolean;
   remoteFeatures?: { attachments: boolean; plan: boolean; draft: boolean };
   context?: ContextUsage;
+  sessionStats?: SessionStats;
   compactSupported?: boolean;
   quoteRequest?: QuoteRequest;
   initialDraft?: string;
@@ -360,6 +363,7 @@ export function Composer({
   remoteSession = false,
   remoteFeatures,
   context,
+  sessionStats,
   compactSupported = false,
   quoteRequest,
   initialDraft,
@@ -1817,7 +1821,8 @@ export function Composer({
           />
         </>
       )}
-      <div className="ml-auto flex shrink-0 items-center">
+      <div className="ml-auto flex shrink-0 items-center gap-2">
+        <SessionStatsChip stats={sessionStats} busy={busy} context={context} />
         <ContextMeter
           usage={context}
           onCompact={

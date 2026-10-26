@@ -73,6 +73,22 @@
           return {label: text(s.label), values: s.values, color: s.color ?? `series${i % 6 + 1}`};
         })};
     },
+    code(source, o) {
+      o = options(o, ["language", "title"]);
+      return {kind: "code", code: text(source), language: o.language == null ? null : text(o.language),
+        title: o.title == null ? null : text(o.title)};
+    },
+    diff(before, after, o) {
+      o = options(o, ["path", "title", "context"]);
+      return {kind: "diff", before: text(before), after: text(after),
+        path: o.path == null ? null : text(o.path), title: o.title == null ? null : text(o.title),
+        context: o.context ?? 3};
+    },
+    callout(value, o) {
+      o = options(o, ["title", "color"]);
+      return {kind: "callout", text: text(value), title: o.title == null ? null : text(o.title),
+        color: o.color ?? "accent"};
+    },
     button(label, fn, o) {
       o = options(o, ["disabled"]);
       const disabled = o.disabled ?? false;

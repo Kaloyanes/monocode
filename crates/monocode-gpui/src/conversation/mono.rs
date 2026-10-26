@@ -732,7 +732,7 @@ impl Conversation {
                 .side(Side::Top)
                 .align(Align::End)
                 .width(310.)
-                .height(442.)
+                .max_height(442.)
                 .on_dismiss(move |window, cx| {
                     let _ = this.update(cx, |this, cx| this.close_mono_models(window, cx));
                 })

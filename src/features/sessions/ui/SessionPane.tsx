@@ -1,4 +1,5 @@
 import { GripVertical, X } from "../../../shared/ui/icons";
+import { computeSessionStats } from "../model/sessionStats";
 import { useSessionSnapshot } from "../model/sessionStateStore";
 import {
   memo,
@@ -650,6 +651,10 @@ const LocalSessionPane = memo(function LocalSessionPane({
     (!draftBlock && (!isEmpty || inSplit || !!session.inboxAsk || !!agent));
   const composerDockMotion = useComposerDockMotion(dockComposer);
   const draftRef = useRef<string | undefined>(getComposerDraft(session.id));
+  const sessionStats = useMemo(
+    () => computeSessionStats(session.blocks),
+    [session.blocks],
+  );
   const composer = (
     <Composer
       key={session.id}
@@ -678,6 +683,7 @@ const LocalSessionPane = memo(function LocalSessionPane({
       hideBranchPicker={!!session.inboxAsk || managed}
       hideTopBar={!!session.inboxAsk}
       context={session.context}
+      sessionStats={sessionStats}
       quoteRequest={quoteRequest}
       initialDraft={
         draftRef.current ??

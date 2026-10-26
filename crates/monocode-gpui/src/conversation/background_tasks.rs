@@ -2,7 +2,9 @@
 //! commands or subagents still going, they sit on the composer's ledge above
 //! the message queue until they finish or the agent picks the thread back up.
 use super::*;
+use crate::{pane_motion::PaneSlide, reveal::Disclosure};
 use monocode_core::provider::BackgroundTask;
+use std::{cell::RefCell, time::Instant};
 
 const ROW_HEIGHT: f32 = 38.;
 /// More rows than this scroll inside the card.
@@ -14,6 +16,28 @@ pub(super) struct BackgroundTasks {
     pub tasks: Vec<BackgroundTask>,
     pub collapsed: bool,
     pub motion: composer_shelf::Motion,
+    /// Springs the rows open or shut when the header is toggled.
+    fold: RefCell<Option<PaneSlide>>,
+}
+
+impl BackgroundTasks {
+    fn toggle(&mut self, animate: bool) {
+        self.collapsed = !self.collapsed;
+        if !animate {
+            *self.fold.get_mut() = None;
+            return;
+        }
+        let target = if self.collapsed { 0. } else { 1. };
+        let fold = self.fold.get_mut();
+        *fold = Some(match fold.as_ref() {
+            Some(slide) => slide.retarget(target, Instant::now()),
+            None => PaneSlide::new(
+                1. - target,
+                target,
+                ROW_HEIGHT * self.tasks.len().min(4) as f32,
+            ),
+        });
+    }
 }
 
 impl Conversation {
@@ -76,7 +100,8 @@ impl Conversation {
             .gap(px(8.))
             .when(collapsible, |d| {
                 d.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
-                    this.background.collapsed = !this.background.collapsed;
+                    let animate = !cx.reduce_motion();
+                    this.background.toggle(animate);
                     cx.notify();
                 }))
             })
@@ -146,11 +171,40 @@ impl Conversation {
                 let row = background_row(task);
                 self.background.motion.row(&task.id, row, row_width, window)
             }));
+        let fold = {
+            let mut slide = self.background.fold.borrow_mut();
+            match slide.as_ref().map(|s| s.at(Instant::now())) {
+                Some((progress, false)) => {
+                    window.request_animation_frame();
+                    Some(progress)
+                }
+                Some((_, true)) => {
+                    *slide = None;
+                    None
+                }
+                None => None,
+            }
+        };
         let card = composer_shelf::card("background-tasks-card", self.classic_layout)
             .role(Role::Group)
             .aria_label("Background tasks")
             .child(header)
-            .when(!collapsed && single.is_none(), |d| d.child(rows));
+            .when_some(
+                match fold {
+                    // A lone task already sits in the header, so it has no rows to fold.
+                    _ if single.is_some() => None,
+                    Some(progress) => Some(
+                        div()
+                            .overflow_hidden()
+                            .opacity(progress.clamp(0., 1.))
+                            .child(Disclosure::new(rows, row_width, progress.max(0.)))
+                            .into_any_element(),
+                    ),
+                    None if !collapsed => Some(rows.into_any_element()),
+                    None => None,
+                },
+                |d, rows| d.child(rows),
+            );
         composer_shelf::shelf("background-tasks")
             .px(inset)
             .child(self.background.motion.card(card, card_width, window))

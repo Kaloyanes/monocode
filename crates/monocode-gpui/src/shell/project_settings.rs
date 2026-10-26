@@ -253,12 +253,17 @@ impl Shell {
             .when_some(background, |d, background| {
                 d.child(background.cached(StyleRefinement::default().absolute().size_full()))
             })
-            .child(
-                div()
-                    .relative()
-                    .size_full()
-                    .child(chat.cached(StyleRefinement::default().size_full())),
-            )
+            .child(div().relative().size_full().child(
+                if chat.read(cx).transcript.read(cx).has_html_visuals() {
+                    // A native web view is only placed during its own
+                    // paint; a replayed conversation would leave the
+                    // frame-end sweep to hide it on every shell-only render.
+                    chat.into_any_element()
+                } else {
+                    chat.cached(StyleRefinement::default().size_full())
+                        .into_any_element()
+                },
+            ))
             .children(linked.map(|notice| {
                 div()
                     .absolute()

@@ -16,6 +16,7 @@ mod notifications;
 mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
+mod shell;
 #[cfg(test)]
 mod submission_tests;
 mod title;
@@ -202,6 +203,15 @@ pub(crate) struct Conversation {
     preparing_worktree: bool,
     context: Option<monocode_core::context::Usage>,
     context_hovered: bool,
+    context_hover_generation: u64,
+    stats_hovered: bool,
+    stats_anchor: AnchorSlot,
+    /// A one-second repaint loop runs while the cache countdown is on screen.
+    stats_ticker: std::cell::Cell<bool>,
+    stats_wanted: std::cell::Cell<bool>,
+    /// The auto-compact button was switched off: messages keep the full
+    /// history even after the cache lapses.
+    keep_full_history: bool,
     menu: Option<OpenMenu>,
     add_anchor: AnchorSlot,
     model_anchor: AnchorSlot,
@@ -229,6 +239,8 @@ pub(crate) struct Conversation {
     cancel: Arc<AtomicBool>,
     title_cancel: Option<Arc<AtomicBool>>,
     _submission: Subscription,
+    _shell_submission: Subscription,
+    shell: shell::State,
     response_events: Option<Subscription>,
     response_menu: Option<ResponseMenu>,
     response_request: Option<(usize, monocode_core::response::TransferKind, Instant)>,
@@ -509,6 +521,9 @@ impl Conversation {
             this.open_typed_btw(cx);
         });
         let submission = cx.subscribe(&input, |this, _, _: &input::Submitted, cx| this.send(cx));
+        let shell_submission = cx.subscribe(&input, |this, _, _: &input::ShellSubmitted, cx| {
+            this.submit_shell(cx)
+        });
         let review =
             cx.new(|_| crate::session_review::SessionReview::new(summary.id, summary.cwd.clone()));
         let review_events = cx.subscribe(&review, |this, review, event, cx| match event {
@@ -639,6 +654,12 @@ impl Conversation {
             preparing_worktree: false,
             context: None,
             context_hovered: false,
+            context_hover_generation: 0,
+            stats_hovered: false,
+            stats_anchor: AnchorSlot::default(),
+            stats_ticker: Default::default(),
+            stats_wanted: Default::default(),
+            keep_full_history: false,
             menu: None,
             add_anchor: AnchorSlot::default(),
             model_anchor: AnchorSlot::default(),
@@ -661,6 +682,8 @@ impl Conversation {
             cancel: Arc::new(AtomicBool::new(false)),
             title_cancel: None,
             _submission: submission,
+            _shell_submission: shell_submission,
+            shell: Default::default(),
             response_events: None,
             response_menu: None,
             response_request: None,
@@ -918,6 +941,11 @@ impl Conversation {
         let raw = monocode_core::composer::consume_command(&raw, "add-to-folder")
             .map(str::to_owned)
             .unwrap_or(raw);
+        // `\!` sends a message that starts with a literal `!`.
+        let raw = match raw.strip_prefix("\\!") {
+            Some(rest) => format!("!{rest}"),
+            None => raw,
+        };
         self.folder_selected = false;
         let prompt = self.consume_mode_command(raw, cx);
         if prompt.trim().is_empty() && self.attachments.is_empty() {
@@ -941,6 +969,7 @@ impl Conversation {
         }
         if self.stopping
             || self.busy
+            || self.shell_busy()
             || self.settings.pending_provider_switch.is_some()
             || (!self.follow_ups.state.messages.is_empty() && !self.follow_ups.state.paused)
         {
@@ -974,7 +1003,33 @@ impl Conversation {
             self.clear_submitted_mode(cx);
         }
     }
-    fn launch_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+    /// The tooltip holds a button, so closing waits briefly for the pointer to
+    /// cross from the ring to the tooltip.
+    fn set_context_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.context_hover_generation = self.context_hover_generation.wrapping_add(1);
+        if hovered {
+            if !self.context_hovered {
+                self.context_hovered = true;
+                cx.notify();
+            }
+            return;
+        }
+        let generation = self.context_hover_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(160))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.context_hover_generation == generation && this.context_hovered {
+                    this.context_hovered = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn start_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
         if self.stopping {
             let mode = if self.settings.orchestrator {
                 Some("orchestrator")
@@ -1383,6 +1438,7 @@ impl Conversation {
                             }
                             if !this.is_remote() {
                                 this.detect_usage_limit(cx);
+                                this.refresh_usage_after_turn(cx);
                             }
                             this.review
                                 .update(cx, |review, cx| review.set_busy(false, cx));
@@ -2528,8 +2584,8 @@ impl Conversation {
                             view: list.into(),
                             width: 310.,
                             padding: 0.,
-                            height: Some(442.),
-                            max_height: None,
+                            height: None,
+                            max_height: Some(442.),
                             focus: Some(focus),
                             surface: None,
                         })
@@ -2693,8 +2749,11 @@ impl Conversation {
         } else {
             None
         };
-        self.input
-            .update(cx, |input, cx| input.selected_command(command, cx));
+        let shell_available = self.shell_available();
+        self.input.update(cx, |input, cx| {
+            input.selected_command(command, cx);
+            input.set_shell_commands(shell_available, cx);
+        });
         let runner = self.composer_runner(cx);
         let beside = cx
             .try_global::<crate::settings::Preferences>()
@@ -2707,6 +2766,16 @@ impl Conversation {
         };
         let input = self.input.read(cx);
         let has_value = input.has_message_text() || !self.attachments.is_empty();
+        let shell_mode = input.shell_mode();
+        let (border, fading) = self.shell_border(
+            composer_border(self.input.focus_handle(cx).is_focused(window)),
+            shell_mode,
+            cx,
+        );
+        if fading {
+            window.request_animation_frame();
+        }
+        let shell_progress = self.shell_progress();
         self.completion.update(cx, |completion, cx| {
             completion.set_cwd(
                 self.settings
@@ -2741,6 +2810,7 @@ impl Conversation {
             .children(self.orchestration_card(cx))
             .children(if self.is_remote() { None } else { self.usage_notice(false, cx) })
             .child(self.background_shelf(window, cx))
+            .children(self.shell_queue(cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })
             .when(self.settings.worktree_removed,|d|d.child(div().mb_2().p_3().rounded_lg().border_1().border_color(content(0.1)).flex().items_center().gap_3().text_size(px(12.)).child(div().flex_1().child("Worktree deleted. Select a branch or worktree to continue this conversation.")).child(tool_pill("reattach-worktree","Select worktree").child("Select worktree").on_click(cx.listener(|this,_,window,cx|this.open_git(GitMode::Worktree,window,cx))))))
@@ -2809,7 +2879,7 @@ impl Conversation {
                     .relative()
                     .rounded(px(radius))
                     .border_1()
-                    .border_color(composer_border(self.input.focus_handle(cx).is_focused(window)))
+                    .border_color(border)
                     .shadow(composer_shadow())
                     .when(self.file_drag, |d| d.border_color(accent_color().opacity(0.6)))
                     .flex()
@@ -2858,7 +2928,9 @@ impl Conversation {
                                             }),
                                     ),
                             )
-                            .child(
+                            .child(if shell_mode {
+                                self.shell_chip(shell_progress).into_any_element()
+                            } else {
                                 div()
                                     .flex_1()
                                     .min_w_0()
@@ -2866,8 +2938,10 @@ impl Conversation {
                                     .flex()
                                     .items_center()
                                     .gap_1()
+                                    .when(shell_progress > 0., |d| d.opacity(1. - shell_progress))
                                     .child(
                                         tool_pill("composer-model", "Model")
+                                            .debug_selector(|| "composer-model".into())
                                             .min_w_0()
                                             .max_w(px(220.))
                                             .flex_shrink(1.)
@@ -2942,8 +3016,9 @@ impl Conversation {
                                             )
                                             .child(pill_label(self.settings.access.label()))
                                             .child(icon("chevron-down", 12.)),
-                                    ),
-                            )
+                                    )
+                                    .into_any_element()
+                            })
                             .child(self.action(has_value, cx)),
                     )
                     .children(self.attachment_drop_overlay(12.)),
@@ -2955,6 +3030,210 @@ impl Conversation {
             .child(self.workspace_bar(cx))
             .into_any_element()
     }
+    /// `$0.84 · cache 4:12`: session spend and time left on the prompt
+    /// cache, each hidden when the provider cannot tell.
+    fn session_stats_chip(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use monocode_core::context::{self as stats_mod, CacheState};
+        let stats = stats_mod::SessionStats::from_turns(self.settings.turns.values());
+        stats.started_at?;
+        let now = monocode_core::time::now_ms();
+        let ttl = self.context.and_then(|usage| usage.cache_ttl_ms);
+        let cache = stats_mod::cache_state(&stats, ttl, now, self.busy);
+        let amber: gpui::Hsla = gpui::rgb(0xfbbf24).into();
+        let approx = if stats.cost_partial { "≥" } else { "" };
+        let cost = stats
+            .cost_usd
+            .map(|usd| format!("{approx}{}", stats_mod::format_cost(usd)));
+        let (cache_label, cache_color) = match cache {
+            Some(CacheState::Live) => (Some("cache live".to_string()), content(0.45)),
+            Some(CacheState::Cold) => (Some("cache cold".to_string()), content(0.3)),
+            Some(CacheState::Warm {
+                remaining_ms,
+                warning,
+            }) => (
+                Some(format!(
+                    "cache {}",
+                    stats_mod::format_countdown(remaining_ms)
+                )),
+                if warning { amber } else { content(0.45) },
+            ),
+            None => (None, content(0.45)),
+        };
+        if matches!(cache, Some(CacheState::Warm { .. })) {
+            self.stats_wanted.set(true);
+            if !self.stats_ticker.replace(true) {
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(1))
+                            .await;
+                        let keep = this
+                            .update(cx, |this, cx| {
+                                let wanted = this.stats_wanted.replace(false);
+                                if wanted {
+                                    cx.notify();
+                                } else {
+                                    this.stats_ticker.set(false);
+                                }
+                                wanted
+                            })
+                            .unwrap_or(false);
+                        if !keep {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+        let mut parts: Vec<(String, gpui::Hsla)> = Vec::new();
+        parts.extend(cost.clone().map(|c| (c, content(0.45))));
+        parts.extend(cache_label.clone().map(|c| (c, cache_color)));
+        let percent = |hit: Option<f64>| hit.map_or("n/a".to_string(), |h| format!("{h:.0}%"));
+        let mut rows: Vec<(&str, String)> = Vec::new();
+        if let Some(cost) = &cost {
+            rows.push(("Cost (API list price)", cost.clone()));
+        }
+        if let Some(label) = &cache_label {
+            rows.push(("Cache", label.clone()));
+        }
+        rows.push((
+            "Cache hit",
+            format!(
+                "{} session · {} last turn",
+                percent(stats.session_hit_percent),
+                percent(stats.last_hit_percent)
+            ),
+        ));
+        rows.push((
+            "Cache tokens",
+            format!(
+                "{} read · {} written",
+                stats_mod::format_tokens(stats.cache_read_tokens),
+                stats_mod::format_tokens(stats.cache_write_tokens)
+            ),
+        ));
+        rows.push(("Agent worked", stats_mod::format_span(stats.working_ms)));
+        let rewrite = (cache == Some(CacheState::Cold))
+            .then(|| self.context.map(|usage| usage.used))
+            .flatten()
+            .filter(|used| *used > 0)
+            .map(|used| {
+                format!(
+                    "Next message re-writes ~{} tokens to cache",
+                    stats_mod::format_tokens(used)
+                )
+            });
+        let label = parts
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let compact_button = self.cache_compaction_available().then(|| {
+            let off = self.keep_full_history;
+            let pending = self.cache_compaction_pending();
+            div()
+                .id("compact-next")
+                .role(Role::Button)
+                .aria_label(if off {
+                    "Auto-compact is off. Click to compact a large thread when the prompt cache expires."
+                } else if pending {
+                    "The next message compacts the thread first because the prompt cache expired. Click to turn auto-compact off."
+                } else {
+                    "Auto-compact is on. A large thread is compacted when the prompt cache expires. Click to turn it off."
+                })
+                .h(px(18.))
+                .px(px(6.))
+                .ml(px(4.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .text_color(content(if off {
+                    0.4
+                } else if pending {
+                    0.9
+                } else {
+                    0.55
+                }))
+                .bg(content(if pending && !off { 0.12 } else { 0.05 }))
+                .hover(|s| s.bg(content(0.16)).text_color(content(1.)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(if off {
+                    "Auto-compact off"
+                } else if pending {
+                    "Compacts next"
+                } else {
+                    "Auto-compact"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.keep_full_history = !this.keep_full_history;
+                    cx.notify();
+                }))
+        });
+        Some(
+            div()
+                .id("session-stats")
+                .role(Role::Group)
+                .aria_label(format!("Session {label}"))
+                .child(self.stats_anchor.probe())
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .text_size(px(11.))
+                .font_features(crate::right_panel::tabular())
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    this.stats_hovered = *hovered;
+                    cx.notify();
+                }))
+                .children(
+                    parts
+                        .into_iter()
+                        .enumerate()
+                        .flat_map(|(i, (text, color))| {
+                            let dot = (i > 0).then(|| div().text_color(content(0.45)).child("·"));
+                            dot.into_iter()
+                                .map(IntoElement::into_any_element)
+                                .chain([div().text_color(color).child(text).into_any_element()])
+                        }),
+                )
+                .children(compact_button)
+                .when(self.stats_hovered, |d| {
+                    d.child(
+                        popover(
+                            "session-stats-tooltip",
+                            Anchor::Slot(self.stats_anchor.clone()),
+                        )
+                        .side(Side::Top)
+                        .align(Align::End)
+                        .max_width(300.)
+                        .padding(10.)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .text_size(px(11.))
+                                .line_height(px(16.))
+                                .children(rows.into_iter().map(|(name, value)| {
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .gap(px(16.))
+                                        .child(div().text_color(content(0.5)).child(name))
+                                        .child(div().text_color(content(1.)).child(value))
+                                }))
+                                .children(
+                                    rewrite
+                                        .map(|text| div().mt(px(4.)).text_color(amber).child(text)),
+                                ),
+                        ),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn workspace_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let draft = !self.summary.has_messages;
         let linked =
@@ -3020,6 +3299,10 @@ impl Conversation {
         };
         let ratio = self.context.and_then(|usage| usage.ratio());
         let show_context = ratio.is_some() || draft;
+        let can_compact = !new
+            && !self.busy
+            && self.summary.provider_id.is_some()
+            && monocode_core::provider::supports_compact(Kind::from_id(&self.summary.provider));
         let headline = ratio
             .map(|r| format!("{:.0}% context used", r * 100.))
             .unwrap_or_else(|| "No context used yet".into());
@@ -3107,6 +3390,7 @@ impl Conversation {
                             )
                         },
                     )
+                    .children(self.session_stats_chip(cx))
                     .when(show_context, |d| {
                         d.child(
                             div()
@@ -3121,8 +3405,7 @@ impl Conversation {
                                 ))
                                 .child(self.context_anchor.probe())
                                 .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                    this.context_hovered = *hovered;
-                                    cx.notify();
+                                    this.set_context_hover(*hovered, cx);
                                 }))
                                 .child(crate::context_meter::ring(ratio.unwrap_or(0.)))
                                 .when(self.context_hovered, |d| {
@@ -3137,6 +3420,12 @@ impl Conversation {
                                         .padding(10.)
                                         .child(
                                             div()
+                                                .id("context-tooltip-body")
+                                                .on_hover(cx.listener(
+                                                    |this, hovered: &bool, _, cx| {
+                                                        this.set_context_hover(*hovered, cx);
+                                                    },
+                                                ))
                                                 .flex()
                                                 .flex_col()
                                                 .text_size(px(12.))
@@ -3150,6 +3439,40 @@ impl Conversation {
                                                             .text_color(content(0.5))
                                                             .child(detail),
                                                     )
+                                                })
+                                                .when(can_compact, |d| {
+                                                    d.child(
+                                                        div()
+                                                            .id("compact-context")
+                                                            .role(Role::Button)
+                                                            .aria_label("Compact context")
+                                                            .mt(px(8.))
+                                                            .h(px(24.))
+                                                            .px(px(8.))
+                                                            .rounded_md()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .cursor_pointer()
+                                                            .text_size(px(11.))
+                                                            .text_color(content(0.8))
+                                                            .bg(content(0.08))
+                                                            .hover(|s| {
+                                                                s.bg(content(0.14))
+                                                                    .text_color(content(1.))
+                                                            })
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                |_, _, cx| cx.stop_propagation(),
+                                                            )
+                                                            .child("Compact context")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.context_hovered = false;
+                                                                    this.compact_context(cx);
+                                                                },
+                                                            )),
+                                                    )
                                                 }),
                                         ),
                                     )
@@ -3161,16 +3484,19 @@ impl Conversation {
 
     // ComposerAction: a solid submit, dimmed while empty; Stop while busy.
     fn action(&self, has_value: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.responding() && !has_value;
+        let busy = (self.responding() || self.shell_running()) && !has_value;
         let draft = self.draft_active(cx);
         let enabled = !self.attaching
             && (!self.preparing_worktree || self.busy || self.stopping)
             && (busy || (has_value && self.loaded))
             && (busy || !draft || (!self.busy && self.follow_ups.state.draft.is_none()));
+        let shell = !busy && self.input.read(cx).shell_mode();
         send_button(
             "send-or-stop",
             if busy {
                 "Stop"
+            } else if shell {
+                "Run command"
             } else if draft {
                 "Save draft"
             } else {
@@ -3178,13 +3504,18 @@ impl Conversation {
             },
             busy,
             enabled,
+            if shell { "terminal" } else { "send" },
         )
         .on_click(cx.listener(move |this, _, _, cx| {
             if !enabled {
                 return;
             }
-            if busy {
+            if busy && this.shell_running() && !this.busy {
+                this.cancel_shell();
+            } else if busy {
                 this.stop(cx);
+            } else if this.input.read(cx).shell_mode() {
+                this.submit_shell(cx);
             } else {
                 this.send(cx);
             }
@@ -3638,11 +3969,19 @@ impl Render for Conversation {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(
+                    .child(if self.transcript.read(cx).has_html_visuals() {
+                        // Native web views follow every paint; replaying cached
+                        // quads would leave them where they were.
+                        div()
+                            .size_full()
+                            .child(self.transcript.clone())
+                            .into_any_element()
+                    } else {
                         self.transcript
                             .clone()
-                            .cached(StyleRefinement::default().size_full()),
-                    )
+                            .cached(StyleRefinement::default().size_full())
+                            .into_any_element()
+                    })
                     // Level with the transcript's jump button, which moves to
                     // the column's other end.
                     .children(pill.map(|pill| {
@@ -3751,6 +4090,7 @@ fn send_button(
     label: &'static str,
     busy: bool,
     enabled: bool,
+    glyph: &'static str,
 ) -> gpui::Stateful<gpui::Div> {
     let accent = primary_action(enabled);
     div()
@@ -3777,7 +4117,7 @@ fn send_button(
             if busy {
                 d.child(div().size(px(10.)).rounded(px(2.)).bg(ink))
             } else {
-                d.child(icon("send", 14.).text_color(ink))
+                d.child(icon(glyph, 14.).text_color(ink))
             }
         })
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

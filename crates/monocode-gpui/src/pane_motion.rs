@@ -35,6 +35,22 @@ impl PaneSlide {
         }
     }
 
+    /// A spring in pixels that sets off at a given speed, so motion a gesture
+    /// hands over keeps going without a hitch.
+    pub(crate) fn thrown(from: f32, to: f32, velocity: f32, frequency: f32) -> Self {
+        Self {
+            from,
+            to,
+            velocity,
+            frequency,
+            pixels_per_unit: 1.,
+            limits: (from.min(to), from.max(to)),
+            start: Cell::new(None),
+            #[cfg(test)]
+            fixed_elapsed: Cell::new(None),
+        }
+    }
+
     pub(crate) fn opening(&self) -> bool {
         self.to > self.from
     }
@@ -148,6 +164,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_thrown_spring_sets_off_at_the_speed_it_was_handed_then_lands() {
+        let slide = PaneSlide::thrown(-100., 0., 1500., 22.);
+        let now = Instant::now();
+        let (start, velocity, _) = slide.sample(now);
+        assert_eq!(start, -100.);
+        assert_eq!(velocity, 1500.);
+        slide.elapsed(std::time::Duration::from_millis(400));
+        assert_eq!(slide.at(Instant::now()), (0., true));
     }
 
     #[test]
