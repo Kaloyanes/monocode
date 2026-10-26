@@ -1493,18 +1493,13 @@ impl Shell {
                 .filter(|(k, _)| harnesses.contains(k))
                 .flat_map(|(k, profile)| {
                     let rows = monocode_core::catalog::models_for(*k, profile).unwrap_or_default();
-                    if *k == kind {
-                        current_model = mobile_catalog::current_model_id(kind, model.as_deref(), &rows);
+                    let current = (*k == kind)
+                        .then(|| mobile_catalog::current_model_id(kind, model.as_deref(), &rows));
+                    if let Some(id) = &current {
+                        current_model = id.clone();
                     }
-                    let hidden_models = &hidden_models;
-                    let model = &model;
-                    rows.into_iter()
-                        .filter(move |m| {
-                            (*k == kind && model.as_deref() == Some(m.id.as_str()))
-                                || !hidden_models.iter().any(|c| {
-                                    c.provider == k.id() && c.model.as_deref() == Some(&m.id)
-                                })
-                        })
+                    mobile_catalog::visible_models(*k, current.as_deref(), rows, &hidden_models)
+                        .into_iter()
                         .map(move |m| catalog_model(*k, m))
                 })
                 .collect();
