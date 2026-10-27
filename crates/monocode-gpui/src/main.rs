@@ -86,6 +86,7 @@ mod transcript;
 mod usage_footer;
 mod visuals;
 mod window_state;
+mod work_item_picker;
 mod workspace;
 mod worktree_switcher;
 
