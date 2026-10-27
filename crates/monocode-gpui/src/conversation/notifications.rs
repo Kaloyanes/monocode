@@ -14,6 +14,7 @@ impl Conversation {
                 request_id: approval.id.clone(),
                 kind: InputKind::Approval,
                 label: approval.title.clone(),
+                can_always_allow: approval.remember_scope.is_some(),
             })
             .chain(self.questions.iter().map(|(card, _)| {
                 let question = card.read(cx);
@@ -21,6 +22,7 @@ impl Conversation {
                     request_id: question.id().to_owned(),
                     kind: InputKind::Question,
                     label: question.notification_label().to_owned(),
+                    can_always_allow: false,
                 }
             }))
             .collect()

@@ -18,6 +18,8 @@ pub(crate) struct PendingInput {
     pub request_id: String,
     pub kind: InputKind,
     pub label: String,
+    /// The provider can save this exact approval as a standing permission.
+    pub can_always_allow: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -175,6 +177,8 @@ impl Render for ApprovalNotices {
                         let deny_session = session.session_id.clone();
                         let allow_request = input.request_id.clone();
                         let deny_request = input.request_id.clone();
+                        let always_session = session.session_id.clone();
+                        let always_request = input.request_id.clone();
                         super::surface::toast_frame()
                             .id(("approval-toast", ix))
                             .role(Role::Status)
@@ -279,6 +283,32 @@ impl Render for ApprovalNotices {
                                                     })
                                                 })),
                                         )
+                                        .when(input.can_always_allow, |row| {
+                                            row.child(
+                                                div()
+                                                    .id(("approval-toast-always", ix))
+                                                    .role(Role::Button)
+                                                    .aria_label("Always allow")
+                                                    .cursor_pointer()
+                                                    .flex_1()
+                                                    .rounded_md()
+                                                    .px(px(10.))
+                                                    .py_1()
+                                                    .text_center()
+                                                    .text_size(px(11.))
+                                                    .bg(content(0.1))
+                                                    .text_color(content(0.7))
+                                                    .hover(|s| s.bg(content(0.2)))
+                                                    .child("Always allow")
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        cx.emit(Action::Decide {
+                                                            session_id: always_session.clone(),
+                                                            request_id: always_request.clone(),
+                                                            decision: Decision::Always,
+                                                        })
+                                                    })),
+                                            )
+                                        })
                                         .child(
                                             div()
                                                 .id(("approval-toast-deny", ix))

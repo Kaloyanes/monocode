@@ -59,6 +59,8 @@ impl Protocol {
         for field in ["threadId", "turnId", "serverName", "nativeContent"] {
             confirmation.remove(field);
         }
+        let mut confirmation = Value::Object(confirmation);
+        crate::permissions::stable(&mut confirmation);
         let settings = &self.request.settings;
         let mut account_home = settings.account.home(self.request.kind).ok()?;
         if settings.account.id == crate::accounts::DEFAULT {
@@ -84,7 +86,7 @@ impl Protocol {
                 binary: crate::permissions::project(&self.request.binary),
                 project: crate::permissions::project(&self.request.cwd),
                 server: server.into(),
-                confirmation: confirmation.into(),
+                confirmation,
             },
         })
     }
@@ -435,6 +437,28 @@ mod permission_tests {
             [Event::Approval(_)]
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn always_allow_matches_a_later_call_with_different_call_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let with_meta = |call: &str, turn: &str| {
+            let mut r = request();
+            r["_meta"] = json!({"callId":call, "tool_name":"get_app_state",
+                "x-codex-turn-metadata":{"turn_id":turn}});
+            r
+        };
+        let mut p = protocol(&path);
+        ask(&mut p, with_meta("call-1", "turn-1"), &mut Vec::new());
+        p.remember_approval("17", &mut Vec::new()).unwrap();
+        let mut later = protocol(&path);
+        let mut out = Vec::new();
+        assert!(ask(&mut later, with_meta("call-2", "turn-2"), &mut out).is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap()["result"]["action"],
+            "accept"
+        );
     }
 
     #[test]

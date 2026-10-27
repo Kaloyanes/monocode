@@ -59,7 +59,14 @@ impl Store {
         if file.version != 1 {
             return Err("Unsupported saved permissions version".into());
         }
-        Ok(file.grants)
+        let mut grants: Vec<Grant> = Vec::with_capacity(file.grants.len());
+        for mut grant in file.grants {
+            stable(&mut grant.key.confirmation);
+            if !grants.iter().any(|g| g.key == grant.key) {
+                grants.push(grant);
+            }
+        }
+        Ok(grants)
     }
 
     pub fn list(&self) -> Result<Vec<Grant>, String> {
@@ -110,6 +117,16 @@ impl Store {
     }
 }
 
+/// Drop the per-call fields Codex attaches to `_meta`, so the same confirmation
+/// in a later turn or chat produces the same key.
+pub fn stable(confirmation: &mut Value) {
+    if let Some(meta) = confirmation.get_mut("_meta").and_then(Value::as_object_mut) {
+        for field in ["callId", "x-codex-turn-metadata"] {
+            meta.remove(field);
+        }
+    }
+}
+
 pub fn project(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -132,6 +149,36 @@ mod tests {
                 confirmation: json!({"message":"Allow this app?","mode":"form","requestedSchema":{"type":"object","properties":{}}}),
             },
         }
+    }
+
+    #[test]
+    fn per_call_metadata_does_not_change_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("permissions.json"));
+        let mut first = json!({"message":"m","_meta":{"callId":"a","tool_name":"t","x-codex-turn-metadata":{"turn_id":"1"}}});
+        let mut second = json!({"message":"m","_meta":{"callId":"b","tool_name":"t","x-codex-turn-metadata":{"turn_id":"2"}}});
+        stable(&mut first);
+        stable(&mut second);
+        assert_eq!(first, second);
+        let mut stored = grant();
+        stored.key.confirmation = json!({"_meta":{"callId":"old","tool_name":"t"}});
+        let mut duplicate = stored.clone();
+        duplicate.key.confirmation = json!({"_meta":{"callId":"older","tool_name":"t"}});
+        let raw = File {
+            version: 1,
+            grants: vec![stored, duplicate],
+        };
+        std::fs::write(
+            dir.path().join("permissions.json"),
+            serde_json::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
+        let grants = store.list().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(
+            grants[0].key.confirmation,
+            json!({"_meta":{"tool_name":"t"}})
+        );
     }
 
     #[test]

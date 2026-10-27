@@ -1076,15 +1076,6 @@ impl Protocol {
                 stdin,
             );
         }
-        if native_read {
-            return self.respond(
-                Control {
-                    id,
-                    decision: Decision::Allow,
-                },
-                stdin,
-            );
-        }
         if self.request.settings.plan || self.request.settings.access == AccessMode::ReadOnly {
             return self.respond(
                 Control {
@@ -2122,7 +2113,17 @@ mod tests {
             );
         }
     }
-
+    #[test]
+    fn the_plan_note_is_allowed_without_asking_even_in_plan_mode() {
+        let mut claude = protocol(Kind::Claude);
+        claude.request.settings.plan = true;
+        let mut out = Vec::new();
+        let input = json!({"plan":[{"step":"Read","status":"in_progress"}]});
+        let events = claude.frame(json!({"type":"control_request","request_id":"plan-1","request":{"subtype":"can_use_tool","tool_name":"mcp__monocode__update_plan","input":input}}), &mut out).unwrap();
+        assert!(events.is_empty());
+        let response: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(response["response"]["response"]["behavior"], "allow");
+    }
     #[test]
     fn selected_model_effort_and_access_reach_the_codex_turn() {
         let mut p = protocol(Kind::Codex);

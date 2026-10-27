@@ -346,6 +346,7 @@ pub fn launch_checkout(
                 std::path::Path::new(project),
                 input["worktreeBase"].as_str().unwrap_or("HEAD"),
                 session,
+                input["prompt"].as_str(),
             )?
             .to_string_lossy()
             .into_owned(),
