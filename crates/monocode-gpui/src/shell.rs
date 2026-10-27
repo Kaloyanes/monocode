@@ -44,6 +44,7 @@ mod title_tabs;
 mod window_chrome;
 mod worktrees;
 
+use crate::tooltip::Tip;
 use crate::{
     conversation::{Conversation, SessionChanged},
     input,
@@ -2212,6 +2213,7 @@ impl Shell {
                     .debug_selector(move || format!("drag-session-pane-{id}"))
                     .role(Role::Button)
                     .aria_label("Drag to reorder pane")
+                    .tip("Drag to reorder pane")
                     .w(px(20.))
                     .h(px(30.))
                     .flex_shrink_0()
@@ -2244,6 +2246,7 @@ impl Shell {
                     .id(("close-chat-pane", id as usize))
                     .role(Role::Button)
                     .aria_label("Close pane")
+                    .tip("Close pane")
                     .group("close-chat-pane")
                     .size(px(20.))
                     .flex_shrink_0()
@@ -4865,6 +4868,11 @@ impl Shell {
                                 } else {
                                     TOGGLE_RIGHT_PANEL_LABEL
                                 })
+                                .tip(if dot {
+                                    TOGGLE_RIGHT_PANEL_DOT_LABEL
+                                } else {
+                                    TOGGLE_RIGHT_PANEL_LABEL
+                                })
                                 .aria_toggled(if panel_active {
                                     gpui::Toggled::True
                                 } else {
@@ -6167,6 +6175,15 @@ impl Shell {
             .debug_selector(move || format!("archive-session-{id}"))
             .role(Role::Button)
             .aria_label(format!(
+                "{} {}",
+                if session.summary.archived {
+                    "Unarchive"
+                } else {
+                    "Archive"
+                },
+                session.display_title()
+            ))
+            .tip(format!(
                 "{} {}",
                 if session.summary.archived {
                     "Unarchive"
@@ -7585,6 +7602,7 @@ impl Shell {
                                 .group("tab-close")
                                 .role(Role::Button)
                                 .aria_label(format!("Close tab {}", copy.headline))
+                                .tip(format!("Close tab {}", copy.headline))
                                 .absolute()
                                 .right_1()
                                 .top(px(10.))
@@ -7846,6 +7864,7 @@ impl Shell {
                             .group("new-tab")
                             .role(Role::Button)
                             .aria_label("New session tab")
+                            .tip("New session tab")
                             .cursor_pointer()
                             .size(px(TAB_PLATE_HEIGHT))
                             .flex_shrink_0()

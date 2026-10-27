@@ -1,4 +1,5 @@
 use super::*;
+use crate::tooltip::Tip;
 use gpui::{App, EntityInputHandler};
 use monocode_core::mono::{Message, Mono};
 use std::path::PathBuf;
@@ -863,6 +864,7 @@ impl Conversation {
                             .debug_selector(|| "mono-send".into())
                             .role(Role::Button)
                             .aria_label("Send")
+                            .tip("Send")
                             .flex_shrink_0()
                             .size(px(26.))
                             .rounded_md()

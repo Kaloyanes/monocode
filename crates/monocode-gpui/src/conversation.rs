@@ -19,6 +19,7 @@ mod response_menu;
 #[cfg(test)]
 mod submission_tests;
 mod title;
+use crate::tooltip::Tip;
 use crate::{
     composer_motion::ComposerMotion,
     git_picker::{GitPicker, Mode as GitMode, Picked as GitPicked},
@@ -3757,6 +3758,7 @@ fn send_button(
         .id(id)
         .role(Role::Button)
         .aria_label(label)
+        .tip(label)
         .cursor_pointer()
         .flex_shrink_0()
         .size(px(26.))
