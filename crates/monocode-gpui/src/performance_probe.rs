@@ -82,8 +82,18 @@ pub(crate) fn start(launched: Instant, cx: &mut App) {
                 write(&mut file, json!({"kind": "lost", "count": drained.lost}))?;
             }
             for entry in drained.entries {
-                let ForegroundJournalEntry::Event(event) = entry else {
-                    continue;
+                let event = match entry {
+                    ForegroundJournalEntry::Event(event) => event,
+                    ForegroundJournalEntry::PlatformSignal(signal) => {
+                        write(
+                            &mut file,
+                            json!({"kind": "signal", "source": format!("{:?}", signal.source),
+                                "at_ms": ms(launched.elapsed().saturating_sub(signal.handled_at.elapsed())),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    _ => continue,
                 };
                 let self_ms = match event {
                     ForegroundEvent::View(view) => Some(ms(view.self_duration)),

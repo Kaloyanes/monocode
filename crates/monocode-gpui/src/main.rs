@@ -18,6 +18,7 @@ mod conversation;
 #[cfg(debug_assertions)]
 mod dev_reload;
 mod diff_view;
+mod draft;
 mod editor_analysis;
 mod editor_scrollbar;
 mod editor_syntax;
@@ -90,9 +91,9 @@ mod traffic_lights;
 mod transcript;
 mod usage_footer;
 mod usage_limit;
-mod visual_expand;
-mod visual_preview;
 mod visuals;
+mod window_state;
+mod work_item_picker;
 mod workspace;
 mod worktree_switcher;
 
@@ -152,6 +153,47 @@ fn restart(cx: &mut App) {
         cx.update(|cx| cx.restart());
     })
     .detach();
+}
+
+/// Saves the window's position and size once a move or resize settles, so the
+/// next launch opens where this one closed.
+fn remember_window_bounds(
+    shell: &gpui::Entity<shell::Shell>,
+    window: &mut gpui::Window,
+    db: Arc<Mutex<Store>>,
+    cx: &mut App,
+) {
+    let generation = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    shell.update(cx, |_, cx| {
+        cx.observe_window_bounds(window, move |_, window, cx| {
+            let raw = window_state::encode(window.window_bounds());
+            let db = db.clone();
+            generation.set(generation.get() + 1);
+            let current = generation.clone();
+            let mine = generation.get();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                if current.get() != mine {
+                    return;
+                }
+                cx.background_executor()
+                    .spawn(async move {
+                        let result = db
+                            .lock()
+                            .map_err(|error| error.to_string())
+                            .and_then(|store| store.save_setting(window_state::KEY, &raw));
+                        if let Err(error) = result {
+                            eprintln!("Cannot save the window position: {error}");
+                        }
+                    })
+                    .await;
+            })
+            .detach();
+        })
+        .detach();
+    });
 }
 
 fn data_dir() -> PathBuf {
@@ -243,6 +285,11 @@ fn main() {
         }
         return;
     }
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    if let Some(page) = std::env::var_os("MONOCODE_DRAFT_SELFTEST") {
+        draft::selftest::run(page);
+        return;
+    }
     let mut args = std::env::args().skip(1);
     let mut fixture = false;
     let mut chat_fixture = false;
@@ -273,7 +320,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "monocode-gpui [--cwd PATH] [--dev-data | --monocode-data | --monocode-db PATH]\nDevelopment builds use a separate database; release builds use the installed MonoCode database.\n--dev-data opens an isolated development database using Monocode's existing schema.\n--monocode-data opens the existing desktop monocode.db directly.\n--monocode-db PATH opens a specific desktop database.\n--fixture, --chat-fixture, --visual-fixture and --plan-fixture add local samples to isolated development data only.\nvisual docs prints the native visual SDK reference.\nvisual check/show --input FILE validates or publishes native session visuals.\nvisual-mcp runs the session visual tool server over standard input/output.\n--check-data validates and lists the selected store read-only, then exits."
+                    "monocode-gpui [--cwd PATH] [--dev-data | --monocode-data | --monocode-db PATH]\nDevelopment builds use a separate database; release builds use the installed MonoCode database.\n--dev-data opens an isolated development database using Monocode's existing schema.\n--monocode-data opens the existing desktop monocode.db directly.\n--monocode-db PATH opens a specific desktop database.\n--fixture, --chat-fixture, --visual-fixture and --plan-fixture add local samples to isolated development data only.\nvisual docs prints the visual quick start; --topic html|native|kit loads a detailed reference.\nvisual check/show/preview --input FILE validates, publishes or renders a session visual.\nvisual-mcp runs the session visual tool server over standard input/output.\n--check-data validates and lists the selected store read-only, then exits."
                 );
                 return;
             }
@@ -425,6 +472,7 @@ fn main() {
         projects.push(workspace.project);
     }
     let sidebar_metadata = db.session_sidebar_metadata(&projects);
+    let saved_bounds = db.setting(window_state::KEY).ok().flatten();
     let db = Arc::new(Mutex::new(db));
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
@@ -437,18 +485,17 @@ fn main() {
             dev_reload::install(cx);
             cx.set_global(title_raster);
             image_memory::init(cx);
-            visual_preview::start(cx);
             #[cfg(target_os = "macos")]
             memory_log::start(cx);
             #[cfg(target_os = "macos")]
             hang_watchdog::start(database.with_file_name("gpui-hangs"), cx);
             input::bind(cx);
             image_lightbox::bind(cx);
-            visual_expand::bind(cx);
             composer_completion::bind(cx);
             file_editor::bind(cx);
             popover::bind(cx);
             cx.set_prompt_builder(modal::prompt_builder);
+            draft::start();
             explorer::bind(cx);
             history::bind(cx);
             diff_view::bind(cx);
@@ -469,10 +516,16 @@ fn main() {
                 }
             })
             .detach();
-            let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
+            let displays = cx.displays().iter().map(|d| d.bounds()).collect::<Vec<_>>();
+            let window_bounds = saved_bounds
+                .and_then(|raw| window_state::decode(&raw, &displays))
+                .unwrap_or_else(|| {
+                    WindowBounds::Windowed(Bounds::centered(None, size(px(1180.), px(800.)), cx))
+                });
+            let bounds_db = db.clone();
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(window_bounds),
                     window_min_size: Some(size(px(820.), px(520.))),
                     window_decorations: workspace
                         .preferences
@@ -503,7 +556,9 @@ fn main() {
                 },
                 |window, cx| {
                     let cleanup = db.clone();
-                    window.on_next_frame(move |_, cx| {
+                    window.on_next_frame(move |window, cx| {
+                        // One frame later, so the first frame presents first.
+                        window.on_next_frame(|_, cx| app_menu::ready(cx));
                         cx.background_executor()
                             .spawn(async move {
                                 let result = cleanup
@@ -529,6 +584,7 @@ fn main() {
                         )
                     });
                     shell.update(cx, |shell, cx| shell.focus_active(window, cx));
+                    remember_window_bounds(&shell, window, bounds_db, cx);
                     #[cfg(target_os = "macos")]
                     {
                         traffic_lights::pin(window, theme::TITLE_BAR_HEIGHT);
