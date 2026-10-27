@@ -176,6 +176,20 @@ impl SettingsView {
                     |p, choice| p.title_model = choice,
                 )],
             ),
+            self.row(
+                Some("branch-model"),
+                false,
+                "Worktree branch names",
+                Some("Name new worktree branches like feat/sidebar-scroll. Separate from the models above.".into()),
+                vec![self.text_model_select(
+                    "branch-model",
+                    "Worktree branch model",
+                    &p.branch_model,
+                    "Session provider’s fast model",
+                    cx,
+                    |p, choice| p.branch_model = choice,
+                )],
+            ),
         ];
         let editor = vec![self.row(
             Some("format-on-save"),

@@ -71,6 +71,14 @@ pub fn supports(kind: Kind) -> bool {
             | Kind::Omp
     )
 }
+/// The fast model background text work uses when no model was chosen.
+pub fn cheap_model(kind: Kind) -> Option<String> {
+    match kind {
+        Kind::Codex => Some("gpt-5.6-luna".into()),
+        Kind::Claude => Some("claude-haiku-4-5".into()),
+        _ => None,
+    }
+}
 pub fn prompt(message: &str) -> String {
     format!(
         "{PROMPT}\n\nUser message:\n{}",
@@ -153,11 +161,7 @@ pub fn generate_for(
         return None;
     }
     let binary = provider::resolve(kind)?;
-    let model = model.or_else(|| match kind {
-        Kind::Codex => Some("gpt-5.6-luna".into()),
-        Kind::Claude => Some("claude-haiku-4-5".into()),
-        _ => None,
-    });
+    let model = model.or_else(|| cheap_model(kind));
     let output = provider::run_text(
         Request {
             kind,

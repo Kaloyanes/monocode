@@ -62,6 +62,40 @@ mod tests {
     }
 
     #[gpui::test]
+    fn branch_switcher_hides_remotes_shadowed_by_a_local_branch(cx: &mut TestAppContext) {
+        let cwd = "/nonexistent/monocode-shadowed-remote-branches";
+        let branch = |name: &str, remote: Option<&str>| git::Branch {
+            name: name.into(),
+            remote: remote.map(Into::into),
+        };
+        crate::git_cache::remember(
+            cwd,
+            &Snapshot {
+                branches: vec![
+                    branch("main", None),
+                    branch("main", Some("origin")),
+                    branch("dev", Some("origin")),
+                ],
+                ..Default::default()
+            },
+        );
+        let mut names = |mode| {
+            let picker = cx.new(|cx| GitPicker::new(cwd.into(), mode, None, cx));
+            picker.update(cx, |view, cx| {
+                view.choices(cx)
+                    .into_iter()
+                    .map(|choice| match choice {
+                        Choice::Branch(b) => format!("{}:{}", b.remote.unwrap_or_default(), b.name),
+                        _ => unreachable!(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(names(Mode::Branch), [":main", "origin:dev"]);
+        assert_eq!(names(Mode::Base), [":main", "origin:main", "origin:dev"]);
+    }
+
+    #[gpui::test]
     fn all_picker_modes_start_with_cached_choices_and_keep_them_after_refresh_failure(
         cx: &mut TestAppContext,
     ) {
@@ -257,6 +291,16 @@ impl GitPicker {
         let mut choices: Vec<_> = state
             .branches
             .iter()
+            // Checking out `origin/x` fails while a local `x` exists, so the
+            // switcher only offers the local copy; a base may still be either.
+            .filter(|branch| {
+                self.mode != Mode::Branch
+                    || branch.remote.is_none()
+                    || !state
+                        .branches
+                        .iter()
+                        .any(|local| local.remote.is_none() && local.name == branch.name)
+            })
             .filter(|branch| {
                 format!("{} {}", branch.name, branch.remote.as_deref().unwrap_or(""))
                     .to_lowercase()
@@ -336,6 +380,7 @@ impl GitPicker {
             .role(Role::ListBoxOption)
             .aria_label(label.clone())
             .aria_selected(selected)
+            .w_full()
             .flex_shrink_0()
             .min_h(px(32.))
             .px(px(8.))
@@ -528,6 +573,7 @@ impl gpui::Render for GitPicker {
                             list(self.list.clone(), move |ix, _, cx| {
                                 entity.update(cx, |view, cx| view.row(ix, cx))
                             })
+                            .w_full()
                             .flex_1()
                             .min_h_0(),
                         )

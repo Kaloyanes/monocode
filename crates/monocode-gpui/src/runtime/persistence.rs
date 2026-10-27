@@ -419,6 +419,11 @@ mod tests {
         let created = rx.try_recv().unwrap();
         let cwd = created.worktree_cwd.unwrap();
         assert!(std::path::Path::new(&cwd).is_dir());
+        assert_eq!(
+            std::path::Path::new(&cwd).file_name().unwrap(),
+            "mc-create-checkout",
+            "the folder is named for the request, not the session"
+        );
         let finished = rx.try_recv().unwrap();
         assert!(finished.finished);
         assert_eq!(finished.worktree_cwd.as_deref(), Some(cwd.as_str()));

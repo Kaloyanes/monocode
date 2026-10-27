@@ -1,5 +1,6 @@
 //! Working-copy operations used by the native composer. Git protects dirty files;
 //! these operations never force a checkout, stash, or discard changes.
+pub mod naming;
 mod remote;
 pub mod report;
 use serde::Deserialize;
@@ -283,19 +284,97 @@ pub fn create_branch(cwd: &Path, name: &str) -> Result<(), String> {
     git(cwd, &["switch", "-c", name])?;
     Ok(())
 }
-pub fn create_worktree(cwd: &Path, base: &str, session: i64) -> Result<PathBuf, String> {
-    if crate::files::remote::is_remote(cwd) {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        return remote::create_worktree(
+/// A folder name for a branch; separators and symbols become dashes.
+fn folder_name(branch: &str) -> String {
+    branch
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+fn stamp_suffix() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut n = millis % 36u128.pow(5);
+    let mut out = String::new();
+    for _ in 0..5 {
+        out.push(char::from_digit((n % 36) as u32, 36).unwrap_or('0'));
+        n /= 36;
+    }
+    out
+}
+/// Git cannot hold `a` beside `a/b`, so either side of that clash is taken.
+fn ref_free(cwd: &Path, name: &str) -> bool {
+    let exists = |reference: &str| {
+        git(
             cwd,
-            &format!("mc/native-{session}-{stamp}"),
-            Some(base),
-            false,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                reference,
+            ],
         )
-        .map(|tree| PathBuf::from(tree.path));
+        .is_ok()
+    };
+    if exists(&format!("refs/heads/{name}")) {
+        return false;
+    }
+    let parts: Vec<&str> = name.split('/').collect();
+    if (1..parts.len()).any(|n| exists(&format!("refs/heads/{}", parts[..n].join("/")))) {
+        return false;
+    }
+    git(
+        cwd,
+        &["for-each-ref", "--count=1", &format!("refs/heads/{name}/")],
+    )
+    .is_ok_and(|found| found.trim().is_empty())
+}
+/// `name`, else `name-2` … `name-9`, else `name-<stamp>`: the first with a free
+/// branch and, when `parent` is given, a free folder.
+fn first_free(cwd: &Path, name: &str, parent: Option<&Path>) -> String {
+    let free = |candidate: &str| {
+        ref_free(cwd, candidate)
+            && parent.is_none_or(|parent| !parent.join(folder_name(candidate)).exists())
+    };
+    (1..=9)
+        .map(|n| {
+            if n == 1 {
+                name.to_owned()
+            } else {
+                format!("{name}-{n}")
+            }
+        })
+        .find(|candidate| free(candidate))
+        .unwrap_or_else(|| format!("{name}-{}", stamp_suffix()))
+}
+/// A new worktree from `base`, named for what `message` asks for (else for the
+/// session), e.g. `mc/fix-sidebar-scroll` in `<project>-worktrees/mc-fix-sidebar-scroll`.
+pub fn create_worktree(
+    cwd: &Path,
+    base: &str,
+    session: i64,
+    message: Option<&str>,
+) -> Result<PathBuf, String> {
+    let wanted = naming::compose(
+        None,
+        &message
+            .and_then(naming::heuristic)
+            .unwrap_or_else(|| format!("session-{session}")),
+    );
+    if crate::files::remote::is_remote(cwd) {
+        let create = |name: &str| remote::create_worktree(cwd, name, Some(base), false);
+        // The host reports a taken branch; a stamp makes the retry distinct.
+        let tree = create(&wanted).or_else(|_| create(&format!("{wanted}-{}", stamp_suffix())))?;
+        return Ok(PathBuf::from(tree.path));
     }
     let state = snapshot(cwd)?;
     let main = state.worktrees.first().ok_or("No working copies found")?;
@@ -304,12 +383,8 @@ pub fn create_worktree(cwd: &Path, base: &str, session: i64) -> Result<PathBuf, 
         "{}-worktrees",
         main.file_name().unwrap_or_default().to_string_lossy()
     ));
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let name = format!("mc/native-{session}-{stamp}");
-    let path = parent.join(name.replace('/', "-"));
+    let name = first_free(cwd, &wanted, Some(&parent));
+    let path = parent.join(folder_name(&name));
     let commit = git(
         cwd,
         &[
@@ -334,6 +409,41 @@ pub fn create_worktree(cwd: &Path, base: &str, session: i64) -> Result<PathBuf, 
         ],
     )?;
     Ok(path)
+}
+/// The branch a linked working copy has checked out, if any.
+pub fn worktree_branch(path: &Path) -> Option<String> {
+    git(path, &["branch", "--show-current"])
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+/// Renames the branch of a worktree that still has the `expected` branch it
+/// was created with. The folder stays, so sessions, terminals and checkpoints
+/// that point at it keep working. Returns the name actually used.
+pub fn rename_worktree_branch(
+    cwd: &Path,
+    path: &Path,
+    expected: &str,
+    wanted: &str,
+) -> Result<String, String> {
+    if crate::files::remote::is_remote(cwd) {
+        return Err("This isn’t available for projects on another machine yet.".into());
+    }
+    valid_branch(cwd, wanted)?;
+    let key = crate::files::path_key(&path.to_string_lossy());
+    let tree = worktrees(cwd)?
+        .into_iter()
+        .find(|tree| crate::files::path_key(&tree.path) == key)
+        .ok_or("This path is not a working copy of this project")?;
+    if tree.main || tree.missing || tree.branch.as_deref() != Some(expected) {
+        return Err("The working copy's branch changed, so it was left alone.".into());
+    }
+    if wanted == expected {
+        return Ok(expected.into());
+    }
+    let name = first_free(cwd, wanted, None);
+    git(Path::new(&tree.path), &["branch", "-m", expected, &name])?;
+    Ok(name)
 }
 
 /// SidebarWorktreeSwitcher: create a named copy from the selected checkout's
@@ -372,16 +482,7 @@ pub fn create_project_worktree(
         "{}-worktrees",
         main.file_name().unwrap_or_default().to_string_lossy()
     ));
-    let slug: String = branch
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
+    let slug = folder_name(branch);
     let path = parent.join(slug);
     if path.exists() {
         return Err(format!(
@@ -554,6 +655,77 @@ mod tests {
         assert!(!unpushed(&cwd, "--all"));
     }
 
+    fn committed_repo(temp: &Path) -> PathBuf {
+        let cwd = temp.join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        git(&cwd, &["init", "-b", "main"]).unwrap();
+        std::fs::write(cwd.join("file"), "committed\n").unwrap();
+        git(&cwd, &["add", "file"]).unwrap();
+        git(
+            &cwd,
+            &[
+                "-c",
+                "user.name=Native test",
+                "-c",
+                "user.email=native@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Initial",
+            ],
+        )
+        .unwrap();
+        cwd
+    }
+
+    #[test]
+    fn new_worktrees_are_named_for_the_request_and_never_collide() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = committed_repo(temp.path());
+        let message = Some("Please fix the sidebar scroll jump. It happens on tab switch.");
+        let first = create_worktree(&cwd, "main", 7, message).unwrap();
+        assert_eq!(first.file_name().unwrap(), "mc-fix-sidebar-scroll-jump");
+        assert_eq!(
+            worktree_branch(&first).as_deref(),
+            Some("mc/fix-sidebar-scroll-jump")
+        );
+        // The same request again, and a branch left behind by a removed folder.
+        let second = create_worktree(&cwd, "main", 8, message).unwrap();
+        assert_eq!(second.file_name().unwrap(), "mc-fix-sidebar-scroll-jump-2");
+        std::fs::remove_dir_all(&second).unwrap();
+        git(&cwd, &["worktree", "prune"]).unwrap();
+        let third = create_worktree(&cwd, "main", 9, message).unwrap();
+        assert_eq!(third.file_name().unwrap(), "mc-fix-sidebar-scroll-jump-3");
+        // No usable request names the session instead of a timestamp.
+        let bare = create_worktree(&cwd, "main", 10, Some("🙂")).unwrap();
+        assert_eq!(bare.file_name().unwrap(), "mc-session-10");
+        // A branch cannot sit beside a nested one with its name as a prefix.
+        git(&cwd, &["branch", "mc/nested/deeper"]).unwrap();
+        let clash = create_worktree(&cwd, "main", 11, Some("nested")).unwrap();
+        assert_eq!(clash.file_name().unwrap(), "mc-nested-2");
+    }
+
+    #[test]
+    fn a_worktrees_branch_is_renamed_once_and_only_while_it_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = committed_repo(temp.path());
+        let tree = create_worktree(&cwd, "main", 1, Some("login redirect loop")).unwrap();
+        let provisional = worktree_branch(&tree).unwrap();
+        assert_eq!(provisional, "mc/login-redirect-loop");
+        git(&cwd, &["branch", "mc/fix/login-redirect"]).unwrap();
+        let renamed =
+            rename_worktree_branch(&cwd, &tree, &provisional, "mc/fix/login-redirect").unwrap();
+        assert_eq!(renamed, "mc/fix/login-redirect-2");
+        assert_eq!(worktree_branch(&tree).as_deref(), Some(renamed.as_str()));
+        assert!(tree.is_dir(), "the folder keeps its name");
+        // The branch moved on (or the user renamed it), so the stale name loses.
+        assert!(rename_worktree_branch(&cwd, &tree, &provisional, "mc/fix/other").is_err());
+        assert!(rename_worktree_branch(&cwd, &cwd, "main", "mc/fix/main").is_err());
+        assert!(rename_worktree_branch(&cwd, &tree, &renamed, "-bad").is_err());
+        assert_eq!(worktree_branch(&tree).as_deref(), Some(renamed.as_str()));
+    }
+
     #[test]
     fn sidebar_named_copies_preserve_dirty_files_and_refuse_collisions() {
         let temp = tempfile::tempdir().unwrap();
@@ -654,7 +826,7 @@ mod tests {
             "my unsaved work\n"
         );
         assert_eq!(snapshot(&cwd).unwrap().current.as_deref(), Some("main"));
-        let tree = create_worktree(&cwd, "feature", 7).unwrap();
+        let tree = create_worktree(&cwd, "feature", 7, None).unwrap();
         let state = snapshot(&tree).unwrap();
         assert!(state.linked);
         assert_eq!(state.worktrees.len(), 2);
