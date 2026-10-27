@@ -45,6 +45,7 @@ mod sidebar_list;
 mod sidebar_peek;
 mod space_swipe;
 mod terminal_dock;
+mod threads;
 mod title_tabs;
 #[cfg(target_os = "linux")]
 mod window_chrome;
@@ -586,6 +587,9 @@ pub(crate) struct Shell {
     orchestration_summaries: HashMap<i64, monocode_core::orchestration::Summary>,
     /// Sessions an /operator thread started, by the session that started them.
     started_by: HashMap<i64, i64>,
+    thread_parents: HashMap<i64, i64>,
+    thread_waiters: HashMap<i64, Vec<monocode_core::mono::bridge::Call>>,
+    agent_summary_writes: HashMap<i64, gpui::Task<()>>,
     /// The sidebar rails under orchestrators and /operator threads.
     rails: rails::Rails,
     usage_footer: Entity<UsageFooter>,
@@ -970,6 +974,9 @@ impl Shell {
             orchestrations: HashMap::new(),
             orchestration_summaries: sidebar_metadata.orchestrations,
             started_by: sidebar_metadata.started_by,
+            thread_parents: sidebar_metadata.thread_parents,
+            thread_waiters: HashMap::new(),
+            agent_summary_writes: HashMap::new(),
             rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
@@ -1329,6 +1336,23 @@ impl Shell {
             // the indexed working directory so those events cannot erase it.
             view.restore_worktree(worktree, None, cx);
             view.draft_hint = self.draft_sessions.contains(&id);
+            view.driven_by = self.thread_parents.get(&id).copied();
+            view.managed |= view.driven_by.is_some() || self.orchestration_worker(id);
+            if let Some(lead) = view.driven_by {
+                let title = self
+                    .session_summaries
+                    .get(&lead)
+                    .map(|s| s.title.as_str())
+                    .unwrap_or("Lead");
+                view.thread_lead_title = title.to_owned();
+                view.thread_driver = self
+                    .sessions
+                    .get(&lead)
+                    .map(|v| v.read(cx).driver_label())
+                    .unwrap_or_else(|| "The lead".into());
+                view.transcript
+                    .update(cx, |t, _| t.thread_driver = Some(format!("From {title}")));
+            }
             view.settings.usage_limit = self.usage_limits.get(&id).cloned();
             if let Some(bridge) = &self.app_bridge {
                 view.set_app_environment(bridge.environment(id));
@@ -1357,6 +1381,7 @@ impl Shell {
                 }
                 this.sync_search_session(id, cx);
                 this.orchestration_session_changed(id, cx);
+                this.thread_session_changed(id, cx);
                 this.automation_session_changed(id, cx);
                 this.sync_review_locks(cx);
                 this.refresh_session_mark(id, cx);
@@ -1366,6 +1391,27 @@ impl Shell {
                 this.invalidate_chrome(cx);
                 cx.notify();
             }));
+        self.observations.push(cx.subscribe(
+            &view,
+            |_, _, event: &crate::conversation::OpenThread, cx| {
+                let id = event.0;
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| this.open(id, window, cx));
+                })
+                .detach();
+            },
+        ));
+        let thread_transcript = view.read(cx).transcript.clone();
+        self.observations.push(cx.subscribe(
+            &thread_transcript,
+            |_, _, event: &crate::conversation::OpenThread, cx| {
+                let id = event.0;
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| this.open(id, window, cx));
+                })
+                .detach();
+            },
+        ));
         self.observations
             .push(cx.subscribe(&view, |this, _, transfer: &Transfer, cx| {
                 this.transfer_response(transfer.clone(), cx)

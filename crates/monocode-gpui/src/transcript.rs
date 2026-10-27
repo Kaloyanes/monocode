@@ -19,6 +19,7 @@ mod remote_plans;
 pub(crate) mod selection;
 mod shell;
 pub(crate) mod tasks;
+mod threads;
 mod tools;
 mod user_links;
 mod visuals;
@@ -567,6 +568,9 @@ pub(crate) struct TranscriptView {
     pub(crate) file_link_base: Option<String>,
     expanded: HashSet<usize>,
     agent_panels: tasks::AgentPanels,
+    thread_states: HashMap<i64, serde_json::Value>,
+    thread_expanded: HashSet<i64>,
+    pub(crate) thread_driver: Option<String>,
     /// User messages opened past their four-line clamp, by start.
     expanded_prompts: HashSet<usize>,
     /// Collapsed user messages whose later chunks are hidden, by start.
@@ -2382,6 +2386,9 @@ impl TranscriptView {
             file_link_base: None,
             expanded: HashSet::new(),
             agent_panels: Default::default(),
+            thread_states: HashMap::new(),
+            thread_expanded: HashSet::new(),
+            thread_driver: None,
             expanded_prompts: HashSet::new(),
             clamped_prompts: HashSet::new(),
             phases: HashMap::new(),
@@ -5114,6 +5121,15 @@ impl TranscriptView {
                     } else {
                         content(1.)
                     })
+                    .when(user && first && self.thread_driver.is_some(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(content(0.45))
+                                .pb_1()
+                                .child(self.thread_driver.clone().unwrap_or_default()),
+                        )
+                    })
                     .when(user, |d| {
                         // AgentTranscript.tsx: text-sm (14px / 20px), px-3 py-2.
                         // Measurement shapes this font at the same size.
@@ -5189,26 +5205,29 @@ impl TranscriptView {
                                     .when_some(prose, |d, rows| d.flex().flex_col().children(rows))
                                     .when(!has_prose, |d| {
                                         d.child({
-                                        let styled = gpui::StyledText::new(text.clone())
-                                            .with_highlights(markdown::mark_styles(
-                                                &text,
-                                                vec![],
-                                                self.search_match
-                                                    .as_ref()
-                                                    .map_or("", |(_, q)| q.as_str()),
-                                                self.search_match.as_ref().is_some_and(
-                                                    |(start, _)| *start == message_start,
-                                                ),
-                                            ));
-                                        let layout = styled.layout().clone();
-                                        let child = styled.into_any_element();
-                                        if let Some(selection) =
-                                            self.text_selection(row.key, message_start, false, cx)
-                                        {
-                                            selection.wrap(text.clone(), layout, child)
-                                        } else {
-                                            child
-                                        }
+                                            let styled = gpui::StyledText::new(text.clone())
+                                                .with_highlights(markdown::mark_styles(
+                                                    &text,
+                                                    vec![],
+                                                    self.search_match
+                                                        .as_ref()
+                                                        .map_or("", |(_, q)| q.as_str()),
+                                                    self.search_match.as_ref().is_some_and(
+                                                        |(start, _)| *start == message_start,
+                                                    ),
+                                                ));
+                                            let layout = styled.layout().clone();
+                                            let child = styled.into_any_element();
+                                            if let Some(selection) = self.text_selection(
+                                                row.key,
+                                                message_start,
+                                                false,
+                                                cx,
+                                            ) {
+                                                selection.wrap(text.clone(), layout, child)
+                                            } else {
+                                                child
+                                            }
                                         })
                                     }),
                             )

@@ -38,6 +38,7 @@ impl SummaryTask {
             "queued" => "Queued",
             "running" => "Working",
             "completed" => "Done",
+            "saved" => "Saved",
             "failed" => "Failed",
             "blocked" => "Needs review",
             _ => "Queued",

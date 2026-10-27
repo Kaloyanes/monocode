@@ -19,6 +19,9 @@ impl Conversation {
         attachments: Vec<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        if self.driven_by.is_some() {
+            return;
+        }
         if !self.history_ready() {
             self.defer_history_action(
                 move |this, cx| this.mobile_submit(prompt, attachments, cx),
@@ -62,6 +65,9 @@ impl Conversation {
         access: Option<AccessMode>,
         cx: &mut Context<Self>,
     ) {
+        if self.driven_by.is_some() {
+            return;
+        }
         if let Some((kind, model)) = model
             && (self.summary.provider != kind.id() || self.model != model)
         {

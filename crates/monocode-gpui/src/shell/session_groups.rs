@@ -993,6 +993,9 @@ impl Shell {
             self.preview_close = None;
         }
         self.sessions.remove(&id);
+        self.thread_parents.remove(&id);
+        self.agent_summary_writes.remove(&id);
+        self.thread_waiters.remove(&id);
         self.session_summaries.remove(&id);
         self.draft_sessions.remove(&id);
         self.usage_limits.remove(&id);

@@ -1068,6 +1068,9 @@ impl Shell {
                         .and_then(|m| m.update(cx, |m, cx| m.mobile_chat(mono, cx))),
                 }
                 .ok_or("This conversation is still opening on desktop; try again")?;
+                if view.read(cx).driven_by.is_some() {
+                    return Err("This child thread is driven by its lead".into());
+                }
                 let model = match (
                     string(params, "harness").as_deref().and_then(Kind::parse),
                     string(params, "model"),
@@ -1156,6 +1159,9 @@ impl Shell {
                         let view = this
                             .ensure_session(*id, cx)
                             .ok_or("Session is no longer available")?;
+                        if view.read(cx).driven_by.is_some() {
+                            return Err("This child thread is driven by its lead".into());
+                        }
                         view.update(cx, |v, cx| v.mobile_submit(text, attachments, cx));
                         Ok(())
                     }

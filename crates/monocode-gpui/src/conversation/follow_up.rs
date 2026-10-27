@@ -153,6 +153,9 @@ impl Conversation {
     /// agent just wrote, starting from its todo list so the rail can follow.
     /// The draft and its attachments stay in the composer.
     pub(crate) fn build_proposed_plan(&mut self, cx: &mut Context<Self>) {
+        if self.driven_by.is_some() {
+            return;
+        }
         if self.is_remote() || self.busy || !self.loaded {
             return;
         }
@@ -166,6 +169,9 @@ impl Conversation {
         self.attachments = attachments;
     }
     pub(super) fn save_message_draft(&mut self, cx: &mut Context<Self>) {
+        if self.driven_by.is_some() {
+            return;
+        }
         if self.is_remote() {
             self.remote_save_draft(cx);
             return;
@@ -231,6 +237,12 @@ impl Conversation {
         cx.emit(SessionChanged);
     }
     pub(super) fn draft_action(&mut self, send: bool, cx: &mut Context<Self>) {
+        if self.driven_by.is_some() {
+            return;
+        }
+        self.apply_draft_action(send, cx);
+    }
+    pub(super) fn apply_draft_action(&mut self, send: bool, cx: &mut Context<Self>) {
         if self.is_remote() {
             self.remote_draft_action(send, cx);
             return;
@@ -450,6 +462,9 @@ impl Conversation {
         ) = previous;
     }
     fn resume_queue(&mut self, cx: &mut Context<Self>) {
+        if self.driven_by.is_some() {
+            return;
+        }
         if self.stopping {
             self.defer_history_action(|this, cx| this.resume_queue(cx), cx);
             return;

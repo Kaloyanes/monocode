@@ -55,7 +55,8 @@ impl Conversation {
         cx.notify();
     }
     fn can_prepare_edit(&self, cx: &gpui::App) -> bool {
-        self.history_ready()
+        self.driven_by.is_none()
+            && self.history_ready()
             && !self.busy
             && !self.stopping
             && !self.editing_last_turn.pending()

@@ -121,7 +121,14 @@ impl Shell {
     fn rail_open(&self, id: i64, rail: &Rail, cx: &App) -> bool {
         match rail {
             // orchestrationExpanded: the lead in view, chosen or working.
-            Rail::Agents(_) => self.in_play(id, cx),
+            Rail::Agents(summary) => {
+                self.in_play(id, cx)
+                    || summary
+                        .tasks
+                        .iter()
+                        .filter_map(|t| t.session)
+                        .any(|child| self.in_play(child, cx))
+            }
             Rail::Started(children) => {
                 self.in_play(id, cx) || children.iter().any(|c| self.in_play(*c, cx))
             }

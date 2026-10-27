@@ -12,7 +12,7 @@ mod follow_up;
 pub(crate) use follow_up::BUILD_PROPOSED_PLAN;
 pub(crate) mod git_actions;
 mod history;
-mod mobile;
+pub(crate) mod mobile;
 mod mono;
 mod notifications;
 mod remote;
@@ -22,6 +22,7 @@ mod restart;
 mod shell;
 #[cfg(test)]
 mod submission_tests;
+mod threads;
 mod title;
 use crate::{
     composer_motion::ComposerMotion,
@@ -124,6 +125,7 @@ struct OpenMenu {
 use response_menu::ResponseMenu;
 pub(crate) struct SessionChanged;
 pub(crate) struct ChooseFolder(pub(crate) AnchorSlot);
+pub(crate) struct OpenThread(pub i64);
 /// The review card asked to open the session's recorded changes.
 pub(crate) struct OpenSessionChanges(pub(crate) crate::review::ReviewTab);
 pub(crate) struct Conversation {
@@ -184,6 +186,9 @@ pub(crate) struct Conversation {
     /// Automation runs and orchestration workers: their owners recover them,
     /// so a relaunch only settles their interrupted turns.
     pub(crate) managed: bool,
+    pub(crate) driven_by: Option<i64>,
+    pub(crate) thread_driver: String,
+    pub(crate) thread_lead_title: String,
     /// The provider model for the next turn; `None` uses its configured default.
     model: Option<String>,
     resolved_model: Option<String>,
@@ -639,6 +644,9 @@ impl Conversation {
             notification_cancelled: false,
             draft_hint: false,
             managed: false,
+            driven_by: None,
+            thread_driver: String::new(),
+            thread_lead_title: String::new(),
             model: std::env::var(format!(
                 "MONOCODE_{}_MODEL",
                 summary.provider.to_uppercase()
@@ -867,6 +875,9 @@ impl Conversation {
         settings: Settings,
         cx: &mut Context<Self>,
     ) {
+        if self.driven_by.is_some() {
+            return;
+        }
         if self.editing_last_turn.pending() {
             self.defer_edit_transfer(settings, Some(prompt), cx);
             return;
@@ -898,6 +909,9 @@ impl Conversation {
     /// `invert` sends a mid-turn message the opposite way from the follow-up
     /// preference: queued when it steers, steering when it queues.
     fn send_follow_up(&mut self, invert: bool, cx: &mut Context<Self>) {
+        if self.driven_by.is_some() {
+            return;
+        }
         if self.is_remote() && self.remote_send_guard(cx) {
             return;
         }
@@ -1184,7 +1198,7 @@ impl Conversation {
             .try_global::<crate::settings::Preferences>()
             .is_some_and(|p| !p.claude_hooks);
         settings.model = self.model.clone();
-        settings.environment.extend(self.app_environment.clone());
+        settings.environment = self.provider_environment(&settings);
         if settings.remote_action.as_ref().is_none_or(|action| {
             (action["type"] == "send"
                 && action["draftBlockId"].is_null()
@@ -1617,6 +1631,7 @@ impl Conversation {
 impl EventEmitter<SessionChanged> for Conversation {}
 impl EventEmitter<ChooseFolder> for Conversation {}
 impl EventEmitter<OpenSessionChanges> for Conversation {}
+impl EventEmitter<OpenThread> for Conversation {}
 impl EventEmitter<Transfer> for Conversation {}
 impl EventEmitter<composer_features::StartOrchestration> for Conversation {}
 impl EventEmitter<composer_features::StopOrchestration> for Conversation {}
@@ -1628,6 +1643,9 @@ impl Conversation {
         prompt: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if self.driven_by.is_some() && prompt.is_some() {
+            return;
+        }
         if self.editing_last_turn.pending() {
             self.defer_edit_transfer(settings, prompt, cx);
             return;
@@ -2284,7 +2302,10 @@ impl Conversation {
         picked: &ModelPicked,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.editing_last_turn.pending() || self.status == "Preparing handoff…" {
+        if self.driven_by.is_some()
+            || self.editing_last_turn.pending()
+            || self.status == "Preparing handoff…"
+        {
             return false;
         }
         let changed_model = self.summary.provider != picked.0.id() || self.model != picked.1;
@@ -2774,6 +2795,10 @@ impl Conversation {
         }
         if self.busy {
             self.stop(cx);
+        } else if self.driven_by.is_none() || self.thread_pending() {
+            self.notification_cancelled = true;
+            cx.emit(SessionChanged);
+            cx.notify();
         }
     }
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -2830,6 +2855,9 @@ impl Conversation {
         Some(runner)
     }
     fn composer(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.driven_by.is_some() {
+            return self.thread_composer(cx);
+        }
         let radius = 12.;
         let command = if self.follow_ups.draft_selected {
             Some(input::Command::Draft)
@@ -4058,6 +4086,24 @@ impl Render for Conversation {
             .flex()
             .flex_col()
             .size_full()
+            .when_some(self.driven_by, |d, lead| {
+                d.child(
+                    div()
+                        .id("thread-breadcrumb")
+                        .role(gpui::Role::Button)
+                        .aria_label("Open lead thread")
+                        .px_4()
+                        .py_2()
+                        .text_size(px(12.))
+                        .text_color(content(0.5))
+                        .cursor_pointer()
+                        .child(format!(
+                            "{} › {}",
+                            self.thread_lead_title, self.summary.title
+                        ))
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenThread(lead)))),
+                )
+            })
             .min_w_0()
             .when_some(self.response_menu.as_ref(), |d, menu| {
                 let panel =

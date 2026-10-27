@@ -11,6 +11,7 @@ pub struct SessionSidebarMetadata {
     pub usage_limits: HashMap<i64, crate::usage::Limit>,
     pub sidebar_hidden: HashSet<i64>,
     pub started_by: HashMap<i64, i64>,
+    pub thread_parents: HashMap<i64, i64>,
     pub orchestrations: HashMap<i64, orchestration::Summary>,
     pub groups: HashMap<String, session_groups::Groups>,
     pub reminders: Vec<super::Reminder>,
@@ -129,6 +130,7 @@ impl Store {
                 HashSet::new()
             },
             started_by: self.started_links().unwrap_or_default(),
+            thread_parents: self.thread_parents().unwrap_or_default(),
             orchestrations: self.orchestration_summaries().unwrap_or_default(),
             groups: projects
                 .iter()

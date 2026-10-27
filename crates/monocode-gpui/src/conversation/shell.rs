@@ -153,6 +153,9 @@ impl Conversation {
     }
 
     pub(super) fn submit_shell(&mut self, cx: &mut Context<Self>) {
+        if self.driven_by.is_some() {
+            return;
+        }
         if !self.shell_available() {
             self.send(cx);
             return;

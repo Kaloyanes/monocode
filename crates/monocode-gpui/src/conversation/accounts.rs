@@ -242,6 +242,9 @@ impl Conversation {
         cx.notify();
     }
     pub(crate) fn resume_usage(&mut self, cx: &mut Context<Self>) {
+        if self.driven_by.is_some() {
+            return;
+        }
         if self.needs_history_restore() {
             self.defer_history_action(|this, cx| this.resume_usage(cx), cx);
             return;
@@ -345,7 +348,7 @@ impl Conversation {
                                 fast: this.settings.fast,
                                 service_tier: this.settings.service_tier.clone(),
                                 thinking: this.settings.thinking,
-                                skip_outgoing_recap: true,
+                                skip_outgoing_recap: this.settings.usage_limit.is_some(),
                                 usage_limit: this.settings.usage_limit.clone(),
                                 account: this.settings.account.clone(),
                                 provider_id: this.summary.provider_id.clone(),

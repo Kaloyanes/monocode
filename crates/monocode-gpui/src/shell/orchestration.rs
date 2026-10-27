@@ -245,7 +245,7 @@ impl Shell {
             .collect::<Vec<_>>()
             .join("\n");
         // The sidebar lists the lead's agents from this, during and after the run.
-        let summary = orchestration::Summary {
+        let mut summary = orchestration::Summary {
             live: !done,
             tasks: run
                 .tasks
@@ -266,17 +266,23 @@ impl Shell {
                 })
                 .collect(),
         };
-        if self.orchestration_summaries.get(&lead) != Some(&summary) {
-            let store = self.store.clone();
-            let saved = summary.clone();
-            cx.background_executor()
-                .spawn(async move {
-                    let _ = locked(&store).and_then(|s| s.save_orchestration_summary(lead, &saved));
-                })
-                .detach();
-            self.orchestration_summaries.insert(lead, summary);
-            self.invalidate_chrome(cx);
+        if let Some(previous) = self.orchestration_summaries.get(&lead) {
+            summary.tasks.extend(
+                previous
+                    .tasks
+                    .iter()
+                    .filter(|t| {
+                        t.session
+                            .is_some_and(|child| self.thread_parents.get(&child) == Some(&lead))
+                    })
+                    .cloned(),
+            );
+            summary.live |= summary
+                .tasks
+                .iter()
+                .any(|t| matches!(t.status.as_str(), "running" | "blocked"));
         }
+        self.set_agent_summary(lead, summary, cx);
         let Some(run) = self.orchestrations.get_mut(&lead) else {
             return;
         };

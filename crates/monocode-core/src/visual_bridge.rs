@@ -24,6 +24,18 @@ const ENV_ENDPOINT: &str = "MONOCODE_VISUAL_ENDPOINT";
 const ENV_TOKEN: &str = "MONOCODE_VISUAL_TOKEN";
 const ENV_SESSION: &str = "MONOCODE_VISUAL_SESSION";
 const ENV_EXECUTABLE: &str = "MONOCODE_VISUAL_EXECUTABLE";
+/// The MCP server's name, so its tools reach the model as `mcp__monocode__*`.
+pub const SERVER_NAME: &str = "monocode";
+const SERVER_ENV: [&str; 8] = [
+    ENV_ENDPOINT,
+    ENV_TOKEN,
+    ENV_SESSION,
+    ENV_EXECUTABLE,
+    "MONOCODE_APP_ENDPOINT",
+    "MONOCODE_APP_TOKEN",
+    "MONOCODE_APP_SESSION",
+    "MONOCODE_THREADS",
+];
 
 /// Loaded through visual_docs or the CLI only when authoring a visual. Keep the
 /// SDK out of ordinary prompts, server instructions and tool descriptions.
@@ -1124,7 +1136,7 @@ fn preview_with_environment(
 }
 
 fn current_environment() -> HashMap<String, String> {
-    [ENV_ENDPOINT, ENV_TOKEN, ENV_SESSION, ENV_EXECUTABLE]
+    SERVER_ENV
         .into_iter()
         .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
         .collect()
@@ -1266,10 +1278,14 @@ pub fn acp_servers(environment: &HashMap<String, String>) -> Value {
     };
     // ACP's stdio server shape omits the transport discriminator.
     server.as_object_mut().unwrap().remove("type");
-    server["name"] = "monocode_visual".into();
-    server["env"] = [ENV_ENDPOINT, ENV_TOKEN, ENV_SESSION, ENV_EXECUTABLE]
+    server["name"] = SERVER_NAME.into();
+    server["env"] = SERVER_ENV
         .into_iter()
-        .map(|key| json!({"name":key,"value":environment[key]}))
+        .filter_map(|key| {
+            environment
+                .get(key)
+                .map(|value| json!({"name":key,"value":value}))
+        })
         .collect::<Vec<_>>()
         .into();
     json!([server])
@@ -1282,13 +1298,11 @@ pub fn configure_codex(command: &mut std::process::Command, environment: &HashMa
     for (key, value) in [
         ("command", json!(environment[ENV_EXECUTABLE])),
         ("args", json!(["visual-mcp"])),
-        (
-            "env_vars",
-            json!([ENV_ENDPOINT, ENV_TOKEN, ENV_SESSION, ENV_EXECUTABLE]),
-        ),
+        ("tool_timeout_sec", json!(90)),
+        ("env_vars", json!(SERVER_ENV)),
     ] {
         // JSON's strings and arrays are valid TOML literals for these values.
-        command.args(["-c", &format!("mcp_servers.monocode_visual.{key}={value}")]);
+        command.args(["-c", &format!("mcp_servers.{SERVER_NAME}.{key}={value}")]);
     }
     // Codex's bundled visualize plugin asks the model for a content reference
     // only the Codex app can render; in MonoCode it shows up as raw text. An
@@ -1319,14 +1333,101 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+pub(crate) fn thread_tool_definitions() -> Vec<Value> {
+    ["start", "send", "wait", "read", "stop", "list"].into_iter().map(|action| {
+        let mut properties = json!({"requestId":{"type":"string","maxLength":128,"description":"Reuse for an uncertain retry with identical input"}});
+        let required = match action {
+            "start" => {
+                properties["prompt"] = json!({"type":"string","minLength":1,"maxLength":240000});
+                for key in ["harness", "model", "effort", "title"] { properties[key] = json!({"type":"string"}); }
+                properties["modelSettings"] = json!({"type":"object","additionalProperties":{"type":"string"}});
+                properties["workspaceMode"] = json!({"enum":["current","worktree"]});
+                vec!["prompt"]
+            }
+            "list" => vec![],
+            _ => {
+                properties["threadId"] = json!({"type":"integer","minimum":1});
+                match action {
+                    "send" => { properties["prompt"] = json!({"type":"string","minLength":1,"maxLength":240000}); }
+                    "wait" => { properties["timeoutSeconds"] = json!({"type":"integer","minimum":0,"maximum":50,"default":50}); }
+                    "read" => {
+                        properties["before"] = json!({"type":["string","integer"]});
+                        properties["limit"] = json!({"type":"integer","minimum":1,"maximum":3});
+                        properties["maxChars"] = json!({"type":"integer","minimum":200,"maximum":6000});
+                    }
+                    _ => (),
+                }
+                if action == "send" { vec!["threadId","prompt"] } else { vec!["threadId"] }
+            }
+        };
+        let detail = match action {
+            "start" => "Start a child on the requested harness and model.",
+            "send" => "Send a follow-up to an idle child; fails while it is busy.",
+            "wait" => "Wait up to 50 seconds. Returns idle with success and the final reply, working, or needsInput for a user approval or question. Tell the user when input is needed.",
+            "read" => "Read recent prose exchanges with an owned child, using nextBefore for older turns.",
+            "stop" => "Stop an owned child.",
+            _ => "List your own children and their current status.",
+        };
+        json!({"name":format!("thread_{action}"),"description":format!("{detail} Start/send return at once; call thread_wait until status is idle. Children share your checkout unless workspaceMode is worktree. Children cannot spawn or message other threads."),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":matches!(action,"wait"|"read"|"list"),"destructiveHint":false,"openWorldHint":false}})
+    }).collect()
+}
+
+fn call_thread_tool(
+    name: &str,
+    mut input: Value,
+    environment: &HashMap<String, String>,
+) -> Result<Value, String> {
+    if environment.get("MONOCODE_THREADS").is_none_or(|v| v != "1") {
+        return Err("Thread tools are only available to top-level threads".into());
+    }
+    let request = crate::app_access::optional_text(&input, "requestId", 128)?
+        .unwrap_or_else(crate::mono::new_id);
+    input
+        .as_object_mut()
+        .ok_or("Input must be an object")?
+        .remove("requestId");
+    let action = format!(
+        "threads.{}",
+        name.strip_prefix("thread_").ok_or("Unknown thread tool")?
+    );
+    crate::app_access::validate_threads(&action, &input)?;
+    let response = crate::mono::bridge::call(&action, input, &request, environment)?;
+    if response["ok"] == true {
+        Ok(response["result"].clone())
+    } else {
+        Err(response["error"]
+            .as_str()
+            .unwrap_or("Thread request failed")
+            .to_owned())
+    }
+}
+
+pub fn read_only_tool(name: &str) -> bool {
+    matches!(
+        name.strip_prefix("mcp__monocode__")
+            .or_else(|| name.strip_prefix("monocode:"))
+            .or_else(|| name.strip_prefix("monocode_")),
+        Some("update_plan" | "thread_wait" | "thread_read" | "thread_list")
+    )
+}
+
 fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option<Value> {
     let id = request.get("id")?.clone();
     let result = match request["method"].as_str().unwrap_or("") {
         "initialize" => Ok(
-            json!({"protocolVersion":request["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"monocode_visual","version":env!("CARGO_PKG_VERSION")}}),
+            json!({"protocolVersion":request["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION")}}),
         ),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools":tool_definitions()})),
+        "tools/list" => {
+            let mut tools = tool_definitions();
+            if environment
+                .get("MONOCODE_THREADS")
+                .is_some_and(|v| v == "1")
+            {
+                tools.extend(thread_tool_definitions());
+            }
+            Ok(json!({"tools":tools}))
+        }
         "tools/call" => {
             let input = request["params"]["arguments"].clone();
             let result = match request["params"]["name"].as_str().unwrap_or("") {
@@ -1335,6 +1436,7 @@ fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option
                 "visual_show" => publish_with_environment(input, environment),
                 "image_show" => publish_image_with_environment(input, environment),
                 "visual_preview" => preview_with_environment(&input, environment),
+                name if name.starts_with("thread_") => call_thread_tool(name, input, environment),
                 _ => Err("Unknown native visual tool".into()),
             };
             let is_preview = request["params"]["name"] == "visual_preview";
@@ -1711,7 +1813,13 @@ mod tests {
     #[test]
     fn provider_configuration_forwards_capability_without_token_in_arguments() {
         let server = Server::start(84).unwrap();
-        let environment = server.environment(std::path::Path::new("/test/app"));
+        let mut environment = server.environment(std::path::Path::new("/test/app"));
+        environment.extend(HashMap::from([
+            ("MONOCODE_APP_ENDPOINT".into(), "127.0.0.1:1".into()),
+            ("MONOCODE_APP_TOKEN".into(), "app-secret".into()),
+            ("MONOCODE_APP_SESSION".into(), "84".into()),
+            ("MONOCODE_THREADS".into(), "1".into()),
+        ]));
         let mut command = std::process::Command::new("provider");
         configure_codex(&mut command, &environment);
         let arguments = command
@@ -1721,6 +1829,9 @@ mod tests {
             .join(" ");
         assert!(arguments.contains("visual-mcp"));
         assert!(arguments.contains(ENV_TOKEN));
+        assert!(arguments.contains("MONOCODE_APP_TOKEN"));
+        assert!(arguments.contains("tool_timeout_sec=90"));
+        assert!(!arguments.contains("app-secret"));
         assert!(!arguments.contains(&environment[ENV_TOKEN]));
         // Only MonoCode's own visual tools stay available to the model.
         assert!(arguments.contains(CODEX_VISUALIZE_OFF));
@@ -1728,8 +1839,63 @@ mod tests {
         configure_codex(&mut plain, &HashMap::new());
         assert_eq!(plain.get_args().count(), 0);
         let acp = acp_servers(&environment);
-        assert_eq!(acp[0]["name"], "monocode_visual");
-        assert_eq!(acp[0]["env"].as_array().unwrap().len(), 4);
+        assert_eq!(acp[0]["name"], SERVER_NAME);
+        assert_eq!(acp[0]["env"].as_array().unwrap().len(), 8);
         assert_eq!(mcp_server(&environment).unwrap()["command"], "/test/app");
+    }
+
+    #[test]
+    fn thread_tools_are_only_listed_and_callable_for_enabled_leads() {
+        let mut env = HashMap::new();
+        let request = json!({"id":1,"method":"tools/list"});
+        let names = |env: &HashMap<String, String>| {
+            mcp_response(request.clone(), env).unwrap()["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        assert!(!names(&env).iter().any(|n| n.starts_with("thread_")));
+        let denied = mcp_response(
+            json!({"id":2,"method":"tools/call","params":{"name":"thread_list","arguments":{}}}),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(denied["result"]["isError"], true);
+        env.insert("MONOCODE_THREADS".into(), "1".into());
+        assert_eq!(
+            names(&env)
+                .iter()
+                .filter(|n| n.starts_with("thread_"))
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn thread_mcp_calls_use_the_authenticated_app_bridge_and_retry_id() {
+        let (server, calls) = crate::mono::bridge::Server::start().unwrap();
+        let mut environment = server.environment(7);
+        environment.insert("MONOCODE_THREADS".into(), "1".into());
+        let worker = std::thread::spawn(move || {
+            mcp_response(json!({"id":1,"method":"tools/call","params":{"name":"thread_wait","arguments":{"threadId":8,"timeoutSeconds":0,"requestId":"retry-1"}}}),&environment).unwrap()
+        });
+        let call = calls.recv_blocking().unwrap();
+        assert_eq!(call.session, 7);
+        assert_eq!(call.request_id, "retry-1");
+        assert_eq!(call.action, "threads.wait");
+        assert_eq!(call.input, json!({"threadId":8,"timeoutSeconds":0}));
+        call.reply
+            .send(Ok(
+                json!({"status":"idle","success":true,"reply":"Reviewed"}),
+            ))
+            .unwrap();
+        let response = worker.join().unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Reviewed"));
     }
 }

@@ -493,6 +493,15 @@ impl Store {
     pub fn save_started_link(&self, child: i64, caller: i64) -> Result<(), String> {
         self.save_setting(&format!("started-by:{child}"), &caller.to_string())
     }
+    pub fn thread_parents(&self) -> Result<std::collections::HashMap<i64, i64>, String> {
+        self.settings_with_prefix("thread-parent:")?
+            .into_iter()
+            .map(|(child, value)| Ok((child, value.parse().map_err(|_| "Invalid thread parent")?)))
+            .collect()
+    }
+    pub fn save_thread_parent(&self, child: i64, parent: i64) -> Result<(), String> {
+        self.save_setting(&format!("thread-parent:{child}"), &parent.to_string())
+    }
     /// Every lead's last orchestration summary.
     pub fn orchestration_summaries(
         &self,
@@ -1064,7 +1073,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1073,7 +1082,8 @@ impl Store {
                 format!("started-by:{id}"),
                 format!("orchestration:{id}"),
                 format!("inbox-ask:{id}"),
-                format!("automation:{id}")
+                format!("automation:{id}"),
+                format!("thread-parent:{id}")
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1319,6 +1329,36 @@ mod tests {
         assert_eq!(store.load(session.id).unwrap().rows, rows);
         store.set_archived(session.id, false).unwrap();
         assert!(!store.sessions().unwrap()[0].archived);
+    }
+    #[test]
+    fn thread_parent_lock_survives_restart_and_is_distinct_from_operator_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        for shared in [false, true] {
+            let path = dir.path().join(if shared {
+                "shared.sqlite3"
+            } else {
+                "native.sqlite3"
+            });
+            let open = || {
+                if shared {
+                    Store::open_monocode(&path).unwrap()
+                } else {
+                    Store::open(&path).unwrap()
+                }
+            };
+            let store = open();
+            let lead = store.create("claude", "/project").unwrap().id;
+            let child = store.create("codex", "/project").unwrap().id;
+            let ordinary = store.create("codex", "/project").unwrap().id;
+            store.save_started_link(child, lead).unwrap();
+            store.save_started_link(ordinary, lead).unwrap();
+            store.save_thread_parent(child, lead).unwrap();
+            drop(store);
+            let store = open();
+            let sidebar = store.session_sidebar_metadata(&[]);
+            assert_eq!(sidebar.thread_parents.get(&child), Some(&lead));
+            assert!(!sidebar.thread_parents.contains_key(&ordinary));
+        }
     }
     #[test]
     fn started_links_and_orchestration_summaries_survive_restart_and_delete() {

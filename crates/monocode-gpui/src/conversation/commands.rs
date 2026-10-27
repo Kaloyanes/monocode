@@ -30,6 +30,9 @@ impl Conversation {
     }
 
     pub(super) fn compact_context(&mut self, cx: &mut Context<Self>) {
+        if self.driven_by.is_some() {
+            return;
+        }
         self.compact_context_then(None, cx);
     }
 
