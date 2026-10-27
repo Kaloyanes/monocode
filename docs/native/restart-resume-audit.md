@@ -138,7 +138,7 @@ Stagger launches (finding 11). Leave queued follow-ups paused.
 
 ### Step 6: Copy and quit prompt
 
-- `request_quit`: when chats are busy, show "N chats are still running. They'll continue when you reopen MonoCode." with Quit and Cancel buttons.
+- `request_quit` does not ask about running chats. They continue on the next launch, and a confirmation would force a mouse click on a keyboard-only Cmd-Q. Only unsaved files still ask.
 - Update the Reload prompt text to match.
 - Optional preference: "Resume running chats after restart", on by default.
 

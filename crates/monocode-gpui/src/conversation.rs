@@ -24,6 +24,8 @@ mod shell;
 mod submission_tests;
 mod threads;
 mod title;
+mod worktree_name;
+use crate::tooltip::Tip;
 use crate::{
     composer_motion::ComposerMotion,
     git_picker::{GitPicker, Mode as GitMode, Picked as GitPicked},
@@ -167,6 +169,8 @@ pub(crate) struct Conversation {
     pub(crate) app_read_only: bool,
     /// The newest turn ran in Plan mode, so its answer is a plan to review.
     pub(crate) plan_turn: bool,
+    /// The rail already asked the running turn for a todo list.
+    pub(crate) plan_asked: bool,
     planning_orchestration: bool,
     pub(crate) orchestration_plan: Option<monocode_core::orchestration::Plan>,
     orchestration_error: Option<String>,
@@ -629,6 +633,7 @@ impl Conversation {
             app_environment: Default::default(),
             app_read_only: false,
             plan_turn: false,
+            plan_asked: false,
             planning_orchestration: false,
             orchestration_plan: None,
             orchestration_error: None,
@@ -748,17 +753,9 @@ impl Conversation {
         self.refresh_catalog(cx);
         let store = self.store.clone();
         let id = self.summary.id;
-        let cwd = self.summary.cwd.clone();
         let mono = self.settings.mono.is_some();
         let work = cx.background_executor().spawn(async move {
             let settings = locked(&store).and_then(|s| s.agent_settings(id));
-            let execution_cwd = settings
-                .as_ref()
-                .ok()
-                .and_then(|s| s.as_ref())
-                .and_then(|s| s.worktree_cwd.as_deref())
-                .unwrap_or(&cwd);
-            let git = crate::git_cache::load(Path::new(execution_cwd)).ok();
             (
                 locked(&store)
                     .and_then(|s| {
@@ -776,7 +773,6 @@ impl Conversation {
                             edits,
                         )
                     }),
-                git,
                 settings,
                 locked(&store).and_then(|s| s.context_usage(id)),
                 locked(&store).and_then(|s| s.follow_ups(id)),
@@ -784,11 +780,9 @@ impl Conversation {
             )
         });
         cx.spawn(async move |this, cx| {
-            let (result, git, settings, context, follow_ups, before) = work.await;
+            let (result, settings, context, follow_ups, before) = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.loading = false;
-                this.branch = git.as_ref().and_then(|s| s.current.clone());
-                this.git = git;
                 this.context = context.ok().flatten();
                 match follow_ups {
                     Ok(state) => {
@@ -803,6 +797,7 @@ impl Conversation {
                     }
                     Err(error) => {
                         this.status = error;
+                        this.load_git(cx);
                         return;
                     }
                 }
@@ -856,6 +851,12 @@ impl Conversation {
                     }
                     Err(e) => this.status = e,
                 }
+                // Git can take tens of milliseconds; history shows first.
+                if let Some(git) = crate::git_cache::get(this.execution_cwd()) {
+                    this.branch = git.current.clone();
+                    this.git = Some(git);
+                }
+                this.load_git(cx);
                 this.mono_flush_external(cx);
                 cx.emit(SessionChanged);
                 cx.notify();
@@ -1166,6 +1167,7 @@ impl Conversation {
             || self.settings.orchestrator
             || self.settings.access == AccessMode::ReadOnly;
         self.plan_turn = self.settings.plan && !self.settings.orchestrator;
+        self.plan_asked = false;
         let mut settings = self.settings.clone();
         settings.resume_after_restart = !self.managed;
         // One-shot: only the launch that continues an interrupted turn.
@@ -1217,6 +1219,7 @@ impl Conversation {
             settings.attachments.clear();
         }
         self.preparing_worktree = settings.new_worktree && settings.worktree_cwd.is_none();
+        let mut naming_message = self.preparing_worktree.then(|| prompt.clone());
         if self.preparing_worktree {
             settings.worktree_base = settings.worktree_base.or(self.branch.clone());
             self.status = "Creating worktree…".into();
@@ -1299,10 +1302,13 @@ impl Conversation {
                                     || this.settings.new_worktree)
                             {
                                 this.preparing_worktree = false;
-                                this.settings.worktree_cwd = Some(cwd);
+                                this.settings.worktree_cwd = Some(cwd.clone());
                                 this.settings.new_worktree = false;
                                 this.save_settings(cx);
                                 this.refresh_git(cx);
+                                if let Some(message) = naming_message.take() {
+                                    this.refine_worktree_branch(cwd, message, cx);
+                                }
                             }
                             if let Some(commands) = update.commands.filter(|_| source_selected) {
                                 this.completion.update(cx, |completion, cx| {
@@ -1367,8 +1373,9 @@ impl Conversation {
                                 }
                                 this.save_settings(cx);
                             }
-                            if let Some(model) = update.model {
-                                turn_model_id = Some(model.clone());
+                            if let Some(model) =
+                                update.model.filter(|model| !model.trim().is_empty())
+                            {
                                 let name: SharedString = this
                                     .catalog
                                     .iter()
@@ -1385,8 +1392,25 @@ impl Conversation {
                                             .into()
                                     })
                                     .unwrap_or_else(|| {
-                                        model_name(Kind::from_id(&source_provider), Some(&model))
+                                        cached_model_name(
+                                            Kind::from_id(&source_provider),
+                                            Some(&model),
+                                        )
                                     });
+                                let name = name.strip_prefix("Claude ").unwrap_or(&name).to_owned();
+                                let name =
+                                    if turn_model_id.as_deref() == Some(&model) && name == model {
+                                        let view = this.transcript.read(cx);
+                                        view.active_turn()
+                                            .and_then(|turn| view.turns.get(&turn))
+                                            .map(|info| info.model.as_str())
+                                            .filter(|name| !name.is_empty())
+                                            .unwrap_or(&name)
+                                            .to_owned()
+                                    } else {
+                                        name
+                                    };
+                                turn_model_id = Some(model.clone());
                                 if source_selected {
                                     this.resolved_model = Some(model);
                                 }
@@ -1854,6 +1878,9 @@ impl Conversation {
     }
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
         self.sync_review(cx);
+        self.load_git(cx);
+    }
+    fn load_git(&mut self, cx: &mut Context<Self>) {
         let cwd = self.execution_cwd().to_owned();
         let work_cwd = cwd.clone();
         let work = cx
@@ -1882,19 +1909,30 @@ impl Conversation {
             .or(self.branch.clone())
             .unwrap_or_else(|| "HEAD".into());
         let id = self.summary.id;
-        let work = cx
-            .background_executor()
-            .spawn(async move { monocode_core::git::create_worktree(Path::new(&cwd), &base, id) });
+        let message = self
+            .follow_ups
+            .state
+            .messages
+            .first()
+            .map(|message| message.text.clone());
+        let named = message.clone();
+        let work = cx.background_executor().spawn(async move {
+            monocode_core::git::create_worktree(Path::new(&cwd), &base, id, named.as_deref())
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.preparing_worktree = false;
                 match result {
                     Ok(path) => {
-                        this.settings.worktree_cwd = Some(path.to_string_lossy().into_owned());
+                        let path = path.to_string_lossy().into_owned();
+                        this.settings.worktree_cwd = Some(path.clone());
                         this.settings.new_worktree = false;
                         this.save_settings(cx);
                         this.refresh_git(cx);
+                        if let Some(message) = message {
+                            this.refine_worktree_branch(path, message, cx);
+                        }
                         if this.follow_ups.state.messages.is_empty() {
                             this.send(cx);
                         } else {
@@ -2907,6 +2945,9 @@ impl Conversation {
             )
         });
         let kind = Kind::from_id(&self.summary.provider);
+        let model_open = self.menu_is(ComposerMenu::Model)
+            || self.menu_is(ComposerMenu::Recent)
+            || self.mono_ui.models.is_some();
         let menu: Vec<_> = self
             .menu
             .as_ref()
@@ -3078,7 +3119,7 @@ impl Conversation {
                                                     .unwrap_or_default()
                                             ))
                                             .child(self.model_anchor.probe())
-                                            .aria_expanded(self.menu_is(ComposerMenu::Model) || self.menu_is(ComposerMenu::Recent) || self.mono_ui.models.is_some())
+                                            .aria_expanded(model_open)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.toggle_menu(ComposerMenu::Model, window, cx)
                                             }))
@@ -3101,7 +3142,11 @@ impl Conversation {
                                                         .child(effort),
                                                 )
                                             })
-                                            .child(icon("chevron-down", 12.)),
+                                            .child(chevron(
+                                                "composer-model-chevron",
+                                                model_open,
+                                                12.,
+                                            )),
                                     )
                                     .children(controls)
                                     .child(
@@ -3138,7 +3183,11 @@ impl Conversation {
                                                 ),
                                             )
                                             .child(pill_label(self.settings.access.label()))
-                                            .child(icon("chevron-down", 12.)),
+                                            .child(chevron(
+                                                "composer-access-chevron",
+                                                self.menu_is(ComposerMenu::Access),
+                                                12.,
+                                            )),
                                     )
                                     .into_any_element()
                             })
@@ -4123,19 +4172,11 @@ impl Render for Conversation {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(if self.transcript.read(cx).has_html_visuals() {
-                        // Native web views follow every paint; replaying cached
-                        // quads would leave them where they were.
-                        div()
-                            .size_full()
-                            .child(self.transcript.clone())
-                            .into_any_element()
-                    } else {
+                    .child(
                         self.transcript
                             .clone()
-                            .cached(StyleRefinement::default().size_full())
-                            .into_any_element()
-                    })
+                            .cached(StyleRefinement::default().size_full()),
+                    )
                     // Level with the transcript's jump button, which moves to
                     // the column's other end.
                     .children(pill.map(|pill| {
@@ -4252,6 +4293,7 @@ fn send_button(
         .id(id)
         .role(Role::Button)
         .aria_label(label)
+        .tip(label)
         .cursor_pointer()
         .flex_shrink_0()
         .size(px(26.))

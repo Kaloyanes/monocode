@@ -27,6 +27,39 @@ mod visual_discovery;
 mod visual_tests;
 use persistence::PendingSave;
 pub(crate) type Database = Arc<Mutex<Store>>;
+fn update_turn_model(info: &mut monocode_core::agent::TurnInfo, kind: Kind, id: &str) {
+    if id.trim().is_empty() {
+        return;
+    }
+    let name = crate::pickers::cached_model_name(kind, Some(id));
+    if info.model.is_empty() || info.model_id.as_deref() != Some(id) || name.as_ref() != id {
+        info.model = name.strip_prefix("Claude ").unwrap_or(&name).into();
+    }
+    info.model_id = Some(id.into());
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    #[test]
+    fn turn_model_keeps_its_name_and_records_changes() {
+        let mut info = monocode_core::agent::TurnInfo {
+            model: "Custom Model".into(),
+            model_id: Some("custom-model".into()),
+            ..Default::default()
+        };
+        update_turn_model(&mut info, Kind::Claude, "");
+        update_turn_model(&mut info, Kind::Claude, "custom-model");
+        assert_eq!(info.model, "Custom Model");
+        update_turn_model(&mut info, Kind::Claude, "claude-sonnet-5-5");
+        assert_eq!(info.model, "Sonnet 5.5");
+        assert_eq!(info.model_id.as_deref(), Some("claude-sonnet-5-5"));
+        let restored: monocode_core::agent::TurnInfo =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(restored.model, "Sonnet 5.5");
+    }
+}
 struct TurnInput {
     summary: Session,
     prompt: String,
@@ -299,6 +332,7 @@ fn run_turn_using(
                 std::path::Path::new(&summary.cwd),
                 settings.worktree_base.as_deref().unwrap_or("HEAD"),
                 summary.id,
+                Some(&prompt),
             )?;
             let cwd = path.to_string_lossy().into_owned();
             created_worktree = Some(cwd.clone());
@@ -792,7 +826,13 @@ fn run_turn_using(
                                 changed_id = Some(id);
                             }
                         }
-                        Event::Model(id) => model = Some(id),
+                        Event::Model(id) if !id.trim().is_empty() => {
+                            if let Some((_, info)) = &mut turn_receipt {
+                                update_turn_model(info, Kind::from_id(&summary.provider), &id);
+                            }
+                            model = Some(id);
+                        }
+                        Event::Model(_) => {}
                         Event::ConfigChanged {
                             model: changed_model,
                             model_settings,
@@ -935,6 +975,9 @@ fn run_turn_using(
                         Content::Visual(document) => serde_json::to_string(document)
                             .map(|text| ("visual", text))
                             .map_err(|e| e.to_string()),
+                        Content::Draft(card) => serde_json::to_string(card)
+                            .map(|text| (monocode_core::visual_bridge::DRAFT_ROLE, text))
+                            .map_err(|e| e.to_string()),
                         Content::Image(request) => std::fs::read(&request.path)
                             .map_err(|e| e.to_string())
                             .and_then(|bytes| {
@@ -945,6 +988,9 @@ fn run_turn_using(
                                 )
                             })
                             .and_then(|document| {
+                                if let Some(page) = &request.draft {
+                                    locked(&store)?.save_thread_draft(&document, page)?;
+                                }
                                 serde_json::to_string(&document).map_err(|e| e.to_string())
                             })
                             .map(|text| (images::ROLE, text)),
@@ -1006,6 +1052,7 @@ fn run_turn_using(
                         None => publication_result.as_ref().map(|_| match &publication.content {
                             Content::Visual(document) => serde_json::json!({"id":document.id,"title":document.title,"saved":true}),
                             Content::Image(request) => serde_json::json!({"title":request.title,"saved":true}),
+                            Content::Draft(card) => serde_json::json!({"draft":card.draft}),
                         }).map_err(Clone::clone),
                     };
                     let _ = publication.reply.send(result);

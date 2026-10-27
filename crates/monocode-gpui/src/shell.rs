@@ -8,6 +8,7 @@ mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
+mod drafts;
 mod file_panes;
 mod idle_agents;
 #[cfg(test)]
@@ -51,6 +52,8 @@ mod title_tabs;
 mod window_chrome;
 mod worktrees;
 
+use crate::settings::TitleBarMode;
+use crate::tooltip::Tip;
 use crate::{
     conversation::{Conversation, SessionChanged},
     input,
@@ -577,8 +580,9 @@ pub(crate) struct Shell {
     monos: Option<Entity<crate::monos::Monos>>,
     quick_open: Option<quick_open::Open>,
     image_lightbox: Option<(Entity<crate::image_lightbox::ImageLightbox>, Subscription)>,
-    visual_expand: Option<(Entity<crate::visual_expand::VisualExpand>, Subscription)>,
     app_bridge: Option<monocode_core::mono::bridge::Server>,
+    /// The live pages behind the agent's draft cards, by conversation.
+    drafts: HashMap<i64, Vec<Entity<crate::draft::Draft>>>,
     mobile: mobile_host::Mobile,
     app_results: HashMap<(i64, String), (String, Result<serde_json::Value, String>)>,
     app_pending: HashSet<(i64, String)>,
@@ -709,6 +713,8 @@ pub(crate) struct Shell {
     window_active: bool,
     window_glass: Option<bool>,
     quit_prompted: bool,
+    /// Set by a first Cmd-Q; a second press before it clears quits.
+    quit_armed: Option<gpui::Task<()>>,
     pub(crate) menu: Option<ShellMenu>,
     background_dialog: Option<project_settings::OpenBackground>,
     backgrounds: HashMap<i64, Entity<crate::project_background::ProjectBackground>>,
@@ -966,8 +972,8 @@ impl Shell {
             monos: None,
             quick_open: None,
             image_lightbox: None,
-            visual_expand: None,
             app_bridge: None,
+            drafts: HashMap::new(),
             mobile: mobile_host::Mobile::default(),
             app_results: HashMap::new(),
             app_pending: HashSet::new(),
@@ -1082,6 +1088,7 @@ impl Shell {
             window_active: false,
             window_glass: None,
             quit_prompted: false,
+            quit_armed: None,
             menu: None,
             background_dialog: None,
             backgrounds: HashMap::new(),
@@ -1236,6 +1243,7 @@ impl Shell {
         this.monos = Some(monos);
         this.bind_notices(cx);
         this.init_app_bridge(cx);
+        this.init_draft_inbox(cx);
         for summary in summaries {
             if this
                 .monos
@@ -1676,7 +1684,7 @@ impl Shell {
             && (!self.workspace.classic_layout
                 || self.mono_active(cx)
                 || self.right_panel.as_ref().is_some_and(|panel| {
-                    panel.read(cx).tab() == crate::right_panel::RightTab::Plan
+                    matches!(panel.read(cx).tab(), crate::right_panel::RightTab::Plan)
                 }))
             && !self.app_view_open()
             && self.settings.is_none()
@@ -2010,19 +2018,61 @@ impl Shell {
         })
         .detach();
     }
+    /// Cmd-Q must be pressed twice so a stray press never closes the app.
+    /// A menu click carries no held modifier and quits at once.
+    fn press_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.modifiers().secondary() || self.quit_armed.take().is_some() {
+            cx.notify();
+            self.request_quit(window, cx);
+            return;
+        }
+        self.quit_armed = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.quit_armed = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+    fn quit_hint(&self) -> Option<gpui::AnyElement> {
+        self.quit_armed.as_ref()?;
+        let key = if cfg!(target_os = "macos") {
+            "⌘Q"
+        } else {
+            "Ctrl+Q"
+        };
+        Some(
+            div()
+                .absolute()
+                .bottom(px(48.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    crate::notifications::surface::glass_frame()
+                        .id("quit-hint")
+                        .role(gpui::Role::Status)
+                        .w_auto()
+                        .rounded(px(10.))
+                        .child(
+                            div()
+                                .relative()
+                                .px(px(14.))
+                                .py(px(8.))
+                                .text_size(px(13.))
+                                .child(format!("Press {key} again to quit")),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
     fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let unsaved = self.unsaved_files(cx);
-        // Automation runs and orchestration workers are recovered by their
-        // owners, not continued, so they do not ask.
-        let running = self
-            .sessions
-            .values()
-            .filter(|view| {
-                let view = view.read(cx);
-                view.busy && !view.managed
-            })
-            .count();
-        if !unsaved && running == 0 {
+        // Running chats continue on the next launch, so only unsaved files ask.
+        if !self.unsaved_files(cx) {
             crate::quit(cx);
             return;
         }
@@ -2030,32 +2080,11 @@ impl Shell {
             return;
         }
         self.quit_prompted = true;
-        let resume = match running {
-            0 => String::new(),
-            1 => "1 chat is still running. It will continue when you reopen MonoCode.".into(),
-            n => {
-                format!("{n} chats are still running. They will continue when you reopen MonoCode.")
-            }
-        };
-        let (message, detail, confirm) = if unsaved {
-            let detail = "Save your files before quitting to keep your changes.";
-            (
-                "Quit with unsaved file edits?",
-                if resume.is_empty() {
-                    detail.to_owned()
-                } else {
-                    format!("{detail} {resume}")
-                },
-                "Quit Without Saving",
-            )
-        } else {
-            ("Quit MonoCode?", resume, "Quit")
-        };
         let answer = window.prompt(
             gpui::PromptLevel::Warning,
-            message,
-            Some(&detail),
-            &[confirm, "Cancel"],
+            "Quit with unsaved file edits?",
+            Some("Save your files before quitting to keep your changes."),
+            &["Quit Without Saving", "Cancel"],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -2132,7 +2161,18 @@ impl Shell {
                     }
                     ReviewEvent::Comment(text) => {
                         let owner = this.workspace.session_for_pane(id);
-                        this.add_to_chat(owner, text, cx);
+                        // Diff comments become chips; short file references
+                        // read fine as text.
+                        match monocode_core::diff::comment_label(text) {
+                            Some(label) => this.add_snippet_to_chat(
+                                owner,
+                                monocode_core::composer::Snippet::Comment,
+                                Some(label),
+                                text,
+                                cx,
+                            ),
+                            None => this.add_to_chat(owner, text, cx),
+                        }
                     }
                     ReviewEvent::Empty => this.close_review(id, cx),
                     ReviewEvent::DragPane(position) => {
@@ -2308,6 +2348,26 @@ impl Shell {
         self.pending_composer_focus = Some(id);
         cx.notify();
     }
+    /// A terminal selection or diff comment joins the tab's attachments as a
+    /// compact chip.
+    fn add_snippet_to_chat(
+        &mut self,
+        id: i64,
+        kind: monocode_core::composer::Snippet,
+        label: Option<String>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.ensure_session(id, cx) else {
+            return;
+        };
+        view.update(cx, |view, cx| {
+            view.attach_snippet(kind, label, text.to_owned(), cx)
+        });
+        self.chat_hidden_off(id, cx);
+        self.pending_composer_focus = Some(id);
+        cx.notify();
+    }
     fn chat_hidden_off(&mut self, id: i64, cx: &mut Context<Self>) {
         if let Some(review) = self.reviews.get(&id) {
             review.update(cx, |r, cx| {
@@ -2374,6 +2434,7 @@ impl Shell {
                     .debug_selector(move || format!("drag-session-pane-{id}"))
                     .role(Role::Button)
                     .aria_label("Drag to reorder pane")
+                    .tip("Drag to reorder pane")
                     .w(px(20.))
                     .h(px(30.))
                     .flex_shrink_0()
@@ -2406,6 +2467,7 @@ impl Shell {
                     .id(("close-chat-pane", id as usize))
                     .role(Role::Button)
                     .aria_label("Close pane")
+                    .tip("Close pane")
                     .group("close-chat-pane")
                     .size(px(20.))
                     .flex_shrink_0()
@@ -3006,8 +3068,22 @@ impl Shell {
     }
     fn spawn_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
         let terminal = cx.new(|cx| Terminal::new(cwd, cx));
-        self.observations
-            .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
+        self.observations.push(
+            cx.subscribe(&terminal, |this, _, event: &TerminalEvent, cx| {
+                if let TerminalEvent::AddToChat(text) = event
+                    && let Some(id) = this.workspace.active
+                {
+                    this.add_snippet_to_chat(
+                        id,
+                        monocode_core::composer::Snippet::Terminal,
+                        None,
+                        text,
+                        cx,
+                    );
+                }
+                cx.notify()
+            }),
+        );
         terminal
     }
     /// A restored dock reopens its tabs as fresh shells once it is shown.
@@ -3516,10 +3592,12 @@ impl Shell {
         let cwd = self.workspace.project.clone();
         let worktree = target.and_then(|id| {
             let path = self.session_working_copy(id, cx);
-            (path != cwd).then(|| crate::worktree_switcher::WorktreeFocus {
-                path: path.into(),
-                branch: self.worktree_focus.get(&cwd).and_then(|f| f.branch.clone()),
-            })
+            (monocode_core::files::path_key(path) != monocode_core::files::path_key(&cwd)).then(
+                || crate::worktree_switcher::WorktreeFocus {
+                    path: path.into(),
+                    branch: self.worktree_focus.get(&cwd).and_then(|f| f.branch.clone()),
+                },
+            )
         });
         let worktree_cwd = worktree.as_ref().map(|f| f.path.clone());
         let work = cx.background_executor().spawn(async move {
@@ -4508,6 +4586,10 @@ impl Shell {
         let store = self.store.clone();
         let cwd = self.workspace.project.clone();
         let focus = self.worktree_focus.get(&cwd).cloned();
+        // The project folder as a selected checkout is not a separate worktree.
+        let copy = focus.clone().filter(|f| {
+            monocode_core::files::path_key(&f.path) != monocode_core::files::path_key(&cwd)
+        });
         let blank_key = format!("{cwd}\0{}", focus.as_ref().map_or("", |f| f.path.as_str()));
         if only_if_empty && !self.pending_project_blanks.insert(blank_key.clone()) {
             return;
@@ -4524,7 +4606,7 @@ impl Shell {
         let effort = crate::conversation::preferred_effort(kind.id(), cx);
         let work = cx.background_executor().spawn({
             let cwd = cwd.clone();
-            let worktree_cwd = focus.as_ref().map(|f| f.path.clone());
+            let worktree_cwd = copy.as_ref().map(|f| f.path.clone());
             async move {
                 let store = locked(&store)?;
                 let summary = store.create(kind.id(), &cwd)?;
@@ -4584,7 +4666,7 @@ impl Shell {
                         if let Some(view) = this.sessions.get(&id) {
                             view.update(cx, |view, cx| view.seed_new_settings(settings, cx));
                         }
-                        this.seed_worktree(id, focus.as_ref(), cx);
+                        this.seed_worktree(id, copy.as_ref(), cx);
                         // A pending blank belongs to the copy that requested it;
                         // navigation to another copy must never redirect that request.
                         if this.workspace.project != cwd
@@ -4955,17 +5037,18 @@ impl Shell {
             } else {
                 self.navigation(cx).into_any_element()
             })
-            .child(if self.tab_strip_visible() {
-                self.tabs_frame
+            .child(match self.title_bar_mode() {
+                TitleBarMode::Tabs => self
+                    .tabs_frame
                     .clone()
                     .cached(
                         StyleRefinement::default()
                             .w(tabs_width)
                             .h(px(TITLE_BAR_HEIGHT)),
                     )
-                    .into_any_element()
-            } else {
-                self.hidden_strip(tabs_width, cx)
+                    .into_any_element(),
+                TitleBarMode::Plan => self.plan_strip(tabs_width.as_f32(), cx),
+                TitleBarMode::SessionTitle => self.hidden_strip(tabs_width, cx),
             })
             .child(if classic {
                 // The toggle holds the window's corner (classic_body); the
@@ -5061,6 +5144,11 @@ impl Shell {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .role(Role::Button)
                                 .aria_label(if dot {
+                                    TOGGLE_RIGHT_PANEL_DOT_LABEL
+                                } else {
+                                    TOGGLE_RIGHT_PANEL_LABEL
+                                })
+                                .tip(if dot {
                                     TOGGLE_RIGHT_PANEL_DOT_LABEL
                                 } else {
                                     TOGGLE_RIGHT_PANEL_LABEL
@@ -5971,6 +6059,21 @@ impl Shell {
             let _ = this.update(cx, |this, cx| this.close_preview(cx));
         }));
     }
+    /// Where an archived thread in the flat archive list came from: its
+    /// folder, else the Pinned group. Unarchiving returns it there.
+    fn archived_origin(&self, id: i64, cx: &App) -> Option<(&'static str, String)> {
+        if !self.session_metadata(id, cx).summary.archived || self.archive_exits.exiting(id) {
+            return None;
+        }
+        match self.project_groups().folder_of(id) {
+            Some(folder) => Some(("folder", folder.name.clone())),
+            None => self
+                .session_metadata(id, cx)
+                .summary
+                .pinned
+                .then(|| ("pin", "Pinned".to_owned())),
+        }
+    }
     fn session_row(&self, id: i64, cx: &mut Context<Self>) -> AnyElement {
         self.session_row_with(id, false, None, cx)
     }
@@ -6036,7 +6139,9 @@ impl Shell {
             mark.update(cx, |mark, cx| mark.set_size(side, cx));
         }
         let work_item = self.work_item_badge(id, compact, cx);
+        let origin = self.archived_origin(id, cx);
         let has_badges = work_item.is_some()
+            || origin.is_some()
             || mode.is_some()
             || self.automation_state.session_automations.contains_key(&id);
         let session = self.session_metadata(id, cx);
@@ -6163,6 +6268,24 @@ impl Shell {
             .items_center()
             .gap_1()
             .flex_shrink_0()
+            .when_some(origin, |d, (glyph, label)| {
+                d.child(
+                    div()
+                        .debug_selector(move || format!("session-origin-{id}"))
+                        .h(px(16.))
+                        .px(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(content(0.15))
+                        .text_size(px(10.))
+                        .text_color(content(0.5))
+                        .child(icon(glyph, 10.))
+                        .child(div().max_w(px(90.)).truncate().child(label)),
+                )
+            })
             .children(work_item)
             .when(
                 self.automation_state.session_automations.contains_key(&id),
@@ -6378,6 +6501,11 @@ impl Shell {
             .debug_selector(move || format!("archive-session-{id}"))
             .role(Role::Button)
             .aria_label(format!(
+                "{} {}",
+                if archived { "Unarchive" } else { "Archive" },
+                session.display_title()
+            ))
+            .tip(format!(
                 "{} {}",
                 if archived { "Unarchive" } else { "Archive" },
                 session.display_title()
@@ -7774,9 +7902,6 @@ impl Shell {
     }
     fn tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let viewport = self.tabs_width(window, cx);
-        if self.workspace.preferences.title_plan {
-            return self.plan_strip(viewport, cx);
-        }
         let tabs = self.visible_tabs(cx);
         let count = tabs.len();
         let insert = self.pane_drag.as_ref().and_then(|d| d.insert);
@@ -8014,6 +8139,7 @@ impl Shell {
                                 .group("tab-close")
                                 .role(Role::Button)
                                 .aria_label(format!("Close tab {}", copy.headline))
+                                .tip(format!("Close tab {}", copy.headline))
                                 .absolute()
                                 .right_1()
                                 .top(px(10.))
@@ -8275,6 +8401,7 @@ impl Shell {
                             .group("new-tab")
                             .role(Role::Button)
                             .aria_label("New session tab")
+                            .tip("New session tab")
                             .cursor_pointer()
                             .size(px(TAB_PLATE_HEIGHT))
                             .flex_shrink_0()
@@ -8377,8 +8504,8 @@ fn enter_from(leaf: &LayoutLeaf) -> (Edge, Rect) {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::monos::html::begin_frame(window);
         self.keep_visible_idle_agents(cx);
+        self.hide_drafts_off_screen(cx);
         self.sync_ui_scale(window, cx);
         if self.mono_panes_unsettled(cx) {
             let this = cx.entity();
@@ -8611,6 +8738,11 @@ impl Render for Shell {
                 this.archive_active_session(window, cx)
             }))
             .on_action(
+                cx.listener(|this, open: &crate::draft::OpenKept, window, cx| {
+                    this.open_kept_draft(&open.page, window, cx)
+                }),
+            )
+            .on_action(
                 cx.listener(|this, open: &crate::image_lightbox::Open, window, cx| {
                     let view = cx.new(|cx| {
                         crate::image_lightbox::ImageLightbox::new(open.clone(), window, cx)
@@ -8621,20 +8753,6 @@ impl Render for Shell {
                             cx.notify();
                         });
                     this.image_lightbox = Some((view, closed));
-                    cx.notify();
-                }),
-            )
-            .on_action(
-                cx.listener(|this, open: &crate::visual_expand::Open, window, cx| {
-                    let view = cx.new(|cx| {
-                        crate::visual_expand::VisualExpand::new(open.clone(), window, cx)
-                    });
-                    let closed =
-                        cx.subscribe(&view, |this, _, _: &crate::visual_expand::Closed, cx| {
-                            this.visual_expand = None;
-                            cx.notify();
-                        });
-                    this.visual_expand = Some((view, closed));
                     cx.notify();
                 }),
             )
@@ -8680,9 +8798,7 @@ impl Render for Shell {
                     }
                 }),
             )
-            .on_action(
-                cx.listener(|this, _: &crate::Quit, window, cx| this.request_quit(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &crate::Quit, window, cx| this.press_quit(window, cx)))
             .on_action(
                 cx.listener(|this, _: &GoToFile, window, cx| {
                     this.open_quick_open(false, window, cx)
@@ -9060,6 +9176,7 @@ impl Render for Shell {
             .children(self.remote_project_modal(window, cx))
             .children(self.notice_modals(window, cx))
             .children(self.folder_picker_popover(window, cx))
+            .children(self.quit_hint())
             .children(crate::accounts::get(cx))
             .children(
                 self.settings
@@ -9083,12 +9200,6 @@ impl Render for Shell {
                     .children(window_chrome::resize_handles(window));
                 root
             })
-            .children(
-                self.visual_expand
-                    .as_ref()
-                    .map(|(view, _)| crate::visual_expand::overlay(view)),
-            )
-            .child(crate::monos::html::reaper())
     }
 }
 
@@ -9171,6 +9282,42 @@ mod tests {
                 shell.run_menu(MenuTarget::SessionFilter, "clear", None, window, cx);
                 assert!(shell.sidebar_session_ids(cx).contains(&a));
                 assert_eq!(shell.workspace.active, Some(b));
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn archived_threads_leave_their_folder_and_remember_it(cx: &mut TestAppContext) {
+        use monocode_core::session_groups::Entry;
+        let (window, a, b) = window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let project = shell.workspace.project.clone();
+                shell
+                    .groups
+                    .entry(project)
+                    .or_default()
+                    .create_folder(&[a], "f".into());
+                let set = |shell: &mut Shell, archived, cx: &mut Context<Shell>| {
+                    shell.sessions[&a].update(cx, |s, _| s.summary.archived = archived)
+                };
+                set(shell, false, cx);
+                let entries = shell.session_entries(&[a, b], cx);
+                assert!(matches!(&entries[0], Entry::Folder { sessions, .. } if sessions == &[a]));
+                assert_eq!(shell.archived_origin(a, cx), None);
+
+                set(shell, true, cx);
+                let entries = shell.session_entries(&[a, b], cx);
+                assert!(!entries.iter().any(|e| matches!(e, Entry::Folder { .. })));
+                assert_eq!(entries.last(), Some(&Entry::Session(a)));
+                assert_eq!(
+                    shell.archived_origin(a, cx),
+                    Some(("folder", "New folder".to_owned()))
+                );
+
+                // Membership was never touched, so unarchiving restores it.
+                set(shell, false, cx);
+                let entries = shell.session_entries(&[a, b], cx);
+                assert!(matches!(&entries[0], Entry::Folder { sessions, .. } if sessions == &[a]));
             })
             .unwrap();
     }
