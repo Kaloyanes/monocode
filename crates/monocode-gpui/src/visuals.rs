@@ -183,6 +183,13 @@ impl VisualView {
         this.initialize();
         this
     }
+    /// Draws the visual inside an answer, captioned, or back in its own row.
+    pub(crate) fn set_inline(&mut self, caption: Option<String>, cx: &mut Context<Self>) {
+        if self.inline != caption {
+            self.inline = caption;
+            self.changed(cx);
+        }
+    }
     fn initialize(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.error = None;

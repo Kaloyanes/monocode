@@ -805,6 +805,8 @@ pub(crate) struct Shell {
     shortcut_hints: bool,
     /// Bumped on each ⌘ press or release to restart the hint crossfade.
     shortcut_hint_flips: usize,
+    /// The room the sidebar was last fitted to; a change refits it.
+    sidebar_fitted_room: Option<(i32, bool)>,
     viewport_width: f32,
     viewport_height: f32,
     observations: Vec<Subscription>,
@@ -1142,6 +1144,7 @@ impl Shell {
             shortcut_slots: HashMap::new(),
             shortcut_hints: false,
             shortcut_hint_flips: 0,
+            sidebar_fitted_room: None,
             terminals: HashMap::new(),
             dock_slide: None,
             dock_resize: None,
@@ -1732,6 +1735,7 @@ impl Shell {
             .classic_sidebar_tabs
             .insert(self.workspace.project.clone(), tab.id().into());
         self.close_preview(cx);
+        self.sidebar_auto_hidden = false;
         self.set_sidebar_visible(true, cx);
         self.sync_right_panel(cx);
         self.notify_sidebar(cx);
@@ -3051,6 +3055,40 @@ impl Shell {
             self.sidebar_auto_hidden = false;
         }
     }
+    /// Refit the sidebar whenever the room around the chats changes, however
+    /// it changed: a window resize, a tab or project switch, a review or pane
+    /// closed from inside, a panel's slide settling. Room is measured without
+    /// the sidebar so showing or hiding it by hand never counts as a change,
+    /// and drags refit once they let go.
+    fn refit_sidebar_to_room(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.resize.is_some()
+            || self.right_resize.is_some()
+            || self.review_drag
+            || self.pane_sash.is_some()
+            || self.dock_resize.is_some()
+            || self.project_resize.is_some()
+        {
+            return;
+        }
+        let room = (
+            self.narrowest_chat(false, cx).round() as i32,
+            self.session_sidebar_available(cx),
+        );
+        if self.sidebar_fitted_room.replace(room) == Some(room) {
+            return;
+        }
+        let this = cx.entity();
+        window.defer(cx, move |_, cx| {
+            this.update(cx, |this, cx| {
+                let visible = this.workspace.sidebar_visible;
+                this.fit_sidebar(cx);
+                if visible != this.workspace.sidebar_visible {
+                    this.persist(cx);
+                    cx.notify();
+                }
+            });
+        });
+    }
     /// newTerminalCwd: the focused session's worktree, else its folder, else
     /// the project.
     fn terminal_cwd(&self, cx: &App) -> String {
@@ -4076,6 +4114,21 @@ impl Shell {
         self.update_usage_provider(cx);
         self.sync_right_panel(cx);
         self.invalidate_chrome(cx);
+        self.save_state(cx);
+    }
+    fn save_window_state(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let bounds = window.inner_window_bounds();
+        // X11 can report Windowed bounds while tracking fullscreen separately.
+        let bounds = if window.is_fullscreen() {
+            gpui::WindowBounds::Fullscreen(bounds.get_bounds())
+        } else {
+            bounds
+        };
+        if self.workspace.window.update(bounds) {
+            self.save_state(cx);
+        }
+    }
+    fn save_state(&mut self, cx: &mut Context<Self>) {
         let state = serde_json::to_string(&self.workspace).unwrap();
         *self.latest_state.lock().unwrap_or_else(|e| e.into_inner()) = state.clone();
         let revision = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -8569,11 +8622,7 @@ impl Render for Shell {
         let glass = window_glass(p, system_light);
         if self.window_glass != Some(glass) {
             self.window_glass = Some(glass);
-            window.set_background_appearance(if glass {
-                gpui::WindowBackgroundAppearance::Blurred
-            } else {
-                gpui::WindowBackgroundAppearance::Opaque
-            });
+            window.set_background_appearance(crate::theme::window_backdrop(glass));
         }
         self.sync_settings(cx);
         self.sidebar_fraction = match &self.sidebar_slide {
@@ -8623,6 +8672,7 @@ impl Render for Shell {
             window.on_window_should_close(cx, move |window, cx| {
                 shell
                     .update(cx, |shell, cx| {
+                        shell.save_window_state(window, cx);
                         #[cfg(all(target_os = "macos", not(test)))]
                         if shell.workspace.preferences.close_to_tray
                             && shell.workspace.preferences.mono_menu_bar_icon
@@ -8654,10 +8704,14 @@ impl Render for Shell {
                     }
                 }));
             self.observations
-                .push(cx.observe_window_bounds(window, |this, _, cx| this.close_preview(cx)));
+                .push(cx.observe_window_bounds(window, |this, window, cx| {
+                    this.save_window_state(window, cx);
+                    this.close_preview(cx);
+                }));
         }
         self.viewport_width = window.viewport_size().width.as_f32();
         self.viewport_height = window.viewport_size().height.as_f32();
+        self.refit_sidebar_to_room(window, cx);
         self.ensure_right_panel(window, cx);
         let full = self.workspace.right_panel_width;
         let right_width = match &self.right_slide {
@@ -9208,6 +9262,53 @@ mod tests {
     use super::*;
     use gpui::{EntityInputHandler, TestAppContext, WindowHandle};
     use monocode_core::store::Store;
+    #[gpui::test]
+    fn window_state_is_saved_on_resize_and_restored_with_the_workspace(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let dimensions = gpui::size(px(1440.), px(900.));
+        cx.simulate_window_resize(window.into(), dimensions);
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let saved = locked(&shell.store).unwrap().ui_state().unwrap().unwrap();
+                assert_eq!(*shell.latest_state.lock().unwrap(), saved);
+                let restored = Workspace::restore(Some(&saved), &[], "/work/monocode");
+                assert_eq!(restored.window.bounds(cx).get_bounds().size, dimensions);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn window_state_preserves_fullscreen_when_backend_bounds_report_windowed(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = window(cx);
+        let normal_size = gpui::size(px(1440.), px(900.));
+        cx.simulate_window_resize(window.into(), normal_size);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| window.toggle_fullscreen())
+            .unwrap();
+        cx.simulate_window_resize(window.into(), gpui::size(px(1920.), px(1080.)));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, window, cx| {
+                // The test backend reproduces X11: fullscreen is tracked separately from bounds.
+                assert!(window.is_fullscreen());
+                assert!(matches!(
+                    window.inner_window_bounds(),
+                    gpui::WindowBounds::Windowed(_)
+                ));
+                let saved = locked(&shell.store).unwrap().ui_state().unwrap().unwrap();
+                assert_eq!(*shell.latest_state.lock().unwrap(), saved);
+                let restored = Workspace::restore(Some(&saved), &[], "/work/monocode");
+                let bounds = restored.window.bounds(cx);
+                assert!(matches!(bounds, gpui::WindowBounds::Fullscreen(_)));
+                assert_eq!(bounds.get_bounds().size, normal_size);
+            })
+            .unwrap();
+    }
     #[gpui::test]
     fn hovering_archive_preserves_history_and_does_not_select_the_row(cx: &mut TestAppContext) {
         let (window, a, b) = window(cx);
@@ -12807,6 +12908,56 @@ mod tests {
                 shell.close_pane(pane, w, cx);
             })
             .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))
+            .unwrap();
+    }
+    #[gpui::test]
+    fn the_sidebar_follows_the_room_however_it_changes(cx: &mut TestAppContext) {
+        let (window, _, b) = window(cx);
+        cx.update(|cx| {
+            bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        cx.simulate_window_resize(window.into(), gpui::size(px(1400.), px(800.)));
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(b, w, cx);
+                shell.focus_active(w, cx);
+            })
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        // Wide enough for two panes beside the sidebar.
+        cx.simulate_keystrokes("cmd-d");
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
+            .unwrap();
+        // Narrowing the window crowds the panes; the sidebar makes room.
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))
+            .unwrap();
+        // Widening it again brings the sidebar back.
+        cx.simulate_resize(gpui::size(px(1400.), px(800.)));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
+            .unwrap();
+        // Shown by hand while crowded, it stays until the room changes again.
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-b");
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
+            .unwrap();
+        // Hidden by hand, it stays hidden however wide the window grows.
+        cx.simulate_keystrokes("cmd-b");
+        cx.simulate_resize(gpui::size(px(1600.), px(800.)));
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))

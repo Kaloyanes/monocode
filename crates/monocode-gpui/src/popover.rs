@@ -561,7 +561,7 @@ pub(crate) fn paint_surface(bounds: Bounds<Pixels>, window: &mut Window) {
         gpui::fill(bounds, gpui::transparent_black())
             .corner_radii(corners)
             .border_widths(px(1.))
-            .border_color(crate::theme::content(0.1)),
+            .border_color(content(0.1)),
     );
 }
 /// The default popover glass tint.

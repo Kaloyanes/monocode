@@ -83,7 +83,7 @@ impl TranscriptView {
     pub(crate) fn toggle_thread(&mut self, id: i64, start: usize, cx: &mut Context<Self>) {
         let _ = start;
         let opening = !self.thread_expanded.contains(&id);
-        let mut touched: HashSet<i64> = self.thread_expanded.drain().collect();
+        let mut touched: HashSet<i64> = std::mem::take(&mut self.thread_expanded);
         touched.insert(id);
         if opening {
             self.thread_expanded.insert(id);

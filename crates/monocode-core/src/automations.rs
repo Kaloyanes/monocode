@@ -1149,11 +1149,11 @@ impl AutomationTrigger {
             let anchor = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
                 .and_then(|date| date.and_hms_opt(0, 0, 0))
                 .unwrap_or_default();
-            let mut index = (start.naive_local() - anchor)
+            let index = (start.naive_local() - anchor)
                 .num_minutes()
                 .div_euclid(step);
-            for _ in 0..1_000 {
-                let naive = anchor + chrono::Duration::minutes(index * step);
+            for offset in 0..1_000 {
+                let naive = anchor + chrono::Duration::minutes((index + offset) * step);
                 for gap in 0..=180 {
                     let target = naive + chrono::Duration::minutes(gap);
                     if let Some(candidate) = Local.from_local_datetime(&target).earliest() {
@@ -1164,7 +1164,6 @@ impl AutomationTrigger {
                         break;
                     }
                 }
-                index += 1;
             }
             return after.saturating_add(step * 60_000);
         }

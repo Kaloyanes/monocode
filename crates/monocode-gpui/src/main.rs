@@ -97,10 +97,7 @@ mod work_item_picker;
 mod workspace;
 mod worktree_switcher;
 
-use gpui::{
-    App, Bounds, KeyBinding, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions, actions, point, prelude::*, px, size,
-};
+use gpui::{App, KeyBinding, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};
 use monocode_core::{store::Store, transcript::Transcript};
 use std::{
     path::PathBuf,
@@ -153,47 +150,6 @@ fn restart(cx: &mut App) {
         cx.update(|cx| cx.restart());
     })
     .detach();
-}
-
-/// Saves the window's position and size once a move or resize settles, so the
-/// next launch opens where this one closed.
-fn remember_window_bounds(
-    shell: &gpui::Entity<shell::Shell>,
-    window: &mut gpui::Window,
-    db: Arc<Mutex<Store>>,
-    cx: &mut App,
-) {
-    let generation = std::rc::Rc::new(std::cell::Cell::new(0u64));
-    shell.update(cx, |_, cx| {
-        cx.observe_window_bounds(window, move |_, window, cx| {
-            let raw = window_state::encode(window.window_bounds());
-            let db = db.clone();
-            generation.set(generation.get() + 1);
-            let current = generation.clone();
-            let mine = generation.get();
-            cx.spawn(async move |_, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(250))
-                    .await;
-                if current.get() != mine {
-                    return;
-                }
-                cx.background_executor()
-                    .spawn(async move {
-                        let result = db
-                            .lock()
-                            .map_err(|error| error.to_string())
-                            .and_then(|store| store.save_setting(window_state::KEY, &raw));
-                        if let Err(error) = result {
-                            eprintln!("Cannot save the window position: {error}");
-                        }
-                    })
-                    .await;
-            })
-            .detach();
-        })
-        .detach();
-    });
 }
 
 fn data_dir() -> PathBuf {
@@ -447,6 +403,13 @@ fn main() {
         db.title(s.id, "Native visuals · Controls, charts and 3D")
             .unwrap();
         db.write_rows(s.id, 0, &fixtures::visuals().rows).unwrap();
+        let s = db
+            .create("claude", &cwd)
+            .expect("create visual story fixture");
+        db.title(s.id, "Native visuals · Charts inside an answer")
+            .unwrap();
+        db.write_rows(s.id, 0, &fixtures::visual_story().rows)
+            .unwrap();
     }
     if plan_fixture {
         for (provider, title, transcript) in fixtures::plans() {
@@ -472,7 +435,6 @@ fn main() {
         projects.push(workspace.project);
     }
     let sidebar_metadata = db.session_sidebar_metadata(&projects);
-    let saved_bounds = db.setting(window_state::KEY).ok().flatten();
     let db = Arc::new(Mutex::new(db));
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
@@ -516,16 +478,10 @@ fn main() {
                 }
             })
             .detach();
-            let displays = cx.displays().iter().map(|d| d.bounds()).collect::<Vec<_>>();
-            let window_bounds = saved_bounds
-                .and_then(|raw| window_state::decode(&raw, &displays))
-                .unwrap_or_else(|| {
-                    WindowBounds::Windowed(Bounds::centered(None, size(px(1180.), px(800.)), cx))
-                });
-            let bounds_db = db.clone();
+            let bounds = workspace.window.bounds(cx);
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(window_bounds),
+                    window_bounds: Some(bounds),
                     window_min_size: Some(size(px(820.), px(520.))),
                     window_decorations: workspace
                         .preferences
@@ -533,11 +489,7 @@ fn main() {
                     // Linux desktops match this to the .desktop file's
                     // StartupWMClass to show the app icon.
                     app_id: Some("dev.usemono.gpui".into()),
-                    window_background: if cfg!(target_os = "macos") {
-                        WindowBackgroundAppearance::Blurred
-                    } else {
-                        WindowBackgroundAppearance::Opaque
-                    },
+                    window_background: theme::window_backdrop(true),
                     // GPUI owns the custom chrome. AppKit must not reinterpret
                     // its controls as native titlebar double-click/drag gestures.
                     app_owns_titlebar_drag: cfg!(target_os = "macos"),
@@ -584,7 +536,6 @@ fn main() {
                         )
                     });
                     shell.update(cx, |shell, cx| shell.focus_active(window, cx));
-                    remember_window_bounds(&shell, window, bounds_db, cx);
                     #[cfg(target_os = "macos")]
                     {
                         traffic_lights::pin(window, theme::TITLE_BAR_HEIGHT);
@@ -609,7 +560,7 @@ fn main() {
 mod native_tests {
     use super::*;
     use crate::{input, transcript::TranscriptView};
-    use gpui::{Context, Entity, Render, StyleRefinement, Window, div};
+    use gpui::{Bounds, Context, Entity, Render, StyleRefinement, Window, WindowBounds, div};
     use gpui::{EntityInputHandler, ListOffset, TestAppContext, point};
     use monocode_core::transcript::Row;
     struct Surface {

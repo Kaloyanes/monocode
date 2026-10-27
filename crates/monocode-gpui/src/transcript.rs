@@ -24,6 +24,8 @@ mod threads;
 mod tools;
 mod user_links;
 mod visuals;
+#[cfg(test)]
+pub(crate) use visuals::placements;
 
 use crate::markdown_model::MarkdownParser;
 use crate::popover::{Anchor, AnchorSlot, Side, popover};
@@ -492,6 +494,10 @@ pub(crate) struct TranscriptView {
     pictures: HashMap<std::path::PathBuf, images::CachedPicture>,
     /// Re-measures the cards of live drafts when one opens, closes or resizes.
     draft_watch: Option<gpui::Subscription>,
+    /// Visual ids the answers place in their prose.
+    placed: HashSet<String>,
+    /// Placed visuals by id: their message's start and document.
+    published: HashMap<String, (usize, Arc<monocode_core::visual::VisualDocument>)>,
     history_position: Option<history::HistoryPosition>,
     history_start: usize,
     history_loading: bool,
@@ -2336,6 +2342,8 @@ impl TranscriptView {
             visuals: HashMap::new(),
             pictures: HashMap::new(),
             draft_watch: None,
+            placed: HashSet::new(),
+            published: HashMap::new(),
             history_position: None,
             history_start: 0,
             history_loading: false,
@@ -2774,6 +2782,17 @@ impl TranscriptView {
                 .get(start)
                 .is_some_and(|row| row.role == "visual")
         });
+        if start == 0 {
+            self.placed.clear();
+        }
+        self.published.retain(|_, (at, _)| *at < start);
+        let placed = self.placed.len();
+        for row in &self.source[start..] {
+            if row.role == "assistant" {
+                visuals::placements(&row.text, &mut self.placed);
+            }
+        }
+        let placed = self.placed.len() != placed;
         if known == 0 && self.mono && !self.streaming {
             self.history_start = history::page_start(&self.source, self.source.len());
         }
@@ -2904,6 +2923,16 @@ impl TranscriptView {
             }
         }
         self.outline.patched(&self.source, start);
+        // A newly placed visual leaves its own row earlier in the turn, so the
+        // whole turn rebuilds rather than just the changed suffix.
+        let start = if placed {
+            self.source[..start]
+                .iter()
+                .rposition(|r| r.is_prompt())
+                .map_or(0, |i| i + 1)
+        } else {
+            start
+        };
         self.rebuild(start, cx);
     }
     pub(crate) fn begin_update_batch(&mut self) {
@@ -3362,20 +3391,28 @@ impl TranscriptView {
                 let document = serde_json::from_str::<monocode_core::visual::VisualDocument>(&text)
                     .ok()
                     .filter(|document| document.validate().is_ok());
-                let body = match document {
-                    Some(document) => Body::Visual(Arc::new(document)),
-                    None => Body::Plain("This visual could not be loaded.".into()),
-                };
-                self.rows.push(UiRow {
-                    key: (0, 0),
-                    body,
-                    message,
-                    first: false,
-                    last: false,
-                    work: false,
-                    work_tail: false,
-                    thought_phase: None,
+                // An answer that places the visual draws it in its prose. While
+                // the turn runs, the call that published it stands for it, so
+                // it never appears above the answer and then jumps into it.
+                let elsewhere = document.as_ref().is_some_and(|document| {
+                    self.placed.contains(&document.id) || (self.streaming && at >= self.live_start)
                 });
+                if !elsewhere {
+                    let body = match document {
+                        Some(document) => Body::Visual(Arc::new(document)),
+                        None => Body::Plain("This visual could not be loaded.".into()),
+                    };
+                    self.rows.push(UiRow {
+                        key: (0, 0),
+                        body,
+                        message,
+                        first: false,
+                        last: false,
+                        work: false,
+                        work_tail: false,
+                        thought_phase: None,
+                    });
+                }
             } else if matches!(role.as_str(), "mono-card" | "mono-note") {
                 if let Ok(value) = serde_json::from_str(&text) {
                     self.rows.push(UiRow {
@@ -4920,7 +4957,7 @@ impl TranscriptView {
                                     .group_hover("activity-phase", |s| s.opacity(0.))
                                     .into_any_element()
                             } else {
-                                icon(glyph, 14.)
+                                crate::activity::glyph(glyph, 14.)
                                     .group_hover("activity-phase", |s| s.opacity(0.))
                                     .into_any_element()
                             })
@@ -5048,6 +5085,8 @@ impl TranscriptView {
                 let md = &prepared.row;
                 let body = if let Part::Code { fence, lines } = &md.part {
                     self.code(fence.clone(), lines.clone(), ix, cx)
+                } else if let Part::Visual { id, caption } = &md.part {
+                    self.placed_visual(id, caption, cx)
                 } else {
                     markdown::body_selected(
                         md,

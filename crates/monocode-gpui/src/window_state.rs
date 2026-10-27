@@ -1,113 +1,128 @@
-//! Remembers where the main window was when MonoCode last closed.
-
-use gpui::{Bounds, WindowBounds, point, px, size};
+use gpui::{App, Bounds, WindowBounds, px, size};
 use serde::{Deserialize, Serialize};
 
-pub const KEY: &str = "window-bounds";
-pub const MIN_WIDTH: f32 = 820.;
-pub const MIN_HEIGHT: f32 = 520.;
-/// Less than this much of the window on a display and the title bar is out of
-/// reach, so the saved position is dropped.
-const MIN_VISIBLE: f32 = 160.;
-
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
-struct Saved {
-    mode: Mode,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct WindowState {
+    size: [f32; 2],
+    maximized: bool,
+    fullscreen: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
-#[serde(rename_all = "lowercase")]
-enum Mode {
-    Windowed,
-    Maximized,
-    Fullscreen,
-}
-
-pub fn encode(bounds: WindowBounds) -> String {
-    let (mode, b) = match bounds {
-        WindowBounds::Windowed(b) => (Mode::Windowed, b),
-        WindowBounds::Maximized(b) => (Mode::Maximized, b),
-        WindowBounds::Fullscreen(b) => (Mode::Fullscreen, b),
-    };
-    serde_json::to_string(&Saved {
-        mode,
-        x: b.origin.x.as_f32(),
-        y: b.origin.y.as_f32(),
-        width: b.size.width.as_f32(),
-        height: b.size.height.as_f32(),
-    })
-    .unwrap_or_default()
-}
-
-/// The saved bounds, if they still land on one of `displays`. A monitor that
-/// was unplugged or rearranged since the last run falls back to the default.
-pub fn decode(raw: &str, displays: &[Bounds<gpui::Pixels>]) -> Option<WindowBounds> {
-    let s: Saved = serde_json::from_str(raw).ok()?;
-    let finite = [s.x, s.y, s.width, s.height].iter().all(|v| v.is_finite());
-    if !finite || s.width < MIN_WIDTH || s.height < MIN_HEIGHT {
-        return None;
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            size: [1180., 800.],
+            maximized: false,
+            fullscreen: false,
+        }
     }
-    let visible = displays.iter().any(|d| {
-        let (left, top) = (d.origin.x.as_f32(), d.origin.y.as_f32());
-        let (right, bottom) = (left + d.size.width.as_f32(), top + d.size.height.as_f32());
-        let w = (s.x + s.width).min(right) - s.x.max(left);
-        let h = (s.y + s.height).min(bottom) - s.y.max(top);
-        w >= MIN_VISIBLE && h >= MIN_VISIBLE
-    });
-    if !visible {
-        return None;
+}
+
+impl WindowState {
+    pub fn bounds(self, cx: &App) -> WindowBounds {
+        let [width, height] = self.size;
+        let size = if width.is_finite() && height.is_finite() && width > 0. && height > 0. {
+            size(px(width.max(820.)), px(height.max(520.)))
+        } else {
+            size(px(1180.), px(800.))
+        };
+        let bounds = Bounds::centered(None, size, cx);
+        if self.fullscreen {
+            WindowBounds::Fullscreen(bounds)
+        } else if self.maximized {
+            WindowBounds::Maximized(bounds)
+        } else {
+            WindowBounds::Windowed(bounds)
+        }
     }
-    let bounds = Bounds::new(point(px(s.x), px(s.y)), size(px(s.width), px(s.height)));
-    Some(match s.mode {
-        Mode::Windowed => WindowBounds::Windowed(bounds),
-        Mode::Maximized => WindowBounds::Maximized(bounds),
-        Mode::Fullscreen => WindowBounds::Fullscreen(bounds),
-    })
+
+    pub fn update(&mut self, bounds: WindowBounds) -> bool {
+        let mut next = *self;
+        next.maximized = matches!(bounds, WindowBounds::Maximized(_));
+        next.fullscreen = matches!(bounds, WindowBounds::Fullscreen(_));
+        if let WindowBounds::Windowed(bounds) = bounds {
+            let width = bounds.size.width.as_f32();
+            let height = bounds.size.height.as_f32();
+            if !width.is_finite() || !height.is_finite() || width <= 0. || height <= 0. {
+                return false;
+            }
+            next.size = [width, height];
+        }
+        if next == *self {
+            return false;
+        }
+        *self = next;
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{TestAppContext, point};
 
-    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<gpui::Pixels> {
-        Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
-    }
-
-    #[test]
-    fn round_trips_every_mode() {
-        let screen = [rect(0., 0., 1920., 1080.)];
-        for bounds in [
-            WindowBounds::Windowed(rect(100., 80., 1180., 800.)),
-            WindowBounds::Maximized(rect(100., 80., 1180., 800.)),
-            WindowBounds::Fullscreen(rect(100., 80., 1180., 800.)),
+    #[gpui::test]
+    fn window_state_restores_size_and_mode_without_losing_normal_size(cx: &mut TestAppContext) {
+        let normal = Bounds::new(point(px(10.), px(20.)), size(px(1440.), px(900.)));
+        let screen = Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1080.)));
+        let mut state = WindowState::default();
+        assert!(state.update(WindowBounds::Windowed(normal)));
+        assert!(!state.update(WindowBounds::Windowed(normal)));
+        for mode in [
+            WindowBounds::Maximized(screen),
+            WindowBounds::Fullscreen(screen),
         ] {
-            assert_eq!(decode(&encode(bounds), &screen), Some(bounds));
+            assert!(state.update(mode));
+            let saved = serde_json::to_string(&state).unwrap();
+            let restored: WindowState = serde_json::from_str(&saved).unwrap();
+            let bounds = cx.update(|cx| restored.bounds(cx));
+            assert_eq!(bounds.get_bounds().size, normal.size);
+            assert_eq!(
+                std::mem::discriminant(&bounds),
+                std::mem::discriminant(&mode)
+            );
         }
+        assert!(state.update(WindowBounds::Windowed(normal)));
+        assert!(matches!(
+            cx.update(|cx| state.bounds(cx)),
+            WindowBounds::Windowed(_)
+        ));
     }
 
-    #[test]
-    fn drops_bounds_on_a_missing_display() {
-        let saved = encode(WindowBounds::Windowed(rect(2000., 100., 1180., 800.)));
-        assert_eq!(decode(&saved, &[rect(0., 0., 1920., 1080.)]), None);
-        assert!(decode(&saved, &[rect(1920., 0., 1920., 1080.)]).is_some());
-    }
-
-    #[test]
-    fn drops_bounds_that_hang_mostly_off_screen() {
-        let saved = encode(WindowBounds::Windowed(rect(1800., 100., 1180., 800.)));
-        assert_eq!(decode(&saved, &[rect(0., 0., 1920., 1080.)]), None);
-    }
-
-    #[test]
-    fn rejects_garbage_and_undersized_windows() {
-        let screen = [rect(0., 0., 1920., 1080.)];
-        assert_eq!(decode("", &screen), None);
-        assert_eq!(decode("{\"mode\":\"windowed\"}", &screen), None);
-        let tiny = encode(WindowBounds::Windowed(rect(0., 0., 300., 200.)));
-        assert_eq!(decode(&tiny, &screen), None);
+    #[gpui::test]
+    fn window_state_defaults_and_rejects_invalid_sizes(cx: &mut TestAppContext) {
+        let state: WindowState = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            cx.update(|cx| state.bounds(cx)).get_bounds().size,
+            size(px(1180.), px(800.))
+        );
+        for dimensions in [
+            [0., 0.],
+            [-1., 700.],
+            [f32::NAN, 800.],
+            [900., f32::INFINITY],
+        ] {
+            let mut invalid = WindowState {
+                size: dimensions,
+                ..state
+            };
+            assert_eq!(
+                cx.update(|cx| invalid.bounds(cx)).get_bounds().size,
+                size(px(1180.), px(800.))
+            );
+            assert!(!invalid.update(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(dimensions[0]), px(dimensions[1])),
+            ))));
+        }
+        let small = WindowState {
+            size: [100., 100.],
+            ..state
+        };
+        assert_eq!(
+            cx.update(|cx| small.bounds(cx)).get_bounds().size,
+            size(px(820.), px(520.))
+        );
     }
 }
