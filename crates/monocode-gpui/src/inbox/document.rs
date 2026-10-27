@@ -64,7 +64,14 @@ impl InboxDocument {
                 }
                 Event::End(TagEnd::Image) => {
                     if let Some((start, url, alt)) = open.take() {
-                        spans.push((start..range.end, url, alt));
+                        spans.push((start..range.end, vec![(url, alt)]));
+                    }
+                }
+                // GitHub's uploader writes `<img width=… src=…>`, not Markdown.
+                Event::Html(html) | Event::InlineHtml(html) if open.is_none() => {
+                    let images = html_images(&html);
+                    if !images.is_empty() {
+                        spans.push((range, images));
                     }
                 }
                 _ => {}
@@ -72,12 +79,12 @@ impl InboxDocument {
         }
         let mut rows = Vec::new();
         let mut at = 0;
-        for (range, url, alt) in spans {
+        for (range, images) in spans {
             if range.start < at || range.end > text.len() {
                 continue;
             }
             append_markdown(&mut rows, &text[at..range.start], &cwd);
-            rows.push(Row::Image { url, alt });
+            rows.extend(images.into_iter().map(|(url, alt)| Row::Image { url, alt }));
             at = range.end;
         }
         append_markdown(&mut rows, &text[at..], &cwd);
@@ -95,6 +102,61 @@ impl InboxDocument {
     }
 }
 
+/// `(src, alt)` of every `<img>` tag in a raw HTML fragment.
+fn html_images(html: &str) -> Vec<(String, String)> {
+    let lower = html.to_ascii_lowercase();
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = lower[from..].find("<img") {
+        let start = from + offset + 4;
+        let end = lower[start..]
+            .find('>')
+            .map_or(html.len(), |end| start + end);
+        from = end;
+        if !lower[start..].starts_with(|c: char| c.is_ascii_whitespace() || c == '/') {
+            continue;
+        }
+        let tag = &html[start..end];
+        if let Some(src) = html_attribute(tag, "src") {
+            found.push((src, html_attribute(tag, "alt").unwrap_or_default()));
+        }
+    }
+    found
+}
+
+fn html_attribute(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(offset) = lower[from..].find(name) {
+        let at = from + offset;
+        from = at + name.len();
+        let boundary = lower[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_whitespace());
+        let rest = lower[from..].trim_start();
+        if !boundary || !rest.starts_with('=') {
+            continue;
+        }
+        let value = tag[tag.len() - rest.len() + 1..].trim_start();
+        let raw = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => value[1..].split(quote).next().unwrap_or(""),
+            _ => value
+                .split(|c: char| c.is_ascii_whitespace())
+                .next()
+                .unwrap_or(""),
+        };
+        return Some(
+            raw.replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&"),
+        );
+    }
+    None
+}
+
 /// GitHub turns bare URLs into links and CommonMark does not, but issue and PR
 /// text is written for GitHub. Wrap them as autolinks before parsing. Code,
 /// existing links and images are left alone.
@@ -102,7 +164,7 @@ fn link_bare_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     let mut wrap = |range: std::ops::Range<usize>, out: &mut String| {
-        for (start, end) in bare_urls(&text[range.clone()]) {
+        for (start, end) in markdown_model::bare_urls(&text[range.clone()]) {
             let (start, end) = (range.start + start, range.start + end);
             out.push_str(&text[copied..start]);
             out.push('<');
@@ -142,63 +204,6 @@ fn link_bare_urls(text: &str) -> String {
     }
     out.push_str(&text[copied..]);
     out
-}
-
-/// Byte ranges of the `http(s)://` URLs in `text`, without the punctuation
-/// that closes the sentence or bracket around them.
-fn bare_urls(text: &str) -> Vec<(usize, usize)> {
-    let mut found = Vec::new();
-    let mut from = 0;
-    while from < text.len() {
-        let rest = &text[from..];
-        let lower = rest.to_ascii_lowercase();
-        let Some(offset) = ["https://", "http://"]
-            .iter()
-            .filter_map(|scheme| lower.find(scheme).map(|at| (at, scheme.len())))
-            .min()
-        else {
-            break;
-        };
-        let (at, scheme) = offset;
-        let start = from + at;
-        let attached = text[..start]
-            .chars()
-            .next_back()
-            .is_some_and(char::is_alphanumeric);
-        let mut end = start
-            + text[start..]
-                .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>'))
-                .unwrap_or(text.len() - start);
-        loop {
-            let url = &text[start..end];
-            let Some(last) = url.chars().next_back() else {
-                break;
-            };
-            let opener = match last {
-                ')' => Some('('),
-                ']' => Some('['),
-                '}' => Some('{'),
-                _ => None,
-            };
-            let trim = match opener {
-                Some(open) => url.matches(open).count() < url.matches(last).count(),
-                None => matches!(
-                    last,
-                    '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '*' | '_'
-                ),
-            };
-            if !trim {
-                break;
-            }
-            end -= last.len_utf8();
-        }
-        let host = text[start + scheme..end].chars().next();
-        if !attached && host.is_some_and(char::is_alphanumeric) {
-            found.push((start, end));
-        }
-        from = end.max(start + scheme);
-    }
-    found
 }
 
 fn append_markdown(rows: &mut Vec<Row>, text: &str, cwd: &std::path::Path) {
@@ -719,6 +724,23 @@ mod tests {
             wrap("line one\nhttps://a.dev\n"),
             "line one\n<https://a.dev>\n"
         );
+    }
+
+    #[test]
+    fn html_img_tags_yield_their_source_and_alt() {
+        assert_eq!(
+            html_images(
+                r#"<p align="center"><img width="260" alt="Before" src="https://github.com/a/b/blob/x/1.png?raw=true&amp;v=1"> <IMG data-src="no" src='https://x.dev/2.png'/></p>"#
+            ),
+            [
+                (
+                    "https://github.com/a/b/blob/x/1.png?raw=true&v=1".to_string(),
+                    "Before".to_string()
+                ),
+                ("https://x.dev/2.png".to_string(), String::new()),
+            ]
+        );
+        assert!(html_images("<imgx src=\"a\"><img alt=\"no source\">").is_empty());
     }
 
     #[test]

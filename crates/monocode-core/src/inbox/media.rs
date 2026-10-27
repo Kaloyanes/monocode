@@ -18,6 +18,9 @@ struct MediaUrl {
 
 pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
     let mut current = parse_allowed_media_url(url)?;
+    if let Some(raw) = github_file_as_raw(&current) {
+        current = raw;
+    }
     let token = if github_auth_host(&current.host) {
         github_auth_token()
     } else {
@@ -199,7 +202,7 @@ fn redirect_target(base: &str, location: &str) -> Result<MediaUrl, String> {
 
 fn is_allowed_media_target(url: &MediaUrl) -> bool {
     if is_github_site(&url.host) {
-        return is_github_attachment_path(&url.path);
+        return is_github_attachment_path(&url.path) || github_file_as_raw(url).is_some();
     }
     is_github_media_cdn(&url.host) || is_linear_uploads(&url.host) || is_github_asset_s3(&url.host)
 }
@@ -212,6 +215,25 @@ fn is_github_attachment_path(path: &str) -> bool {
     // /owner/repo/assets/<user-id>/<uuid>
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     parts.len() >= 4 && parts[2] == "assets" && parts[3].bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// `github.com/<owner>/<repo>/blob|raw/<ref>/<path>` as its raw.githubusercontent.com
+/// file. The github.com route ignores API tokens, so private repo files 404 there.
+fn github_file_as_raw(url: &MediaUrl) -> Option<MediaUrl> {
+    if !is_github_site(&url.host) {
+        return None;
+    }
+    let mut parts = url.path.splitn(5, '/').skip(1);
+    let (owner, repo, kind, rest) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if owner.is_empty() || repo.is_empty() || !matches!(kind, "blob" | "raw") || rest.is_empty() {
+        return None;
+    }
+    let path = format!("/{owner}/{repo}/{rest}");
+    Some(MediaUrl {
+        host: "raw.githubusercontent.com".into(),
+        url: format!("https://raw.githubusercontent.com{path}"),
+        path,
+    })
 }
 
 fn is_github_site(host: &str) -> bool {
@@ -235,8 +257,9 @@ fn is_github_asset_s3(host: &str) -> bool {
 }
 
 fn github_auth_host(host: &str) -> bool {
-    // JWT-signed githubusercontent URLs reject an extra Authorization header.
-    is_github_site(host)
+    // JWT-signed githubusercontent URLs reject an extra Authorization header;
+    // raw.githubusercontent.com needs one for private repositories.
+    is_github_site(host) || host == "raw.githubusercontent.com"
 }
 
 fn is_redirect(status: u16) -> bool {
@@ -309,6 +332,25 @@ mod tests {
         )
         .is_err());
         assert!(parse_allowed_media_url("https://127.0.0.1/shot.png").is_err());
+    }
+
+    #[test]
+    fn github_file_links_fetch_from_the_raw_host() {
+        let raw = |url: &str| {
+            github_file_as_raw(&parse_allowed_media_url(url).unwrap())
+                .unwrap()
+                .url
+        };
+        assert_eq!(
+            raw("https://github.com/acme/web/blob/issue-assets/img/pr-7/a.png?raw=true"),
+            "https://raw.githubusercontent.com/acme/web/issue-assets/img/pr-7/a.png"
+        );
+        assert_eq!(
+            raw("https://github.com/acme/web/raw/main/a.png"),
+            "https://raw.githubusercontent.com/acme/web/main/a.png"
+        );
+        assert!(parse_allowed_media_url("https://github.com/acme/web/blob/").is_err());
+        assert!(parse_allowed_media_url("https://github.com/acme/web/tree/main/a.png").is_err());
     }
 
     #[test]

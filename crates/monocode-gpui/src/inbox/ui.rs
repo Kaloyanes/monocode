@@ -923,7 +923,7 @@ impl Inbox {
                             .gap(px(8.))
                             .when(!is_pr, |d| {
                                 d.child(
-                                    action("inbox-send-agent", "Send to agent")
+                                    action("inbox-send-agent", "Open in new session")
                                         .px(px(12.))
                                         .bg(content(1.))
                                         .text_color(shell_fill())
@@ -961,6 +961,20 @@ impl Inbox {
                             .when(is_pr && item.provider == "github", |d| {
                                 d.child(self.pr_actions(&item, cx))
                             })
+                            .child(
+                                icon_action("inbox-copy-link", "Copy link", "response-copy")
+                                    .when(item.url.is_empty(), |d| d.opacity(0.4))
+                                    .on_click({
+                                        let url = item.url.clone();
+                                        move |_, _, cx| {
+                                            if !url.is_empty() {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    url.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }),
+                            )
                             .child(
                                 icon_action(
                                     "inbox-open-external",
@@ -2104,6 +2118,9 @@ impl Inbox {
         self.save();
         if let Some(item) = self.visible_items(cx).first() {
             self.select(item.key(), cx);
+        } else {
+            self.selected = None;
+            self.pinned = None;
         }
         if refetch {
             self.refresh(cx);
@@ -2958,6 +2975,51 @@ mod tests {
         window.update(cx, |_, _, cx| cx.notify()).unwrap();
         cx.refresh().unwrap();
         cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn linear_team_filters_hide_cached_issues_before_refresh(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    inbox.state.source = "linear".into();
+                    inbox.state.filters = model::Filters::default();
+                    inbox.snapshot.items = ["web", "mobile"]
+                        .into_iter()
+                        .map(|team| Item {
+                            provider: "linear".into(),
+                            identifier: format!("{team}-1"),
+                            team_id: team.into(),
+                            ..Default::default()
+                        })
+                        .collect();
+                    let visible_teams = |inbox: &Inbox, cx: &App| {
+                        inbox
+                            .visible_items(cx)
+                            .into_iter()
+                            .map(|item| item.team_id)
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(visible_teams(inbox, cx), ["web", "mobile"]);
+                    toggle(&mut inbox.state.hidden_linear_teams, "web".into());
+                    assert_eq!(visible_teams(inbox, cx), ["mobile"]);
+                    let mobile = inbox.visible_items(cx).remove(0);
+                    inbox.selected = Some(mobile.key());
+                    inbox.filters_changed(false, cx);
+                    assert_eq!(inbox.item().map(|item| item.team_id), Some("mobile".into()));
+                    toggle(&mut inbox.state.hidden_linear_teams, "mobile".into());
+                    assert!(inbox.visible_items(cx).is_empty());
+                    inbox.pinned = Some(mobile);
+                    inbox.filters_changed(false, cx);
+                    assert!(inbox.item().is_none());
+                    assert!(inbox.pinned.is_none());
+                    toggle(&mut inbox.state.hidden_linear_teams, "web".into());
+                    assert_eq!(visible_teams(inbox, cx), ["web"]);
+                    inbox.state.hidden_linear_teams.clear();
+                    assert_eq!(visible_teams(inbox, cx), ["web", "mobile"]);
+                });
+            })
+            .unwrap();
     }
     #[gpui::test]
     fn long_discussion_materializes_only_viewport_comments_and_reply_focus_reaches_composer(
