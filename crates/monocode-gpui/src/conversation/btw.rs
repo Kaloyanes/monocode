@@ -107,6 +107,8 @@ pub(super) struct Btw {
     session: i64,
     store: Database,
     parent_input: Entity<input::Input>,
+    /// Where quotes land, as chips in its composer.
+    parent: gpui::WeakEntity<Conversation>,
     input: Entity<input::Input>,
     transcript: Entity<TranscriptView>,
     target: Target,
@@ -151,6 +153,7 @@ impl Btw {
         session: i64,
         store: Database,
         parent_input: Entity<input::Input>,
+        parent: gpui::WeakEntity<Conversation>,
         home: AnchorSlot,
         target: Target,
         cx: &mut Context<Self>,
@@ -261,6 +264,7 @@ impl Btw {
             session,
             store,
             parent_input,
+            parent,
             input,
             transcript,
             target,
@@ -467,12 +471,10 @@ impl Btw {
                 if self.parent_input.read(cx).is_composing() {
                     return;
                 }
-                self.parent_input.update(cx, |input, cx| {
-                    input.set_text(
-                        monocode_core::composer::append_selection_quote(&input.content, text),
-                        cx,
-                    )
-                });
+                let text = text.clone();
+                let _ = self
+                    .parent
+                    .update(cx, |parent, cx| parent.attach_quote(text, cx));
                 self.close(window, cx);
             }
             ResponseRequest::SaveNote {
@@ -1863,11 +1865,13 @@ impl Conversation {
             return false;
         };
         if self.btw.is_none() {
+            let parent = cx.entity().downgrade();
             let btw = cx.new(|cx| {
                 Btw::new(
                     self.summary.id,
                     self.store.clone(),
                     self.input.clone(),
+                    parent,
                     self.btw_home.0.clone(),
                     target.clone(),
                     cx,

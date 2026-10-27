@@ -72,12 +72,7 @@ impl Conversation {
         if self.input.read(cx).is_composing() {
             return;
         }
-        self.input.update(cx, |i, cx| {
-            i.set_text(
-                monocode_core::composer::append_selection_quote(&i.content, text),
-                cx,
-            );
-        });
+        self.attach_quote(text.to_owned(), cx);
         window.focus(&self.input.focus_handle(cx), cx);
     }
     pub(crate) fn mono_external_pending(&self) -> bool {
@@ -950,6 +945,7 @@ impl Conversation {
                         .child(self.mono_ui.setting_anchors[0].probe())
                         .child(icon(glyph, 14.))
                         .child(div().min_w_0().truncate().child(value))
+                        .child(chevron("mono-effort-chevron", open, 12.))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.toggle_menu(ComposerMenu::Setting(0), window, cx)
                         }))
@@ -1016,6 +1012,9 @@ impl Conversation {
                                 .when(toggle && !on, |d| d.opacity(0.5))
                                 .child(if toggle { control.name.clone() } else { value }),
                         )
+                        .when(!toggle, |d| {
+                            d.child(chevron(("mono-control-chevron", ix), open, 12.))
+                        })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if toggle {
                                 this.menu_choice(&toggle_id, cx);

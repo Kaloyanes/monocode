@@ -55,9 +55,17 @@ impl Shell {
         }
     }
 
-    /// "Hide tab bar" applies to the Focused layout; Classic keeps its strip.
+    /// What the title strip shows. Classic keeps its tabs unless the plan
+    /// takes their place.
+    pub(super) fn title_bar_mode(&self) -> TitleBarMode {
+        match self.workspace.preferences.title_bar_mode() {
+            TitleBarMode::SessionTitle if self.workspace.classic_layout => TitleBarMode::Tabs,
+            mode => mode,
+        }
+    }
+
     pub(super) fn tab_strip_visible(&self) -> bool {
-        self.workspace.classic_layout || !self.workspace.preferences.hide_tab_bar
+        self.title_bar_mode() == TitleBarMode::Tabs
     }
 
     /// With the strip hidden, an open chat that has no messages yet would be
@@ -780,7 +788,7 @@ mod interaction_tests {
                     !shell.sidebar_navigation_ids(cx).contains(&blank),
                     "a chat with no messages is not listed while the strip shows its tab"
                 );
-                shell.workspace.preferences.hide_tab_bar = true;
+                shell.workspace.preferences.title_bar = Some(TitleBarMode::SessionTitle);
                 shell.persist(cx);
                 cx.notify();
                 assert_eq!(shell.sidebar_navigation_ids(cx), [blank, older]);
@@ -803,9 +811,37 @@ mod interaction_tests {
                 assert_eq!(shell.workspace.active, Some(blank));
                 shell.activate_tab(-1, w, cx);
                 assert_eq!(shell.workspace.active, Some(older));
-                shell.workspace.preferences.hide_tab_bar = false;
+                shell.workspace.preferences.title_bar = Some(TitleBarMode::Tabs);
                 shell.persist(cx);
                 assert_eq!(shell.sidebar_navigation_ids(cx), [older]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn plan_in_the_title_bar_hands_switching_to_the_sidebar(cx: &mut TestAppContext) {
+        let (window, older, blank) = window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&older].update(cx, |view, _| {
+                    view.summary.cwd = "/work/monocode".into();
+                    view.summary.has_messages = true;
+                });
+                shell.workspace.preferences.title_bar = Some(TitleBarMode::Plan);
+                shell.persist(cx);
+                cx.notify();
+                assert_eq!(shell.sidebar_navigation_ids(cx), [blank, older]);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        assert!(visual.debug_bounds("title-plan-strip").is_some());
+        assert!(visual.debug_bounds("new-tab").is_none());
+        window
+            .update(visual, |shell, w, cx| {
+                shell.activate_tab(1, w, cx);
+                assert_eq!(shell.workspace.active, Some(older));
             })
             .unwrap();
     }

@@ -496,8 +496,11 @@ impl Shell {
                 Ok((summary, settings, prompt)) => {
                     let id = summary.id;
                     this.add(summary, cx);
-                    this.sessions[&id]
-                        .update(cx, |view, cx| view.quick_submit(prompt, settings, cx));
+                    this.sessions[&id].update(cx, |view, cx| {
+                        view.seed_new_settings(settings, cx);
+                        view.input
+                            .update(cx, |input, cx| input.set_text(prompt, cx));
+                    });
                     if this.navigation_revision == revision {
                         this.activate_session(id, window, cx);
                     }
@@ -510,5 +513,46 @@ impl Shell {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn inbox_opens_a_prefilled_session_without_sending(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        let item = monocode_core::inbox::Item {
+            provider: "github".into(),
+            kind: "issue".into(),
+            repo: "acme/web".into(),
+            number: 157,
+            title: "Fix the inbox handoff".into(),
+            url: "https://github.com/acme/web/issues/157".into(),
+            project_path: std::env::temp_dir().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let prompt = item.prompt("Issue description\n\nalice: Discussion context", false);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.start_inbox_session(item.clone(), prompt.clone(), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, window, cx| {
+                assert!(shell.error.is_none(), "{:?}", shell.error);
+                let id = shell.workspace.active.unwrap();
+                let session = shell.sessions[&id].read(cx);
+                assert_eq!(session.summary.cwd, item.project_path);
+                assert_eq!(session.summary.work_item, Some(item.work_item()));
+                assert_eq!(session.input.read(cx).content.as_ref(), prompt);
+                assert!(!session.busy);
+                assert!(!session.summary.has_messages);
+                assert!(session.transcript.read(cx).source_rows().is_empty());
+                assert!(session.input.focus_handle(cx).is_focused(window));
+            })
+            .unwrap();
     }
 }

@@ -255,6 +255,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "live running sessions rail card",
     ),
     (
+        "title-bar",
+        Section::General,
+        "Title bar",
+        "tabs plan session title hide tab bar top strip sidebar shortcuts",
+    ),
+    (
         "action-opens-terminal",
         Section::General,
         "Show terminal for actions",

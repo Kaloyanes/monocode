@@ -58,6 +58,19 @@ fn row_session(row: &Row) -> Option<i64> {
     }
 }
 
+/// What a session row shows besides its session, so two layouts can be told
+/// apart when the same sessions appear in both.
+fn row_kind(row: &Row) -> Option<(i64, bool, bool, bool)> {
+    match row {
+        Row::Session(id) => Some((*id, false, false, false)),
+        Row::GroupedSession { id, first, last } => Some((*id, true, *first, *last)),
+        Row::ClassicGroupMember {
+            id, first, last, ..
+        } => Some((*id, true, *first, *last)),
+        _ => None,
+    }
+}
+
 impl SidebarList {
     pub(super) fn new(cx: &mut Context<Shell>) -> Self {
         let state =
@@ -137,39 +150,88 @@ impl SidebarList {
         self.state.remeasure_items(0..self.rows.len().min(2));
     }
 
-    /// When exactly one session joined or left, records where the rows after
-    /// it were painted so they can travel from there. Must run before the
-    /// list state forgets the old layout.
+    /// When exactly one session joined, left or changed place, records where
+    /// the rows after it were painted so they can travel from there. Must run
+    /// before the list state forgets the old layout.
     fn start_cascade(&self, rows: &[Row], prefix: usize) {
-        self.cascade.cancel();
-        if self.reduce_motion {
-            return;
+        if self.reduce_motion || self.begin_cascade(rows, prefix).is_none() {
+            self.cascade.cancel();
         }
+    }
+
+    fn begin_cascade(&self, rows: &[Row], prefix: usize) -> Option<()> {
         let old: HashSet<i64> = self.rows.iter().filter_map(row_session).collect();
         let new: HashSet<i64> = rows.iter().filter_map(row_session).collect();
         let added: Vec<_> = new.difference(&old).copied().collect();
-        let entering = match (added.as_slice(), old.difference(&new).count()) {
-            ([id], 0) => rows.iter().position(|row| row_session(row) == Some(*id)),
-            ([], 1) => None,
-            _ => return,
-        };
+        let position = |id: i64| rows.iter().position(|row| row_session(row) == Some(id));
+        let (mut entering, mut reordered) = (None, None);
+        match (added.as_slice(), old.difference(&new).count()) {
+            ([id], 0) => entering = position(*id),
+            ([], 1) => {}
+            ([], 0) => {
+                // Only a plain row changing place animates; moving into or out
+                // of a folder changes what the rows are.
+                let kinds =
+                    |rows: &[Row]| -> HashSet<_> { rows.iter().filter_map(row_kind).collect() };
+                if kinds(&self.rows) != kinds(rows) {
+                    return None;
+                }
+                reordered = position(self.reordered_session(rows)?);
+            }
+            _ => return None,
+        }
         // Far below the viewport nothing is seen moving.
         const REACH: usize = 64;
-        let painted: Vec<_> = (prefix..self.rows.len().min(prefix + REACH))
-            .filter_map(|ix| Some((&self.rows[ix], self.state.bounds_for_item(ix)?.top())))
+        // A run still going has rows above the change in motion too; they
+        // carry on from where they are painted instead of snapping.
+        let first = if self.cascade.active() { 0 } else { prefix };
+        let painted: Vec<_> = (first..self.rows.len().min(prefix + REACH))
+            .filter_map(|ix| {
+                let top = self.state.bounds_for_item(ix)?.top();
+                let (offset, opacity) = self.cascade.carried(ix, top);
+                Some((&self.rows[ix], top + px(offset), opacity))
+            })
             .collect();
         let mut moved = HashMap::default();
+        let mut fades = HashMap::default();
         let mut rank = 0;
-        for (ix, row) in rows.iter().enumerate().skip(prefix).take(REACH) {
+        for (ix, row) in rows.iter().enumerate().skip(first).take(REACH) {
             if Some(ix) == entering || matches!(row, Row::Gap | Row::ClassicGap(_)) {
                 continue;
             }
-            if let Some((_, top)) = painted.iter().find(|(old, _)| *old == row) {
-                moved.insert(ix, (*top, rank));
+            let Some(&(_, top, opacity)) = painted.iter().find(|(old, ..)| *old == row) else {
+                continue;
+            };
+            if opacity < 0.99 && Some(ix) != reordered {
+                fades.insert(ix, opacity);
+            }
+            if ix < prefix || Some(ix) == reordered {
+                moved.insert(ix, (top, 0));
+            } else {
+                moved.insert(ix, (top, rank));
                 rank += 1;
             }
         }
-        self.cascade.start(entering, moved);
+        // A session that was not on screen before has nowhere to travel from,
+        // so it fades in at its new slot like a new one.
+        if reordered.is_some_and(|ix| !moved.contains_key(&ix)) {
+            entering = reordered.take();
+        }
+        self.cascade.start(entering, reordered, moved, fades);
+        Some(())
+    }
+
+    /// The one session whose removal leaves old and new order identical.
+    fn reordered_session(&self, rows: &[Row]) -> Option<i64> {
+        let before: Vec<i64> = self.rows.iter().filter_map(row_session).collect();
+        let after: Vec<i64> = rows.iter().filter_map(row_session).collect();
+        let first = before.iter().zip(&after).position(|(a, b)| a != b)?;
+        let without = |ids: &[i64], id: i64| -> Vec<i64> {
+            ids.iter().copied().filter(|other| *other != id).collect()
+        };
+        [before[first], after[first]]
+            .into_iter()
+            .find(|id| without(&before, *id) == without(&after, *id))
     }
 }
 
@@ -782,11 +844,6 @@ impl Shell {
                 .icon("list-bullet")
                 .toggle(self.workspace.compact_session_cards)
                 .into(),
-            MenuAction::new("hide-tab-bar", "Hide tab bar")
-                .icon("panel-top")
-                .toggle(self.workspace.preferences.hide_tab_bar)
-                .disabled(self.workspace.classic_layout)
-                .into(),
         ]
     }
 
@@ -798,11 +855,10 @@ impl Shell {
             "sidebar-monos" => &mut self.workspace.preferences.monos,
             "sidebar-activity" => &mut self.workspace.sidebar_activity_visible,
             "compact-session-cards" => &mut self.workspace.compact_session_cards,
-            "hide-tab-bar" => &mut self.workspace.preferences.hide_tab_bar,
             _ => return,
         };
         *value = !*value;
-        if action == "sidebar-monos" || action == "hide-tab-bar" {
+        if action == "sidebar-monos" {
             self.apply_preferences(cx);
             self.sync_settings(cx);
         }
@@ -1491,9 +1547,11 @@ mod tests {
         window
             .update(cx, |shell, _, _| {
                 assert!(shell.sidebar_list.cascade.active());
+                // The new row left before the rows had moved, so they keep
+                // the places they are painted at instead of jumping.
                 assert!(
-                    top(shell, older[0]) > before[0] + px(1.),
-                    "rows slide up from below"
+                    (top(shell, older[0]) - before[0]).abs() < px(1.),
+                    "rows stay where they are painted"
                 );
             })
             .unwrap();
@@ -1509,6 +1567,118 @@ mod tests {
                 assert!(!shell.sidebar_list.cascade.active());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_session_moving_to_the_top_travels_from_where_it_was(cx: &mut TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        super::super::list_cascade::freeze(true);
+        let ids = window
+            .update(cx, |shell, window, cx| {
+                let mut ids = Vec::new();
+                for i in 0..4 {
+                    let mut summary = locked(&shell.store)
+                        .unwrap()
+                        .create("codex", "/work/reorder")
+                        .unwrap();
+                    summary.title = format!("Session {i}");
+                    summary.has_messages = true;
+                    ids.push(summary.id);
+                    shell.order.push(summary.id);
+                    shell.session_summaries.insert(summary.id, summary);
+                }
+                shell.select_project("/work/reorder".into(), window, cx);
+                ids
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let top = |shell: &Shell, id| shell.session_row_bounds[&id].get().unwrap().top();
+        let mover = ids[0];
+        let before = window
+            .update(cx, |shell, _, cx| {
+                let before: Vec<_> = ids.iter().map(|id| top(shell, *id)).collect();
+                shell.order.retain(|id| *id != mover);
+                shell.order.insert(0, mover);
+                shell.session_summaries.get_mut(&mover).unwrap().updated_at = u64::MAX / 2;
+                shell.sidebar_list.invalidate_structure();
+                shell.sidebar_frame.update(cx, |_, cx| cx.notify());
+                before
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.sidebar_list.cascade.active());
+                let rows = &shell.sidebar_list.rows;
+                let ix = rows
+                    .iter()
+                    .position(|row| super::row_session(row) == Some(mover))
+                    .unwrap();
+                let first = rows
+                    .iter()
+                    .position(|row| super::row_session(row).is_some());
+                assert_eq!(first, Some(ix), "the session took the top slot");
+                // Nothing jumps on the first frame, including the session that moved.
+                for (id, was) in ids.iter().zip(&before) {
+                    assert!((top(shell, *id) - *was).abs() < px(1.), "{id} jumped");
+                }
+            })
+            .unwrap();
+        super::super::list_cascade::freeze(false);
+    }
+
+    #[gpui::test]
+    fn a_second_reorder_carries_on_from_where_the_rows_are_painted(cx: &mut TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        super::super::list_cascade::freeze(true);
+        let ids = window
+            .update(cx, |shell, window, cx| {
+                let mut ids = Vec::new();
+                for i in 0..4 {
+                    let mut summary = locked(&shell.store)
+                        .unwrap()
+                        .create("codex", "/work/rapid")
+                        .unwrap();
+                    summary.title = format!("Session {i}");
+                    summary.has_messages = true;
+                    ids.push(summary.id);
+                    shell.order.push(summary.id);
+                    shell.session_summaries.insert(summary.id, summary);
+                }
+                shell.select_project("/work/rapid".into(), window, cx);
+                ids
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let top = |shell: &Shell, id| shell.session_row_bounds[&id].get().unwrap().top();
+        let bump = |shell: &mut Shell, id: i64, at: u64, cx: &mut Context<Shell>| {
+            shell.session_summaries.get_mut(&id).unwrap().updated_at = at;
+            shell.sidebar_list.invalidate_structure();
+            shell.sidebar_frame.update(cx, |_, cx| cx.notify());
+        };
+        window
+            .update(cx, |shell, _, cx| bump(shell, ids[0], u64::MAX / 2, cx))
+            .unwrap();
+        cx.refresh().unwrap();
+        // Time is frozen, so every row is still painted where the first
+        // reorder found it.
+        let painted = window
+            .update(cx, |shell, _, cx| {
+                let painted: Vec<_> = ids.iter().map(|id| top(shell, *id)).collect();
+                bump(shell, ids[1], u64::MAX / 2 + 1, cx);
+                painted
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.sidebar_list.cascade.active());
+                for (id, was) in ids.iter().zip(&painted) {
+                    assert!((top(shell, *id) - *was).abs() < px(1.), "{id} jumped");
+                }
+            })
+            .unwrap();
+        super::super::list_cascade::freeze(false);
     }
 
     #[gpui::test]

@@ -1,7 +1,7 @@
 //! GeneralPage and UpdateRow.
 use crate::notifications::updater::{self, Action};
 use crate::settings::{
-    SettingsView,
+    SettingsView, TitleBarMode,
     widgets::{primary_button, secondary_button},
 };
 use crate::theme::*;
@@ -135,17 +135,23 @@ impl SettingsView {
             )],
         ));
         workspace.push(self.row(
-            Some("title-plan"),
+            Some("title-bar"),
             false,
-            "Plan in title bar",
-            Some("Show the agent's plan for the open chat in place of session tabs.".into()),
-            vec![self.toggle(
-                "title-plan",
-                "Plan in title bar",
-                p.title_plan,
-                false,
+            "Title bar",
+            Some("What the top bar shows for the open chat. With Plan or Session title, switch sessions from the sidebar: ⌘1–9 follow its order and new sessions appear at its top.".into()),
+            vec![self.segmented(
+                "title-bar",
+                "Title bar",
+                p.title_bar_mode().key(),
+                &[
+                    ("tabs", "Tabs"),
+                    ("plan", "Plan"),
+                    ("session-title", "Session title"),
+                ],
                 cx,
-                |this, on, cx| this.update(cx, |p| p.title_plan = on),
+                |this, key, cx| {
+                    this.update(cx, |p| p.title_bar = Some(TitleBarMode::from_key(key)))
+                },
             )],
         ));
         workspace.push(self.row(
@@ -162,20 +168,6 @@ impl SettingsView {
                 false,
                 cx,
                 |this, on, cx| this.update(cx, |p| p.action_opens_terminal = on),
-            )],
-        ));
-        workspace.push(self.row(
-            Some("hide-tab-bar"),
-            false,
-            "Hide tab bar",
-            Some("Use the sidebar to switch sessions. ⌘1–9 and tab shortcuts follow the sidebar's order, and new sessions appear at its top.".into()),
-            vec![self.toggle(
-                "hide-tab-bar",
-                "Hide tab bar",
-                p.hide_tab_bar,
-                false,
-                cx,
-                |this, on, cx| this.update(cx, |p| p.hide_tab_bar = on),
             )],
         ));
         workspace.push(self.row(

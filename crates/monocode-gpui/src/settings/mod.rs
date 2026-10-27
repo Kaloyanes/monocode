@@ -18,8 +18,9 @@ pub(crate) mod widgets;
 pub(crate) use keymap::apply as apply_keybindings;
 pub(crate) use model::Section;
 pub(crate) use pages::command_shortcut;
-pub(crate) use preferences::{ModelChoice, Preferences, TextTask, UI_SCALE_PERCENTS};
+pub(crate) use preferences::{ModelChoice, Preferences, TextTask, TitleBarMode, UI_SCALE_PERCENTS};
 
+use crate::tooltip::Tip;
 use crate::{
     input::{self, Input},
     popover::{Align, Anchor, AnchorSlot, Side, popover},
@@ -758,6 +759,7 @@ impl SettingsView {
                                                 .id("clear-settings-search")
                                                 .role(Role::Button)
                                                 .aria_label("Clear settings search")
+                                                .tip("Clear settings search")
                                                 .size_4()
                                                 .flex_shrink_0()
                                                 .flex()

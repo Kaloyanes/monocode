@@ -1069,7 +1069,11 @@ impl QuickComposer {
                     ))
                 })
                 .child(div().truncate().child(project))
-                .child(icon("chevron-down", 12.).text_color(content(0.4)))
+                .child(chevron(
+                    "quick-project-chevron",
+                    self.picker == Some(Picker::Project),
+                    12.,
+                ))
                 .on_click(cx.listener(|this, _, window, cx| {
                     if !this.projects.is_empty() {
                         this.open(Picker::Project, window, cx)
@@ -1214,7 +1218,11 @@ impl QuickComposer {
                 .py_1()
                 .child(provider_icon(self.kind.id(), 14.))
                 .child(div().truncate().child(name))
-                .child(icon("chevron-down", 12.).text_color(content(0.4)))
+                .child(chevron(
+                    "quick-model-chevron",
+                    self.picker == Some(Picker::Model),
+                    12.,
+                ))
                 .on_click(cx.listener(|this, _, window, cx| this.open(Picker::Model, window, cx))),
             )
             .when(self.kind != Kind::Fx, |d| {
@@ -1239,7 +1247,11 @@ impl QuickComposer {
                         },
                     ))
                     .child(div().truncate().child(self.access.label()))
-                    .child(icon("chevron-down", 12.).text_color(content(0.4)))
+                    .child(chevron(
+                        "quick-permissions-chevron",
+                        self.picker == Some(Picker::Permissions),
+                        12.,
+                    ))
                     .on_click(
                         cx.listener(|this, _, window, cx| {
                             this.open(Picker::Permissions, window, cx)
@@ -1978,6 +1990,7 @@ impl Render for QuickComposer {
                             .id("quick-close")
                             .role(Role::Button)
                             .aria_label("Close composer")
+                            .tip("Close composer")
                             .group("quick-close")
                             .cursor_pointer()
                             .absolute()

@@ -18,15 +18,17 @@ pub(crate) struct Preferences {
     pub notes: bool,
     pub quick_composer: bool,
     pub working_agents: bool,
-    /// The title bar shows the active session's agent plan instead of tabs.
+    /// What the title strip shows; `None` until chosen, read through
+    /// `title_bar_mode`.
+    pub title_bar: Option<TitleBarMode>,
+    /// Legacy "Plan in title bar", read when `title_bar` is unset.
     pub title_plan: bool,
     pub close_to_tray: bool,
     /// Running an action shows the terminal it runs in.
     pub action_opens_terminal: bool,
     /// The new layout opens the terminal as a right panel tab, not a dock.
     pub terminal_in_panel: bool,
-    /// The sidebar replaces the title strip's tabs; ⌘1–9 and tab stepping
-    /// follow the sidebar's order.
+    /// Legacy "Hide tab bar", read when `title_bar` is unset.
     pub hide_tab_bar: bool,
     // Appearance
     pub theme: String,
@@ -72,6 +74,9 @@ pub(crate) struct Preferences {
     pub commit_model: Option<ModelChoice>,
     pub pr_model: Option<ModelChoice>,
     pub title_model: Option<ModelChoice>,
+    /// Names new worktree branches. Unlike the actions above it never falls
+    /// back to `text_model`; unset uses the session provider's fast model.
+    pub branch_model: Option<ModelChoice>,
     pub mask_emails: bool,
     pub idle_agents: u32,
     pub claude_hooks: bool,
@@ -124,6 +129,7 @@ impl Default for Preferences {
             notes: true,
             quick_composer: true,
             working_agents: true,
+            title_bar: None,
             title_plan: false,
             close_to_tray: true,
             action_opens_terminal: true,
@@ -165,6 +171,7 @@ impl Default for Preferences {
             commit_model: None,
             pr_model: None,
             title_model: None,
+            branch_model: None,
             mask_emails: true,
             idle_agents: 3,
             claude_hooks: true,
@@ -192,15 +199,57 @@ impl Default for Preferences {
     }
 }
 
+/// What the title strip shows. Anything but tabs makes the sidebar the
+/// session list: ⌘1–9 and tab stepping follow its order, and new sessions
+/// appear at its top.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TitleBarMode {
+    Tabs,
+    Plan,
+    SessionTitle,
+}
+
+impl TitleBarMode {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Tabs => "tabs",
+            Self::Plan => "plan",
+            Self::SessionTitle => "session-title",
+        }
+    }
+
+    pub(crate) fn from_key(key: &str) -> Self {
+        match key {
+            "plan" => Self::Plan,
+            "session-title" => Self::SessionTitle,
+            _ => Self::Tabs,
+        }
+    }
+}
+
 /// An action that has the CLI write text for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextTask {
     Commit,
     PullRequest,
     Title,
+    Branch,
 }
 
 impl Preferences {
+    /// Before one setting covered the title strip, "Plan in title bar" took
+    /// it over and "Hide tab bar" left the session's title.
+    pub(crate) fn title_bar_mode(&self) -> TitleBarMode {
+        self.title_bar.unwrap_or(if self.title_plan {
+            TitleBarMode::Plan
+        } else if self.hide_tab_bar {
+            TitleBarMode::SessionTitle
+        } else {
+            TitleBarMode::Tabs
+        })
+    }
+
     /// The model chosen for `task`, else the general text model; `None` leaves
     /// the choice to the caller's default.
     pub(crate) fn text_model_for(&self, task: TextTask) -> Option<&ModelChoice> {
@@ -208,6 +257,7 @@ impl Preferences {
             TextTask::Commit => &self.commit_model,
             TextTask::PullRequest => &self.pr_model,
             TextTask::Title => &self.title_model,
+            TextTask::Branch => return self.branch_model.as_ref(),
         }
         .as_ref()
         .or(self.text_model.as_ref())
@@ -460,7 +510,7 @@ mod tests {
 
 #[cfg(test)]
 mod decoration_tests {
-    use super::Preferences;
+    use super::{Preferences, TitleBarMode};
 
     #[test]
     fn decoration_requests_are_scoped_to_the_wayland_backend() {
@@ -481,6 +531,33 @@ mod decoration_tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn title_bar_mode_carries_over_the_legacy_toggles() {
+        let read = |json: &str| {
+            serde_json::from_str::<Preferences>(json)
+                .unwrap()
+                .title_bar_mode()
+        };
+        assert_eq!(read("{}"), TitleBarMode::Tabs);
+        assert_eq!(read(r#"{"hide_tab_bar":true}"#), TitleBarMode::SessionTitle);
+        assert_eq!(
+            read(r#"{"title_plan":true,"hide_tab_bar":true}"#),
+            TitleBarMode::Plan
+        );
+        assert_eq!(
+            read(r#"{"title_plan":true,"title_bar":"session-title"}"#),
+            TitleBarMode::SessionTitle
+        );
+        let prefs = Preferences {
+            title_bar: Some(TitleBarMode::Plan),
+            ..Default::default()
+        };
+        assert_eq!(
+            read(&serde_json::to_string(&prefs).unwrap()),
+            TitleBarMode::Plan
+        );
     }
 
     #[test]

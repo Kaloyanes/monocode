@@ -1,6 +1,7 @@
 // The pickers that open as flyouts beside a menu row: ModelPicker.tsx's
 // ModelFlyout and SearchableProjectPicker.tsx's ProjectPickerPopover. Each
 // owns a search field; arrows and Enter in it move and pick in the list.
+use crate::tooltip::Tip;
 use crate::{input, theme::*, workspace::project_name};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Role, SharedString,
@@ -12,6 +13,7 @@ use monocode_core::provider::Kind;
 /// Friendly names used before a provider's live catalog arrives.
 pub(crate) const CLAUDE_MODELS: &[(&str, &str)] = &[
     ("claude-sonnet-5", "Claude Sonnet 5"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
     ("claude-opus-5", "Claude Opus 5"),
     ("claude-opus-5-5", "Claude Opus 5.5"),
     ("claude-fable-5", "Claude Fable 5"),
@@ -981,6 +983,12 @@ impl Render for ModelList {
                                 star_name,
                                 if starred { "from" } else { "to" }
                             ))
+                            .tip(format!(
+                                "{} {} {} favorites",
+                                if starred { "Remove" } else { "Add" },
+                                star_name,
+                                if starred { "from" } else { "to" }
+                            ))
                             .cursor_pointer()
                             .size(px(24.))
                             .flex_shrink_0()
@@ -1219,6 +1227,12 @@ impl ModelList {
                             .id(("quick-model-star", ix))
                             .role(Role::Button)
                             .aria_label(format!(
+                                "{} {} {} favorites",
+                                if starred { "Remove" } else { "Add" },
+                                entry.name,
+                                if starred { "from" } else { "to" }
+                            ))
+                            .tip(format!(
                                 "{} {} {} favorites",
                                 if starred { "Remove" } else { "Add" },
                                 entry.name,
