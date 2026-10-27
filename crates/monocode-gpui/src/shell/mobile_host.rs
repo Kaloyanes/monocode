@@ -10,7 +10,7 @@ use crate::{
 use gpui::{EntityId, Task};
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
-    mobile::{Event, Invite, MobileHost, Push, Request, Status, WatchStart, watch},
+    mobile::{Event, Invite, MobileHost, Push, Request, Status, TerminalStart, WatchStart, watch},
     transcript::Row,
 };
 use serde_json::{Value, json};
@@ -48,6 +48,8 @@ pub(super) struct Mobile {
     git_jobs: HashMap<String, GitJob>,
     git_order: VecDeque<String>,
     watches: HashMap<String, Watch>,
+    /// Shells phones have open, which outlive the phone's connection.
+    pub(super) terminals: super::mobile_terminal::Terminals,
     push_scheduled: bool,
     publishing: bool,
     /// Persisted session IDs, which stay stable for paired phones.
@@ -204,6 +206,7 @@ impl Shell {
         if let Some(host) = &self.mobile.host {
             host.shutdown();
         }
+        self.mobile.terminals.close_for(None);
     }
 
     pub(super) fn mobile_status(&self) -> Option<Status> {
@@ -240,6 +243,19 @@ impl Shell {
             });
         })
         .detach();
+    }
+
+    pub(super) fn mobile_set_terminal(&mut self, allowed: bool, cx: &mut Context<Self>) {
+        if let Some(host) = &self.mobile.host
+            && let Err(error) = host.set_terminal(allowed)
+        {
+            self.error = Some(format!("Mobile access: {error}"));
+        }
+        // Turning it off ends the open shells; the host says so with an event.
+        if !allowed {
+            self.mobile.terminals.close_for(None);
+        }
+        self.sync_settings(cx);
     }
 
     pub(super) fn mobile_invite(&mut self, cx: &mut Context<Self>) {
@@ -282,8 +298,14 @@ impl Shell {
         match event {
             Event::Request(request) => self.handle_mobile_request(request, window, cx),
             Event::Watch(start) => self.start_mobile_watch(start, cx),
+            Event::Terminal(start) => self.start_mobile_terminal(start, cx),
             Event::WatchStop(id) => {
                 self.mobile.watches.remove(&id);
+                self.mobile.terminals.detach(&id);
+            }
+            Event::TerminalsClosed(device) => {
+                self.mobile.terminals.close_for(device.as_deref());
+                self.sync_settings(cx);
             }
         }
     }
@@ -422,6 +444,10 @@ impl Shell {
                 }
                 if let Some(mascot) = appearance.mascot {
                     project["mascot"] = json!(mascot);
+                }
+                // The footer's actions, which the phone's terminal runs too.
+                if let Some(actions) = self.workspace.actions.get(path) {
+                    project["actions"] = json!(actions);
                 }
                 project
             })
@@ -587,6 +613,7 @@ impl Shell {
                 request.reply(Ok(project::file_highlight(&job, from)));
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
+            method if method.starts_with("terminal.") => self.mobile_terminal_request(request, cx),
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }
@@ -847,6 +874,115 @@ impl Shell {
         start.accept(Ok(()));
         // The phone waits for its first frame; send it straight away.
         self.push_mobile_watches(cx);
+    }
+
+    /// A phone opens a terminal in a project, or in one of its worktrees. The
+    /// folder is resolved from the project the desktop lists, never taken from
+    /// the phone; starting the shell can block, so it runs off the main thread.
+    fn start_mobile_terminal(&mut self, start: TerminalStart, cx: &mut Context<Self>) {
+        let (Some(host), cwd) = (
+            self.mobile.host.clone(),
+            self.mobile_project_path(&start.project_id, cx),
+        ) else {
+            return start.accept(Err("Mobile access is unavailable".into()));
+        };
+        let cwd = match cwd {
+            Ok(cwd) => cwd,
+            Err(error) => return start.accept(Err(error)),
+        };
+        let terminals = self.mobile.terminals.clone();
+        let (watch, device, worktree) = (
+            start.id.clone(),
+            start.device_id.clone(),
+            start.worktree.clone(),
+        );
+        let (shell, after, cols, rows) = (start.shell.clone(), start.after, start.cols, start.rows);
+        let work = cx.background_executor().spawn(async move {
+            let root = match &worktree {
+                Some(_) => project::resolve_root(Path::new(&cwd), worktree.as_deref())?,
+                None => PathBuf::from(&cwd),
+            };
+            terminals.open(
+                &host,
+                super::mobile_terminal::Opening {
+                    watch,
+                    device,
+                    cwd: root.to_string_lossy().into_owned(),
+                    shell,
+                    after,
+                    cols,
+                    rows,
+                },
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            // The phone hears why a terminal could not open.
+            start.accept(work.await);
+            let _ = this.update(cx, |this, cx| this.sync_settings(cx));
+        })
+        .detach();
+    }
+
+    /// Typing, resizing and closing a shell the phone opened. Each answers at
+    /// once and none is kept as a receipt: input carries its own sequence.
+    fn mobile_terminal_request(&mut self, request: Request, cx: &mut Context<Self>) {
+        if request.method == "terminal.actions.save" {
+            let result = self.save_mobile_actions(&request.params, cx);
+            return request.reply(result);
+        }
+        let params = &request.params;
+        let (Some(shell), device) = (string(params, "shellId"), request.device_id.clone()) else {
+            return request.reply(Err("Missing terminal".into()));
+        };
+        let terminals = &self.mobile.terminals;
+        let result = match request.method.as_str() {
+            "terminal.input" => terminals.input(
+                &device,
+                &shell,
+                params["seq"].as_u64().unwrap_or(0),
+                params["data"].as_str().unwrap_or_default(),
+            ),
+            "terminal.resize" => terminals
+                .resize(
+                    &device,
+                    &shell,
+                    params["cols"].as_u64().unwrap_or(80) as u16,
+                    params["rows"].as_u64().unwrap_or(24) as u16,
+                )
+                .map(|()| Value::Null),
+            "terminal.close" => terminals.close(&device, &shell).map(|()| Value::Null),
+            _ => Err("Unsupported mobile operation".into()),
+        };
+        if request.method == "terminal.close" {
+            self.sync_settings(cx);
+        }
+        request.reply(result);
+    }
+
+    /// A project's actions as edited on the phone: the whole list, in order,
+    /// replacing the desktop's. Ones without an ID are new.
+    fn save_mobile_actions(
+        &mut self,
+        params: &Value,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        let id = params["projectId"].as_str().ok_or("Missing project")?;
+        let path = self.mobile_project_path(id, cx)?;
+        let actions = mobile_actions(&params["actions"])?;
+        if let Some(last) = self.workspace.last_actions.get(&path)
+            && !actions.iter().any(|action| action.id == *last)
+        {
+            self.workspace.last_actions.remove(&path);
+        }
+        if actions.is_empty() {
+            self.workspace.actions.remove(&path);
+        } else {
+            self.workspace.actions.insert(path, actions.clone());
+        }
+        self.persist(cx);
+        self.publish_mobile_catalog(cx);
+        cx.notify();
+        Ok(json!({ "actions": actions }))
     }
 
     fn schedule_mobile_push(&mut self, cx: &mut Context<Self>) {
@@ -1704,6 +1840,53 @@ fn title_case(value: &str) -> String {
 }
 
 /// A catalog model as the phone's model sheet lists it, with its settings.
+/// Actions sent from the phone, checked as the desktop's own dialog checks
+/// them: a name and a one-line command each, and a known icon.
+fn mobile_actions(value: &Value) -> Result<Vec<crate::workspace::ProjectAction>, String> {
+    const MAX_ACTIONS: usize = 50;
+    const MAX_LENGTH: usize = 500;
+    let items = value.as_array().ok_or("Missing actions")?;
+    if items.len() > MAX_ACTIONS {
+        return Err("Too many actions".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut next = format!("{:x}", monocode_core::time::now_ms());
+    items
+        .iter()
+        .map(|item| {
+            let text = |key: &str| {
+                item[key]
+                    .as_str()
+                    .map(|v| v.replace(['\r', '\n'], " ").trim().to_owned())
+                    .filter(|v| !v.is_empty() && v.len() <= MAX_LENGTH)
+            };
+            let (Some(name), Some(command)) = (text("name"), text("command")) else {
+                return Err("Give each action a name and a command".to_owned());
+            };
+            let id = match text("id").filter(|id| id.len() <= 64 && !seen.contains(id)) {
+                Some(id) => id,
+                None => {
+                    // Unique within the list, for several added at once.
+                    while seen.contains(&next) {
+                        next.push('0');
+                    }
+                    next.clone()
+                }
+            };
+            seen.insert(id.clone());
+            let icon = text("icon")
+                .filter(|icon| crate::workspace::ACTION_ICONS.contains(&icon.as_str()))
+                .unwrap_or_else(|| crate::workspace::ACTION_ICONS[0].to_owned());
+            Ok(crate::workspace::ProjectAction {
+                id,
+                name,
+                command,
+                icon,
+            })
+        })
+        .collect()
+}
+
 fn catalog_model(kind: Kind, model: monocode_core::catalog::Model) -> Value {
     let toggle = |id: &str, label: &str| {
         json!({
@@ -1752,6 +1935,24 @@ fn catalog_model(kind: Kind, model: monocode_core::catalog::Model) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actions_from_the_phone_are_checked_as_the_dialog_checks_them() {
+        let saved = mobile_actions(&json!([
+            {"id": "a", "name": " Run Dev ", "command": "npm run dev", "icon": "rocket"},
+            {"name": "Test", "command": "cargo test\nrm -rf /", "icon": "nope"},
+            {"name": "Lint", "command": "cargo clippy"},
+        ]))
+        .unwrap();
+        assert_eq!(saved[0].id, "a");
+        assert_eq!(saved[0].name, "Run Dev");
+        assert_eq!(saved[0].icon, "rocket");
+        assert_eq!(saved[1].command, "cargo test rm -rf /");
+        assert_eq!(saved[1].icon, "play");
+        assert_ne!(saved[1].id, saved[2].id);
+        assert!(mobile_actions(&json!([{"name": "", "command": "ls"}])).is_err());
+        assert!(mobile_actions(&json!({})).is_err());
+    }
 
     #[gpui::test]
     fn mobile_catalog_matches_sidebar_visibility_for_saved_and_open_sessions(
