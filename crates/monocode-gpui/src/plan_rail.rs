@@ -5,6 +5,7 @@ use crate::conversation::Conversation;
 use crate::popover::{self, Anchor, AnchorSlot};
 use crate::pulse::{self, Rate};
 use crate::theme::*;
+use crate::tooltip::Tip;
 use crate::transcript::TranscriptView;
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, Hsla, Role, SharedString, Subscription, WeakEntity,
@@ -24,11 +25,16 @@ const RAIL_HEIGHT: f32 = 10.;
 /// it gives way to the readout and drag area in a small window.
 const RAIL_WIDTH: f32 = 440.;
 const RAIL_MIN_WIDTH: f32 = 160.;
-/// Ask for a plan only once a turn has done real work without one.
-const ASK_AFTER_CALLS: usize = 6;
+/// Ask for a plan once a turn has done some real work without one. A small
+/// list is still worth having, so this is only a few calls in.
+const ASK_AFTER_CALLS: usize = 3;
+const ASK_FOR_PLAN: &str = "Before you continue, lay out the remaining work as a short \
+                            todo list with your todo tool, then keep it updated as you go.";
 const TICK_PITCH: f32 = 5.;
 const HAIR_PITCH: f32 = 7.;
 const PROPOSAL_HEIGHT: f32 = 360.;
+/// A pending step's two hover actions, which its text wraps clear of.
+const ACTIONS_WIDTH: f32 = 48.;
 
 pub(crate) enum PreviewEvent {
     Open,
@@ -163,6 +169,24 @@ impl PlanRail {
                 self.open = false;
             }
             cx.notify();
+        }
+        self.ask_unprompted(&conversation, cx);
+    }
+
+    /// A turn that has worked a few calls with no list gets asked, once, to
+    /// write one. The agent keeps it from there; nothing is asked of the user.
+    fn ask_unprompted(&mut self, conversation: &Entity<Conversation>, cx: &mut Context<Self>) {
+        let c = conversation.read(cx);
+        let due = self.busy
+            && !self.planning
+            && self.asked.is_none()
+            && !c.plan_asked
+            && self.snapshot.plan.is_none()
+            && self.snapshot.proposal.is_none()
+            && self.snapshot.turn_calls >= ASK_AFTER_CALLS
+            && c.can_steer_plan();
+        if due {
+            self.steer("a plan".into(), ASK_FOR_PLAN.into(), cx);
         }
     }
 
@@ -350,7 +374,7 @@ impl PlanRail {
         let count = |s: String| {
             div()
                 .flex_shrink_0()
-                .font_family(crate::markdown::MONO)
+                .font_family(crate::fonts::mono())
                 .text_color(content(0.45))
                 .child(s)
         };
@@ -406,39 +430,35 @@ impl PlanRail {
                 .into_any_element();
         }
         if self.building() {
-            let label = if self.busy {
-                "Building the approved plan"
-            } else {
-                "Built the approved plan"
+            // Once the turn ends the rail cannot tell whether the build worked,
+            // so it names the plan rather than claiming it was built.
+            let Some(proposal) = snapshot.proposal.as_ref().filter(|_| !self.busy) else {
+                return row
+                    .child(text("Building the approved plan".into(), content(0.85)))
+                    .child(count(format!("{} tool calls", snapshot.turn_calls)))
+                    .into_any_element();
             };
             return row
-                .child(text(label.into(), content(0.85)))
-                .when(self.busy, |d| {
-                    d.child(count(format!("{} tool calls", snapshot.turn_calls)))
-                })
+                .child(text(proposal.title().into(), content(0.45)))
                 .into_any_element();
         }
         let Some(plan) = &snapshot.plan else {
-            let label = if self.busy {
-                format!("No plan · {} tool calls", snapshot.turn_calls)
-            } else {
-                "No plan".into()
+            // No list to place the agent on, but its newest call says what it is doing.
+            let label = match (&snapshot.now, self.busy) {
+                (Some(now), true) => format!("{} {}", now.action, now.target).trim().to_owned(),
+                (None, true) => format!("No plan · {} tool calls", snapshot.turn_calls),
+                _ => "No plan".into(),
             };
             let ask = (self.busy && snapshot.turn_calls >= ASK_AFTER_CALLS).then(|| {
                 small_button("plan-rail-ask", "Ask for plan").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.steer(
-                            "a plan".into(),
-                            "Before you continue, lay out the remaining work as a short \
-                             todo list with your todo tool, then keep it updated as you go."
-                                .into(),
-                            cx,
-                        )
-                    },
+                    |this, _, _, cx| this.steer("a plan".into(), ASK_FOR_PLAN.into(), cx),
                 ))
             });
             return row
-                .child(text(label.into(), content(0.45)))
+                .child(text(label.into(), content(0.6)))
+                .when(self.busy && snapshot.now.is_some(), |r| {
+                    r.child(count(format!("{} calls", snapshot.turn_calls)))
+                })
                 .children(ask)
                 .into_any_element();
         };
@@ -460,7 +480,9 @@ impl PlanRail {
             .current()
             .map(|t| t.text.clone())
             .unwrap_or_else(|| "Planning".into());
-        row.child(text(current.into(), content(0.85)))
+        // The steps are the agent's own, but where it is on them is a guess.
+        row.when(plan.inferred, |r| r.child(count("≈".into())))
+            .child(text(current.into(), content(0.85)))
             .child(count(format!("{done}/{total}")))
             .into_any_element()
     }
@@ -469,8 +491,11 @@ impl PlanRail {
         let Some(plan) = &self.snapshot.plan else {
             return div().into_any_element();
         };
-        let steerable = self.busy && !plan.stale && self.conversation.is_some();
-        let header = if plan.stale {
+        let steerable = self.busy && !plan.stale && !plan.inferred && self.conversation.is_some();
+        let header = if plan.inferred {
+            "The approved plan's steps. Where the agent is on them is estimated from its tool calls"
+                .to_string()
+        } else if plan.stale {
             "From the previous turn".to_string()
         } else if plan.list.explanation.trim().is_empty() {
             "Written by the agent with its todo tool".to_string()
@@ -493,46 +518,50 @@ impl PlanRail {
             let actions = (steerable && task.status == TaskStatus::Pending).then(|| {
                 let next = task.text.clone();
                 let skip = task.text.clone();
-                // Over the row's end on hover, so idle rows keep their full width.
+                // Over the row's end on hover, so idle rows keep their full width;
+                // the step's text makes room for it then (see `ACTIONS_WIDTH`).
                 div()
                     .absolute()
-                    .right(px(6.))
+                    .right(px(4.))
                     .top_0()
                     .bottom_0()
                     .flex()
                     .items_center()
-                    .gap(px(4.))
-                    .pl(px(16.))
-                    .bg(floating_fill())
                     .invisible()
                     .group_hover("plan-row", |s| s.visible())
                     .child(
-                        small_button(("plan-next", ix), "Do next").on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.steer(
-                                    format!("do “{next}” next"),
-                                    format!(
-                                        "Change of order: do “{next}” next, before the other \
-                                     remaining steps. Update your todo list to match."
-                                    ),
-                                    cx,
-                                )
-                            },
-                        )),
-                    )
-                    .child(
-                        small_button(("plan-skip", ix), "Skip").on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.steer(
-                                    format!("skip “{skip}”"),
-                                    format!(
-                                        "Skip “{skip}”: don't do that step. Mark it cancelled \
-                                     in your todo list and continue with the rest."
-                                    ),
-                                    cx,
-                                )
-                            },
-                        )),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.))
+                            .child(
+                                step_action(("plan-next", ix), "move-to-top", "Do next").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.steer(
+                                        format!("do “{next}” next"),
+                                        format!(
+                                            "Change of order: do “{next}” next, before the other \
+                                         remaining steps. Update your todo list to match."
+                                        ),
+                                        cx,
+                                    )
+                                    }),
+                                ),
+                            )
+                            .child(
+                                step_action(("plan-skip", ix), "skip-over", "Skip").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.steer(
+                                        format!("skip “{skip}”"),
+                                        format!(
+                                            "Skip “{skip}”: don't do that step. Mark it cancelled \
+                                         in your todo list and continue with the rest."
+                                        ),
+                                        cx,
+                                    )
+                                    }),
+                                ),
+                            ),
                     )
             });
             div()
@@ -562,6 +591,9 @@ impl PlanRail {
                         .text_size(px(13.))
                         .text_color(content(if done { 0.45 } else { 0.9 }))
                         .when(task.status == TaskStatus::Cancelled, |d| d.line_through())
+                        .when(actions.is_some(), |d| {
+                            d.group_hover("plan-row", |s| s.pr(px(ACTIONS_WIDTH)))
+                        })
                         .child(format!("{}. {}", ix + 1, task.text)),
                 )
                 .children(actions)
@@ -806,6 +838,35 @@ fn ring(color: Hsla, dashed: bool) -> AnyElement {
         .when(dashed, |d| d.border_dashed())
         .border_color(color)
         .into_any_element()
+}
+
+/// An icon-only step action, named by its tooltip.
+fn step_action(
+    id: impl Into<gpui::ElementId>,
+    path: &'static str,
+    label: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    let id = id.into();
+    div()
+        .id(id.clone())
+        .group(SharedString::from(format!("{id}")))
+        .role(Role::Button)
+        .aria_label(label)
+        .tip(label)
+        .cursor_pointer()
+        .size(px(22.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.))
+        .hover(|s| s.bg(content(0.08)))
+        .child(
+            icon(path, 13.)
+                .text_color(content(0.55))
+                .group_hover(SharedString::from(format!("{id}")), |s| {
+                    s.text_color(content(0.95))
+                }),
+        )
 }
 
 fn small_button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::Stateful<gpui::Div> {

@@ -556,11 +556,7 @@ impl ToolCall {
             return Some(panel);
         }
         let input: Value = serde_json::from_str(&self.input).unwrap_or_default();
-        let name = self.name.to_lowercase().replace([' ', '-', '_'], "");
-        if ["todowrite", "writetodos", "updatetodos", "updateplan"]
-            .iter()
-            .any(|suffix| name == *suffix || name.ends_with(&format!(":{suffix}")))
-        {
+        if is_todo_tool(&self.name) {
             return TaskList::from_value(&input).map(Panel::Tasks);
         }
         let display = self.display.as_ref().unwrap_or(&input["__desktop"]);
@@ -736,6 +732,17 @@ pub fn desktop_agent(run: &AgentRun) -> Value {
             value
         }).collect::<Vec<_>>()
     })
+}
+
+/// The todo tools whose input is a task list: each provider's own, and
+/// MonoCode's `update_plan` however a provider prefixes an MCP tool's name
+/// (`mcp__monocode__update_plan`, `monocode:update_plan`).
+pub fn is_todo_tool(name: &str) -> bool {
+    let name = name.to_lowercase().replace([' ', '-', '_'], "");
+    ["todowrite", "writetodos", "updatetodos", "updateplan"]
+        .iter()
+        .any(|tool| name == *tool || name.ends_with(&format!(":{tool}")))
+        || name == "mcpmonocodeupdateplan"
 }
 
 #[cfg(test)]

@@ -45,7 +45,7 @@ fn plan_rail_shots() {
     }
     state.sidebar_visible = true;
     state.right_panel_open = false;
-    state.preferences.title_plan = true;
+    state.preferences.title_bar = Some(crate::settings::TitleBarMode::Plan);
     let saved = serde_json::to_string(&state).unwrap();
     let store = Arc::new(Mutex::new(store));
 
@@ -195,7 +195,7 @@ fn plan_rail_shots() {
     // The same session with the setting off, for comparison.
     window
         .update(&mut cx, |shell, w, cx| {
-            shell.workspace.preferences.title_plan = false;
+            shell.workspace.preferences.title_bar = Some(crate::settings::TitleBarMode::Tabs);
             shell.open(mid, w, cx);
             shell.invalidate_chrome(cx);
         })
@@ -203,7 +203,7 @@ fn plan_rail_shots() {
     shot(&mut cx, "00-tabs-before");
     window
         .update(&mut cx, |shell, _, cx| {
-            shell.workspace.preferences.title_plan = true;
+            shell.workspace.preferences.title_bar = Some(crate::settings::TitleBarMode::Plan);
             shell.invalidate_chrome(cx);
         })
         .unwrap();
@@ -313,6 +313,79 @@ fn plan_rail_shots() {
     shot(&mut cx, "16-building-with-list");
 }
 
+/// Appends a running turn's rows to the shell's session and reports whether
+/// the rail asked that turn for a todo list.
+fn asked_after(cx: &mut gpui::TestAppContext, rows: Vec<Row>, busy: bool) -> bool {
+    let (window, _, id) = super::tests::window(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&id].update(cx, |chat, cx| {
+                chat.transcript
+                    .update(cx, |view, cx| view.patch(0, rows, cx));
+                chat.busy = busy;
+                cx.notify();
+            });
+            // The rail follows a session only while the title bar shows it.
+            shell.workspace.preferences.title_bar = Some(crate::settings::TitleBarMode::Plan);
+            shell.invalidate_chrome(cx);
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    window
+        .update(visual, |shell, _, cx| {
+            shell.sessions[&id].read(cx).plan_asked
+        })
+        .unwrap()
+}
+
+fn turn_rows(reads: usize) -> Vec<Row> {
+    let mut rows = vec![Row {
+        role: "user".into(),
+        text: "Fix the clippy warning.".into(),
+        first: true,
+        sent_at: None,
+    }];
+    rows.extend((0..reads).map(|i| {
+        tool_row(
+            &format!("ask-{i}"),
+            "Read",
+            serde_json::json!({ "file_path": format!("src/file{i}.rs") }),
+        )
+    }));
+    rows
+}
+
+#[gpui::test]
+fn a_busy_turn_with_no_list_is_asked_for_one_after_a_few_calls(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    assert!(asked_after(cx, turn_rows(3), true));
+}
+
+#[gpui::test]
+fn a_turn_is_not_asked_before_it_has_worked_or_once_it_has_stopped(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    assert!(!asked_after(cx, turn_rows(2), true));
+    assert!(!asked_after(cx, turn_rows(5), false));
+}
+
+#[gpui::test]
+fn a_turn_that_wrote_its_own_list_is_not_asked(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut rows = turn_rows(1);
+    rows.push(tool_row(
+        "own-list",
+        "TodoWrite",
+        serde_json::json!({ "todos": [
+            { "content": "One", "status": "in_progress" },
+            { "content": "Two", "status": "pending" },
+        ]}),
+    ));
+    rows.extend(turn_rows(4).into_iter().skip(1));
+    assert!(!asked_after(cx, rows, true));
+}
+
 #[gpui::test]
 fn plan_review_opens_sidebar_beside_chat(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -325,7 +398,7 @@ fn plan_review_opens_sidebar_beside_chat(cx: &mut gpui::TestAppContext) {
                     .update(cx, |view, cx| view.patch(0, transcript.rows, cx));
                 chat.busy = false;
             });
-            shell.workspace.preferences.title_plan = true;
+            shell.workspace.preferences.title_bar = Some(crate::settings::TitleBarMode::Plan);
             shell.invalidate_chrome(cx);
             cx.notify();
         })

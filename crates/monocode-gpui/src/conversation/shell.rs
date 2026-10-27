@@ -3,6 +3,7 @@
 //! command as the question. Commands sent during a turn or another run queue
 //! behind it.
 use super::*;
+use crate::tooltip::Tip;
 use gpui::{App, Hsla};
 use monocode_core::shell_run::{self, ShellRun};
 use std::collections::VecDeque;
@@ -342,7 +343,7 @@ impl Conversation {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .font_family(crate::markdown::MONO)
+                            .font_family(crate::fonts::mono())
                             .text_size(px(12.))
                             .text_color(content(0.75))
                             .child(queued.command.clone()),
@@ -352,6 +353,7 @@ impl Conversation {
                             .id(("queued-shell-remove", id as usize))
                             .role(Role::Button)
                             .aria_label("Remove queued command")
+                            .tip("Remove queued command")
                             .size(px(24.))
                             .flex_shrink_0()
                             .rounded_md()

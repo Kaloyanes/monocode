@@ -79,7 +79,7 @@ impl TranscriptView {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .font_family(markdown::MONO)
+                                    .font_family(crate::fonts::mono())
                                     .text_size(px(12.5))
                                     .text_color(content(0.9))
                                     .child(run.command.clone()),
@@ -121,7 +121,7 @@ impl TranscriptView {
                                 .pb(px(8.))
                                 .border_t_1()
                                 .border_color(content(0.06))
-                                .font_family(markdown::MONO)
+                                .font_family(crate::fonts::mono())
                                 .text_size(px(12.))
                                 .line_height(px(18.))
                                 .text_color(content(0.7))

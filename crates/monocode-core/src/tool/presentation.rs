@@ -148,6 +148,17 @@ pub(super) fn present(call: &ToolCall, fallback_cwd: Option<&str>) -> ToolPresen
         .or_else(|| string(preview, &["kind"]))
         .unwrap_or_default();
     let name = call.name.to_lowercase();
+    if let Some(target) = draft_target(&name, &input) {
+        return ToolPresentation {
+            action: "Draft".into(),
+            target,
+            file_path: None,
+            start_line: None,
+            command: None,
+            description: None,
+            steps: Vec::new(),
+        };
+    }
     let execute = matches!(
         name.as_str(),
         "bash" | "commandexecution" | "shell" | "execute" | "exec_command"
@@ -291,6 +302,40 @@ pub(super) fn present(call: &ToolCall, fallback_cwd: Option<&str>) -> ToolPresen
     shown.target = shown.target.lines().next().unwrap_or("").into();
     shown
 }
+/// What the agent is doing in the Draft panel, in words: the tool names
+/// `draft_preview` and `draft_keep` arrive as `mcp__monocode__…` or
+/// `monocode:…` depending on the provider.
+fn draft_target(name: &str, input: &Value) -> Option<String> {
+    let tool = name
+        .rsplit(['_', ':'])
+        .next()
+        .filter(|_| name.ends_with("draft_preview") || name.ends_with("draft_keep"))?;
+    if tool == "keep" {
+        let title = input["title"].as_str().unwrap_or("").trim();
+        return Some(if title.is_empty() {
+            "keep the page".into()
+        } else {
+            format!("keep \u{201c}{title}\u{201d}")
+        });
+    }
+    let action = input["action"]["kind"].as_str().unwrap_or("snapshot");
+    Some(match action {
+        "click" => "click a control".into(),
+        "type" => "type into the page".into(),
+        "resume" => "take control back".into(),
+        "close" => "close".into(),
+        _ if input["url"].as_str().is_some_and(|url| !url.is_empty()) => {
+            format!("open {}", input["url"].as_str().unwrap_or_default())
+        }
+        _ if input["html"].is_string() => "show a page".into(),
+        _ if input["width"].is_number() || input["height"].is_number() => {
+            "change the viewport".into()
+        }
+        _ if input["appearance"].is_string() => "change the theme".into(),
+        _ => "look again".into(),
+    })
+}
+
 fn location(value: &Value) -> Option<&Value> {
     let locations = value.get("locations").or_else(|| value.get("location"))?;
     locations
@@ -712,6 +757,44 @@ mod tests {
         let mut call = ToolCall::new("one", name);
         call.input = input.to_string();
         call
+    }
+
+    #[test]
+    fn draft_tools_read_as_what_the_agent_is_doing() {
+        let shown = |name: &str, input: Value| {
+            let shown = call(name, input).presentation();
+            (shown.action, shown.target)
+        };
+        for name in ["mcp__monocode__draft_preview", "monocode:draft_preview"] {
+            assert_eq!(
+                shown(name, json!({"html": "<p>Hi</p>"})),
+                ("Draft".into(), "show a page".into())
+            );
+            assert_eq!(
+                shown(
+                    name,
+                    json!({"draft": "d", "action": {"kind": "click", "reference": "1-1-0"}})
+                )
+                .1,
+                "click a control"
+            );
+            assert_eq!(
+                shown(name, json!({"draft": "d", "width": 375})).1,
+                "change the viewport"
+            );
+            assert_eq!(shown(name, json!({"draft": "d"})).1, "look again");
+            assert_eq!(
+                shown(name, json!({"url": "http://localhost:5173"})).1,
+                "open http://localhost:5173"
+            );
+        }
+        assert_eq!(
+            shown(
+                "mcp__monocode__draft_keep",
+                json!({"draft": "d", "title": "Sign-up"})
+            ),
+            ("Draft".into(), "keep \u{201c}Sign-up\u{201d}".into())
+        );
     }
 
     #[test]
