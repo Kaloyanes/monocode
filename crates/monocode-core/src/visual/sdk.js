@@ -50,13 +50,43 @@
     column: (nodes, o) => layout("column", nodes, o),
     row: (nodes, o) => layout("row", nodes, o),
     grid: (nodes, o) => layout("grid", nodes, o),
+    card: (nodes, o) => layout("card", nodes, o),
     text(value, o) {
       o = options(o, ["size", "color"]);
       return {kind: "text", text: text(value), size: o.size ?? "body", color: o.color ?? "ink"};
     },
     stat(label, value, o) {
-      o = options(o, ["detail", "color"]);
-      return {kind: "stat", label: text(label), value: text(value), detail: o.detail == null ? null : text(o.detail), color: o.color ?? "ink"};
+      o = options(o, ["detail", "color", "delta", "trend", "better"]);
+      assert(o.better === undefined || o.better === "higher" || o.better === "lower", "Stat better must be 'higher' or 'lower'");
+      assert(o.trend === undefined || Array.isArray(o.trend), "Stat trend must be an array of numbers");
+      return {kind: "stat", label: text(label), value: text(value), detail: o.detail == null ? null : text(o.detail),
+        color: o.color ?? "ink", delta: o.delta == null ? null : text(o.delta), trend: o.trend ?? [],
+        lower_is_better: o.better === "lower"};
+    },
+    gauge(label, value, o) {
+      o = options(o, ["min", "max", "unit", "color"]);
+      return {kind: "gauge", label: text(label), value, min: o.min ?? 0, max: o.max ?? 100,
+        unit: o.unit == null ? null : text(o.unit), color: color(o)};
+    },
+    donut(slices, o) {
+      o = options(o, ["label", "value"]);
+      assert(Array.isArray(slices), "Donut slices must be an array");
+      return {kind: "donut", label: o.label == null ? null : text(o.label), value: o.value == null ? null : text(o.value),
+        slices: slices.map((s, i) => {
+          options(s, ["label", "value", "color"]);
+          return {label: text(s.label), value: s.value, color: s.color ?? `series${i % 6 + 1}`};
+        })};
+    },
+    heatmap(values, o) {
+      o = options(o, ["rows", "columns", "color"]);
+      assert(Array.isArray(values) && values.every(Array.isArray), "Heatmap values must be an array of rows");
+      return {kind: "heatmap", values, rows: (o.rows ?? []).map(text), columns: (o.columns ?? []).map(text),
+        color: o.color ?? "positive"};
+    },
+    progress(label, value, o) {
+      o = options(o, ["max", "detail", "color"]);
+      return {kind: "progress", label: text(label), value, max: o.max ?? 100,
+        detail: o.detail == null ? null : text(o.detail), color: color(o)};
     },
     table(columns, rows) {
       assert(Array.isArray(columns) && Array.isArray(rows), "Table columns and rows must be arrays");
@@ -72,22 +102,6 @@
           options(s, ["label", "values", "color"]);
           return {label: text(s.label), values: s.values, color: s.color ?? `series${i % 6 + 1}`};
         })};
-    },
-    code(source, o) {
-      o = options(o, ["language", "title"]);
-      return {kind: "code", code: text(source), language: o.language == null ? null : text(o.language),
-        title: o.title == null ? null : text(o.title)};
-    },
-    diff(before, after, o) {
-      o = options(o, ["path", "title", "context"]);
-      return {kind: "diff", before: text(before), after: text(after),
-        path: o.path == null ? null : text(o.path), title: o.title == null ? null : text(o.title),
-        context: o.context ?? 3};
-    },
-    callout(value, o) {
-      o = options(o, ["title", "color"]);
-      return {kind: "callout", text: text(value), title: o.title == null ? null : text(o.title),
-        color: o.color ?? "accent"};
     },
     button(label, fn, o) {
       o = options(o, ["disabled"]);

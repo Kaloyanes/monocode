@@ -276,6 +276,13 @@ pub(crate) fn pane_fill() -> Hsla {
 pub(crate) fn inset_chrome_wash() -> Hsla {
     content(0.05)
 }
+/// The solid color of the content card as the person has themed it, even when
+/// the card is glass, for a native view that cannot show the window through.
+pub(crate) fn pane_surface() -> Hsla {
+    let mut surface = inset_pane_fill();
+    surface.a = 1.;
+    surface
+}
 pub(crate) fn inset_pane_fill() -> Hsla {
     TOKENS
         .with(|tokens| tokens.borrow().as_ref().map(|t| t.inset_pane))
@@ -300,6 +307,43 @@ pub(crate) fn icon(path: &'static str, side: f32) -> Svg {
         .size(px(side))
         .text_color(content(0.5))
         .flex_shrink_0()
+}
+/// A menu trigger's chevron: points down, and turns to point up while its
+/// menu is open.
+#[derive(IntoElement)]
+pub(crate) struct Chevron {
+    id: gpui::ElementId,
+    open: bool,
+    side: f32,
+}
+pub(crate) fn chevron(id: impl Into<gpui::ElementId>, open: bool, side: f32) -> Chevron {
+    Chevron {
+        id: id.into(),
+        open,
+        side,
+    }
+}
+impl RenderOnce for Chevron {
+    fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
+        use std::time::Instant;
+        const TURN_SECS: f32 = 0.18;
+        let open = self.open;
+        let state = window.use_keyed_state(self.id, cx, |_, _| (open, None::<Instant>));
+        if state.read(cx).0 != open {
+            state.update(cx, |state, _| *state = (open, Some(Instant::now())));
+        }
+        let progress = match state.read(cx).1 {
+            Some(at) if !cx.reduce_motion() => (at.elapsed().as_secs_f32() / TURN_SECS).min(1.),
+            _ => 1.,
+        };
+        if progress < 1. {
+            window.request_animation_frame();
+        }
+        let eased = 1. - (1. - progress).powi(3);
+        let turn = 0.5 * if open { eased } else { 1. - eased };
+        icon("chevron-down", self.side)
+            .with_transformation(gpui::Transformation::rotate(gpui::percentage(turn)))
+    }
 }
 pub(crate) fn provider_icon(provider: &str, side: f32) -> Div {
     let (path, monochrome, scale) = match provider {

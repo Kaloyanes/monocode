@@ -20,9 +20,7 @@ fn button(node: &Node) -> &str {
 
 #[test]
 fn native_state_and_handlers_survive_rerenders() {
-    let mut vm = runtime(
-        "const s=visual.state({count:0}); return () => visual.column([visual.text(s.count),visual.button('Add',()=>s.count++)]);",
-    );
+    let mut vm = runtime("const s=visual.state({count:0}); return () => visual.column([visual.text(s.count),visual.button('Add',()=>s.count++)]);");
     let first = vm.render().unwrap();
     let updated = vm.dispatch(button(&first), json!(null)).unwrap();
     let Node::Column { children, .. } = &updated else {
@@ -118,9 +116,7 @@ fn control_payloads_are_checked_before_callbacks() {
 
 #[test]
 fn input_select_and_slider_update_state() {
-    let mut vm = runtime(
-        "const s={value:'old'};return () => visual.column([visual.text(s.value),visual.input('Name',s.value,v=>s.value=v)]);",
-    );
+    let mut vm = runtime("const s={value:'old'};return () => visual.column([visual.text(s.value),visual.input('Name',s.value,v=>s.value=v)]);");
     let node = vm.render().unwrap();
     let id = serde_json::to_value(&node).unwrap()["children"][1]["handler"]
         .as_str()
@@ -136,9 +132,7 @@ fn input_select_and_slider_update_state() {
         .dispatch(first["handler"].as_str().unwrap(), json!(1))
         .unwrap();
     assert!(matches!(updated, Node::Select { selected: 1, .. }));
-    let mut vm = runtime(
-        "const s={value:2};return () => visual.slider('Value',s.value,0,10,v=>s.value=v,{step:0.5});",
-    );
+    let mut vm = runtime("const s={value:2};return () => visual.slider('Value',s.value,0,10,v=>s.value=v,{step:0.5});");
     let first = serde_json::to_value(vm.render().unwrap()).unwrap();
     let updated = vm
         .dispatch(first["handler"].as_str().unwrap(), json!(3.5))
@@ -260,9 +254,7 @@ fn structural_and_resource_limits_reject_unbounded_views() {
         "return () => visual.scene([visual.object({kind:'mesh',vertices:[[0,0,0],[1,0,0],[0,1,0]],indices:[[0,1,3]]})]);",
         "return () => visual.scene(Array.from({length:24},()=>visual.object({kind:'sphere'})));",
         "return () => visual.input('Too long','x'.repeat(4097),()=>{});",
-    ] {
-        assert!(check(source).is_err(), "accepted {source}");
-    }
+    ] { assert!(check(source).is_err(), "accepted {source}"); }
     assert!(VisualRuntime::new(&" ".repeat(MAX_SOURCE_BYTES + 1)).is_err());
     assert!(check("return () => visual.text('x'.repeat(64*1024*1024));").is_err());
 }
@@ -283,8 +275,6 @@ fn cycles_async_and_invalid_return_values_are_rejected() {
 #[test]
 fn document_metadata_and_primitive_mesh_are_validated() {
     let mut doc = VisualDocument {
-        format: Default::default(),
-        height: None,
         id: "chart-1".into(),
         title: "Chart".into(),
         source: "return () => visual.text('ok');".into(),
@@ -300,36 +290,48 @@ fn document_metadata_and_primitive_mesh_are_validated() {
 }
 
 #[test]
-fn code_diff_and_callout_blocks_validate() {
-    let mut vm = runtime(
-        "return () => visual.column([visual.code('let a = 1;', {language:'rust', title:'a.rs'}), visual.diff('a\\nb', 'a\\nc', {path:'x.txt'}), visual.callout('Heads up', {color:'warning'})]);",
-    );
-    let tree = vm.render().unwrap();
-    tree.validate().unwrap();
-    let Node::Column { children, .. } = tree else {
-        panic!()
+fn dashboard_components_render_and_reject_invalid_data() {
+    let tree = check(
+        "return () => visual.card([
+            visual.stat('MRR', '$48K', {delta: '+12%', trend: [1, 3, 2, 5]}),
+            visual.gauge('CPU', 68, {unit: '%'}),
+            visual.donut([{label: 'API', value: 3}, {label: 'Web', value: 1}], {label: 'Requests'}),
+            visual.heatmap([[0, 1, 2], [3, 4, 5]], {rows: ['Mon', 'Tue']}),
+            visual.progress('Build', 28),
+        ]);",
+    )
+    .unwrap();
+    let Node::Card { children, .. } = tree else {
+        panic!("Expected card")
     };
-    assert!(matches!(&children[0], Node::Code { language: Some(l), .. } if l == "rust"));
-    assert!(matches!(&children[1], Node::Diff { context: 3, .. }));
-    assert!(matches!(
-        &children[2],
-        Node::Callout {
-            color: ThemeColor::Warning,
-            ..
-        }
-    ));
+    assert!(
+        matches!(&children[0], Node::Stat { delta: Some(d), trend, .. } if d == "+12%" && trend.len() == 4)
+    );
+    assert!(matches!(&children[1], Node::Gauge { max, .. } if *max == 100.));
+    assert!(
+        matches!(&children[2], Node::Donut { slices, .. } if slices[1].color == ThemeColor::Series2)
+    );
+    for source in [
+        "return () => visual.gauge('CPU', 1, {min: 5, max: 5});",
+        "return () => visual.donut([{label: 'none', value: 0}]);",
+        "return () => visual.donut([{label: 'neg', value: -1}]);",
+        "return () => visual.heatmap([[1, 2], [3]]);",
+        "return () => visual.heatmap([[1, 2]], {rows: ['a', 'b']});",
+        "return () => visual.progress('Over', 120);",
+        "return () => visual.stat('Bad', '1', {trend: [NaN]});",
+        "return () => visual.card([visual.button('Stale', () => {})], {columns: 2});",
+    ] {
+        assert!(check(source).is_err(), "accepted {source}");
+    }
 }
 
 #[test]
-fn code_blocks_reject_oversized_input_and_unknown_options() {
-    let big = "x\\n".repeat(2000);
-    let mut vm = runtime(&format!("return () => visual.code('{big}');"));
-    assert!(vm.render().is_err());
-    let mut vm = runtime("return () => visual.diff('a', 'b', {context: 99});");
-    assert!(vm.render().is_err());
-    assert!(
-        VisualRuntime::new("return () => visual.code('a', {html: true});")
-            .and_then(|mut vm| vm.render())
-            .is_err()
-    );
+fn saved_native_visuals_load_and_html_era_ones_are_refused_not_run() {
+    let native = json!({"id":"a","title":"A","source":"return () => visual.text('x');"});
+    let document: VisualDocument = serde_json::from_value(native).unwrap();
+    assert!(document.validate().is_ok());
+    // Saved while HTML visuals existed: they are no longer rendered, and a
+    // page must never be handed to the script interpreter.
+    let html = json!({"id":"b","title":"B","source":"<p>Hi</p>","format":"html","height":480});
+    assert!(serde_json::from_value::<VisualDocument>(html).is_err());
 }

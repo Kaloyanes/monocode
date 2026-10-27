@@ -44,7 +44,7 @@ return () => visual.column([
 ], { gap: 16 });
 ```
 
-Handlers update local state and the app rerenders the component tree. The script interpreter persists while that view is retained. Reset recreates its initial state. `Math.random()` starts from a repeatable source-based seed, so generated example data is consistent when the program is checked or reopened. The header icons switch to the syntax-highlighted JavaScript source and reset the visual; source mode also offers a copy icon. Visuals grow to their full content height and scroll with the conversation. The source view also shows the whole program at full height; long lines scroll sideways.
+Handlers update local state and the app rerenders the component tree. The script interpreter persists while that view is retained. Reset recreates its initial state. `Math.random()` starts from a repeatable source-based seed, so generated example data is consistent when the program is checked or reopened. The header icons switch to the syntax-highlighted JavaScript source and reset the visual; source mode also offers a copy icon. Visuals grow to their full content height and scroll with the conversation. The source viewer scrolls long programs within its code pane.
 
 | Component | Signature |
 | --- | --- |
@@ -93,15 +93,6 @@ Visual source is saved as a dedicated transcript message, including programs spl
 Each interpreter has a 16 MiB memory budget and a 60 ms execution deadline per call. Source is limited to 64 KiB, trees to 512 components and 16 nesting levels. Tables, chart series, drawing commands, text, and mesh geometry have additional validated limits. Invalid or interrupted programs show an error in their own view and can be reset.
 
 Programs have no filesystem, network, process, DOM, module loading, or timer bindings. Controls change only their visual's local state. Publication is scoped to the calling session and requires an active turn; it cannot target another conversation.
-
-## Images
-
-Agents can also put images in the conversation. Each image is copied into the conversation's own folder, `<data dir>/threads/<session>/images/`, and is deleted with the conversation. Files in the project are never moved or changed.
-
-- **Publishing:** `image_show` with `{ "path": "...", "title": "..." }`, or `monocode-gpui visual image --path FILE --title TITLE`, shows a PNG, JPEG, GIF or WebP file the agent created. Relative paths resolve against the agent's working directory. Images are limited to 20 MB.
-- **Capture:** images returned by MCP tools, such as browser screenshots or image generators, are saved and shown automatically for Claude, Codex and ACP agents. Built-in file reads are skipped, because the agent only looked at an existing file. A repeated image is shown once per turn and stored once.
-
-An image keeps its own aspect ratio, up to 560 points wide, stays visible when tool activity folds, and opens full screen when clicked. The phone shows its title with an instruction to open it on desktop.
 
 ## Local examples
 

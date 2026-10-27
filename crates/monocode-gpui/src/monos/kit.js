@@ -49,7 +49,7 @@ const select=i=>{[...bar.children].forEach((b,j)=>b.setAttribute('aria-selected'
 labels.forEach((l,i)=>bar.append(h('button',{class:'mc-tab',role:'tab','aria-selected':String(i===selected),onclick:()=>select(i)},l)));
 bar.select=i=>{[...bar.children].forEach((b,j)=>b.setAttribute('aria-selected',String(i===j)))};return bar};
 const stagger=(els,start=0)=>{[...els].forEach((el,i)=>el.style.setProperty('--i',String(start+i)));return els};
-// A variant carousel: tabs, a stage, replay and a playback speed slider.
+// A variant carousel: a stage with tabs, and optional replay and playback speed.
 const variants=(target,list,o={})=>{let index=Math.min(o.initial||0,list.length-1),cleanup=null;
 const stage=h('div',{class:'mc-stage'+(o.stage?' '+o.stage:'')});
 if(o.stageHeight)stage.style.minHeight=o.stageHeight+'px';
@@ -66,9 +66,13 @@ cleanup=null;stage.replaceChildren();const v=list[index];note.textContent=v.note
 try{cleanup=v.render(stage,{index,name:v.name,replay:()=>show(index),speed:()=>speed,now})}catch(e){console.error(e);stage.append(h('div',{class:'mc-muted'},String(e)))}
 requestAnimationFrame(pace)};
 const bar=tabs(list.map(v=>v.name),index,show);
+// Chrome is opt-in: tabs only for several variants, Replay when there is
+// something to replay, Playback only when asked for.
 const replay=h('button',{class:'mc-button ghost small',title:'Replay',onclick:()=>show(index)},icon('replay',{size:14}),'Replay');
-const top=h('div',{class:'mc-demo-bar'},list.length>1?bar:h('span',{class:'mc-title'},o.title||list[0].name),h('div',{class:'mc-spacer'}),o.controls||null,o.replay===false?null:replay);
-const foot=h('div',{class:'mc-demo-foot'},note,o.playback===false?null:slider('Playback',{min:.1,max:2,step:.05,value:speed,format:v=>v.toFixed(2)+'×',onInput:setSpeed}));
+const wantReplay=o.replay===true||(o.replay!==false&&list.length>1);
+const head=list.length>1?bar:o.title?h('span',{class:'mc-title'},o.title):null;
+const top=head||o.controls||wantReplay?h('div',{class:'mc-demo-bar'},head,h('div',{class:'mc-spacer'}),o.controls||null,wantReplay?replay:null):null;
+const foot=list.some(v=>v.note)||o.playback===true?h('div',{class:'mc-demo-foot'},note,o.playback===true?slider('Playback',{min:.1,max:2,step:.05,value:speed,format:v=>v.toFixed(2)+'×',onInput:setSpeed}):null):null;
 const demo=h('div',{class:'mc-demo'},top,stage,foot);
 demo.tabIndex=-1;demo.addEventListener('keydown',e=>{if(e.key==='ArrowRight')show(index+1);else if(e.key==='ArrowLeft')show(index-1);else if(e.key==='r')show(index)});
 const mount=()=>{root(target).append(demo);show(index)};

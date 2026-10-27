@@ -127,4 +127,5 @@ you want an empty fixture store.
 See [architecture](migration.md) for the crate boundaries and renderer patches,
 and [preview limitations](parity.md) for remaining work. The
 [session visuals guide](visuals.md) documents the agent-facing visual API and
-examples.
+examples, and the [drafts guide](drafts.md) covers the live pages agents build in
+the thread to design and check UI.

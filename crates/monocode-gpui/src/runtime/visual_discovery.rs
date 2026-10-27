@@ -2,7 +2,8 @@
 use monocode_core::{provider::Kind, store::Store};
 use std::path::Path;
 
-const VERSION: u8 = 1;
+// 3: native visuals only again. Receipts from the HTML-visual wording (2) are stale.
+const VERSION: u8 = 3;
 
 pub(super) struct Discovery {
     key: String,

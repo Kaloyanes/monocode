@@ -3,62 +3,6 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_NODES: usize = 512;
-const MAX_CODE_BYTES: usize = 32 * 1024;
-const MAX_CODE_LINES: usize = 1500;
-
-/// What `VisualDocument::source` holds.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum VisualFormat {
-    /// A JavaScript program for the native component SDK.
-    #[default]
-    Native,
-    /// One HTML document with inline CSS and JavaScript, shown in an isolated
-    /// web view with no network and no app bridge.
-    Html,
-}
-impl VisualFormat {
-    fn is_native(&self) -> bool {
-        *self == Self::Native
-    }
-}
-
-pub const DEFAULT_HTML_HEIGHT: u32 = 480;
-pub const HTML_HEIGHT_RANGE: std::ops::RangeInclusive<u32> = 120..=900;
-
-/// The only origins an HTML visual may load code from. The page's content
-/// security policy admits exactly these, and `visual_check` reports anything
-/// else before publishing.
-pub const SCRIPT_HOSTS: [&str; 4] = [
-    "cdn.jsdelivr.net",
-    "cdnjs.cloudflare.com",
-    "unpkg.com",
-    "esm.sh",
-];
-pub const STYLE_HOSTS: [&str; 6] = [
-    "cdn.jsdelivr.net",
-    "cdnjs.cloudflare.com",
-    "unpkg.com",
-    "esm.sh",
-    "fonts.googleapis.com",
-    "fonts.gstatic.com",
-];
-pub const FONT_HOSTS: [&str; 5] = [
-    "cdn.jsdelivr.net",
-    "cdnjs.cloudflare.com",
-    "unpkg.com",
-    "fonts.googleapis.com",
-    "fonts.gstatic.com",
-];
-
-/// `https://a https://b`, the form a CSP source list takes.
-pub fn csp_sources(hosts: &[&str]) -> String {
-    hosts
-        .iter()
-        .map(|host| format!("https://{host}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -66,11 +10,6 @@ pub struct VisualDocument {
     pub id: String,
     pub title: String,
     pub source: String,
-    #[serde(default, skip_serializing_if = "VisualFormat::is_native")]
-    pub format: VisualFormat,
-    /// Frame height in points for `Html`; a page cannot report its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub height: Option<u32>,
 }
 
 impl VisualDocument {
@@ -89,25 +28,7 @@ impl VisualDocument {
         if self.title.trim().is_empty() || self.title.chars().count() > 160 {
             return Err("Visual title must contain 1–160 characters".into());
         }
-        match self.format {
-            VisualFormat::Native => validate_source(&self.source)?,
-            VisualFormat::Html => {
-                if self.source.trim().is_empty()
-                    || self.source.len() > super::images::MAX_HTML_BYTES
-                {
-                    return Err("HTML visual must contain 1 byte to 10 MiB".into());
-                }
-            }
-        }
-        match (self.format, self.height) {
-            (VisualFormat::Native, Some(_)) => Err("Only HTML visuals take a height".into()),
-            (VisualFormat::Html, Some(h)) if !HTML_HEIGHT_RANGE.contains(&h) => Err(format!(
-                "HTML visual height must be {}–{}",
-                HTML_HEIGHT_RANGE.start(),
-                HTML_HEIGHT_RANGE.end()
-            )),
-            _ => Ok(()),
-        }
+        validate_source(&self.source)
     }
 }
 
@@ -169,6 +90,15 @@ pub struct Series {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Slice {
+    pub label: String,
+    pub value: f64,
+    #[serde(default)]
+    pub color: ThemeColor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Node {
     Column {
@@ -184,6 +114,11 @@ pub enum Node {
         columns: usize,
         gap: f32,
     },
+    /// A raised panel around its children, laid out as a column.
+    Card {
+        children: Vec<Node>,
+        gap: f32,
+    },
     Text {
         text: String,
         size: TextSize,
@@ -194,6 +129,15 @@ pub enum Node {
         value: String,
         detail: Option<String>,
         color: ThemeColor,
+        /// A signed change such as "+12.4%", drawn with an arrow.
+        #[serde(default)]
+        delta: Option<String>,
+        /// A sparkline under the value.
+        #[serde(default)]
+        trend: Vec<f64>,
+        /// A falling value is good news, as for latency or error rates.
+        #[serde(default)]
+        lower_is_better: bool,
     },
     Table {
         columns: Vec<String>,
@@ -204,6 +148,32 @@ pub enum Node {
         series: Vec<Series>,
         labels: Vec<String>,
         height: f32,
+    },
+    Gauge {
+        label: String,
+        value: f64,
+        min: f64,
+        max: f64,
+        unit: Option<String>,
+        color: ThemeColor,
+    },
+    Donut {
+        slices: Vec<Slice>,
+        label: Option<String>,
+        value: Option<String>,
+    },
+    Heatmap {
+        values: Vec<Vec<f64>>,
+        rows: Vec<String>,
+        columns: Vec<String>,
+        color: ThemeColor,
+    },
+    Progress {
+        label: String,
+        value: f64,
+        max: f64,
+        detail: Option<String>,
+        color: ThemeColor,
     },
     Button {
         label: String,
@@ -239,25 +209,6 @@ pub enum Node {
         labels: Vec<String>,
         selected: usize,
         handler: String,
-    },
-    /// Syntax-highlighted source, never executed.
-    Code {
-        code: String,
-        language: Option<String>,
-        title: Option<String>,
-    },
-    /// A line diff between two texts, with unchanged runs folded.
-    Diff {
-        before: String,
-        after: String,
-        path: Option<String>,
-        title: Option<String>,
-        context: usize,
-    },
-    Callout {
-        text: String,
-        title: Option<String>,
-        color: ThemeColor,
     },
     Canvas {
         width: f32,
@@ -367,7 +318,9 @@ impl Node {
             return Err("Visual tree exceeds 512 nodes or 16 levels".into());
         }
         match self {
-            Self::Column { children, gap } | Self::Row { children, gap } => {
+            Self::Column { children, gap }
+            | Self::Row { children, gap }
+            | Self::Card { children, gap } => {
                 bounded(*gap as f64, 0., 48., "layout gap")?;
                 children
                     .iter()
@@ -391,6 +344,8 @@ impl Node {
                 label,
                 value,
                 detail,
+                delta,
+                trend,
                 ..
             } => {
                 budget.text(label, 256)?;
@@ -398,6 +353,87 @@ impl Node {
                 if let Some(detail) = detail {
                     budget.text(detail, 2048)?;
                 }
+                if let Some(delta) = delta {
+                    budget.text(delta, 64)?;
+                }
+                points(trend, budget)?;
+            }
+            Self::Gauge {
+                label,
+                value,
+                min,
+                max,
+                unit,
+                ..
+            } => {
+                budget.text(label, 256)?;
+                if let Some(unit) = unit {
+                    budget.text(unit, 32)?;
+                }
+                bounded(*min, -1e12, 1e12, "gauge min")?;
+                bounded(*max, -1e12, 1e12, "gauge max")?;
+                if min >= max {
+                    return Err("Gauge max must exceed min".into());
+                }
+                bounded(*value, -1e12, 1e12, "gauge value")?;
+            }
+            Self::Donut {
+                slices,
+                label,
+                value,
+            } => {
+                if slices.is_empty() || slices.len() > 12 {
+                    return Err("Donuts need 1–12 slices".into());
+                }
+                for slice in slices {
+                    budget.text(&slice.label, 256)?;
+                    bounded(slice.value, 0., 1e12, "slice value")?;
+                }
+                if slices.iter().all(|s| s.value <= 0.) {
+                    return Err("A donut needs at least one positive slice".into());
+                }
+                for text in [label, value].into_iter().flatten() {
+                    budget.text(text, 128)?;
+                }
+            }
+            Self::Heatmap {
+                values,
+                rows,
+                columns,
+                ..
+            } => {
+                let width = values.first().map_or(0, Vec::len);
+                if values.is_empty() || values.len() > 32 || width == 0 || width > 128 {
+                    return Err("Heatmaps need 1–32 rows of 1–128 values".into());
+                }
+                if values.iter().any(|row| row.len() != width) {
+                    return Err("Heatmap rows must have equal lengths".into());
+                }
+                if (!rows.is_empty() && rows.len() != values.len())
+                    || (!columns.is_empty() && columns.len() != width)
+                {
+                    return Err("Heatmap labels must match its rows and columns".into());
+                }
+                for label in rows.iter().chain(columns) {
+                    budget.text(label, 64)?;
+                }
+                for row in values {
+                    points(row, budget)?;
+                }
+            }
+            Self::Progress {
+                label,
+                value,
+                max,
+                detail,
+                ..
+            } => {
+                budget.text(label, 256)?;
+                if let Some(detail) = detail {
+                    budget.text(detail, 256)?;
+                }
+                bounded(*max, 1e-9, 1e12, "progress max")?;
+                bounded(*value, 0., *max, "progress value")?;
             }
             Self::Table { columns, rows } => {
                 if columns.is_empty() || columns.len() > 24 || rows.len() > 250 {
@@ -509,41 +545,6 @@ impl Node {
                 }
                 validate_handler(handler)?;
             }
-            Self::Code {
-                code,
-                language,
-                title,
-            } => {
-                budget.text(code, MAX_CODE_BYTES)?;
-                budget.lines(code)?;
-                for label in [language, title].into_iter().flatten() {
-                    budget.text(label, 256)?;
-                }
-            }
-            Self::Diff {
-                before,
-                after,
-                path,
-                title,
-                context,
-            } => {
-                budget.text(before, MAX_CODE_BYTES)?;
-                budget.text(after, MAX_CODE_BYTES)?;
-                budget.lines(before)?;
-                budget.lines(after)?;
-                if *context > 20 {
-                    return Err("Diff context must be 0–20 lines".into());
-                }
-                for label in [path, title].into_iter().flatten() {
-                    budget.text(label, 256)?;
-                }
-            }
-            Self::Callout { text, title, .. } => {
-                budget.text(text, 2048)?;
-                if let Some(title) = title {
-                    budget.text(title, 256)?;
-                }
-            }
             Self::Canvas {
                 width,
                 height,
@@ -593,6 +594,21 @@ impl Node {
     }
 }
 
+/// Data points count against the shared vertex budget.
+fn points(values: &[f64], budget: &mut Budget) -> Result<(), String> {
+    if values.len() > 512 {
+        return Err("A data row may hold at most 512 values".into());
+    }
+    budget.vertices += values.len();
+    if budget.vertices > 32_768 {
+        return Err("Visual data point budget exceeded".into());
+    }
+    for value in values {
+        bounded(*value, -1e12, 1e12, "data value")?;
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Budget {
     nodes: usize,
@@ -600,18 +616,8 @@ struct Budget {
     primitives: usize,
     vertices: usize,
     triangles: usize,
-    lines: usize,
 }
 impl Budget {
-    fn lines(&mut self, text: &str) -> Result<(), String> {
-        self.lines += text.lines().count();
-        if self.lines > MAX_CODE_LINES {
-            return Err(format!(
-                "Code and diffs are limited to {MAX_CODE_LINES} lines"
-            ));
-        }
-        Ok(())
-    }
     fn text(&mut self, text: &str, max: usize) -> Result<(), String> {
         self.text_bytes += text.len();
         if text.len() > max || self.text_bytes > 128 * 1024 {

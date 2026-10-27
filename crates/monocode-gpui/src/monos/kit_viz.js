@@ -210,7 +210,71 @@ const fill=()=>{const sorted=key==null?rows:[...rows].sort((a,b)=>{const x=a[key
 tb.replaceChildren(...sorted.map(r=>h('tr',null,cols.map(c=>{const v=r[c.key];return h('td',{class:numeric(c)?'num':''},c.format?c.format(v,r):v==null?'—':typeof v==='number'?v.toLocaleString():String(v))}))))};
 t.append(h('thead',null,head),tb);fill();return h('div',{class:'mc-table-wrap',style:o.maxHeight?{maxHeight:o.maxHeight+'px'}:null},t)};
 
+// Content a block can hold: an element, an HTML string, or a function that builds one.
+const node=v=>typeof v==='function'?v():typeof v==='string'?h('div',{html:v}):v;
+
+// Before/after: two renderings stacked, one revealed by dragging a handle.
+const compare=(target,o={})=>{const labels=o.labels||['Before','After'];let pct=o.initial??50;
+const range=h('input',{class:'mc-compare-range',type:'range',min:0,max:100,step:.5,value:pct,'aria-label':'Reveal '+labels[1]});
+const el=h('div',{class:'mc-compare'},h('div',{class:'mc-compare-layer'},node(o.before)),h('div',{class:'mc-compare-layer after'},node(o.after)),
+h('span',{class:'mc-compare-tag l'},labels[0]),h('span',{class:'mc-compare-tag r'},labels[1]),
+h('div',{class:'mc-compare-line'},h('span',{class:'mc-compare-grip'},icon('chevron-left',{size:12}),icon('chevron-right',{size:12}))),range);
+const set=v=>{pct=Math.max(0,Math.min(100,Number(v)));el.style.setProperty('--p',pct+'%');range.value=pct;o.onInput&&o.onInput(pct)};
+range.addEventListener('input',()=>set(range.value));set(pct);mount(target,el);return{el,set,get value(){return pct}}};
+
+// Numbered pins over any picture, paired with a list of notes that light up together.
+const annotate=(target,o={})=>{const notes=o.notes||[];let active=-1;
+const content=node(o.content!=null?o.content:o.src?h('img',{src:o.src,alt:o.alt||''}):null);
+const pins=notes.map((n,i)=>h('button',{class:'mc-pin mc-pop',style:{left:n.x+'%',top:n.y+'%','--i':i},'aria-label':n.title||'Note '+(i+1)},String(i+1)));
+const items=notes.map((n,i)=>h('li',{class:'mc-note-item'},h('b',null,n.title||''),n.text?h('span',null,n.text):null));
+const paint=()=>[pins,items].forEach(list=>list.forEach((x,i)=>{x.classList.toggle('on',i===active);x.classList.toggle('dim',active>=0&&i!==active)}));
+const pick=i=>{active=i;paint()};
+pins.forEach((p,i)=>{p.onclick=()=>pick(i===active?-1:i);p.onmouseenter=()=>pick(i);p.onmouseleave=()=>pick(-1)});
+items.forEach((li,i)=>{li.onclick=()=>pick(i===active?-1:i);li.onmouseenter=()=>pick(i);li.onmouseleave=()=>pick(-1)});
+const el=h('div',{class:'mc-annotate'},h('div',{class:'mc-annotate-art'},content,pins),h('ol',{class:'mc-notes'},items));
+mount(target,el);return{el,pick}};
+
+// Events on a time axis. A number `at` is a moment; `end` makes it a span. Overlaps stack into lanes.
+const timeline=(target,o={})=>{const ev=(o.events||[]).filter(e=>typeof e.at==='number');
+const lo=o.min??Math.min(...ev.map(e=>e.at)),hi=o.max??Math.max(...ev.map(e=>e.end??e.at)),span=hi>lo?hi-lo:1,fmt=formatter(o.format);
+const el=h('div',{class:'mc-timeline'}),track=h('div',{class:'mc-tl-track'});el.append(track);
+const layout=()=>{const W=Math.max(240,el.clientWidth),lanes=[];track.replaceChildren();
+const ticks=nice(lo,hi,Math.max(2,Math.floor(W/110))).ticks.filter(v=>v>=lo&&v<=hi);
+for(const v of ticks){const at=(v-lo)/span*100;track.append(h('div',{class:'mc-tl-tick'+(at<3?' first':at>97?' last':''),style:{left:at+'%'}},h('span',null,fmt(v))))}
+ev.forEach((e,i)=>{const x=(e.at-lo)/span*100,isSpan=e.end!=null,w=isSpan?Math.max(.6,(e.end-e.at)/span*100):0,
+need=(Math.max(textWidth(e.label||''),textWidth(e.detail||'')*.92)+22)/W*100,right=!isSpan&&x+need>100;
+const a=right?x-need:x,b=isSpan?x+Math.max(w,Math.min(need,8)):right?x:x+need;
+let lane=lanes.findIndex(end=>end<=a);if(lane<0){lane=lanes.length;lanes.push(0)}lanes[lane]=b;
+const label=[h('div',{class:'mc-tl-label'},e.label||''),e.detail?h('div',{class:'mc-tl-detail'},e.detail):null],top=lane*46+28+'px',tone='tone-'+(e.tone||'accent');
+const item=isSpan?h('div',{class:'mc-tl-span mc-in '+tone,style:{left:x+'%',width:w+'%',top},title:[e.label,e.detail].filter(Boolean).join(' — ')},label)
+:h('div',{class:'mc-tl-point mc-in '+tone+(right?' right':''),style:{[right?'right':'left']:(right?100-x:x)+'%',top}},h('i',{class:'mc-tl-dot'}),h('div',{class:'mc-tl-text'},label));
+item.style.setProperty('--i',i);track.append(item)});
+track.style.height=lanes.length*46+34+'px'};
+mount(target,el);let last=0;new ResizeObserver(()=>{if(Math.abs(el.clientWidth-last)>1){last=el.clientWidth;layout()}}).observe(el);layout();return{el,layout}};
+
+// A tiny inline trend for use inside stats, tables and text.
+const spark=(values,o={})=>{const v=(values||[]).filter(x=>typeof x==='number'&&isFinite(x));if(!v.length)return h('span');
+const W=o.width||96,H=o.height||28,n=v.length,lo=o.min??Math.min(...v),hi=o.max??Math.max(...v),pad=3,c=tint(o.color,o.index||0);
+const px=i=>pad+(n>1?i/(n-1):.5)*(W-2*pad),py=x=>H-pad-(hi>lo?(x-lo)/(hi-lo):.5)*(H-2*pad),d='M'+v.map((x,i)=>px(i).toFixed(1)+' '+py(x).toFixed(1)).join('L');
+return s('svg',{class:'mc-spark',viewBox:`0 0 ${W} ${H}`,width:W,height:H,role:'img','aria-label':o.label||'Trend'},
+o.fill===false?null:s('path',{d:`${d}L${px(n-1).toFixed(1)} ${H}L${px(0).toFixed(1)} ${H}Z`,fill:c,opacity:.14}),
+s('path',{d,fill:'none',stroke:c,'stroke-width':1.75,'stroke-linejoin':'round','stroke-linecap':'round'}),
+o.last===false?null:s('circle',{cx:px(n-1).toFixed(1),cy:py(v[n-1]).toFixed(1),r:2.5,fill:c}))};
+
+// A scrubber for when time is the point. Dragging calls onInput(t); {duration} adds Play.
+const scrub=(target,o={})=>{const min=o.min??0,max=o.max??1,fmt=o.format||(x=>x.toFixed(2));let t=o.value??min,raf=0;
+const play=h('button',{class:'mc-button ghost small icon','aria-label':'Play'},icon('play',{size:14}));
+const input=h('input',{class:'mc-range wide',type:'range',min,max,step:o.step??(max-min)/400,value:t,'aria-label':o.label||'Time'}),out=h('output',null,fmt(t));
+const el=h('div',{class:'mc-scrub'},o.duration?play:null,h('span',{class:'mc-label'},o.label||'Time'),input,out);
+const set=x=>{t=Math.max(min,Math.min(max,Number(x)));input.value=t;out.textContent=fmt(t);o.onInput&&o.onInput(t)};
+const stop=()=>{cancelAnimationFrame(raf);raf=0;play.replaceChildren(icon('play',{size:14}))};
+const run=()=>{if(t>=max)set(min);const t0=performance.now(),from=t;play.replaceChildren(icon('pause',{size:14}));
+const frame=()=>{const x=from+(performance.now()-t0)*mc.speed*(max-min)/o.duration;
+if(x>=max){set(max);if(o.loop){set(min);return run()}return stop()}set(x);raf=requestAnimationFrame(frame)};raf=requestAnimationFrame(frame)};
+play.onclick=()=>raf?stop():run();input.addEventListener('input',()=>{stop();set(input.value)});
+mount(target,el);if(o.autoplay&&o.duration)run();return{el,set,play:run,pause:stop,get value(){return t}}};
+
 let data;
 Object.defineProperty(mc,'data',{get(){if(data===undefined){const el=document.getElementById('mc-data');try{data=el?JSON.parse(el.textContent):{}}catch(e){console.error('mc.data: '+e.message);data={}}}return data}});
-Object.assign(mc,{svg:s,chart,flow,steps,code,highlight,table,format:short});
+Object.assign(mc,{svg:s,chart,flow,steps,code,highlight,table,compare,annotate,timeline,spark,scrub,format:short});
 })();

@@ -15,12 +15,6 @@ pub(super) struct CachedVisual {
 }
 
 impl TranscriptView {
-    /// Whether any retained visual hosts a native web view.
-    pub(crate) fn has_html_visuals(&self) -> bool {
-        self.visuals
-            .values()
-            .any(|cached| cached.document.format == monocode_core::visual::VisualFormat::Html)
-    }
     pub(super) fn visual_row(
         &mut self,
         message: usize,
@@ -31,8 +25,6 @@ impl TranscriptView {
             cached.document.id == document.id
                 && cached.document.title == document.title
                 && cached.document.source == document.source
-                && cached.document.format == document.format
-                && cached.document.height == document.height
         });
         if !unchanged {
             self.visuals.remove(&message);
@@ -93,8 +85,6 @@ mod tests {
 
     fn document(id: &str) -> VisualDocument {
         VisualDocument {
-            format: Default::default(),
-            height: None,
             id: id.into(),
             title: "Interactive result".into(),
             source: "return () => visual.text('Ready');".into(),
@@ -130,20 +120,6 @@ mod tests {
                     .count(),
                 1
             );
-        });
-    }
-
-    #[gpui::test]
-    fn only_html_visuals_make_the_transcript_uncached(cx: &mut TestAppContext) {
-        let view = cx.new(|_| TranscriptView::new());
-        view.update(cx, |view, cx| {
-            let _ = view.visual_row(0, Arc::new(document("native")), cx);
-            assert!(!view.has_html_visuals());
-            let mut page = document("page");
-            page.format = monocode_core::visual::VisualFormat::Html;
-            page.source = "<p>Hi</p>".into();
-            let _ = view.visual_row(1, Arc::new(page), cx);
-            assert!(view.has_html_visuals());
         });
     }
 

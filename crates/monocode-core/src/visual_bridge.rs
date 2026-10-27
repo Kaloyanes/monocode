@@ -1,7 +1,7 @@
 //! Ephemeral, session-scoped publication of native visuals and images. No user
 //! MCP settings are changed. Stable provider capabilities can publish only during
 //! a live turn.
-use crate::visual::{self, VisualDocument, VisualFormat, DEFAULT_HTML_HEIGHT};
+use crate::visual::{self, VisualDocument};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -17,15 +17,38 @@ use std::{
 };
 
 const MAX_WIRE_BYTES: usize = 1_048_576;
-/// A publish or preview reaching the app carries its embedded images.
-const MAX_HUB_BYTES: usize = visual::images::MAX_HTML_BYTES + MAX_WIRE_BYTES;
+/// A draft request carries its page with images embedded.
+const MAX_DRAFT_BYTES: usize = draft::images::MAX_HTML_BYTES + MAX_WIRE_BYTES;
 const MAX_SOURCE_BYTES: usize = visual::MAX_SOURCE_BYTES;
 const ENV_ENDPOINT: &str = "MONOCODE_VISUAL_ENDPOINT";
 const ENV_TOKEN: &str = "MONOCODE_VISUAL_TOKEN";
 const ENV_SESSION: &str = "MONOCODE_VISUAL_SESSION";
 const ENV_EXECUTABLE: &str = "MONOCODE_VISUAL_EXECUTABLE";
+mod draft;
+pub use draft::{
+    csp_sources, local_url, staging_dir as draft_staging_dir, Diagnostics as DraftDiagnostics,
+    DraftAction, DraftContent, DraftReply, DraftRequest, Element as DraftElement,
+    Feedback as DraftFeedback, LogEntry as DraftLog, Snapshot as DraftSnapshot,
+    DEFAULT_HEIGHT as DRAFT_DEFAULT_HEIGHT, DEFAULT_WAIT_SECONDS as DRAFT_DEFAULT_WAIT_SECONDS,
+    DEFAULT_WIDTH as DRAFT_DEFAULT_WIDTH, FONT_HOSTS, SCRIPT_HOSTS, STYLE_HOSTS,
+};
+
+type DraftHandler = Box<dyn Fn(DraftRequest) + Send + Sync>;
+static DRAFT_HANDLER: OnceLock<DraftHandler> = OnceLock::new();
+
+/// The app registers its draft host once at startup; requests from every
+/// session's MCP server arrive here, off the main thread.
+pub fn set_draft_handler(handler: impl Fn(DraftRequest) + Send + Sync + 'static) {
+    let _ = DRAFT_HANDLER.set(Box::new(handler));
+}
+
+const MAX_DRAFT_RESPONSE_BYTES: usize = 24 * 1024 * 1024;
+
 /// The MCP server's name, so its tools reach the model as `mcp__monocode__*`.
 pub const SERVER_NAME: &str = "monocode";
+/// Records the agent's plan in the transcript, where the title bar's plan rail
+/// reads it. It changes nothing, so a provider's approval prompt skips it.
+pub const PLAN_TOOL: &str = "update_plan";
 const SERVER_ENV: [&str; 8] = [
     ENV_ENDPOINT,
     ENV_TOKEN,
@@ -37,18 +60,15 @@ const SERVER_ENV: [&str; 8] = [
     "MONOCODE_THREADS",
 ];
 
+const PLAN_INSTRUCTIONS: &str = "Keep the user's plan rail current with update_plan: call it when you start work that takes three or more steps, and again each time a step starts or finishes.";
+const MAX_PLAN_STEPS: usize = 24;
+const MAX_STEP_CHARS: usize = 160;
+
 /// Loaded through visual_docs or the CLI only when authoring a visual. Keep the
 /// SDK out of ordinary prompts, server instructions and tool descriptions.
-const DOCUMENTATION: &str = r#"Session visuals come in two kinds. Pick by what you need to show:
-- html: any rich or custom picture (UI mockups, diagrams, flows, animated or
-  styled charts, SVG, layouts). Pass {html, height?}. See "HTML visuals" at the end,
-  and call visual_preview to see the result before visual_show.
-- native: small interactive widgets built from the component SDK below. Pass {source}.
+const DOCUMENTATION: &str = r#"Native session visuals
 Use visual_check to validate a visual, then visual_show to publish it into this
-conversation. They accept {source} or {html,height?}, never both; visual_show also
-accepts {title?,id?}.
-
-Native session visuals
+conversation. They accept {source}; visual_show also accepts {title?,id?}.
 The source is a JavaScript function body with a `visual` SDK. Always return a render function. Use closure state for interactions. Example:
 const state = visual.state({count: 0});
 return () => visual.column([
@@ -57,17 +77,33 @@ return () => visual.column([
   visual.button('Add', () => { state.count += 1; })
 ], {gap: 12});
 
+Answers that tell a story: publish one small visual per idea (a single chart,
+a stat row, a gauge) rather than one dashboard holding everything. Each
+visual_show adds a card to the conversation, titled with the title you give it.
+Mention what it shows in your reply, but do not restate what the visual already
+shows. Choose short, readable ids.
+
 Native components:
 visual.column(children,{gap?}), row(children,{gap?}), grid(children,{columns?,gap?})
-visual.text(text,{size?,color?}), stat(label,value,{detail?,color?})
+visual.card(children,{gap?}) groups a chart or stats on a raised panel.
+visual.text(text,{size?,color?})
+visual.stat(label,value,{detail?,delta?,trend?,better?,color?}): delta is a signed
+change such as '+12.4%'; trend is an array of numbers drawn as a sparkline;
+better:'lower' colors a falling delta as good (latency, errors, cost).
 visual.table(columns,rows)
-visual.code(source,{language?,title?}) highlights source; visual.diff(before,after,{path?,title?,context?})
-shows a folded line diff; visual.callout(text,{title?,color?}) marks a note, warning or result.
 visual.chart('bar'|'line'|'area',[{label,values,color?}],{labels?,height?})
+A single-series bar chart labels its latest bar; give each series its own color.
+visual.gauge(label,value,{min?,max?,unit?,color?}) for a reading against a range.
+visual.donut([{label,value,color?}],{label?,value?}) for parts of a whole;
+label and value are written in the middle (default: the total).
+visual.heatmap(rows,{rows?,columns?,color?}): rows is an array of equal-length
+number arrays, such as weekdays by weeks; labels are optional.
+visual.progress(label,value,{max?,detail?,color?})
 visual.button(label,onClick,{disabled?}), toggle(label,value,onChange)
 visual.slider(label,value,min,max,onChange,{step?}), tabs(labels,selected,onChange)
 visual.input(label,value,onChange,{placeholder?}), select(label,options,selectedIndex,onChange)
 Input handlers receive a string (up to 4096 bytes); select handlers receive an index.
+Select and input labels are not shown: make options and placeholders self-explanatory.
 visual.canvas(shapes,{width?,height?})
 Canvas shapes: visual.rect(x,y,w,h,{color?}), circle(x,y,r,{color?}),
 line(x1,y1,x2,y2,{color?,width?}), polyline([[x,y],...],{color?,width?}),
@@ -89,194 +125,12 @@ Do not draw custom buttons, simulate a whole webpage, add a page background, or
 hardcode font families or CSS. Native controls and the app theme own those styles.
 Include units, chart legends, readable labels, and useful empty states. Keep
 supporting prose in the conversation.
-The native sandbox has no DOM, network, files, timers, imports, or external libraries.
-No HTML, SVG markup, or shader code in native source. Source is limited to 64 KiB; keep
+The sandbox has no DOM, network, files, timers, imports, or external libraries.
+No HTML, SVG markup, or shader code. Source is limited to 64 KiB; keep
 scripts compact. Check validates execution, the initial component tree, and representative controls;
 it does not capture a screenshot. Fix errors before publishing. Set a concise
 title for the published visual. Never expose capability environment variables.
-
-HTML visuals
-{html} is one complete document body: HTML with inline <style> and <script>. It
-runs in an isolated web view: no network requests from your code (fetch, XHR,
-WebSocket), no app access and no storage. It may load scripts, stylesheets and
-fonts from these CDNs only, over https: cdn.jsdelivr.net, cdnjs.cloudflare.com,
-unpkg.com and esm.sh for code and styles, plus fonts.googleapis.com and
-fonts.gstatic.com for fonts. For example
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4"></script>; pin a
-version and prefer small, well known libraries. Anything else is blocked. A page that needs a library fails to render if
-the reader is offline, so use plain HTML, CSS, inline SVG and vanilla JavaScript
-when they are enough. Links open in the system browser.
-Images: reference local files by absolute path (or ~/...) and https images
-directly, in <img src>, CSS url() or a JavaScript string, e.g.
-<img src="/Users/me/Desktop/Screenshot 1.png"> or
-url(https://images.unsplash.com/photo-123?w=800). visual_check, visual_preview
-and visual_show embed them in the page, so it never fetches anything and keeps
-working offline. PNG, JPEG, GIF, WebP, AVIF, BMP, ICO and SVG work; large
-rasters are scaled to 1600 pixels on their long side; at most 24 images and
-6 MiB per page. Use screenshots and real photos when they show the point better
-than a drawing, give every image alt text, and size them with CSS (width:100%,
-aspect-ratio, object-fit). data: URLs and inline SVG work too.
-{height} is the frame height in points while the page loads, 120–900 (default
-480); pass the preview's contentHeight. Once loaded, the frame fits the page's
-content and follows it as it grows (up to 900). It never drops below the first
-height it measured, and it shrinks only after a smaller height lasts a second,
-so a demo that rebuilds smaller and grows back doesn't move the conversation.
-Let content set the page height: never use 100vh, or height:100% on html or body. The page never
-scrolls inside its frame. Let wide layouts shrink with the thread width (use %,
-flex, grid and an SVG viewBox, not fixed pixel widths).
-The app theme is injected as CSS variables on :root and follows light and dark:
---background, --foreground, --muted, --muted-foreground, --card, --card-foreground,
---popover, --popover-foreground, --secondary, --secondary-foreground, --border,
---input, --ring, --primary, --primary-foreground (solid buttons), --accent,
---accent-foreground, --accent-surface, --accent-surface-foreground, --destructive,
---destructive-foreground, --destructive-surface, --warning, --warning-foreground,
---warning-surface, --success, --success-foreground, --info, --info-foreground,
---code-background, --code-foreground, --chart-1 … --chart-6, --radius, --font-sans,
---font-mono. Use them instead of hardcoded colors so both themes work.
-Layout: the page sits directly on the conversation's own surface and is part of
-your reply. The base stylesheet sets box-sizing:border-box, body margin 0, the
-theme font and color, and transparent html and body backgrounds; leave them
-transparent. Do not wrap everything in an outer card, border or banner title. If
-one element needs its own surface (a mock of a screen, a panel), give it
-var(--card) or var(--popover) with var(--border), var(--radius) corners and at
-least 16px padding. Make the layout fluid: % widths, flex, grid and an SVG
-viewBox, never fixed pixel widths. Give charts fixed pixel heights. Keep it under
-64 KiB, make text at least 12px, label every chart axis and unit, and keep
-supporting prose in the conversation. Check validates size, embeds images and rejects
-network use; it does not render the page.
-
-Always preview before you publish. visual_preview (CLI: visual preview) renders
-the page in the app and returns a screenshot, the page's console output and
-errors, and contentHeight. Pass it the same html, plus the height you intend to
-publish; pass appearance light or dark to check the other theme, which every
-reader may be using. Look at the screenshot critically: alignment, clipping at the frame edge,
-empty areas, contrast in the current theme, text that is too small. Fix every
-console error, then preview again; publish only when the picture is good. A page
-with a script error often renders blank, and only the preview shows that.
-contentHeight is the height the page wants; publish with that height.
-
-Built-in kit. Every HTML page already has MonoCode's component kit; use it
-instead of styling controls from scratch, and never load another UI framework.
-Classes: mc-row, mc-col, mc-grid, mc-spacer, mc-muted, mc-label, mc-mono,
-mc-title, mc-divider; mc-card (tinted panel), mc-surface (floating popover with
-shadow); mc-button (+ primary, accent, ghost, danger, icon, small), mc-input,
-mc-badge (+ accent, success, warning, danger), mc-kbd, mc-avatar; mc-menu with
-mc-menu-item (+ active, danger; an mc-kbd inside is right-aligned) and
-mc-menu-sep; mc-stat (label text then <b>value</b>); mc-window with mc-window-bar
-(three <i></i> for traffic lights) for app mockups; mc-stage (+ dots or
-grid-lines) as the backdrop a subject sits on; mc-tabs with mc-tab
-(aria-selected); mc-switch (role=switch, aria-checked); mc-skeleton; motion
-classes mc-in and mc-pop that stagger by the --i custom property.
-Script helpers on window.mc:
-- mc.h(tag, attrs, ...children) builds elements; attrs take class, style
-  objects, onclick-style handlers and plain attributes.
-- mc.icon(name, {size?}) returns an inline SVG icon; mc.icons lists the names
-  (check x plus minus chevron-* arrow-right arrow-left search settings user file
-  folder trash copy edit play pause replay more menu bell mail home star heart
-  link lock calendar clock download upload filter sun moon info alert sparkle
-  terminal code git).
-- mc.variants(target, [{name, note?, render(stage, ctx)}], {stage?, stageHeight?,
-  controls?, replay?, playback?, autoplay?}) builds a variant switcher: tabs, a plain stage (pass {stage:'dots'} or 'grid-lines' for a pattern),
-  a Replay button, a one-line note and a Playback speed slider that slows every
-  CSS and Web Animations animation. render fills the stage and may return a
-  cleanup function; it runs again on every switch and replay, so entrance
-  animations replay for free. ctx.now() is playback-scaled time for
-  requestAnimationFrame loops. Arrow keys switch variants, r replays.
-- mc.slider(label, {min,max,step,value,unit?,format?,onInput}),
-  mc.toggle(label, value, onChange), mc.tabs(labels, selected, onChange) return
-  ready controls; put them in the variants controls option or your own bar.
-- mc.stagger(elements) sets --i on each; mc.series(i) is chart color i.
-- mc.chart(target, {type, labels?, series?, values?, height?, x?, y?, legend?,
-  curve?, animate?}) draws a themed, responsive SVG chart with hover tooltips, a
-  crosshair and a legend that toggles series. type: line, area, bar (grouped),
-  stacked, hbar (horizontal; labels down the side), scatter or donut.
-  series: [{name, values, color?}], values aligned with labels; scatter values
-  are [x, y, r?, label?]; donut takes labels and values (plus format, center,
-  centerLabel). x and y take {label, format, min, max, zero}; format is a
-  function or a unit like '$', '%' or ' ms'. Returns {el, update(partialSpec)}
-  for controls that change the data. Prefer it to a CDN chart library.
-- mc.flow(target, {nodes:[{id, label, detail?, icon?, tone?}], edges:[[from, to,
-  label?] or {from, to, label, dashed}], direction?, onSelect?}) lays out a
-  diagram from its edges: ranks run left to right and wrap to new rows, or
-  direction 'down' stacks them. tone: accent, success, warning, danger, muted.
-  Returns {el, focus(ids)}; focus highlights those nodes and animates the edges
-  between them.
-- mc.steps(target, [{title, body, focus?, render?(el)}], {flow?, autoplay?,
-  initial?}) is a stepper with previous/next, progress and arrow keys; with
-  {flow} each step focuses its nodes, and render can draw anything per step.
-- mc.code(source, {lang, title?, numbers?, highlight?: [lines], wrap?}) returns a
-  highlighted code block (js/ts, rust, python, go, c-like, sh, sql, css, json,
-  html/xml, diff); mc.highlight(source, lang) returns the HTML.
-- mc.table(rows, {columns?: [key or {key, label, format(v,row)}], sort?,
-  maxHeight?}) returns a sortable table; numbers align right.
-- mc.data is the data files passed with the visual (see Data files).
-Images in a page open in the app's image viewer when clicked, unless they sit in
-a link or button or the page handles the click itself.
-
-Data files. To chart or tabulate real data, pass {data: {name: "/abs/path"}} to
-visual_check, visual_preview and visual_show (CLI input JSON takes the same
-field). Up to 8 files of 2 MiB each: .json is parsed, .csv and .tsv become
-arrays of row objects keyed by the header (numbers as numbers, empty cells as
-null, leading-zero codes kept as text), anything else arrives as a string. The
-page reads them as mc.data.name. Aggregate large data first (with a script) and
-pass the result; never paste big datasets into the HTML.
-
-Make HTML visuals worth opening. A single static picture is the weak result.
-Treat each request as a small product demo:
-- UI, interaction or animation ideas: build 3 to 5 genuinely different variants
-  with mc.variants, each with a short note that says what it changes. Mount it on
-  document.body. Animation plays on load; Replay
-  and Playback come from the kit.
-- UI mockups: real product content (names, dates, numbers, icons), the states
-  that matter (hover, selected, empty, loading, error), a focused subject on an
-  mc-stage instead of a whole fake website, and working interactions (open and
-  close, select, type, toggle).
-- Data: real numbers through data files, an mc.chart with labelled axes and
-  units, the two or three numbers that matter as mc-stat, controls (range,
-  grouping, metric) that call update, and an mc.table when readers will want
-  exact values.
-- Explanations, architecture and flows: an mc.flow driven by mc.steps, so the
-  reader advances through the story while the diagram highlights each part; add
-  mc.code for the lines that matter.
-Size by content: mc-variants has a stage of at least 320 points; pass
-{stageHeight} to change it. The stage keeps the tallest height its content
-reaches, so a replay or tab switch that starts smaller doesn't move what's below
-it. Hand-built demos that reset should do the same: give their stage a
-min-height at least as tall as their largest state. Respect
-prefers-reduced-motion (the kit already shortens CSS motion). A script error
-leaves a blank page, so preview every time.
 "#;
-
-/// A rendered page: what the agent needs to judge it before publishing.
-pub struct Preview {
-    pub png: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub content_height: u32,
-    pub loaded: bool,
-    pub console: Vec<(String, String)>,
-}
-
-pub struct PreviewRequest {
-    pub html: String,
-    pub width: u32,
-    pub height: u32,
-    /// Render on a light surface instead of a dark one; None follows the app.
-    pub light: Option<bool>,
-    pub reply: mpsc::Sender<Result<Preview, String>>,
-}
-
-type PreviewHandler = Box<dyn Fn(PreviewRequest) + Send + Sync>;
-static PREVIEW_HANDLER: OnceLock<PreviewHandler> = OnceLock::new();
-
-/// The app registers the renderer once; the loopback hub forwards requests to it.
-pub fn set_preview_handler(handler: impl Fn(PreviewRequest) + Send + Sync + 'static) {
-    let _ = PREVIEW_HANDLER.set(Box::new(handler));
-}
-
-pub const PREVIEW_WIDTHS: std::ops::RangeInclusive<u32> = 240..=1600;
-pub const PREVIEW_HEIGHTS: std::ops::RangeInclusive<u32> = 120..=1200;
-const MAX_PREVIEW_RESPONSE_BYTES: usize = 24 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct Wire {
@@ -295,12 +149,29 @@ struct Wire {
 pub struct ImageRequest {
     pub path: std::path::PathBuf,
     pub title: String,
+    /// The HTML page this picture is a snapshot of, kept beside it so the
+    /// conversation can reopen the draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<std::path::PathBuf>,
+}
+
+/// The transcript role of a draft's card.
+pub const DRAFT_ROLE: &str = "draft";
+
+/// A live draft's place in the conversation. The page itself lives in the
+/// app while the draft is open; the card only names it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftCard {
+    pub draft: String,
+    pub title: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub enum Content {
     Visual(VisualDocument),
     Image(ImageRequest),
+    /// Published by the bridge itself when an agent opens a draft.
+    Draft(DraftCard),
 }
 
 impl Wire {
@@ -480,7 +351,7 @@ impl Server {
 }
 
 fn valid_document(document: &VisualDocument) -> Result<(), String> {
-    if document.format == VisualFormat::Native && document.source.len() > MAX_SOURCE_BYTES {
+    if document.source.len() > MAX_SOURCE_BYTES {
         return Err("Visual source exceeds 64 KiB".into());
     }
     if document.id.is_empty()
@@ -498,99 +369,7 @@ fn valid_document(document: &VisualDocument) -> Result<(), String> {
         return Err("Visual title exceeds 160 characters".into());
     }
     document.validate()?;
-    match document.format {
-        VisualFormat::Native => visual::check(&document.source).map(drop),
-        VisualFormat::Html => check_html(&document.source),
-    }
-}
-
-/// The page runs under a strict CSP, so network and external resources fail
-/// silently in the view. Say so before publishing instead.
-pub fn check_html(html: &str) -> Result<(), String> {
-    // Embedded images count against their own budget, not the page's.
-    let images: usize = embedded_images()
-        .find_iter(html)
-        .map(|image| image.len())
-        .sum();
-    let data = html
-        .strip_prefix(visual::data::BLOCK_START)
-        .and_then(|rest| rest.find("</script>"))
-        .map_or(0, |end| visual::data::BLOCK_START.len() + end);
-    if html.len().saturating_sub(images + data) > MAX_SOURCE_BYTES {
-        return Err("Visual HTML exceeds 64 KiB".into());
-    }
-    if html.len() > visual::images::MAX_HTML_BYTES {
-        return Err("Visual HTML with its images and data exceeds 10 MiB".into());
-    }
-    if html.trim().is_empty() {
-        return Err("HTML must not be empty".into());
-    }
-    let lower = html.to_ascii_lowercase();
-    // Code and styles may come from a short list of CDNs over https; the
-    // page's CSP admits exactly those origins.
-    let allowed = |url: &str, hosts: &[&str], what: &str| -> Result<(), String> {
-        if !(url.starts_with("http") || url.starts_with("//")) {
-            return Ok(());
-        }
-        let host = url.strip_prefix("https://").map(|rest| {
-            rest.split(['/', '?', '#', ':', '"', '\'', ' ', ')'])
-                .next()
-                .unwrap_or("")
-        });
-        match host {
-            Some(host) if hosts.contains(&host) => Ok(()),
-            _ => Err(format!(
-                "{what} may only load from https://{}",
-                hosts.join(", https://")
-            )),
-        }
-    };
-    let values = |tag: &str, attr: &str| -> Vec<String> {
-        lower
-            .match_indices(tag)
-            .filter_map(|(at, _)| {
-                let end = lower[at..].find('>').map_or(lower.len(), |n| at + n);
-                let element = &lower[at..end];
-                let i = element.find(attr)?;
-                let rest = element[i + attr.len()..].trim_start_matches(['=', ' ', '"', '\'']);
-                Some(rest.to_owned())
-            })
-            .collect()
-    };
-    for url in values("<script", "src") {
-        allowed(&url, &visual::SCRIPT_HOSTS, "Scripts")?;
-    }
-    for url in values("<link", "href") {
-        allowed(&url, &visual::STYLE_HOSTS, "Stylesheets")?;
-    }
-    for (at, _) in lower.match_indices("@import") {
-        let rest = lower[at + 7..]
-            .trim_start()
-            .trim_start_matches("url(")
-            .trim_start_matches(['"', '\'', ' ']);
-        allowed(rest, &visual::STYLE_HOSTS, "@import")?;
-    }
-    if values("<img", "src")
-        .iter()
-        .any(|url| url.starts_with("http") || url.starts_with("//"))
-    {
-        return Err(
-            "This image was not embedded; give it as an https URL or an absolute file path to an image file"
-                .into(),
-        );
-    }
-    for api in [
-        "fetch(",
-        "xmlhttprequest",
-        "websocket",
-        "eventsource",
-        "sendbeacon",
-    ] {
-        if lower.contains(api) {
-            return Err(format!("The page has no network access ({api} is blocked)"));
-        }
-    }
-    Ok(())
+    visual::check(&document.source).map(drop)
 }
 
 fn valid_image(image: &ImageRequest) -> Result<(), String> {
@@ -607,6 +386,18 @@ fn valid_image(image: &ImageRequest) -> Result<(), String> {
     if metadata.len() > crate::transcript::images::MAX_BYTES {
         return Err("Image is larger than 20 MB".into());
     }
+    if let Some(draft) = &image.draft {
+        let staged = draft.starts_with(draft::staging_dir())
+            && !draft
+                .components()
+                .any(|c| c == std::path::Component::ParentDir);
+        let size = std::fs::metadata(draft)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX);
+        if !staged || size > draft::images::MAX_HTML_BYTES as u64 {
+            return Err("The draft page must be one the app just saved".into());
+        }
+    }
     let bytes = std::fs::read(&image.path).map_err(|e| e.to_string())?;
     crate::transcript::images::inspect(&bytes).map(|_| ())
 }
@@ -615,20 +406,8 @@ fn valid_content(content: &Content) -> Result<(), String> {
     match content {
         Content::Visual(document) => valid_document(document),
         Content::Image(image) => valid_image(image),
+        Content::Draft(_) => Err("Invalid visual request".into()),
     }
-}
-
-/// What the agent wrote, with its images and data files embedded.
-fn prepare_html(html: &str, input: &Value) -> Result<String, String> {
-    let html = visual::images::embed_images(html)?;
-    visual::data::embed_data(&html, &input["data"])
-}
-
-fn embedded_images() -> &'static regex::Regex {
-    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| {
-        regex::Regex::new(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+").unwrap()
-    })
 }
 
 fn active_generation(hub: &Hub, session: i64) -> Option<u64> {
@@ -639,6 +418,106 @@ fn active_generation(hub: &Hub, session: i64) -> Option<u64> {
         .active
         .as_ref()
         .map(|active| active.generation)
+}
+
+/// One draft renders at a time; a draft needs the app, never a session turn.
+fn serve_draft(mut stream: TcpStream, hub: &Hub, wire: &Value) -> Result<(), String> {
+    /// One request at a time per conversation; a long wait in one must not
+    /// hold up another's.
+    static BUSY: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+    let release = |session: i64| {
+        if let Ok(mut busy) = BUSY.lock() {
+            busy.retain(|s| *s != session);
+        }
+    };
+    let response = (|| -> Result<Value, String> {
+        let session = wire["session"].as_i64().ok_or("Invalid visual session")?;
+        authorized(
+            hub,
+            session,
+            wire["token"].as_str().ok_or("Invalid visual capability")?,
+        )?;
+        let (reply, result) = mpsc::channel();
+        let mut request = DraftRequest::parse(session, &wire["draft_request"], reply)?;
+        let handler = DRAFT_HANDLER
+            .get()
+            .ok_or("Drafts need the MonoCode desktop app")?;
+        {
+            let mut busy = BUSY.lock().map_err(|_| "Drafts are unavailable")?;
+            if busy.contains(&session) {
+                return Err("Another draft call is still running; try again in a moment".into());
+            }
+            busy.push(session);
+        }
+        // A new draft takes its place in the conversation first: that card is
+        // where the page is drawn, so the page cannot load before it.
+        if request.draft.is_none() && request.content.is_some() {
+            let id = format!("draft-{session}-{:08x}", rand::random::<u32>());
+            let card = DraftCard {
+                draft: id.clone(),
+                title: request.title.clone().unwrap_or_default(),
+            };
+            if let Err(error) = publish_card(hub, session, card) {
+                release(session);
+                return Err(error);
+            }
+            request.id = Some(id);
+        }
+        handler(request);
+        let reply = result.recv_timeout(Duration::from_secs(45));
+        release(session);
+        let reply = reply.map_err(|_| "The draft timed out".to_string())??;
+        Ok(json!({"ok":true,"result":reply.value()}))
+    })()
+    .unwrap_or_else(|error| json!({"ok": false, "error": error}));
+    stream
+        .set_write_timeout(Some(Duration::from_secs(20)))
+        .map_err(|e| e.to_string())?;
+    writeln!(stream, "{response}").map_err(|e| e.to_string())
+}
+
+/// Puts a draft's card into the session's running turn and waits until the
+/// conversation has it.
+fn publish_card(hub: &Hub, session: i64, card: DraftCard) -> Result<(), String> {
+    let (reply, result) = mpsc::channel();
+    let generation = {
+        let mut sessions = hub
+            .sessions
+            .lock()
+            .map_err(|_| "Visual session unavailable")?;
+        let active = sessions
+            .get_mut(&session)
+            .and_then(|capability| capability.active.as_mut())
+            .ok_or("Drafts open inside a conversation turn, and this session has none running")?;
+        if active.publications >= 64 {
+            return Err("This turn has reached its visual publication limit".into());
+        }
+        active
+            .send
+            .try_send(Publication {
+                content: Content::Draft(card),
+                reply,
+                generation: active.generation,
+            })
+            .map_err(|_| "Visual publication queue unavailable")?;
+        active.publications += 1;
+        active.generation
+    };
+    let started = Instant::now();
+    loop {
+        if active_generation(hub, session) != Some(generation) {
+            return Err("The session turn has ended".into());
+        }
+        match result.recv_timeout(Duration::from_millis(25)) {
+            Ok(result) => return result.map(drop),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("The draft's card was not saved".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if started.elapsed() < Duration::from_secs(15) => {
+            }
+            Err(_) => return Err("The draft's card timed out".into()),
+        }
+    }
 }
 
 fn authorized(hub: &Hub, session: i64, token: &str) -> Result<(), String> {
@@ -663,76 +542,6 @@ fn authorized(hub: &Hub, session: i64, token: &str) -> Result<(), String> {
     }
 }
 
-/// One page renders at a time; a preview needs the app, never a session turn.
-fn serve_preview(mut stream: TcpStream, hub: &Hub, wire: &Value) -> Result<(), String> {
-    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let response = (|| -> Result<Value, String> {
-        authorized(
-            hub,
-            wire["session"].as_i64().ok_or("Invalid visual session")?,
-            wire["token"].as_str().ok_or("Invalid visual capability")?,
-        )?;
-        let input = &wire["preview"];
-        let html = input["html"].as_str().ok_or("html must be a string")?;
-        check_html(html)?;
-        let dimension = |key: &str, default: u32, range: &std::ops::RangeInclusive<u32>| match input
-            .get(key)
-            .filter(|v| !v.is_null())
-        {
-            None => Ok(default),
-            Some(value) => value
-                .as_u64()
-                .and_then(|v| u32::try_from(v).ok())
-                .filter(|v| range.contains(v))
-                .ok_or_else(|| format!("{key} must be {}–{}", range.start(), range.end())),
-        };
-        let width = dimension("width", 640, &PREVIEW_WIDTHS)?;
-        let height = dimension("height", 480, &PREVIEW_HEIGHTS)?;
-        let light = match input.get("appearance").and_then(Value::as_str) {
-            None => None,
-            Some("light") => Some(true),
-            Some("dark") => Some(false),
-            Some(_) => return Err("appearance must be light or dark".into()),
-        };
-        let handler = PREVIEW_HANDLER
-            .get()
-            .ok_or("Previews need the MonoCode desktop app")?;
-        if BUSY.swap(true, Ordering::AcqRel) {
-            return Err("Another preview is rendering; try again in a moment".into());
-        }
-        let (reply, result) = mpsc::channel();
-        handler(PreviewRequest {
-            html: html.to_owned(),
-            width,
-            height,
-            light,
-            reply,
-        });
-        let preview = result.recv_timeout(Duration::from_secs(40));
-        BUSY.store(false, Ordering::Release);
-        let preview = preview.map_err(|_| "The preview timed out".to_string())??;
-        use base64::Engine;
-        Ok(json!({
-            "ok": true,
-            "result": {
-                "png": base64::engine::general_purpose::STANDARD.encode(&preview.png),
-                "width": preview.width,
-                "height": preview.height,
-                "contentHeight": preview.content_height,
-                "loaded": preview.loaded,
-                "console": preview.console.iter()
-                    .map(|(level, text)| json!({"level": level, "text": text}))
-                    .collect::<Vec<_>>(),
-            }
-        }))
-    })()
-    .unwrap_or_else(|error| json!({"ok": false, "error": error}));
-    stream
-        .set_write_timeout(Some(Duration::from_secs(20)))
-        .map_err(|e| e.to_string())?;
-    writeln!(stream, "{response}").map_err(|e| e.to_string())
-}
-
 fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -741,16 +550,19 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
     let mut line = String::new();
-    BufReader::new((&stream).take((MAX_HUB_BYTES + 1) as u64))
+    BufReader::new((&stream).take((MAX_DRAFT_BYTES + 1) as u64))
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
-    if line.len() > MAX_HUB_BYTES || !line.ends_with('\n') {
+    if line.len() > MAX_DRAFT_BYTES || !line.ends_with('\n') {
         return Err("Invalid visual request".into());
     }
     if let Ok(value) = serde_json::from_str::<Value>(&line) {
-        if value.get("preview").is_some() {
-            return serve_preview(stream, hub, &value);
+        if value.get("draft_request").is_some() {
+            return serve_draft(stream, hub, &value);
         }
+    }
+    if line.len() > MAX_WIRE_BYTES {
+        return Err("Invalid visual request".into());
     }
     let wire: Wire = serde_json::from_str(&line).map_err(|_| "Invalid visual request")?;
     let (session, token, request_id) = (wire.session, wire.token.clone(), wire.request_id.clone());
@@ -895,29 +707,13 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
     writeln!(stream, "{response}").map_err(|e| e.to_string())
 }
 
-/// Validates either kind: `{html}` or `{source}`.
+/// Validates a native visual's `{source}`.
 pub fn check_input(input: &Value) -> Result<Value, String> {
-    match (input["source"].as_str(), input["html"].as_str()) {
-        (Some(_), Some(_)) => Err("Pass either source or html, not both".into()),
-        (Some(source), None) => check(source),
-        (None, Some(html)) => {
-            height(input)?;
-            let html = prepare_html(html, input)?;
-            check_html(&html).map(|()| json!({"ok":true,"format":"html","bytes":html.len()}))
-        }
-        (None, None) => Err("Pass source (native) or html (HTML visual)".into()),
-    }
-}
-
-fn height(input: &Value) -> Result<Option<u32>, String> {
-    match input.get("height") {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .and_then(|h| u32::try_from(h).ok())
-            .map(Some)
-            .ok_or_else(|| "height must be a whole number of points".into()),
-    }
+    check(
+        input["source"]
+            .as_str()
+            .ok_or("source must be a JavaScript string")?,
+    )
 }
 
 /// Local validation never requires an active session capability.
@@ -941,23 +737,9 @@ fn publish_with_environment(
             return Err(format!("{field} must be a string"));
         }
     }
-    let (source, format) = match (input["source"].as_str(), input["html"].as_str()) {
-        (Some(_), Some(_)) => return Err("Pass either source or html, not both".into()),
-        (Some(source), None) => (source, VisualFormat::Native),
-        (None, Some(html)) => (html, VisualFormat::Html),
-        (None, None) => return Err("source must be a JavaScript string".into()),
-    };
-    let embedded;
-    let source = if format == VisualFormat::Html {
-        embedded = prepare_html(source, &input)?;
-        embedded.as_str()
-    } else {
-        source
-    };
-    let height = height(&input)?;
-    if format == VisualFormat::Html && height.is_none() {
-        // The default is applied by the view; keep the document explicit.
-    }
+    let source = input["source"]
+        .as_str()
+        .ok_or("source must be a JavaScript string")?;
     let request_id = input["requestId"]
         .as_str()
         .map(str::to_owned)
@@ -977,8 +759,6 @@ fn publish_with_environment(
             .unwrap_or_else(|| format!("visual-{document_id}")),
         title: input["title"].as_str().unwrap_or("Visual").to_owned(),
         source: source.to_owned(),
-        format,
-        height: (format == VisualFormat::Html).then(|| height.unwrap_or(DEFAULT_HTML_HEIGHT)),
     };
     valid_document(&document)?;
     send(Content::Visual(document), request_id, environment)
@@ -1009,6 +789,7 @@ fn publish_image_with_environment(
     let image = ImageRequest {
         title: input["title"].as_str().unwrap_or("").trim().to_owned(),
         path,
+        draft: None,
     };
     valid_image(&image)?;
     send(Content::Image(image), request_id, environment)
@@ -1048,6 +829,7 @@ fn send(
             image: Some(image),
             ..wire
         },
+        Content::Draft(_) => return Err("Invalid visual request".into()),
     };
     let mut stream =
         TcpStream::connect_timeout(&endpoint, Duration::from_secs(3)).map_err(|e| e.to_string())?;
@@ -1078,18 +860,22 @@ fn send(
     Ok(response)
 }
 
-/// Ask the running app to render an HTML page and report what it looks like.
-fn preview_with_environment(
+/// Ask the running app to show or inspect a draft in the conversation.
+fn draft_with_environment(
     input: &Value,
     environment: &HashMap<String, String>,
 ) -> Result<Value, String> {
-    let html = input["html"].as_str().ok_or("html must be a string")?;
-    let html = &prepare_html(html, input)?;
-    check_html(html)?;
+    let mut prepared = input.clone();
+    if let Some(html) = input.get("html") {
+        let html = draft::images::embed_images(html.as_str().ok_or("html must be a string")?)?;
+        prepared["html"] = html.into();
+    }
+    let (reply, _) = mpsc::channel();
+    DraftRequest::parse(0, &prepared, reply)?;
     let get = |key| {
         environment
             .get(key)
-            .ok_or("Previews require a running MonoCode session")
+            .ok_or("Drafts require a running MonoCode session")
     };
     let endpoint: SocketAddr = get(ENV_ENDPOINT)?
         .parse()
@@ -1103,36 +889,71 @@ fn preview_with_environment(
     let mut stream =
         TcpStream::connect_timeout(&endpoint, Duration::from_secs(3)).map_err(|e| e.to_string())?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(50)))
+        .set_read_timeout(Some(Duration::from_secs(60)))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
-    let mut preview = json!({"html": html});
-    for key in ["width", "height", "appearance"] {
-        if let Some(value) = input.get(key).filter(|v| !v.is_null()) {
-            preview[key] = value.clone();
-        }
-    }
     writeln!(
         stream,
         "{}",
-        json!({"session": session, "token": get(ENV_TOKEN)?, "preview": preview})
+        json!({"session": session, "token": get(ENV_TOKEN)?, "draft_request": prepared})
     )
     .map_err(|e| e.to_string())?;
     let mut response = String::new();
-    BufReader::new(stream.take(MAX_PREVIEW_RESPONSE_BYTES as u64))
+    BufReader::new(stream.take(MAX_DRAFT_RESPONSE_BYTES as u64))
         .read_line(&mut response)
         .map_err(|e| e.to_string())?;
     let response: Value =
-        serde_json::from_str(&response).map_err(|_| "The app closed without a preview")?;
+        serde_json::from_str(&response).map_err(|_| "The app closed without a draft")?;
     if response["ok"] != true {
-        return Err(response["error"]
-            .as_str()
-            .unwrap_or("Preview failed")
-            .into());
+        return Err(response["error"].as_str().unwrap_or("Draft failed").into());
     }
     Ok(response["result"].clone())
+}
+
+/// A draft's page with its images embedded, as the tools hand it to the app.
+pub fn embed_draft_images(html: &str) -> Result<String, String> {
+    draft::images::embed_images(html)
+}
+
+/// Waits for the person to send feedback from the page or hand the draft
+/// back, then looks at the page again.
+fn wait_for_draft(input: &Value, environment: &HashMap<String, String>) -> Result<Value, String> {
+    let draft = input["draft"].as_str().ok_or("draft must be a string")?;
+    let mut action = json!({"kind":"wait"});
+    if let Some(seconds) = input.get("seconds").filter(|v| !v.is_null()) {
+        action["seconds"] = seconds.clone();
+    }
+    draft_with_environment(&json!({"draft":draft,"action":action}), environment)
+}
+
+/// Saves the draft as a picture card in the conversation, with its page kept
+/// beside it so the card can reopen the draft.
+fn keep_draft(input: &Value, environment: &HashMap<String, String>) -> Result<Value, String> {
+    let draft = input["draft"].as_str().ok_or("draft must be a string")?;
+    let title = input["title"].as_str().unwrap_or("").trim();
+    let kept = draft_with_environment(
+        &json!({"draft":draft,"action":{"kind":"keep","title":title}}),
+        environment,
+    )?;
+    let path = |key: &str| {
+        kept[key]
+            .as_str()
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| "The app returned no draft files".to_string())
+    };
+    let image = ImageRequest {
+        title: title.to_owned(),
+        path: path("png")?,
+        draft: Some(path("html")?),
+    };
+    valid_image(&image)?;
+    let request_id = input["requestId"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+    send(Content::Image(image), request_id, environment)
 }
 
 fn current_environment() -> HashMap<String, String> {
@@ -1148,14 +969,24 @@ pub fn client(args: &[String]) -> Result<Value, String> {
         .filter(|a| !matches!(a.as_str(), "help" | "--help" | "-h"))
     else {
         return Ok(
-            json!({"help":format!("Usage: monocode-gpui visual docs\n       monocode-gpui visual check|show|preview --input FILE [--title TITLE] [--id ID]\n       monocode-gpui visual image --path IMAGE [--title TITLE]\nFILE is JavaScript source, or JSON with source/title/id/requestId. Use - for stdin.\nIMAGE is a PNG, JPEG, GIF or WebP file to show in the conversation.\n{DOCUMENTATION}")}),
+            json!({"help":format!("Usage: monocode-gpui visual docs\n       monocode-gpui visual draft --json JSON\n       monocode-gpui visual check|show --input FILE [--title TITLE] [--id ID]\n       monocode-gpui visual image --path IMAGE [--title TITLE]\nFILE is JavaScript source, or JSON with source/title/id/requestId. Use - for stdin.\nIMAGE is a PNG, JPEG, GIF or WebP file to show in the conversation.\n{DOCUMENTATION}")}),
         );
     };
     if action == "docs" {
-        if args.len() != 1 {
-            return Err("Usage: monocode-gpui visual docs".into());
-        }
-        return Ok(documentation());
+        return match args {
+            [_] => Ok(documentation()),
+            _ => Err("Usage: monocode-gpui visual docs".into()),
+        };
+    }
+    if action == "draft" {
+        let json = match &args[1..] {
+            [flag, json] if flag == "--json" => json,
+            _ => {
+                return Err("Usage: monocode-gpui visual draft --json '{\"html\":\"...\"}'".into())
+            }
+        };
+        let input = serde_json::from_str::<Value>(json).map_err(|e| e.to_string())?;
+        return draft_with_environment(&input, &current_environment());
     }
     if action == "image" {
         let mut input = json!({});
@@ -1175,11 +1006,8 @@ pub fn client(args: &[String]) -> Result<Value, String> {
         }
         return publish_image_with_environment(input, &current_environment());
     }
-    if !matches!(action.as_str(), "check" | "show" | "preview") {
-        return Err(
-            "Expected visual docs, visual check, visual show, visual preview or visual image"
-                .into(),
-        );
+    if !matches!(action.as_str(), "check" | "show") {
+        return Err("Expected visual docs, visual check, visual show or visual image".into());
     }
     let mut input = None;
     let mut title = None;
@@ -1237,12 +1065,24 @@ pub fn client(args: &[String]) -> Result<Value, String> {
     if let Some(request_id) = request_id {
         input["requestId"] = request_id.into();
     }
-    if action == "preview" {
-        preview_with_environment(&input, &current_environment())
-    } else if action == "check" {
+    if action == "check" {
         check_input(&input)
     } else {
         publish_with_environment(input, &current_environment())
+    }
+}
+
+const DRAFT_DOCUMENTATION: &str = include_str!("visual_bridge/reference/draft.md");
+const KIT_DOCUMENTATION: &str = include_str!("visual_bridge/reference/kit.md");
+const APP_DOCUMENTATION: &str = include_str!("visual_bridge/reference/app.md");
+
+fn documentation_for(input: &Value) -> Result<Value, String> {
+    match input.get("topic").and_then(Value::as_str) {
+        None | Some("native") => Ok(documentation()),
+        Some("draft") => Ok(json!({"documentation": DRAFT_DOCUMENTATION})),
+        Some("kit") => Ok(json!({"documentation": KIT_DOCUMENTATION})),
+        Some("app") => Ok(json!({"documentation": APP_DOCUMENTATION})),
+        Some(_) => Err("topic must be native, draft, kit or app".into()),
     }
 }
 
@@ -1314,21 +1154,19 @@ pub fn configure_codex(command: &mut std::process::Command, environment: &HashMa
 const CODEX_VISUALIZE_OFF: &str = r#"plugins={"visualize@openai-bundled"={enabled=false}}"#;
 
 pub fn tool_definitions() -> Vec<Value> {
-    let properties = json!({
-        "source":{"type":"string","description":"Native kind: JavaScript function body using the visual SDK"},
-        "html":{"type":"string","description":"HTML page instead of source"},
-        "height":{"type":"integer","minimum":120,"maximum":900,"description":"HTML frame height"},
-        "data":{"type":"object","additionalProperties":{"type":"string"},"description":"HTML: name to file path, read as mc.data"}
-    });
+    let properties = json!({"source":{"type":"string","description":"JavaScript function body using the native visual SDK"}});
     let mut show_properties = properties.clone();
     show_properties["title"] = json!({"type":"string","maxLength":160});
     show_properties["id"] = json!({"type":"string","maxLength":96,"description":"Optional document identifier. A new request appends a new visual; reuse requestId to retry a publication."});
     show_properties["requestId"] = json!({"type":"string","maxLength":128,"description":"Reuse when retrying an uncertain publication"});
     vec![
-        json!({"name":"visual_docs","description":"Read the native visual SDK reference, examples and styling rules when preparing an inline visual. Does not publish.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
-        json!({"name":"visual_check","description":"Validate a native or HTML visual without publishing. Read visual_docs.","inputSchema":{"type":"object","properties":properties,"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
-        json!({"name":"visual_preview","description":"Render an HTML page in the app: returns a screenshot, contentHeight and console errors. Use before visual_show; see visual_docs.","inputSchema":{"type":"object","properties":{"html":{"type":"string"},"width":{"type":"integer","minimum":240,"maximum":1600},"height":{"type":"integer","minimum":120,"maximum":1200},"appearance":{"enum":["light","dark"]},"data":{"type":"object","additionalProperties":{"type":"string"}}},"required":["html"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":true}}),
-        json!({"name":"visual_show","description":"Publish a native or HTML visual into the conversation. Read visual_docs; validate first.","inputSchema":{"type":"object","properties":show_properties,"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
+        json!({"name":"visual_docs","description":"Read the native visual SDK reference, examples and styling rules when preparing an inline visual. Pass topic draft for the design-draft guide, kit for the optional component kit, or app for the real MonoCode design language to mock its UI. Does not publish.","inputSchema":{"type":"object","properties":{"topic":{"enum":["native","draft","kit","app"]}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"visual_check","description":"Validate a native visual program and representative controls without publishing. Returns its component tree. Read visual_docs for the SDK reference.","inputSchema":{"type":"object","properties":properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"visual_show","description":"Publish a native visual into the conversation as its own card. Read visual_docs first; validate with visual_check.","inputSchema":{"type":"object","properties":show_properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
+        json!({"name":PLAN_TOOL,"description":"Show the user your plan and what you are doing now. Send the whole list each time, one step in_progress. Call when multi-step work starts and on every step change.","inputSchema":{"type":"object","properties":{"explanation":{"type":"string"},"plan":{"type":"array","items":{"type":"object","properties":{"step":{"type":"string"},"status":{"enum":["pending","in_progress","completed","cancelled"]}},"required":["step","status"]}}},"required":["plan"]},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"draft_preview","description":"Build and inspect a live page inside the conversation, as a card at this point in the thread. Pass {html} (inline CSS/JS) or a localhost {url} to open one, with a short {title}; pass {draft} to look again. Returns a screenshot, text, controls with refs, console output and diagnostics. Revise with {draft,html}; resize or retheme with width/height/appearance. Actions: click {reference}, type {text,replace?}, resume, close. If userControl is true the user took over: inspect, but resume only after they hand it back. Results carry feedback the person sent from the page and issues the page reveals; to wait for feedback use draft_wait. Read visual_docs {topic:draft} first. Keep a good result with draft_keep.","inputSchema":{"type":"object","properties":{"html":{"type":"string"},"title":{"type":"string","maxLength":160},"url":{"type":"string","description":"A dev server on localhost"},"draft":{"type":"string","maxLength":96},"action":{"type":"object","properties":{"kind":{"enum":["snapshot","click","type","resume","close"]},"reference":{"type":"string","maxLength":96},"text":{"type":"string","maxLength":4096},"replace":{"type":"boolean"}},"required":["kind"],"additionalProperties":false},"width":{"type":"integer","minimum":240,"maximum":1600},"height":{"type":"integer","minimum":120,"maximum":1600},"appearance":{"enum":["light","dark"]}},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":true}}),
+        json!({"name":"draft_wait","description":"Pause until the person has tried the draft and sends their feedback (pinned notes on the page) or hands it back, then look at the page again. Returns the usual screenshot and numbers plus feedback, userActions and event (feedback, handed back or timeout). Waits up to 30 seconds; call again to keep waiting. Use after asking the person to try it, not in place of draft_preview.","inputSchema":{"type":"object","properties":{"draft":{"type":"string","maxLength":96},"seconds":{"type":"integer","minimum":1,"maximum":30}},"required":["draft"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"draft_keep","description":"Save the current HTML draft as a picture in the conversation that reopens the live page after the draft is gone. Use for a result worth keeping, not every iteration.","inputSchema":{"type":"object","properties":{"draft":{"type":"string","maxLength":96},"title":{"type":"string","maxLength":160},"requestId":{"type":"string","maxLength":128}},"required":["draft","title"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
         json!({"name":"image_show","description":"Show a PNG, JPEG, GIF or WebP file you made, such as a chart or screenshot, in the conversation. The app keeps its own copy.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"title":{"type":"string","maxLength":160},"requestId":{"type":"string","maxLength":128}},"required":["path"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
     ]
 }
@@ -1407,15 +1245,42 @@ pub fn read_only_tool(name: &str) -> bool {
         name.strip_prefix("mcp__monocode__")
             .or_else(|| name.strip_prefix("monocode:"))
             .or_else(|| name.strip_prefix("monocode_")),
-        Some("update_plan" | "thread_wait" | "thread_read" | "thread_list")
+        Some("update_plan" | "thread_wait" | "thread_read" | "thread_list" | "draft_wait")
     )
+}
+
+/// The plan itself lives in the tool call's input; this only refuses a list
+/// the rail could not show honestly.
+fn check_plan(input: &Value) -> Result<Value, String> {
+    let steps = input["plan"]
+        .as_array()
+        .ok_or("plan must be a list of steps")?;
+    if steps.is_empty() || steps.len() > MAX_PLAN_STEPS {
+        return Err(format!("plan needs 1 to {MAX_PLAN_STEPS} steps"));
+    }
+    let mut current = 0;
+    for step in steps {
+        let text = step["step"].as_str().map(str::trim).unwrap_or("");
+        if text.is_empty() || text.chars().count() > MAX_STEP_CHARS {
+            return Err(format!("each step needs 1 to {MAX_STEP_CHARS} characters"));
+        }
+        match step["status"].as_str() {
+            Some("pending" | "completed" | "cancelled") => {}
+            Some("in_progress") => current += 1,
+            _ => return Err("status must be pending, in_progress, completed or cancelled".into()),
+        }
+    }
+    if current > 1 {
+        return Err("only one step can be in_progress".into());
+    }
+    Ok(json!({"ok": true, "steps": steps.len()}))
 }
 
 fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option<Value> {
     let id = request.get("id")?.clone();
     let result = match request["method"].as_str().unwrap_or("") {
         "initialize" => Ok(
-            json!({"protocolVersion":request["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION")}}),
+            json!({"protocolVersion":request["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION")},"instructions":PLAN_INSTRUCTIONS}),
         ),
         "ping" => Ok(json!({})),
         "tools/list" => {
@@ -1431,30 +1296,29 @@ fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option
         "tools/call" => {
             let input = request["params"]["arguments"].clone();
             let result = match request["params"]["name"].as_str().unwrap_or("") {
-                "visual_docs" => Ok(documentation()),
+                "visual_docs" => documentation_for(&input),
                 "visual_check" => check_input(&input),
                 "visual_show" => publish_with_environment(input, environment),
                 "image_show" => publish_image_with_environment(input, environment),
-                "visual_preview" => preview_with_environment(&input, environment),
+                "draft_preview" => draft_with_environment(&input, environment),
+                "draft_keep" => keep_draft(&input, environment),
+                "draft_wait" => wait_for_draft(&input, environment),
+                PLAN_TOOL => check_plan(&input),
                 name if name.starts_with("thread_") => call_thread_tool(name, input, environment),
                 _ => Err("Unknown native visual tool".into()),
             };
-            let is_preview = request["params"]["name"] == "visual_preview";
+            let is_draft = matches!(
+                request["params"]["name"].as_str(),
+                Some("draft_preview" | "draft_wait")
+            );
             Ok(match result {
-                Ok(mut value) if is_preview => {
+                Ok(mut value) if is_draft && value.get("png").is_some() => {
                     // The picture is an image block; the text keeps the numbers
                     // and console output without a megabyte of base64.
-                    let png = value["png"].take();
-                    let note = json!({
-                        "width": value["width"],
-                        "height": value["height"],
-                        "contentHeight": value["contentHeight"],
-                        "loaded": value["loaded"],
-                        "console": value["console"],
-                    });
+                    let png = value.as_object_mut().unwrap().remove("png").unwrap();
                     json!({"content":[
                         {"type":"image","data":png,"mimeType":"image/png"},
-                        {"type":"text","text":note.to_string()}
+                        {"type":"text","text":value.to_string()}
                     ],"isError":false})
                 }
                 Ok(value) => {
@@ -1566,145 +1430,6 @@ mod tests {
     }
 
     #[test]
-    fn html_visuals_publish_with_a_default_height_and_need_exactly_one_kind() {
-        let server = Server::start(11).unwrap();
-        let environment = server.environment(std::path::Path::new("/test/app"));
-        let worker = std::thread::spawn(move || {
-            publish_with_environment(
-                json!({"html":"<h1>Hi</h1>","title":"Page","requestId":"html-1"}),
-                &environment,
-            )
-        });
-        let publication = server
-            .publications
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap();
-        let Content::Visual(page) = &publication.content else {
-            panic!("expected a visual publication");
-        };
-        assert_eq!(page.format, VisualFormat::Html);
-        assert_eq!(page.height, Some(DEFAULT_HTML_HEIGHT));
-        publication.reply.send(Ok(json!({"id":"x"}))).unwrap();
-        worker.join().unwrap().unwrap();
-        assert!(
-            check_input(&json!({"source":"return () => visual.text('a')","html":"<p>a</p>"}))
-                .is_err()
-        );
-        assert!(check_input(&json!({})).is_err());
-        assert!(check_input(&json!({"html":"<p>a</p>","height":50})).is_ok());
-        let mut document = VisualDocument {
-            id: "page".into(),
-            title: "Page".into(),
-            source: "<p>a</p>".into(),
-            format: VisualFormat::Html,
-            height: Some(50),
-        };
-        assert!(valid_document(&document).is_err());
-        document.height = Some(400);
-        assert!(valid_document(&document).is_ok());
-    }
-
-    #[test]
-    fn embedded_images_have_their_own_budget_and_reach_the_published_page() {
-        let image = format!("data:image/png;base64,{}", "A".repeat(200 * 1024));
-        assert!(check_html(&format!("<img src=\"{image}\">")).is_ok());
-        assert!(check_html(&format!("<p>{}</p>", "x".repeat(MAX_SOURCE_BYTES))).is_err());
-        let huge = format!("data:image/png;base64,{}", "A".repeat(11 * 1024 * 1024));
-        assert!(check_html(&format!("<img src=\"{huge}\">"))
-            .unwrap_err()
-            .contains("10 MiB"));
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("Screenshot 2026-10-26 at 9.41.12 AM.png");
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::RgbImage::new(4, 4)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        std::fs::write(&path, png.into_inner()).unwrap();
-        let input = json!({"html": format!("<img src=\"{}\">", path.display())});
-        let checked = check_input(&input).unwrap();
-        assert_eq!(checked["format"], "html");
-    }
-
-    #[test]
-    fn html_checks_allow_https_libraries_and_reject_everything_else_remote() {
-        assert!(check_html(
-            "<svg viewBox='0 0 10 10'><circle r='4'/></svg><script>let a=1</script>"
-        )
-        .is_ok());
-        assert!(check_html("<p>See https://example.com for more</p>").is_ok());
-        assert!(check_html(
-            "<script src=\"https://cdn.jsdelivr.net/npm/chart.js@4\"></script><link rel=stylesheet href=https://fonts.googleapis.com/css2?family=Inter><script src=https://unpkg.com/x></script>"
-        )
-        .is_ok());
-        for bad in [
-            "<script src=\"https://evil.example/x.js\"></script>",
-            "<script src=\"https://cdn.jsdelivr.net.evil.example/x.js\"></script>",
-            "<link rel=stylesheet href=https://x.test/a.css>",
-            "<style>@import url(https://evil.example/a.css)</style>",
-            "<script src=\"http://cdn.example/x.js\"></script>",
-            "<script src='//cdn.example/x.js'></script>",
-            "<link rel=stylesheet href=http://x/y.css>",
-            "<style>@import url(http://x/y.css)</style>",
-            "<img src=\"https://x/y.png\">",
-            "<script>fetch('/a')</script>",
-            "<script>new WebSocket('ws://x')</script>",
-            "   ",
-        ] {
-            assert!(check_html(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn previews_authenticate_validate_and_reach_the_registered_renderer() {
-        let server = Server::start(21).unwrap();
-        let environment = server.environment(std::path::Path::new("/test/app"));
-        // No renderer yet: a clear error, and bad input is rejected first.
-        assert!(preview_with_environment(
-            &json!({"html":"<script src='http://x'></script>"}),
-            &environment
-        )
-        .is_err());
-        set_preview_handler(|request| {
-            let _ = request.reply.send(Ok(Preview {
-                png: vec![137, 80, 78, 71],
-                width: request.width,
-                height: request.height,
-                content_height: 321,
-                loaded: true,
-                console: vec![("error".into(), "boom".into())],
-            }));
-        });
-        let result = preview_with_environment(
-            &json!({"html":"<p>hi</p>","width":500,"height":300}),
-            &environment,
-        )
-        .unwrap();
-        assert_eq!(result["contentHeight"], 321);
-        assert_eq!(result["width"], 500);
-        assert_eq!(result["console"][0]["text"], "boom");
-        assert!(
-            preview_with_environment(&json!({"html":"<p>hi</p>","width":10}), &environment)
-                .is_err()
-        );
-        let mut wrong = environment.clone();
-        wrong.insert(ENV_TOKEN.into(), "nope".into());
-        assert!(preview_with_environment(&json!({"html":"<p>hi</p>"}), &wrong).is_err());
-        // The tool returns an image block plus the numbers, not base64 text.
-        let response = mcp_response(
-            json!({"id":3,"method":"tools/call","params":{"name":"visual_preview","arguments":{"html":"<p>hi</p>"}}}),
-            &environment,
-        )
-        .unwrap();
-        let content = &response["result"]["content"];
-        assert_eq!(content[0]["type"], "image");
-        assert!(content[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("contentHeight"));
-        assert!(!content[1]["text"].as_str().unwrap().contains("png"));
-    }
-
-    #[test]
     fn wrong_session_and_expired_capabilities_cannot_publish() {
         let server = Server::start(7).unwrap();
         let mut environment = server.environment(std::path::Path::new("/test/app"));
@@ -1734,6 +1459,180 @@ mod tests {
             .contains("Saving failed"));
     }
 
+    /// What the tests' Draft panel answers; the files a keep returns are set
+    /// by the test that asks for one.
+    static KEPT: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>> = Mutex::new(None);
+    /// One draft renders at a time process-wide, so the draft tests take turns.
+    static DRAFT_TESTS: Mutex<()> = Mutex::new(());
+
+    fn install_draft_handler() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            set_draft_handler(|request| {
+                let reply = match &request.action {
+                    DraftAction::Keep { title } => {
+                        let (png, html) = KEPT.lock().unwrap().clone().unwrap();
+                        DraftReply::Kept {
+                            draft: "d1".into(),
+                            title: title.clone(),
+                            png,
+                            html,
+                        }
+                    }
+                    _ => DraftReply::Snapshot(Box::new(DraftSnapshot {
+                        png: vec![137, 80, 78, 71],
+                        draft: "d1".into(),
+                        width: request.width.unwrap_or(DRAFT_DEFAULT_WIDTH),
+                        height: request.height.unwrap_or(DRAFT_DEFAULT_HEIGHT),
+                        content_height: 321,
+                        loaded: true,
+                        console: vec![DraftLog {
+                            level: "error".into(),
+                            text: "boom".into(),
+                        }],
+                        diagnostics: DraftDiagnostics {
+                            ready: true,
+                            horizontal_overflow: 12,
+                            ..Default::default()
+                        },
+                        elements: Vec::new(),
+                        text: "hi".into(),
+                        user_control: false,
+                        url: None,
+                        title: None,
+                        feedback: vec![DraftFeedback {
+                            note: "Bigger".into(),
+                            ..DraftFeedback::default()
+                        }],
+                        user_actions: Vec::new(),
+                        event: Some("feedback".into()),
+                        issues: vec!["Small target 16×16".into()],
+                        state: Some(json!({"radius": 12})),
+                    })),
+                };
+                let _ = request.reply.send(Ok(reply));
+            });
+        });
+    }
+
+    #[test]
+    fn drafts_authenticate_validate_and_reach_the_registered_panel() {
+        let _turn = DRAFT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let server = Server::start(21).unwrap();
+        let environment = server.environment(std::path::Path::new("/test/app"));
+        // Bad input is refused before any panel is asked.
+        assert!(draft_with_environment(
+            &json!({"html":"<script src='http://x'></script>"}),
+            &environment
+        )
+        .is_err());
+        install_draft_handler();
+        // Each new draft takes a card in the conversation before its page loads.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let cards = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+            let result = draft_with_environment(
+                &json!({"html":"<p>hi</p>","title":"Pricing","width":500,"height":300}),
+                &environment,
+            )
+            .unwrap();
+            assert_eq!(result["contentHeight"], 321);
+        // What the person sent and what the page reveals reach the agent.
+        assert_eq!(result["feedback"][0]["note"], "Bigger");
+        assert_eq!(result["event"], "feedback");
+        assert_eq!(result["issues"][0], "Small target 16×16");
+        assert_eq!(result["state"]["radius"], 12);
+            assert_eq!(result["width"], 500);
+            assert_eq!(result["diagnostics"]["horizontalOverflow"], 12);
+            assert_eq!(result["console"][0]["text"], "boom");
+            for invalid in [
+                json!({"html":"<p>hi</p>","appearance":true}),
+                json!({"html":"<p>hi</p>","width":10}),
+                json!({"url":"https://example.com"}),
+            ] {
+                assert!(draft_with_environment(&invalid, &environment).is_err());
+            }
+            let mut wrong = environment.clone();
+            wrong.insert(ENV_TOKEN.into(), "nope".into());
+            assert!(draft_with_environment(&json!({"html":"<p>hi</p>"}), &wrong).is_err());
+            // The tool returns an image block plus the numbers, not base64 text.
+            let response = mcp_response(
+                json!({"id":3,"method":"tools/call","params":{"name":"draft_preview","arguments":{"html":"<p>hi</p>"}}}),
+                &environment,
+            )
+            .unwrap();
+            let content = &response["result"]["content"];
+            assert_eq!(content[0]["type"], "image");
+            assert!(content[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("contentHeight"));
+            assert!(!content[1]["text"].as_str().unwrap().contains("\"png\""));
+                stop.store(true, Ordering::Relaxed);
+            });
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(publication) = server.publications.recv_timeout(Duration::from_millis(20))
+                {
+                    if let Content::Draft(card) = &publication.content {
+                        cards.lock().unwrap().push(card.clone());
+                    }
+                    let _ = publication.reply.send(Ok(json!({"saved":true})));
+                }
+            }
+        });
+        let cards = cards.into_inner().unwrap();
+        assert!(!cards.is_empty());
+        assert_eq!(cards[0].title, "Pricing");
+        assert!(cards[0].draft.starts_with("draft-21-"));
+    }
+
+    #[test]
+    fn keeping_a_draft_publishes_its_picture_with_the_page_the_app_staged() {
+        let _turn = DRAFT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        install_draft_handler();
+        let staging = draft::staging_dir();
+        std::fs::create_dir_all(&staging).unwrap();
+        let png = staging.join("draft-test-keep.png");
+        let page = staging.join("draft-test-keep.html");
+        std::fs::write(&png, crate::transcript::images::tests::png(2, 2)).unwrap();
+        std::fs::write(&page, "<p>kept</p>").unwrap();
+        *KEPT.lock().unwrap() = Some((png.clone(), page.clone()));
+        let server = Server::start(61).unwrap();
+        let environment = server.environment(std::path::Path::new("/test/app"));
+        let worker = std::thread::spawn(move || {
+            keep_draft(&json!({"draft":"d1","title":"Pricing"}), &environment)
+        });
+        let Ok(publication) = server.publications.recv_timeout(Duration::from_secs(5)) else {
+            panic!("nothing was published: {:?}", worker.join());
+        };
+        let Content::Image(image) = &publication.content else {
+            panic!("expected an image publication");
+        };
+        assert_eq!(image.title, "Pricing");
+        assert_eq!(image.draft.as_deref(), Some(page.as_path()));
+        publication.reply.send(Ok(json!({"saved":true}))).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap()["result"]["saved"], true);
+
+        // A page the app did not stage cannot ride along with a picture.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let stray = elsewhere.path().join("page.html");
+        std::fs::write(&stray, "<p>x</p>").unwrap();
+        let image = ImageRequest {
+            path: png.clone(),
+            title: String::new(),
+            draft: Some(stray),
+        };
+        assert!(valid_image(&image).is_err());
+        let sneaky = ImageRequest {
+            draft: Some(staging.join("../escape.html")),
+            ..image
+        };
+        assert!(valid_image(&sneaky).is_err());
+        let _ = std::fs::remove_file(png);
+        let _ = std::fs::remove_file(page);
+    }
+
     #[test]
     fn local_validation_and_mcp_notifications_need_no_capability() {
         assert!(check("return () => visual.text('Local');").is_ok());
@@ -1745,7 +1644,7 @@ mod tests {
         );
         let response = mcp_response(json!({"id":2,"method":"tools/call","params":{"name":"visual_show","arguments":input()}}), &environment).unwrap();
         assert_eq!(response["result"]["isError"], true);
-        assert_eq!(tool_definitions().len(), 5);
+        assert_eq!(tool_definitions().len(), 8);
         assert_eq!(acp_servers(&environment), json!([]));
     }
 
@@ -1757,14 +1656,16 @@ mod tests {
             &environment,
         )
         .unwrap();
-        assert!(initialization["result"].get("instructions").is_none());
+        // Only the plan habit rides along; the visual SDK stays on demand.
+        assert_eq!(initialization["result"]["instructions"], PLAN_INSTRUCTIONS);
         let catalog = mcp_response(json!({"id":2,"method":"tools/list"}), &environment).unwrap();
         let metadata = catalog["result"].to_string();
         assert!(
-            metadata.len() < 3_000,
+            metadata.len() < 9_000,
             "Discovery must stay small: {} bytes",
             metadata.len()
         );
+        assert!(metadata.contains(PLAN_TOOL));
         assert!(!metadata.contains("visual.column"));
         assert!(!metadata.contains("hardcode font"));
         let response = mcp_response(
@@ -1779,11 +1680,7 @@ mod tests {
         assert!(reference["documentation"]
             .as_str()
             .unwrap()
-            .contains("visual.scene"));
-        assert!(reference["documentation"]
-            .as_str()
-            .unwrap()
-            .contains("Style is inherited from the app"));
+            .contains("Native session visuals"));
         assert_eq!(reference, client(&["docs".into()]).unwrap());
         assert!(client(&["docs".into(), "--input".into(), "unused".into()]).is_err());
     }
@@ -1897,5 +1794,22 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Reviewed"));
+    }
+
+    #[test]
+    fn plans_need_ordered_steps_and_at_most_one_current() {
+        let ok = json!({"plan":[{"step":"Read","status":"completed"},{"step":"Edit","status":"in_progress"},{"step":"Test","status":"pending"}]});
+        assert_eq!(check_plan(&ok).unwrap()["steps"], 3);
+        let two = json!({"plan":[{"step":"a","status":"in_progress"},{"step":"b","status":"in_progress"}]});
+        assert!(check_plan(&two).is_err());
+        assert!(check_plan(&json!({"plan":[]})).is_err());
+        assert!(check_plan(&json!({"plan":[{"step":" ","status":"pending"}]})).is_err());
+        assert!(check_plan(&json!({"plan":[{"step":"a","status":"done"}]})).is_err());
+        let response = mcp_response(
+            json!({"id":4,"method":"tools/call","params":{"name":PLAN_TOOL,"arguments":ok}}),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["isError"], false);
     }
 }
