@@ -2049,6 +2049,8 @@ impl Inbox {
         self.save();
         if let Some(item) = self.visible_items(cx).first() {
             self.select(item.key(), cx);
+        } else {
+            self.selected = None;
         }
         if refetch {
             self.refresh(cx);
@@ -2903,6 +2905,49 @@ mod tests {
         window.update(cx, |_, _, cx| cx.notify()).unwrap();
         cx.refresh().unwrap();
         cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn linear_team_filters_hide_cached_issues_before_refresh(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    inbox.state.source = "linear".into();
+                    inbox.state.filters = model::Filters::default();
+                    inbox.snapshot.items = ["web", "mobile"]
+                        .into_iter()
+                        .map(|team| Item {
+                            provider: "linear".into(),
+                            identifier: format!("{team}-1"),
+                            team_id: team.into(),
+                            ..Default::default()
+                        })
+                        .collect();
+                    let visible_teams = |inbox: &Inbox, cx: &App| {
+                        inbox
+                            .visible_items(cx)
+                            .into_iter()
+                            .map(|item| item.team_id)
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(visible_teams(inbox, cx), ["web", "mobile"]);
+                    toggle(&mut inbox.state.hidden_linear_teams, "web".into());
+                    assert_eq!(visible_teams(inbox, cx), ["mobile"]);
+                    let mobile = inbox.visible_items(cx).remove(0);
+                    inbox.selected = Some(mobile.key());
+                    inbox.filters_changed(false, cx);
+                    assert_eq!(inbox.item().map(|item| item.team_id), Some("mobile".into()));
+                    toggle(&mut inbox.state.hidden_linear_teams, "mobile".into());
+                    assert!(inbox.visible_items(cx).is_empty());
+                    inbox.filters_changed(false, cx);
+                    assert!(inbox.item().is_none());
+                    toggle(&mut inbox.state.hidden_linear_teams, "web".into());
+                    assert_eq!(visible_teams(inbox, cx), ["web"]);
+                    inbox.state.hidden_linear_teams.clear();
+                    assert_eq!(visible_teams(inbox, cx), ["web", "mobile"]);
+                });
+            })
+            .unwrap();
     }
     #[gpui::test]
     fn long_discussion_materializes_only_viewport_comments_and_reply_focus_reaches_composer(
