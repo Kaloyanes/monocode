@@ -139,6 +139,7 @@ impl Conversation {
         if self.is_remote() || !self.responding() {
             return;
         }
+        self.plan_asked = true;
         let mut message = self.message(prompt, Vec::new(), None, cx);
         message.steer = Kind::from_id(&self.summary.provider).can_steer() && message.can_steer();
         self.follow_ups.motion.insert(
@@ -148,6 +149,31 @@ impl Conversation {
         );
         self.follow_ups.state.messages.push(message);
         self.save_follow_ups(cx);
+    }
+    /// Notes the person pinned on a draft, as a message: queued to steer a
+    /// running turn where the provider can take it, or sent as a new turn.
+    pub(crate) fn send_draft_feedback(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.is_remote() {
+            return;
+        }
+        if !self.responding() {
+            self.send_thread_prompt(prompt, cx);
+            return;
+        }
+        let mut message = self.message(prompt, Vec::new(), None, cx);
+        message.steer = Kind::from_id(&self.summary.provider).can_steer() && message.can_steer();
+        self.follow_ups.motion.insert(
+            &message.id,
+            self.follow_ups.state.messages.is_empty(),
+            !cx.reduce_motion(),
+        );
+        self.follow_ups.state.messages.push(message);
+        self.save_follow_ups(cx);
+    }
+    /// Whether a plan request reaches the agent mid-turn. Where it would only
+    /// queue for after the turn, asking for a plan is pointless.
+    pub(crate) fn can_steer_plan(&self) -> bool {
+        !self.is_remote() && Kind::from_id(&self.summary.provider).can_steer()
     }
     /// The plan rail's Build: leave Plan mode and build the proposal the
     /// agent just wrote, starting from its todo list so the rail can follow.
@@ -586,7 +612,7 @@ impl Conversation {
                             .child(queue_button("queue-cancel", "Cancel queued message edit", "close").on_click(cx.listener(|this, _, window, cx| this.finish_queue_edit(false, window, cx))))
                     } else {
                         let (steer, edit, remove) = (id.clone(), id.clone(), id);
-                        row.child(div().flex_1().min_w_0().py_1().child(div().id("queued-message-text").role(Role::Label).aria_label(message.label()).truncate().text_color(content(0.75)).child(message.label())).when_some(message.error.clone(), |d, error| d.child(div().id("queue-error").role(Role::Alert).text_color(gpui::rgb(0xf87171)).child(error))))
+                        row.children(queued_attachments(&message.id, &message.attachments)).child(div().flex_1().min_w_0().py_1().child(div().id("queued-message-text").role(Role::Label).aria_label(message.label()).truncate().text_color(content(0.75)).child(message.label())).when_some(message.error.clone(), |d, error| d.child(div().id("queue-error").role(Role::Alert).text_color(gpui::rgb(0xf87171)).child(error))))
                             .when(Kind::from_id(&self.summary.provider).can_steer(), |d| d.child(queue_button("queue-steer", "Steer queued message", "queue-steer").w_auto().px_2().gap(px(6.)).opacity(if sending { 0.4 } else { 1. }).child("Steer").on_click(cx.listener(move |this, _, _, cx| {
                                 if !sending && let Some(message) = this.follow_ups.state.messages.iter_mut().find(|m| m.id == steer) {
                                     if !message.can_steer() && this.busy { return; }
@@ -612,6 +638,73 @@ impl Conversation {
             .child(self.follow_ups.motion.card(card, card_width, window))
             .into_any_element()
     }
+}
+
+/// A queued message's attachments, ahead of its text: images as small
+/// thumbnails that open full screen, other files as their type icon.
+fn queued_attachments(id: &str, attachments: &[std::path::PathBuf]) -> Option<AnyElement> {
+    if attachments.is_empty() {
+        return None;
+    }
+    Some(
+        div()
+            .id(SharedString::from(format!("queued-attachments-{id}")))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .children(attachments.iter().enumerate().map(|(ix, path)| {
+                let snippet = monocode_core::composer::snippet(path);
+                let label = match &snippet {
+                    Some((_, label)) => label.clone(),
+                    None => path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                };
+                let chip = div()
+                    .id(("queued-attachment", ix))
+                    .size(px(24.))
+                    .flex_shrink_0()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .tip(label.clone());
+                if monocode_core::composer::image_mime(path).is_none() {
+                    return chip
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(content(0.06))
+                        .child(match &snippet {
+                            Some((kind, _)) => icon(kind.icon(), 14.).into_any_element(),
+                            None => crate::file_icons::file_type_icon(&label, false, false, 14.)
+                                .into_any_element(),
+                        })
+                        .into_any_element();
+                }
+                let preview = crate::image_lightbox::Open {
+                    source: crate::image_lightbox::Source::Path(path.clone()),
+                    alt: label.clone().into(),
+                };
+                chip.role(Role::Button)
+                    .aria_label(format!("Open {label} full screen"))
+                    .cursor(CursorStyle::PointingHand)
+                    .bg(content(0.04))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        window.dispatch_action(Box::new(preview.clone()), cx);
+                    })
+                    .child(
+                        crate::image_memory::thumbnail(path.clone())
+                            .size(px(24.))
+                            .object_fit(gpui::ObjectFit::Cover),
+                    )
+                    .into_any_element()
+            }))
+            .into_any_element(),
+    )
 }
 
 fn queue_button(

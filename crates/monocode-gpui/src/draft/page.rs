@@ -1,0 +1,338 @@
+//! The page a draft shows: the agent's HTML inside an opaque sandbox, themed
+//! from the app, plus the scripts that let the app read the page and drive it
+//! the way a person would (without ever being a person's input).
+use monocode_core::visual_bridge::{FONT_HOSTS, SCRIPT_HOSTS, STYLE_HOSTS, csp_sources};
+
+/// The colors a page is themed from: the app's own, so a mock of MonoCode
+/// looks like MonoCode.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct Palette {
+    ink: gpui::Hsla,
+    accent: gpui::Hsla,
+    /// The content card's solid color.
+    surface: gpui::Hsla,
+    /// What menus and popovers are made of.
+    popover: gpui::Hsla,
+}
+impl Palette {
+    pub(crate) fn current() -> Self {
+        Self {
+            ink: crate::theme::content(1.),
+            accent: crate::theme::accent_color(),
+            surface: crate::theme::pane_surface(),
+            popover: crate::theme::floating_fill(),
+        }
+    }
+    /// A light or dark page, whatever the app is set to. The app's own theme
+    /// is used when it already is that appearance; otherwise the defaults.
+    pub(crate) fn forced(light: bool) -> Self {
+        if light == crate::theme::is_light() {
+            return Self::current();
+        }
+        let (ink, surface, popover) = if light {
+            (0x171717, 0xffffff, 0xffffff)
+        } else {
+            (crate::theme::TEXT, crate::theme::CHAT, 0x1f1f1f)
+        };
+        Self {
+            ink: gpui::rgb(ink).into(),
+            accent: crate::theme::accent_color(),
+            surface: gpui::rgb(surface).into(),
+            popover: gpui::rgb(popover).into(),
+        }
+    }
+    pub(crate) fn of(light: Option<bool>) -> Self {
+        light.map_or_else(Self::current, Self::forced)
+    }
+    pub(crate) fn light(self) -> bool {
+        let ink: gpui::Rgba = self.ink.into();
+        ink.r * 0.2126 + ink.g * 0.7152 + ink.b * 0.0722 < 0.5
+    }
+}
+
+fn hex(value: gpui::Hsla) -> String {
+    let value: gpui::Rgba = value.into();
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (value.r * 255.) as u8,
+        (value.g * 255.) as u8,
+        (value.b * 255.) as u8
+    )
+}
+
+fn background(palette: Palette) -> String {
+    hex(palette.surface)
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The theme of a page as CSS variables. A page that is already open receives
+/// a new set through `__mcTheme` instead of reloading.
+///
+/// The scale is the app's own: borders are the ink at 10%, hover and chip
+/// fills 6%, cards 3%, muted text 60%, with 6, 8 and 12 point corners.
+fn tokens(palette: Palette) -> String {
+    let foreground = hex(palette.ink);
+    let accent = hex(palette.accent);
+    let background = background(palette);
+    let popover = hex(palette.popover);
+    let on_primary = &background;
+    let scheme = if palette.light() { "light" } else { "dark" };
+    let mix = |percent: u32| format!("color-mix(in srgb,{foreground} {percent}%,transparent)");
+    let (muted_foreground, muted, card, secondary, border, input, code) =
+        (mix(60), mix(6), mix(3), mix(6), mix(10), mix(12), mix(6));
+    format!(
+        ":root{{--background:{background};--foreground:{foreground};--muted-foreground:{muted_foreground};--muted:{muted};--card:{card};--card-foreground:{foreground};--popover:{popover};--popover-foreground:{foreground};--secondary:{secondary};--secondary-foreground:{foreground};--border:{border};--input:{input};--ring:{accent};--primary:{foreground};--primary-foreground:{on_primary};--accent:{accent};--accent-foreground:#ffffff;--accent-surface:color-mix(in srgb,{accent} 16%,transparent);--accent-surface-foreground:{accent};--destructive:#f43f5e;--destructive-foreground:#ffffff;--destructive-surface:color-mix(in srgb,#f43f5e 16%,transparent);--warning:#f59e0b;--warning-foreground:#1a1a1a;--warning-surface:color-mix(in srgb,#f59e0b 16%,transparent);--success:#10b981;--success-foreground:#ffffff;--info:#38bdf8;--info-foreground:#0b1a24;--code-background:{code};--code-foreground:{foreground};--surface:var(--card);--link:{accent};--selection:color-mix(in srgb,{accent} {selection}%,transparent);--positive:var(--success);--negative:var(--destructive);--chart-1:{accent};--chart-2:#10b981;--chart-3:#f59e0b;--chart-4:#f43f5e;--chart-5:#a78bfa;--chart-6:#22d3ee;--font-sans:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;--font-mono:ui-monospace,'SF Mono',Menlo,monospace;--font-size:13px;--radius-sm:6px;--radius:8px;--radius-lg:12px;color-scheme:{scheme}}}",
+        selection = if palette.light() { 20 } else { 35 }
+    )
+}
+
+/// The script that restyles an open page.
+pub(crate) fn retheme_script(palette: Palette) -> String {
+    format!(
+        "window.__mcTheme&&__mcTheme({});document.querySelectorAll('html,body,iframe').forEach(e=>e.style.background='{}')",
+        serde_json::Value::String(tokens(palette)),
+        background(palette)
+    )
+}
+
+/// MonoCode's component kit: `mc-*` classes and the `window.mc` helpers that
+/// `visual_docs {topic:"kit"}` describes.
+const KIT_STYLE: &str = concat!(
+    include_str!("../monos/kit.css"),
+    include_str!("../monos/kit_viz.css"),
+    include_str!("../monos/kit_controls.css")
+);
+const KIT_SCRIPT: &str = concat!(
+    include_str!("../monos/kit.js"),
+    "\n",
+    include_str!("../monos/kit_viz.js"),
+    "\n",
+    include_str!("../monos/kit_controls.js")
+);
+
+/// Runs first inside the page. It reports console output, errors, load and
+/// layout to the wrapper, answers inspection, and carries out the agent's
+/// clicks and typing as script events: never as real input, so the person's
+/// own focus and typing are left alone.
+const PAGE_PROBE: &str = r#"<script>(()=>{const post=m=>{try{parent.postMessage(Object.assign({__mc:1},m),'*')}catch(e){}};
+const text=a=>a.map(x=>{try{return typeof x==='string'?x:JSON.stringify(x)}catch(e){return String(x)}}).join(' ').slice(0,500);
+for(const l of ['log','info','warn','error']){const o=console[l];console[l]=(...a)=>{post({k:'c',l,t:text(a)});o.apply(console,a)}}
+addEventListener('error',e=>post({k:'c',l:'error',t:(e.message||'Script error')+(e.lineno?' (line '+e.lineno+')':'')}));
+addEventListener('unhandledrejection',e=>post({k:'c',l:'error',t:'Unhandled rejection: '+text([e.reason])}));
+addEventListener('securitypolicyviolation',e=>post({k:'c',l:'error',t:'Blocked by the page policy: '+e.blockedURI+' ('+e.violatedDirective+')'}));
+const metrics=()=>{const r=document.documentElement;if(!r)return;post({k:'m',w:r.scrollWidth,vw:r.clientWidth,fontsReady:document.fonts.status==='loaded',failedImages:Array.from(document.images).filter(i=>i.complete&&!i.naturalWidth).length})};
+document.fonts.ready.then(metrics);
+document.fonts.addEventListener('loadingdone',metrics);
+addEventListener('load',()=>{metrics();post({k:'l'})});
+post({k:'p',v:String(performance.timeOrigin)});
+let mode=false;
+const label=el=>{try{return String(el.getAttribute('aria-label')||(el.innerText||'').trim().replace(/\s+/g,' ').slice(0,60)||el.alt||el.placeholder||el.tagName.toLowerCase())}catch(x){return ''}};
+addEventListener('pointerdown',e=>{if(e.isTrusted&&!mode){const t=e.target;post({k:'u',a:t&&t.closest?'clicked '+JSON.stringify(label(t.closest('button,a,input,select,textarea,summary,[role]')||t)):''})}},true);
+addEventListener('keydown',e=>{if(e.isTrusted&&!mode)post({k:'u'})},true);
+const css=(el,o)=>Object.assign(el.style,o);
+const ui=(tag,o,text)=>{const el=document.createElement(tag);el.setAttribute('data-mc-ui','');css(el,o);if(text)el.textContent=text;return el};
+const ink='var(--foreground,#fff)',sheet='var(--popover,#222)',line='var(--border,rgba(255,255,255,.14))';
+let hl=null,box=null,note=null,pending=null,pins=0;
+const frame=()=>{const r=document.documentElement;return {w:Math.max(r.scrollWidth,1),h:Math.max(r.scrollHeight,1)}};
+const close=()=>{if(box){box.remove();box=null}pending=null};
+const pin=(x,y,n)=>{const p=ui('div',{position:'absolute',left:x-11+'px',top:y-11+'px',width:'22px',height:'22px',borderRadius:'11px',background:'var(--accent,#4da3f5)',color:'#fff',font:'600 12px/22px system-ui',textAlign:'center',zIndex:'2147483646',pointerEvents:'none',boxShadow:'0 2px 8px rgba(0,0,0,.35)'},String(n));document.documentElement.appendChild(p)};
+const open=e=>{close();const el=e.target;pending={el,x:e.pageX,y:e.pageY};
+box=ui('div',{position:'absolute',left:Math.max(8,Math.min(e.pageX+12,document.documentElement.clientWidth-268))+'px',top:e.pageY+12+'px',width:'256px',padding:'8px',background:sheet,color:ink,border:'1px solid '+line,borderRadius:'12px',boxShadow:'0 20px 25px -5px rgba(0,0,0,.25)',font:'13px system-ui',zIndex:'2147483647',display:'flex',flexDirection:'column',gap:'8px'});
+note=ui('textarea',{width:'100%',boxSizing:'border-box',minHeight:'56px',resize:'none',background:'transparent',color:'inherit',border:'1px solid '+line,borderRadius:'8px',padding:'6px 8px',font:'inherit',outline:'none'});note.placeholder='What should change here?';
+const row=ui('div',{display:'flex',gap:'6px',justifyContent:'flex-end'});
+const cancel=ui('button',{background:'transparent',color:'inherit',border:'1px solid '+line,borderRadius:'6px',padding:'0 10px',height:'26px',font:'12px system-ui',cursor:'pointer'},'Cancel');
+const add=ui('button',{background:ink,color:sheet,border:'0',borderRadius:'6px',padding:'0 10px',height:'26px',font:'12px system-ui',cursor:'pointer'},'Add');
+const commit=()=>{const text=note.value.trim();if(!text){close();return}const el=pending.el,f=frame();pins++;pin(pending.x,pending.y,pins);
+post({k:'f',f:{note:text.slice(0,600),tag:el.tagName.toLowerCase(),name:label(el),x:Math.round(1000*pending.x/f.w)/10,y:Math.round(1000*pending.y/f.h)/10}});close()};
+cancel.onclick=close;add.onclick=commit;
+note.addEventListener('keydown',k=>{k.stopPropagation();if(k.key==='Enter'&&!k.shiftKey){k.preventDefault();commit()}else if(k.key==='Escape')close()},true);
+row.append(cancel,add);box.append(note,row);document.documentElement.appendChild(box);note.focus()};
+const setMode=on=>{mode=!!on;if(!mode){close();if(hl)hl.style.display='none'}
+let s=document.getElementById('__mcmode');if(on&&!s){s=document.createElement('style');s.id='__mcmode';s.setAttribute('data-mc-ui','');s.textContent='html,html *{cursor:crosshair!important}';document.head.appendChild(s)}else if(!on&&s)s.remove();
+if(on&&!hl){hl=ui('div',{position:'fixed',pointerEvents:'none',border:'2px solid var(--accent,#4da3f5)',borderRadius:'4px',background:'rgba(77,163,245,.12)',zIndex:'2147483645',display:'none'});document.documentElement.appendChild(hl)}};
+addEventListener('mousemove',e=>{if(!mode||pending||!hl)return;const t=e.target;if(!t||!t.closest||t.closest('[data-mc-ui]')||t===document.documentElement){hl.style.display='none';return}const r=t.getBoundingClientRect();css(hl,{display:'block',left:r.left+'px',top:r.top+'px',width:r.width+'px',height:r.height+'px'})},true);
+for(const type of ['pointerdown','mousedown','mouseup','click']){addEventListener(type,e=>{if(!mode||!e.target.closest||e.target.closest('[data-mc-ui]'))return;e.preventDefault();e.stopPropagation();if(type==='click'&&!pending)open(e)},true)}
+const refs=new Map();
+const rgba=c=>{const m=/rgba?\(([^)]+)\)/.exec(c);if(!m)return null;const p=m[1].split(/[ ,\/]+/).filter(Boolean).map(Number);return {r:p[0],g:p[1],b:p[2],a:p.length>3?p[3]:1}};
+const lum=c=>{const f=v=>{v/=255;return v<=.03928?v/12.92:Math.pow((v+.055)/1.055,2.4)};return .2126*f(c.r)+.7152*f(c.g)+.0722*f(c.b)};
+const base=()=>{const v=getComputedStyle(document.documentElement).getPropertyValue('--background').trim(),m=/^#([0-9a-f]{6})$/i.exec(v);return m?{r:parseInt(m[1].slice(0,2),16),g:parseInt(m[1].slice(2,4),16),b:parseInt(m[1].slice(4,6),16)}:{r:255,g:255,b:255}};
+const under=el=>{let bg=base();const chain=[];for(let n=el;n;n=n.parentElement)chain.push(n);for(const n of chain.reverse()){const c=rgba(getComputedStyle(n).backgroundColor);if(c&&c.a>0){bg=c.a>=1?{r:c.r,g:c.g,b:c.b}:{r:c.r*c.a+bg.r*(1-c.a),g:c.g*c.a+bg.g*(1-c.a),b:c.b*c.a+bg.b*(1-c.a)}}}return bg};
+const audit=()=>{const out=[],say=t=>{if(out.length<12&&!out.includes(t))out.push(t)};
+const doc=document.documentElement;let seen=0;
+for(const el of document.body?document.body.querySelectorAll('*'):[]){if(seen++>1500)break;if(el.closest('[data-mc-ui]'))continue;
+const r=el.getBoundingClientRect();if(r.width<=0||r.height<=0)continue;const st=getComputedStyle(el);if(st.visibility==='hidden'||st.display==='none'||+st.opacity===0)continue;
+const own=Array.from(el.childNodes).some(n=>n.nodeType===3&&n.textContent.trim());
+if(own){const fg=rgba(st.color);if(fg){const bg=under(el),a=fg.a<1?{r:fg.r*fg.a+bg.r*(1-fg.a),g:fg.g*fg.a+bg.g*(1-fg.a),b:fg.b*fg.a+bg.b*(1-fg.a)}:fg;const l1=lum(a),l2=lum(bg),ratio=(Math.max(l1,l2)+.05)/(Math.min(l1,l2)+.05),size=parseFloat(st.fontSize),big=size>=24||(size>=18.66&&+st.fontWeight>=700);if(ratio<(big?3:4.5))say('Low contrast '+ratio.toFixed(1)+':1 on '+JSON.stringify(label(el)))}}
+const tag=el.tagName;const control=/^(BUTTON|A|INPUT|SELECT|TEXTAREA|SUMMARY)$/.test(tag)||el.getAttribute('role')==='button';
+if(control&&!el.disabled&&(r.height<24||r.width<24)&&!(tag==='INPUT'&&/^(checkbox|radio)$/.test(el.type)))say('Small target '+Math.round(r.width)+'×'+Math.round(r.height)+' on '+JSON.stringify(label(el)));
+if(/^(INPUT|SELECT|TEXTAREA)$/.test(tag)&&el.type!=='hidden'&&el.type!=='submit'&&el.type!=='button'&&!el.getAttribute('aria-label')&&!el.getAttribute('aria-labelledby')&&!(el.labels&&el.labels.length)&&!el.title)say('Field without a label'+(el.placeholder?' (placeholder '+JSON.stringify(el.placeholder)+')':''));
+if((tag==='BUTTON'||el.getAttribute('role')==='button')&&!(el.innerText||'').trim()&&!el.getAttribute('aria-label')&&!el.title)say('Button without a name');
+if(tag==='IMG'&&!el.hasAttribute('alt'))say('Image without alt text');
+if(st.overflow!=='visible'&&el.scrollWidth>el.clientWidth+2&&own&&st.textOverflow!=='ellipsis'&&el.clientWidth>0)say('Text is clipped in '+JSON.stringify(label(el)))}
+const f=frame();if(f.w>doc.clientWidth+2)say('The page is '+(f.w-doc.clientWidth)+'px wider than its viewport');
+return out};
+const fire=(el,type,C,init)=>el.dispatchEvent(new C(type,Object.assign({bubbles:true,cancelable:true,composed:true,view:window},init)));
+const click=el=>{el.scrollIntoView({block:'nearest',inline:'nearest'});
+const r=el.getBoundingClientRect(),i={button:0,buttons:1,pointerId:1,pointerType:'mouse',isPrimary:true,clientX:r.x+r.width/2,clientY:r.y+r.height/2};
+fire(el,'pointerover',PointerEvent,i);fire(el,'mouseover',MouseEvent,i);fire(el,'pointermove',PointerEvent,i);fire(el,'mousemove',MouseEvent,i);
+fire(el,'pointerdown',PointerEvent,i);const go=fire(el,'mousedown',MouseEvent,i);
+if(go&&el.focus)el.focus({preventScroll:true});
+i.buttons=0;fire(el,'pointerup',PointerEvent,i);fire(el,'mouseup',MouseEvent,i);el.click()};
+const typing=(text,replace)=>{const el=document.activeElement;
+if(!el||el===document.body||el===document.documentElement)return 'Click an input before typing';
+const edit=(type,data,inputType)=>fire(el,type,InputEvent,{data,inputType});
+if(el.isContentEditable){if(replace)document.execCommand('selectAll');document.execCommand(text?'insertText':'delete',false,text||null);return ''}
+if(el.tagName==='SELECT'){const o=Array.from(el.options).find(o=>o.text.trim()===text||o.value===text);if(!o)return 'No option matches '+JSON.stringify(text);el.value=o.value;fire(el,'input',Event);fire(el,'change',Event);return ''}
+if(el.tagName!=='INPUT'&&el.tagName!=='TEXTAREA')return 'The focused element is not editable';
+const set=Object.getOwnPropertyDescriptor(el.tagName==='INPUT'?HTMLInputElement.prototype:HTMLTextAreaElement.prototype,'value').set;
+const typed=el.tagName==='TEXTAREA'||/^(text|search|email|url|tel|password)?$/.test(el.type);
+if(!typed){set.call(el,text);edit('input',text,'insertText');fire(el,'change',Event);return ''}
+if(replace){set.call(el,'');edit('input',null,'deleteContentBackward')}
+for(const ch of text){const enter=ch==='\n',key={key:enter?'Enter':ch,bubbles:true,cancelable:true,composed:true};
+if(el.dispatchEvent(new KeyboardEvent('keydown',key))){el.dispatchEvent(new KeyboardEvent('keypress',key));
+if(enter&&el.tagName==='INPUT'){if(el.form)el.form.requestSubmit()}
+else if(el.dispatchEvent(new InputEvent('beforeinput',{data:enter?null:ch,inputType:enter?'insertLineBreak':'insertText',bubbles:true,cancelable:true,composed:true}))){set.call(el,el.value+ch);edit('input',enter?null:ch,enter?'insertLineBreak':'insertText')}}
+el.dispatchEvent(new KeyboardEvent('keyup',key))}
+fire(el,'change',Event);return ''};
+addEventListener('message',e=>{const d=e.data;if(e.source!==parent||!d)return;
+if(typeof d.__mcComment==='boolean')setMode(d.__mcComment);
+if(typeof d.__mcTheme==='string'){const s=document.getElementById('mc-theme');if(s){const k=document.createElement('style');k.textContent='*,*::before,*::after{transition:none!important}';document.head.appendChild(k);s.textContent=d.__mcTheme;getComputedStyle(document.body).color;setTimeout(()=>k.remove(),80)}}
+if(d.__mcAct){const a=d.__mcAct;let err='';try{if(a.kind==='click'){const el=refs.get(a.ref);if(!el||!el.isConnected)err='Element reference expired; inspect the draft again';else click(el)}else if(a.kind==='type')err=typing(String(a.text),!!a.replace)}catch(x){err=String(x&&x.message||x)}
+post({k:'r',id:a.id,err})}
+if(typeof d.__mcInspect==='string'){refs.clear();
+const elements=[];for(const el of document.querySelectorAll('button,input:not([type=hidden]),select,textarea,a[href],summary,[role=button],[role=switch],[role=tab],[role=checkbox],[role=menuitem],[contenteditable=""],[contenteditable=true],[tabindex]:not([tabindex="-1"])')){
+const r=el.getBoundingClientRect(),style=getComputedStyle(el);if(r.width<=0||r.height<=0||style.visibility==='hidden'||style.display==='none'||el.disabled||el.closest('[data-mc-ui]'))continue;
+const name=el.getAttribute('aria-label')||(el.labels&&Array.from(el.labels).map(l=>l.textContent).join(' '))||el.textContent||el.placeholder||el.tagName;
+const ref=d.__mcInspect+'-'+elements.length;refs.set(ref,el);
+elements.push({ref,name:String(name).trim().replace(/\s+/g,' ').slice(0,160),role:el.getAttribute('role')||el.tagName.toLowerCase(),x:r.x,y:r.y,width:r.width,height:r.height,value:el.getAttribute('aria-checked')??el.getAttribute('aria-selected')??(typeof el.value==='string'?el.value:null)});if(elements.length>=128)break}
+metrics();post({k:'s',id:d.__mcInspect,elements,issues:audit(),text:(document.body.innerText||'').slice(0,8000),url:location.href,title:document.title})}});
+const h=()=>{const r=document.documentElement;if(!r)return;post({k:'h',v:Math.ceil(r.scrollHeight>r.clientHeight?r.scrollHeight:r.getBoundingClientRect().height)});metrics()};
+const o=new ResizeObserver(h);if(document.documentElement)o.observe(document.documentElement);
+addEventListener('DOMContentLoaded',()=>{if(document.documentElement)o.observe(document.documentElement);if(document.body)o.observe(document.body);h()});addEventListener('load',h);})();</script>"#;
+
+/// The wrapper keeps the probe's reports where the app can read them.
+const WRAPPER_SCRIPT: &str = r#"<script>window.__mc={log:[],loaded:false,h:0,w:0,vw:0,fontsReady:false,failedImages:0,userControl:false,feedback:[],trail:[],issues:[]};
+const __frame=()=>document.querySelector('iframe')&&document.querySelector('iframe').contentWindow;
+window.__mcTheme=t=>{const f=__frame();if(f)f.postMessage({__mcTheme:t},'*')};
+window.__mcSend=m=>{const f=__frame()||window;f.postMessage(m,'*')};
+addEventListener('message',e=>{const d=e.data,s=window.__mc;if(!d||d.__mc!==1)return;
+if(d.k==='c'){if(s.log.length<50)s.log.push({level:String(d.l).slice(0,8),text:String(d.t).slice(0,500)})}
+else if(d.k==='l')s.loaded=true;
+else if(d.k==='p')s.page=d.v;
+else if(d.k==='u'){s.userControl=true;if(d.a&&s.trail.length<40)s.trail.push(String(d.a).slice(0,100))}
+else if(d.k==='v'&&d.v&&typeof d.v==='object')s.state=d.v;
+else if(d.k==='f'){if(s.feedback.length<50&&d.f)s.feedback.push(d.f)}
+else if(d.k==='r')s.result={id:d.id,err:d.err||''};
+else if(d.k==='s'){s.inspection=d.id;s.issues=d.issues||[];s.elements=d.elements;s.text=d.text;s.url=d.url;s.title=d.title}
+else if(d.k==='m'){s.w=d.w;s.vw=d.vw;s.fontsReady=d.fontsReady;s.failedImages=d.failedImages}
+else if(d.k==='h'&&Number.isFinite(d.v))s.h=Math.min(d.v,20000)});</script>"#;
+
+/// The probe and wrapper as one user script for a page the app does not
+/// author, such as a dev server: they share the top window.
+pub(crate) fn browser_probe() -> String {
+    let wrapper = WRAPPER_SCRIPT
+        .trim_start_matches("<script>")
+        .trim_end_matches("</script>")
+        .replace(
+            "if(!d||d.__mc!==1)return;",
+            "if(e.source!==window||!d||d.__mc!==1)return;",
+        );
+    format!(
+        "{wrapper}{}",
+        PAGE_PROBE
+            .trim_start_matches("<script>")
+            .trim_end_matches("</script>")
+            // In the top window the parent is the window itself.
+            .replace("e.source!==parent", "e.source!==window")
+    )
+}
+
+/// The agent's page inside a sandboxed iframe on the app's surface color.
+/// Nothing in it can reach the app, the network or the filesystem.
+pub(crate) fn sandbox(body: &str, palette: Palette) -> String {
+    let theme = tokens(palette);
+    let background = background(palette);
+    let policy = format!(
+        "script-src 'unsafe-inline' {}; style-src 'unsafe-inline' {}; img-src data: blob:; font-src data: {}; media-src data: blob:",
+        csp_sources(&SCRIPT_HOSTS),
+        csp_sources(&STYLE_HOSTS),
+        csp_sources(&FONT_HOSTS),
+    );
+    let csp = format!(
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; {policy}; worker-src blob:; connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'\"><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    );
+    let source = format!(
+        "<!doctype html>{csp}<style id=mc-theme>{theme}</style><style>*{{box-sizing:border-box}}html{{background:transparent}}body{{margin:0;font:var(--font-size)/1.5 var(--font-sans);color:var(--foreground);background:transparent;-webkit-font-smoothing:antialiased}}a{{color:var(--link)}}::selection{{background:var(--selection)}}{KIT_STYLE}</style>{PAGE_PROBE}<script>{KIT_SCRIPT}</script><body>{body}"
+    );
+    format!(
+        "<!doctype html><style>html,body,iframe{{margin:0;border:0;width:100%;height:100%;overflow:hidden;background:{background}}}</style>{WRAPPER_SCRIPT}<iframe sandbox=\"allow-scripts\" referrerpolicy=\"no-referrer\" srcdoc=\"{}\"></iframe>",
+        escape(&source)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_markup_cannot_escape_the_opaque_iframe() {
+        let html = sandbox(
+            "\"><script>window.top.postMessage('x','*')</script>",
+            Palette::forced(false),
+        );
+        assert!(html.contains("sandbox=\"allow-scripts\""));
+        assert!(!html.contains("allow-same-origin"));
+        assert!(html.contains("connect-src 'none'"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn pages_load_code_only_from_listed_cdns_and_never_connect_or_fetch_images() {
+        let page = sandbox("<p>x</p>", Palette::forced(false));
+        assert!(page.contains("script-src 'unsafe-inline' https://cdn.jsdelivr.net"));
+        assert!(!page.contains("script-src 'unsafe-inline' https:;"));
+        assert!(page.contains("img-src data: blob:;"));
+        assert!(page.contains("frame-src 'none'"));
+    }
+
+    #[test]
+    fn open_pages_are_rethemed_in_place_with_the_tokens_a_new_page_starts_with() {
+        let dark = Palette::forced(false);
+        let light = Palette::forced(true);
+        let page = sandbox("<p>x</p>", dark);
+        assert!(page.contains(&escape(&format!(
+            "<style id=mc-theme>{}</style>",
+            tokens(dark)
+        ))));
+        assert!(tokens(light).contains("color-scheme:light"));
+        assert!(tokens(dark).contains("color-scheme:dark"));
+        let script = retheme_script(light);
+        assert!(script.starts_with("window.__mcTheme&&__mcTheme(\""));
+        assert!(script.contains("--background:#ffffff"));
+        // The iframe paints over the document, so it is recolored too.
+        assert!(script.contains("querySelectorAll('html,body,iframe')"));
+        assert!(script.contains("style.background='#ffffff'"));
+    }
+
+    #[test]
+    fn the_browser_probe_reads_its_own_window_not_a_parent() {
+        let probe = browser_probe();
+        assert!(probe.contains("e.source!==window||!d||d.__mc!==1"));
+        assert!(!probe.contains("e.source!==parent"));
+        assert!(!probe.contains("<script>"));
+    }
+
+    #[test]
+    fn the_page_carries_the_optional_controls_kit() {
+        assert!(KIT_SCRIPT.contains("Object.assign(mc,{state,controls})"));
+        assert!(KIT_STYLE.contains(".mc-ctl.rail"));
+        // The wrapper keeps what the page reports for the agent's snapshot.
+        assert!(WRAPPER_SCRIPT.contains("d.k==='v'"));
+    }
+}

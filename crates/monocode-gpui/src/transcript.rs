@@ -7,6 +7,7 @@ mod follow_tests;
 pub(crate) mod git_turns;
 mod history;
 mod images;
+pub(crate) mod pages;
 pub(crate) use history::{HistoryPager, PreparedHistory};
 mod links;
 mod live_phase;
@@ -28,6 +29,7 @@ use crate::markdown_model::MarkdownParser;
 use crate::popover::{Anchor, AnchorSlot, Side, popover};
 use crate::response_actions::{self, Request as ResponseRequest};
 use crate::syntax::{HighlightRequest, HighlightedDocument};
+use crate::tooltip::Tip;
 use crate::{
     markdown::{self, Fence, MarkdownRow, Part},
     reveal::{Disclosure, Motion, PacedText},
@@ -139,6 +141,8 @@ enum Body {
     Markdown(Arc<MarkdownRow>),
     Visual(Arc<monocode_core::visual::VisualDocument>),
     Image(Arc<monocode_core::transcript::images::ImageDocument>),
+    /// A live page the agent opened here.
+    Draft(Arc<monocode_core::visual_bridge::DraftCard>),
     Plain(SharedString),
     Interjection(monocode_core::transcript::Interjection),
     Shell(Arc<monocode_core::shell_run::ShellRun>),
@@ -486,6 +490,8 @@ pub(crate) struct TranscriptView {
     attachment_images: HashMap<String, gpui::Entity<attachments::Photo>>,
     visuals: HashMap<usize, visuals::CachedVisual>,
     pictures: HashMap<std::path::PathBuf, images::CachedPicture>,
+    /// Re-measures the cards of live drafts when one opens, closes or resizes.
+    draft_watch: Option<gpui::Subscription>,
     history_position: Option<history::HistoryPosition>,
     history_start: usize,
     history_loading: bool,
@@ -570,6 +576,8 @@ pub(crate) struct TranscriptView {
     agent_panels: tasks::AgentPanels,
     thread_states: HashMap<i64, serde_json::Value>,
     thread_expanded: HashSet<i64>,
+    /// Finished child threads the user removed from the spawn tree.
+    thread_dismissed: HashSet<i64>,
     pub(crate) thread_driver: Option<String>,
     /// User messages opened past their four-line clamp, by start.
     expanded_prompts: HashSet<usize>,
@@ -2327,6 +2335,7 @@ impl TranscriptView {
             attachment_images: HashMap::new(),
             visuals: HashMap::new(),
             pictures: HashMap::new(),
+            draft_watch: None,
             history_position: None,
             history_start: 0,
             history_loading: false,
@@ -2388,6 +2397,7 @@ impl TranscriptView {
             agent_panels: Default::default(),
             thread_states: HashMap::new(),
             thread_expanded: HashSet::new(),
+            thread_dismissed: HashSet::new(),
             thread_driver: None,
             expanded_prompts: HashSet::new(),
             clamped_prompts: HashSet::new(),
@@ -3165,6 +3175,7 @@ impl TranscriptView {
                         | "remote-plan"
                         | "visual"
                         | monocode_core::transcript::images::ROLE
+                        | monocode_core::visual_bridge::DRAFT_ROLE
                         | "mono-document"
                         | "mono-note"
                         | "mono-launch"
@@ -3321,6 +3332,21 @@ impl TranscriptView {
                 let body = match document {
                     Some(document) => Body::Image(Arc::new(document)),
                     None => Body::Plain("This image could not be loaded.".into()),
+                };
+                self.rows.push(UiRow {
+                    key: (0, 0),
+                    body,
+                    message,
+                    first: false,
+                    last: false,
+                    work: false,
+                    work_tail: false,
+                    thought_phase: None,
+                });
+            } else if role == monocode_core::visual_bridge::DRAFT_ROLE {
+                let body = match serde_json::from_str(&text) {
+                    Ok(card) => Body::Draft(Arc::new(card)),
+                    Err(_) => Body::Plain("This draft could not be loaded.".into()),
                 };
                 self.rows.push(UiRow {
                     key: (0, 0),
@@ -3581,6 +3607,7 @@ impl TranscriptView {
                     && ready
                     && role != "visual"
                     && role != monocode_core::transcript::images::ROLE
+                    && role != monocode_core::visual_bridge::DRAFT_ROLE
                     && !activity.pinned.contains(&at)
                     && final_answer.is_some_and(|answer| at < answer)
                     && !matches!(row.body, Body::WorkLine { .. });
@@ -4652,6 +4679,7 @@ impl TranscriptView {
             Body::RemotePlan(plan) => self.remote_plan_card(&plan, cx),
             Body::Visual(document) => self.visual_row(message_start, document, cx),
             Body::Image(document) => self.image_row(document, cx),
+            Body::Draft(card) => self.draft_row(&card, cx),
             Body::Interjection(ref note) => {
                 let open = self.expanded.contains(&message_start);
                 let long = note.text.lines().count() > 4 || note.text.len() > 300;
@@ -5770,6 +5798,7 @@ impl Render for TranscriptView {
                 .left_0()
                 .size_full(),
             )
+            .child(crate::draft::sentinel())
             .children(self.outline(window, cx))
             .children(self.selection_menu(cx))
             .child(self.link_overlays(cx))
@@ -5805,6 +5834,7 @@ impl Render for TranscriptView {
                                         .child(self.jump_anchor.probe())
                                         .role(Role::Button)
                                         .aria_label("Scroll to bottom")
+                                        .tip("Scroll to bottom")
                                         .relative()
                                         .flex()
                                         .items_center()
@@ -6137,6 +6167,56 @@ mod scroll_tests {
                 assert_eq!(
                     bubble.corner_radii.top_left,
                     bubble.corner_radii.bottom_left
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn linked_prompt_wraps_inside_its_bubble(cx: &mut TestAppContext) {
+        // A prompt with a non-GitHub link once laid out in a flex row, so its
+        // long lines ran past the bubble instead of wrapping.
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(900.), px(1000.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| TranscriptView::new()),
+            )
+            .unwrap()
+        });
+        // About 2,200px of text: two lines unwrapped, six once it wraps at
+        // the bubble's 576px cap with the link's line above it.
+        let long = "Signatures are optional and drift from the headers. ".repeat(6);
+        window
+            .update(cx, |view, _, cx| {
+                let text = format!("https://linear.app/team/issue/WEB-515\n{long}");
+                view.patch(0, vec![row("user", &text)], cx);
+                settle(view, cx);
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, _| {
+                assert!(view.messages[0].user_link.is_some());
+                let bubble = window
+                    .painted_quads()
+                    .into_iter()
+                    .find(|quad| quad.background == user_bubble_fill().into())
+                    .unwrap();
+                let scale = window.scale_factor();
+                assert!(bubble.bounds.size.width.0 / scale <= 576.);
+                // 20px lines inside 8px of padding above and below.
+                let lines = (bubble.bounds.size.height.0 / scale - 16.) / 20.;
+                assert!(
+                    (5. ..=7.).contains(&lines),
+                    "linked text wraps to the bubble, got {lines} lines"
                 );
             })
             .unwrap();
