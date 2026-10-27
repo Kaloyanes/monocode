@@ -12,3 +12,7 @@ license = "MIT"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+
+# Full DWARF dominates target/ size; line tables keep backtraces usable.
+[profile.dev]
+debug = "line-tables-only"
