@@ -22,7 +22,9 @@ const state = vi.hoisted(() => ({
   getPermissions: vi.fn(),
   requestPermissions: vi.fn(),
   setChannel: vi.fn(),
-  schedule: vi.fn(),
+  activity: false,
+  pushToken: vi.fn(),
+  request: vi.fn(),
 }));
 
 vi.mock("react-native", () => ({
@@ -40,16 +42,25 @@ vi.mock("expo-notifications", () => ({
   getPermissionsAsync: state.getPermissions,
   requestPermissionsAsync: state.requestPermissions,
   setNotificationChannelAsync: state.setChannel,
-  scheduleNotificationAsync: state.schedule,
+  getExpoPushTokenAsync: state.pushToken,
   useLastNotificationResponse: () => null,
   DEFAULT_ACTION_IDENTIFIER: "default",
   AndroidImportance: { DEFAULT: 3 },
   IosAuthorizationStatus: { NOT_DETERMINED: 0 },
 }));
 vi.mock("expo-router", () => ({ router: { push: vi.fn() } }));
+vi.mock("expo-constants", () => ({
+  default: { expoConfig: { extra: { eas: { projectId: "project-id" } } } },
+}));
+vi.mock("@/features/connection/nativeLink", () => ({ request: state.request }));
+vi.mock("@/features/liveActivity/liveActivity", () => ({
+  liveActivitiesAvailable: () => true,
+  useLiveActivityPreference: () => [state.activity, vi.fn()],
+}));
+const pairing = { desktop: { fingerprint: "desktop" } };
 vi.mock("@/features/connection/ConnectionProvider", () => ({
   useConnection: () => ({
-    pairing: state.paired ? "desktop" : null,
+    pairing: state.paired ? pairing : null,
     connected: state.paired,
     catalog: { sessions: state.sessions, projects: [] },
   }),
@@ -73,11 +84,13 @@ beforeEach(() => {
   state.paired = true;
   state.enabled = true;
   state.sessions = [];
+  state.activity = false;
   state.settings = { status: "undetermined", canAskAgain: true };
   state.getPermissions.mockImplementation(async () => state.settings);
   state.requestPermissions.mockResolvedValue({ status: "granted" });
   state.setChannel.mockResolvedValue(null);
-  state.schedule.mockResolvedValue("notification");
+  state.pushToken.mockResolvedValue({ data: "ExponentPushToken[phone]" });
+  state.request.mockResolvedValue(null);
   root = createRoot(document.createElement("div"));
 });
 afterEach(() => act(() => root.unmount()));
@@ -130,17 +143,45 @@ it("does not prompt again for provisional iOS authorization", async () => {
   expect(state.requestPermissions).not.toHaveBeenCalled();
 });
 
-it.each(["android", "ios"])("routes immediate session alerts on %s", async (os) => {
-  state.os = os;
-  state.sessions = [{ id: "session", projectId: "project", busy: true, waiting: null }];
+it("registers the iOS push token and enabled categories with the desktop", async () => {
+  state.os = "ios";
+  state.settings = { status: "granted", canAskAgain: true, granted: true } as never;
   await render();
-  state.appState = "background";
-  state.sessions = [{ ...state.sessions[0], busy: false }];
+  expect(state.pushToken).toHaveBeenCalledWith({ projectId: "project-id" });
+  expect(state.request).toHaveBeenCalledWith(pairing, "device.notify", {
+    token: "ExponentPushToken[phone]",
+    categories: ["agentFinished"],
+    activity: false,
+  });
+  // A re-render with nothing changed does not register again.
   await render();
-  expect(state.schedule).toHaveBeenCalledWith(expect.objectContaining({
-    content: expect.objectContaining({ body: "Finished" }),
-    trigger: os === "android" ? { channelId: "sessions" } : null,
-  }));
+  expect(state.request).toHaveBeenCalledOnce();
+});
+
+it("asks the desktop to stop sending when every category is off", async () => {
+  state.os = "ios";
+  state.enabled = false;
+  state.settings = { status: "granted", canAskAgain: true, granted: true } as never;
+  await render();
+  expect(state.pushToken).not.toHaveBeenCalled();
+  expect(state.request).toHaveBeenCalledWith(pairing, "device.notify", {});
+});
+
+it("registers for silent pushes with alerts off while a Live Activity is wanted", async () => {
+  state.os = "ios";
+  state.enabled = false;
+  state.activity = true;
+  await render();
+  expect(state.request).toHaveBeenCalledWith(pairing, "device.notify", {
+    token: "ExponentPushToken[phone]",
+    categories: [],
+    activity: true,
+  });
+});
+
+it("does not register Android, which has no push service set up", async () => {
+  await render();
+  expect(state.request).not.toHaveBeenCalled();
 });
 
 it.each([true, false])("reflects Android notification denial with canAskAgain %s and updates after returning from Settings", async (canAskAgain) => {
