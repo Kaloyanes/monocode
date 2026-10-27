@@ -174,6 +174,8 @@ pub(crate) struct FileEditor {
     markdown: Option<Entity<TranscriptView>>,
     markdown_source: SharedString,
     navigation: Option<(usize, usize)>,
+    file_menu: Option<(Entity<crate::popover::Menu>, Subscription)>,
+    file_menu_anchor: crate::popover::AnchorSlot,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -317,6 +319,8 @@ impl FileEditor {
             markdown: None,
             markdown_source: "".into(),
             navigation: None,
+            file_menu: None,
+            file_menu_anchor: Default::default(),
             _subscriptions: subscriptions,
             _poll: poll,
         }
@@ -1252,6 +1256,7 @@ impl gpui::Render for FileEditor {
             .when(ready && !self.preview, |d| d.child(self.status_footer(cx)))
             .child(self.selection_surface(cx))
             .children(selection_menu)
+            .children(self.file_menu_popover(cx))
     }
 }
 

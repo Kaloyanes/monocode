@@ -1134,6 +1134,11 @@ impl DiffView {
                         if expanded { "Collapse" } else { "Expand" },
                         f.label
                     )))
+                    .tip(SharedString::from(format!(
+                        "{} {}",
+                        if expanded { "Collapse" } else { "Expand" },
+                        f.label
+                    )))
                     .aria_expanded(expanded)
                     .h_full()
                     .min_w_0()

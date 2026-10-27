@@ -1,25 +1,102 @@
 use super::FileEditor;
 use crate::{
     file_icons::file_type_icon,
+    popover::{Align, Anchor, Menu, MenuAction, MenuEvent, MenuItem, menu_popover},
     right_panel::{stroke, tabular},
     theme::*,
+    tooltip::Tip,
 };
-use gpui::{AnyElement, App, Context, Role, div, prelude::*, px};
+use gpui::{AnyElement, App, ClipboardItem, Context, Role, Task, Window, div, prelude::*, px};
+use monocode_core::files;
 use std::path::{Component, Path};
+
+const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+    "Reveal in Finder"
+} else if cfg!(target_os = "windows") {
+    "Reveal in File Explorer"
+} else {
+    "Open Containing Folder"
+};
+
+/// The open/reveal/copy rows shared by the path header and image menus.
+pub(super) fn file_menu_items() -> Vec<MenuItem> {
+    vec![
+        MenuAction::new("open-default", "Open in Default App").into(),
+        MenuAction::new("reveal", REVEAL_LABEL).into(),
+        MenuItem::Separator,
+        MenuAction::new("copy-path", "Copy Path").into(),
+    ]
+}
+
+/// Runs a `file_menu_items` pick; Finder/Launch Services calls go off the UI
+/// thread. `None` when `action` isn't a file action.
+pub(super) fn run_file_action(
+    path: &str,
+    action: &str,
+    cx: &mut App,
+) -> Option<Task<Result<(), String>>> {
+    let path = std::path::PathBuf::from(path);
+    match action {
+        "copy-path" => {
+            cx.write_to_clipboard(ClipboardItem::new_string(path.to_string_lossy().into()));
+            Some(Task::ready(Ok(())))
+        }
+        "open-default" => Some(
+            cx.background_executor()
+                .spawn(async move { files::open_path_with_default_app(&path) }),
+        ),
+        "reveal" => Some(
+            cx.background_executor()
+                .spawn(async move { files::reveal_path(&path) }),
+        ),
+        _ => None,
+    }
+}
 
 const HEADER_HEIGHT: f32 = 30.;
 const CONTROL_HEIGHT: f32 = 20.;
 const CONTROL_INSET: f32 = (HEADER_HEIGHT - 1. - CONTROL_HEIGHT) / 2.;
 
 impl FileEditor {
-    pub(super) fn path_header(&self, controls: Option<AnyElement>, cx: &App) -> AnyElement {
+    fn toggle_file_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let menu = cx.new(|cx| Menu::new("File actions", file_menu_items(), window, cx));
+        let sub = cx.subscribe(&menu, |this, _, event: &MenuEvent, cx| {
+            this.file_menu = None;
+            if let MenuEvent::Picked(id, _) = event
+                && let Some(task) = run_file_action(&this.path, id, cx)
+            {
+                cx.spawn(async move |this, cx| {
+                    if let Err(error) = task.await {
+                        let _ = this.update(cx, |this, cx| {
+                            this.error = Some(error);
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }
+            cx.notify();
+        });
+        self.file_menu = Some((menu, sub));
+        cx.notify();
+    }
+
+    pub(super) fn path_header(
+        &self,
+        controls: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let path = Path::new(&self.path);
         let name = path
             .file_name()
             .unwrap_or(path.as_os_str())
             .to_string_lossy();
-        let git = self.git.read(cx);
-        let root = [git.root.as_str(), self.cwd.as_str()]
+        let git_root = self.git.read(cx).root.clone();
+        let root = [git_root.as_str(), self.cwd.as_str()]
             .into_iter()
             .filter(|root| !root.is_empty() && *root != "~")
             .map(Path::new)
@@ -91,7 +168,46 @@ impl FileEditor {
                     ),
             )
             .children(controls)
+            .child(self.file_menu_button(cx))
             .into_any_element()
+    }
+
+    fn file_menu_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.file_menu.is_some();
+        div()
+            .id("file-actions")
+            .debug_selector(|| "file-actions".into())
+            .role(Role::Button)
+            .aria_label("File actions")
+            .tip("File actions")
+            .aria_expanded(open)
+            .group("file-actions")
+            .relative()
+            .size(px(CONTROL_HEIGHT))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .child(self.file_menu_anchor.probe())
+            .when(open, |d| d.bg(content(0.1)))
+            .when(!open, |d| d.hover(|s| s.bg(content(0.1))))
+            .child(
+                icon("more-horizontal", 14.)
+                    .text_color(content(if open { 1. } else { 0.5 }))
+                    .group_hover("file-actions", |s| s.text_color(content(1.))),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_file_menu(window, cx)))
+            .into_any_element()
+    }
+
+    pub(super) fn file_menu_popover(&self, cx: &App) -> Option<AnyElement> {
+        let (menu, _) = self.file_menu.as_ref()?;
+        Some(
+            menu_popover(menu, Anchor::Slot(self.file_menu_anchor.clone()), cx)
+                .align(Align::End)
+                .into_any_element(),
+        )
     }
 
     pub(super) fn word_wrap_control(&self, cx: &mut Context<Self>) -> AnyElement {

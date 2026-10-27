@@ -1660,6 +1660,7 @@ impl ReviewPane {
                         .debug_selector(|| "drag-file-pane".into())
                         .role(Role::Button)
                         .aria_label("Drag to reorder pane")
+                        .tip("Drag to reorder pane")
                         .w(px(20.))
                         .h(px(TAB_PLATE_HEIGHT))
                         .ml(px(6.))

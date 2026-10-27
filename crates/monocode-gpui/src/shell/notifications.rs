@@ -1256,7 +1256,7 @@ impl Shell {
                     self.open_work_link_later(url, cx);
                 }
             }
-            LinkedActivityEvent::AddToChat(id, prompt) => {
+            LinkedActivityEvent::AddToChat(id, prompt, label) => {
                 cx.spawn(async move |this, cx| {
                     let _ = this.update_in(cx, |this, window, cx| {
                         this.close_settings(window, cx);
@@ -1268,23 +1268,15 @@ impl Shell {
                         }
                         if let Some(view) = this.notification_chat(id, cx) {
                             let input = view.read(cx).input.clone();
-                            if !input.read(cx).is_composing() {
-                                input.update(cx, |input, cx| {
-                                    let draft = input.content.to_string();
-                                    let separator = if draft.is_empty() || draft.ends_with("\n\n") {
-                                        ""
-                                    } else if draft.ends_with('\n') {
-                                        "\n"
-                                    } else {
-                                        "\n\n"
-                                    };
-                                    input.set_text(
-                                        format!("{draft}{separator}{}\n\n", prompt.trim()),
-                                        cx,
-                                    );
-                                });
-                                window.focus(&input.focus_handle(cx), cx);
-                            }
+                            view.update(cx, |view, cx| {
+                                view.attach_snippet(
+                                    monocode_core::composer::Snippet::Activity,
+                                    Some(label),
+                                    prompt,
+                                    cx,
+                                )
+                            });
+                            window.focus(&input.focus_handle(cx), cx);
                         }
                         window.activate_window();
                         cx.notify();

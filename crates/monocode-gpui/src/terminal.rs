@@ -80,6 +80,8 @@ impl Dimensions for GridSize {
 pub(crate) enum TerminalEvent {
     /// Title, foreground process or running state changed.
     Changed,
+    /// The selection, attached to the active chat as a snippet.
+    AddToChat(String),
 }
 
 /// Where the grid was painted, for mapping the pointer to cells.
@@ -106,6 +108,8 @@ pub(crate) struct Terminal {
     selecting: bool,
     selection_pointer: Option<gpui::Point<gpui::Pixels>>,
     selection_scroll: Option<Task<()>>,
+    /// Where a finished drag left its pointer: the Add to chat menu's anchor.
+    selection_menu: Option<gpui::Point<gpui::Pixels>>,
     scroll_remainder: f32,
     pub(crate) visible: bool,
     _events: Task<()>,
@@ -294,6 +298,7 @@ impl Terminal {
             selecting: false,
             selection_pointer: None,
             selection_scroll: None,
+            selection_menu: None,
             scroll_remainder: 0.,
             visible: true,
             _events: events,
@@ -381,6 +386,7 @@ impl Terminal {
     /// Typing returns a scrolled-back view to the prompt.
     fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
         self.stop_selection();
+        self.selection_menu = None;
         {
             let mut term = self.term.lock();
             term.scroll_display(Scroll::Bottom);
@@ -496,6 +502,7 @@ impl Terminal {
     }
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
+        self.selection_menu = None;
         let Some((at, side)) = self.grid_point(event.position) else {
             return;
         };
@@ -540,6 +547,82 @@ impl Terminal {
         self.selecting = false;
         self.selection_pointer = None;
         self.selection_scroll = None;
+    }
+    /// Releasing a drag over some text offers it to the chat.
+    fn finish_selection(&mut self, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        // Capture runs before the menu's own click, which must still land.
+        if !self.selecting {
+            return;
+        }
+        self.stop_selection();
+        if self.selected_text().is_some() {
+            self.selection_menu = Some(position);
+            cx.notify();
+        }
+    }
+    fn selected_text(&self) -> Option<String> {
+        self.term
+            .lock()
+            .selection_to_string()
+            .filter(|t| !t.trim().is_empty())
+    }
+    fn add_selection_to_chat(&mut self, cx: &mut Context<Self>) {
+        self.selection_menu = None;
+        let Some(text) = self.selected_text() else {
+            cx.notify();
+            return;
+        };
+        self.term.lock().selection = None;
+        cx.emit(TerminalEvent::AddToChat(text.trim_end().to_owned()));
+        cx.notify();
+    }
+    fn selection_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        use crate::popover::{Align, Anchor, Side, popover};
+        let at = self.selection_menu?;
+        let weak = cx.entity().downgrade();
+        Some(
+            popover("terminal-selection-menu", Anchor::Point(at))
+                .side(Side::Top)
+                .align(Align::Center)
+                .gap(6.)
+                .child(
+                    div()
+                        .id("terminal-selection-actions")
+                        .role(gpui::Role::Toolbar)
+                        .aria_label("Selected terminal text actions")
+                        .p_1()
+                        .child(
+                            div()
+                                .id("terminal-selection-chat")
+                                .role(gpui::Role::Button)
+                                .aria_label("Add to chat")
+                                .tab_index(0)
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .h(px(28.))
+                                .px_2()
+                                .rounded(px(8.))
+                                .text_size(px(13.))
+                                .hover(|s| s.bg(content(0.05)))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(icon("comment-add", 14.))
+                                .child("Add to chat")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.add_selection_to_chat(cx)),
+                                ),
+                        ),
+                )
+                .on_dismiss(move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.selection_menu = None;
+                        cx.notify();
+                    });
+                })
+                .into_any_element(),
+        )
     }
     /// Keep extending the same selection through scrollback at either edge,
     /// even when the pointer is held still outside the terminal.
@@ -610,6 +693,7 @@ impl Terminal {
         if lines == 0 {
             return;
         }
+        self.selection_menu = None;
         let mode = *self.term.lock().mode();
         // A program tracking the mouse gets the wheel itself.
         if mode.intersects(TermMode::MOUSE_MODE) {
@@ -675,6 +759,7 @@ impl Render for Terminal {
                 terminal: cx.entity(),
                 focused,
             })
+            .children(self.selection_menu(cx))
     }
 }
 
@@ -953,7 +1038,9 @@ impl Element for Grid {
         let terminal = self.terminal.downgrade();
         window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _, cx| {
             if phase == gpui::DispatchPhase::Capture && event.button == MouseButton::Left {
-                let _ = terminal.update(cx, |terminal, _| terminal.stop_selection());
+                let _ = terminal.update(cx, |terminal, cx| {
+                    terminal.finish_selection(event.position, cx)
+                });
             }
         });
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
@@ -1380,6 +1467,42 @@ mod tests {
     }
     fn bytes(spec: &str) -> Option<Vec<u8>> {
         key_bytes(&key(spec), TermMode::empty())
+    }
+
+    #[gpui::test]
+    fn releasing_a_drag_offers_the_selection_to_chat(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| Terminal::new("/tmp".into(), cx));
+        let sent = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = sent.clone();
+        cx.update(|cx| {
+            cx.subscribe(&view, move |_, event: &TerminalEvent, _| {
+                if let TerminalEvent::AddToChat(text) = event {
+                    log.borrow_mut().push(text.clone());
+                }
+            })
+            .detach()
+        });
+        view.update(cx, |terminal, cx| {
+            terminal.resize(40, 4, size(px(8.), px(16.)));
+            write_note(&terminal.term, "\x1b[2J\x1b[Hrun ```x```");
+            let mut selection = Selection::new(
+                SelectionType::Simple,
+                GridPoint::new(Line(0), Column(0)),
+                Side::Left,
+            );
+            selection.update(GridPoint::new(Line(0), Column(10)), Side::Right);
+            // A plain click leaves no menu behind.
+            terminal.finish_selection(point(px(4.), px(4.)), cx);
+            assert!(terminal.selection_menu.is_none());
+            terminal.term.lock().selection = Some(selection);
+            terminal.selecting = true;
+            terminal.finish_selection(point(px(40.), px(8.)), cx);
+            assert_eq!(terminal.selection_menu, Some(point(px(40.), px(8.))));
+            terminal.add_selection_to_chat(cx);
+            assert!(terminal.selection_menu.is_none());
+            assert!(terminal.term.lock().selection.is_none());
+        });
+        assert_eq!(*sent.borrow(), vec!["run ```x```".to_owned()]);
     }
 
     #[gpui::test]
