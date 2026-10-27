@@ -6,8 +6,9 @@ pub(crate) mod text;
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::files::remote as remote_workspace;
@@ -15,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use review::{
-    commit_file_diff, commit_files, diff_files, file_diff, file_diff_versions, review_index,
-    stage_contents, FileDiff, FileDiffVersion, MAX_TEXT_FILE_BYTES,
+    FileDiff, FileDiffVersion, MAX_TEXT_FILE_BYTES, commit_file_diff, commit_files, diff_files,
+    file_diff, file_diff_versions, review_index, stage_contents,
 };
 pub(crate) use shell::{expand_home, path_to_js};
 
@@ -29,7 +30,10 @@ pub fn terminal_search_path() -> String {
 pub fn resolve_gui_binary(name: &str) -> Option<std::path::PathBuf> {
     shell::resolve_gui_binary(name)
 }
-pub use text::{commit_message_prompt, parse_commit_message, parse_pr_content, pr_content_prompt};
+pub use text::{
+    PlannedCommit, commit_message_prompt, commit_plan_prompt, parse_commit_message,
+    parse_commit_plan, parse_pr_content, pr_content_prompt,
+};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -316,6 +320,15 @@ pub fn staged_context(cwd: &Path) -> Result<StagedContext, String> {
         summary,
         patch,
     })
+}
+
+/// Everything uncommitted, staged or not, against HEAD, for splitting it into commits.
+pub fn working_patch(cwd: &Path) -> Result<String, String> {
+    if remote_workspace::is_remote(cwd) {
+        return Err("A commit plan needs a local project.".into());
+    }
+    let root = expand_home(cwd);
+    Ok(git_run(&root, &["diff", "HEAD", "--no-ext-diff", "--", "."]).unwrap_or_default())
 }
 
 /// Commits and diff between the default branch and HEAD, for PR text generation.
@@ -731,9 +744,38 @@ fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>) {
         let entry = files.entry(relative.clone()).or_default();
         entry.untracked = true;
         if entry.additions == 0 {
-            entry.additions = text_line_count(&root.join(rel));
+            entry.additions = cached_line_count(&root.join(rel));
         }
     }
+}
+
+/// Untracked files' line counts by path, with the size and modified time they
+/// were counted at. A build folder nobody ignored can hold tens of thousands of
+/// files and gigabytes; each refresh then only reads their metadata.
+static UNTRACKED_LINES: LazyLock<Mutex<HashMap<PathBuf, (u64, SystemTime, i64)>>> =
+    LazyLock::new(Default::default);
+/// Past this many entries the cache starts over, rather than grow for good.
+const UNTRACKED_LINES_CAP: usize = 200_000;
+
+fn cached_line_count(path: &Path) -> i64 {
+    let Some(stamp) = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| Some((meta.len(), meta.modified().ok()?)))
+    else {
+        return text_line_count(path);
+    };
+    if let Some(&(len, modified, lines)) = UNTRACKED_LINES.lock().unwrap().get(path) {
+        if (len, modified) == stamp {
+            return lines;
+        }
+    }
+    let lines = text_line_count(path);
+    let mut cache = UNTRACKED_LINES.lock().unwrap();
+    if cache.len() >= UNTRACKED_LINES_CAP {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), (stamp.0, stamp.1, lines));
+    lines
 }
 
 fn text_line_count(path: &Path) -> i64 {
@@ -1376,11 +1418,7 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 #[cfg(test)]
