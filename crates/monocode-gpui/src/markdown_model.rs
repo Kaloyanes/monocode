@@ -467,7 +467,8 @@ fn parse_at(text: &str, base: usize, hard_breaks: bool) -> BlockTree {
         if depth == 0 {
             let mut events = std::mem::take(&mut pending).into_iter().peekable();
             tree.blocks
-                .extend(blocks(&mut events, None, 0).into_iter().map(|block| {
+                .extend(blocks(&mut events, None, 0).into_iter().map(|mut block| {
+                    link_bare_urls(&mut block);
                     Arc::new(TopBlock {
                         range: base + start..base + range.end,
                         block,
@@ -477,6 +478,130 @@ fn parse_at(text: &str, base: usize, hard_breaks: bool) -> BlockTree {
     }
     tree
 }
+/// Agents write bare URLs the way GitHub renders them, but CommonMark leaves
+/// them as text. Turn them into link runs, merging the text pieces that
+/// pulldown splits around `_` and `*` so a URL is scanned whole.
+fn link_bare_urls(block: &mut Block) {
+    match block {
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => link_runs(runs),
+        Block::List { items, .. } => items.iter_mut().flatten().for_each(link_bare_urls),
+        Block::BlockQuote { children } => children.iter_mut().for_each(link_bare_urls),
+        Block::Table { header, rows, .. } => header
+            .iter_mut()
+            .chain(rows.iter_mut().flatten())
+            .for_each(link_runs),
+        Block::CodeBlock { .. } | Block::Rule | Block::Math { .. } => {}
+    }
+}
+
+fn link_runs(runs: &mut Vec<InlineRun>) {
+    let plain = |run: &InlineRun| {
+        run.style.link.is_none() && !run.style.code && !run.style.math && run.style.task.is_none()
+    };
+    if !runs
+        .iter()
+        .any(|run| plain(run) && run.text.contains("://"))
+    {
+        return;
+    }
+    let mut out = Vec::with_capacity(runs.len());
+    for run in runs.drain(..) {
+        match out.last_mut() {
+            Some(last) if plain(&run) && plain(last) && last.style == run.style => {
+                last.text.push_str(&run.text)
+            }
+            _ => out.push(run),
+        }
+    }
+    for run in out {
+        if !plain(&run) {
+            runs.push(run);
+            continue;
+        }
+        let mut copied = 0;
+        for (start, end) in bare_urls(&run.text) {
+            if copied < start {
+                runs.push(InlineRun {
+                    text: run.text[copied..start].into(),
+                    style: run.style.clone(),
+                });
+            }
+            let url = &run.text[start..end];
+            runs.push(InlineRun {
+                text: url.into(),
+                style: InlineStyle {
+                    link: Some(url.into()),
+                    ..run.style.clone()
+                },
+            });
+            copied = end;
+        }
+        if copied < run.text.len() {
+            runs.push(InlineRun {
+                text: run.text[copied..].into(),
+                style: run.style,
+            });
+        }
+    }
+}
+
+/// Byte ranges of the `http(s)://` URLs in `text`, without the punctuation
+/// that closes the sentence or bracket around them.
+pub(crate) fn bare_urls(text: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while from < text.len() {
+        let rest = &text[from..];
+        let lower = rest.to_ascii_lowercase();
+        let Some(offset) = ["https://", "http://"]
+            .iter()
+            .filter_map(|scheme| lower.find(scheme).map(|at| (at, scheme.len())))
+            .min()
+        else {
+            break;
+        };
+        let (at, scheme) = offset;
+        let start = from + at;
+        let attached = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        let mut end = start
+            + text[start..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>'))
+                .unwrap_or(text.len() - start);
+        loop {
+            let url = &text[start..end];
+            let Some(last) = url.chars().next_back() else {
+                break;
+            };
+            let opener = match last {
+                ')' => Some('('),
+                ']' => Some('['),
+                '}' => Some('{'),
+                _ => None,
+            };
+            let trim = match opener {
+                Some(open) => url.matches(open).count() < url.matches(last).count(),
+                None => matches!(
+                    last,
+                    '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '*' | '_'
+                ),
+            };
+            if !trim {
+                break;
+            }
+            end -= last.len_utf8();
+        }
+        let host = text[start + scheme..end].chars().next();
+        if !attached && host.is_some_and(char::is_alphanumeric) {
+            found.push((start, end));
+        }
+        from = end.max(start + scheme);
+    }
+    found
+}
+
 fn blocks(events: &mut Events<'_>, until: Option<TagEnd>, depth: usize) -> Vec<Block> {
     let mut out = Vec::new();
     while let Some(event) = events.next() {
@@ -712,6 +837,39 @@ mod note_break_tests {
             panic!("expected code")
         };
         assert_eq!(code, "one\ntwo\n");
+    }
+
+    #[test]
+    fn bare_urls_become_links_outside_code_and_existing_links() {
+        fn links(text: &str) -> Vec<String> {
+            fn walk(block: &Block, out: &mut Vec<String>) {
+                match block {
+                    Block::Paragraph { runs } => {
+                        out.extend(runs.iter().filter_map(|run| run.style.link.clone()))
+                    }
+                    Block::List { items, .. } => items.iter().flatten().for_each(|b| walk(b, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            parse_full(text)
+                .blocks
+                .iter()
+                .for_each(|b| walk(&b.block, &mut out));
+            out
+        }
+        assert_eq!(
+            links("I opened the draft PR: https://github.com/acme/app/pull/1177."),
+            ["https://github.com/acme/app/pull/1177"]
+        );
+        assert_eq!(
+            links("- see (https://x.dev/a_b_c) and **https://y.dev**"),
+            ["https://x.dev/a_b_c", "https://y.dev"]
+        );
+        assert_eq!(
+            links("[docs](https://x.dev) `https://y.dev`\n\n```\nhttps://z.dev\n```"),
+            ["https://x.dev"]
+        );
     }
 }
 

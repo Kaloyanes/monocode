@@ -270,6 +270,16 @@ fn notice(rows: &[Row], at: usize, end: usize) -> Option<Value> {
                 json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to interact")}),
             )
         }
+        monocode_core::visual_bridge::DRAFT_ROLE => {
+            let title = serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(&text)
+                .ok()
+                .map(|card| card.title)
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| "Draft".into());
+            Some(
+                json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to interact")}),
+            )
+        }
         monocode_core::transcript::images::ROLE => {
             let title =
                 serde_json::from_str::<monocode_core::transcript::images::ImageDocument>(&text)
@@ -478,7 +488,10 @@ fn agent_turn(source: &Source, turn: &Turn, live: bool) -> Value {
             continue;
         }
         responded = true;
-        if role == "visual" || role == monocode_core::transcript::images::ROLE {
+        if role == "visual"
+            || role == monocode_core::transcript::images::ROLE
+            || role == monocode_core::visual_bridge::DRAFT_ROLE
+        {
             close(&mut work, &mut items);
             if let Some(notice) = notice(rows, at, end) {
                 items.push(notice);
@@ -808,8 +821,6 @@ mod tests {
     #[test]
     fn native_visuals_keep_a_readable_phone_fallback_outside_folded_work() {
         let document = monocode_core::visual::VisualDocument {
-            format: Default::default(),
-            height: None,
             id: "phone-example".into(),
             title: "Capacity explorer".into(),
             source: "return () => visual.text('Example');".into(),

@@ -179,6 +179,26 @@ pub fn format_comment(path: &str, line: &Line, comment: &str) -> String {
     )
 }
 
+/// The short "main.rs L42" a formatted comment's chip shows.
+pub fn comment_label(comment: &str) -> Option<String> {
+    let first = comment.lines().next()?.strip_prefix("Diff comment on `")?;
+    let first = first.strip_suffix(':')?;
+    let location = first
+        .strip_suffix(" (deleted line)")
+        .unwrap_or(first)
+        .strip_suffix('`')?
+        .replace("\\`", "`");
+    let (path, line) = match location.rsplit_once(':') {
+        Some((path, line)) if line.parse::<u32>().is_ok() => (path, Some(line)),
+        _ => (location.as_str(), None),
+    };
+    let name = path.rsplit('/').next().unwrap_or(path);
+    Some(match line {
+        Some(line) => format!("{name} L{line}"),
+        None => name.to_owned(),
+    })
+}
+
 /// Monospace columns: tab stops of 4, wide CJK and emoji 2, marks 0.
 pub fn visual_columns(text: &str) -> usize {
     use unicode_width::UnicodeWidthChar;
@@ -637,6 +657,9 @@ mod tests {
             "Diff comment on `src/a\\`b.rs:4` (deleted line):\n\n> -let x = 1;\n\nwhy?"
         );
         assert_eq!(format_comment("a", &line, "  "), "");
+        let comment = format_comment("src/a`b.rs", &line, "why?");
+        assert_eq!(comment_label(&comment).as_deref(), Some("a`b.rs L4"));
+        assert_eq!(comment_label("not a comment"), None);
     }
     #[test]
     fn columns_count_tabs_and_wide_characters() {

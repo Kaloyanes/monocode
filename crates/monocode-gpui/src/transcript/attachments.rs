@@ -294,6 +294,10 @@ impl TranscriptView {
                         .child(photo)
                         .into_any_element()
                 } else {
+                    let snippet = file
+                        .path
+                        .as_deref()
+                        .and_then(monocode_core::composer::snippet);
                     div()
                         .min_w_0()
                         .flex()
@@ -303,16 +307,19 @@ impl TranscriptView {
                         .py_1()
                         .rounded_md()
                         .bg(content(0.06))
-                        .child(crate::file_icons::file_type_icon(
-                            &file.name, false, false, 16.,
+                        .child(match &snippet {
+                            Some((kind, _)) => icon(kind.icon(), 16.).into_any_element(),
+                            None => {
+                                crate::file_icons::file_type_icon(&file.name, false, false, 16.)
+                                    .into_any_element()
+                            }
+                        })
+                        .child(div().max_w(px(140.)).truncate().text_size(px(11.)).child(
+                            match snippet {
+                                Some((_, label)) => label.into(),
+                                None => file.name.clone(),
+                            },
                         ))
-                        .child(
-                            div()
-                                .max_w(px(140.))
-                                .truncate()
-                                .text_size(px(11.))
-                                .child(file.name.clone()),
-                        )
                         .into_any_element()
                 }
             }))

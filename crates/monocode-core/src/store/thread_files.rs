@@ -97,6 +97,18 @@ impl Store {
             height: found.height,
         })
     }
+    /// Keeps the page a saved picture was made from beside it, so the card can
+    /// reopen the draft. Written once per picture.
+    pub fn save_thread_draft(&self, image: &ImageDocument, html: &Path) -> Result<(), String> {
+        let target = image.path.with_extension("html");
+        if target.exists() {
+            return Ok(());
+        }
+        let partial = target.with_extension("html.partial");
+        std::fs::copy(html, &partial)
+            .and_then(|_| std::fs::rename(&partial, &target))
+            .map_err(|e| e.to_string())
+    }
     /// Moves files from `staging` into the conversation's attachment folder and
     /// returns the updated paths. Paths outside `staging` belong to the user and
     /// are returned unchanged.
@@ -264,6 +276,29 @@ mod tests {
 
         store.delete(id).unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_kept_draft_keeps_its_page_beside_the_picture_and_goes_with_the_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_monocode(&temp.path().join("sessions.db")).unwrap();
+        let id = store.create("claude", "/tmp").unwrap().id;
+        let png = crate::transcript::images::tests::png(4, 3);
+        let image = store.save_thread_image(id, &png, "Pricing").unwrap();
+        // A plain picture has no page to reopen.
+        assert!(image.draft().is_none());
+        let page = temp.path().join("page.html");
+        std::fs::write(&page, "<p>one</p>").unwrap();
+        store.save_thread_draft(&image, &page).unwrap();
+        let kept = image.draft().expect("the page is kept");
+        assert_eq!(kept.parent(), image.path.parent());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "<p>one</p>");
+        // Keeping the same picture again does not overwrite the page.
+        std::fs::write(&page, "<p>two</p>").unwrap();
+        store.save_thread_draft(&image, &page).unwrap();
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "<p>one</p>");
+        store.delete(id).unwrap();
+        assert!(!kept.exists());
     }
 
     #[test]

@@ -15,6 +15,8 @@ impl AssetSource for Assets {
    "queue-pause"=>include_bytes!("../assets/hugeicons/queue-pause.svg"),
    "queue-play"=>include_bytes!("../assets/hugeicons/queue-play.svg"),
    "play"=>include_bytes!("../assets/hugeicons/play.svg"),
+   "move-to-top"=>include_bytes!("../assets/hugeicons/move-to-top.svg"),
+   "skip-over"=>include_bytes!("../assets/hugeicons/skip-over.svg"),
    "test-tube"=>include_bytes!("../assets/hugeicons/test-tube.svg"),
    "hammer"=>include_bytes!("../assets/hugeicons/hammer.svg"),
    "rocket"=>include_bytes!("../assets/hugeicons/rocket.svg"),

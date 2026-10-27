@@ -200,6 +200,16 @@ impl Conversation {
             })
             .collect();
         if images.is_empty() {
+            // A queued message's editor has no attachments; it keeps text.
+            let text = clipboard.text().filter(|text| {
+                self.follow_ups.edit.is_none()
+                    && !self.input.read(cx).is_composing()
+                    && monocode_core::composer::is_long_paste(text)
+            });
+            if let Some(text) = text {
+                self.attach_snippet(monocode_core::composer::Snippet::Pasted, None, text, cx);
+                return true;
+            }
             return false;
         }
         if self.attaching {
@@ -243,6 +253,50 @@ impl Conversation {
         .detach();
         cx.notify();
         true
+    }
+    /// Add a terminal selection, long paste, quote or comment as a compact
+    /// chip, not as text in the draft. The agent still receives the full
+    /// text with the prompt.
+    pub(crate) fn attach_snippet(
+        &mut self,
+        kind: monocode_core::composer::Snippet,
+        label: Option<String>,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let id = self.summary.id;
+        let work = cx.background_executor().spawn(async move {
+            let root = locked(&store)?
+                .thread_attachments_dir(id)?
+                .unwrap_or_else(|| std::env::temp_dir().join("monocode-attachments"));
+            monocode_core::composer::save_snippet(&root, kind, label.as_deref(), &text)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(path) => this.add_attachments(vec![path], cx),
+                Err(error) => {
+                    this.attachment_error = Some(error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+    /// A quoted passage, labelled by its opening words.
+    pub(super) fn attach_quote(&mut self, text: String, cx: &mut Context<Self>) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let text = text.trim();
+        if !text.is_empty() {
+            let label = Some(text.to_owned());
+            self.attach_snippet(
+                monocode_core::composer::Snippet::Quote,
+                label,
+                text.into(),
+                cx,
+            );
+        }
     }
     pub(super) fn add_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         for path in paths {
@@ -320,11 +374,15 @@ impl Conversation {
                 .flex_wrap()
                 .gap_1p5()
                 .children(self.attachments.iter().enumerate().map(|(ix, path)| {
-                    let label = path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
+                    let snippet = monocode_core::composer::snippet(path);
+                    let label = match &snippet {
+                        Some((_, label)) => label.clone(),
+                        None => path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                    };
                     let photo = self.attachment_photos.get(path).cloned();
                     let image = monocode_core::composer::image_mime(path).is_some();
                     let remove = div()
@@ -398,7 +456,11 @@ impl Conversation {
                         .rounded_md()
                         .bg(content(0.06))
                         .text_size(px(11.))
-                        .child(crate::file_icons::file_type_icon(&label, false, false, 14.))
+                        .child(match &snippet {
+                            Some((kind, _)) => icon(kind.icon(), 14.).into_any_element(),
+                            None => crate::file_icons::file_type_icon(&label, false, false, 14.)
+                                .into_any_element(),
+                        })
                         .child(div().max_w(px(190.)).truncate().child(label))
                         .child(remove)
                         .into_any_element()

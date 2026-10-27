@@ -165,7 +165,7 @@ fn project_content(block: &Value) -> Result<Vec<Row>, String> {
         t.begin(match role {
             "user" if block["internal"] == true => "mono-system",
             "user" | "assistant" | "reasoning" | "error" | "mono-card" | "visual" => role,
-            crate::transcript::images::ROLE => role,
+            crate::transcript::images::ROLE | crate::visual_bridge::DRAFT_ROLE => role,
             "system" if block["notice"] == "error" => "error",
             "plan" | "tasks" => "assistant",
             _ => "system",
@@ -623,8 +623,6 @@ mod panel_tests {
     #[test]
     fn native_visuals_survive_chunking_storage_and_later_messages() {
         let document = crate::visual::VisualDocument {
-            format: Default::default(),
-            height: None,
             id: "visual-plot".into(),
             title: "Results 🙂".into(),
             source: format!(

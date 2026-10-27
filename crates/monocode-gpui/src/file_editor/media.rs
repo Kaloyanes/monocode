@@ -291,14 +291,21 @@ impl MediaPreview {
         let menu = cx.new(|cx| {
             Menu::new(
                 "Image actions",
-                vec![MenuAction::new("copy", "Copy Original File").into()],
+                std::iter::once(MenuAction::new("copy", "Copy Original File").into())
+                    .chain(std::iter::once(crate::popover::MenuItem::Separator))
+                    .chain(super::chrome::file_menu_items())
+                    .collect(),
                 window,
                 cx,
             )
         });
         let sub = cx.subscribe(&menu, |this, _, event: &MenuEvent, cx| {
-            if matches!(event, MenuEvent::Picked(..)) {
-                this.copy_original(cx);
+            if let MenuEvent::Picked(id, _) = event {
+                if id == "copy" {
+                    this.copy_original(cx);
+                } else if let Some(task) = super::chrome::run_file_action(&this.path, id, cx) {
+                    task.detach();
+                }
             }
             this.menu = None;
             cx.notify();

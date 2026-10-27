@@ -9,49 +9,6 @@ use std::{
 pub const MAX_ATTACHMENTS: usize = 20;
 pub const MAX_EMBED_BYTES: u64 = 20 * 1024 * 1024;
 
-/// quoteDraft.ts: append selected rendered text without replacing a live draft.
-pub fn append_selection_quote(draft: &str, text: &str) -> String {
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let text = normalized.trim();
-    if text.is_empty() {
-        return draft.into();
-    }
-    let quote = text
-        .split('\n')
-        .map(|line| {
-            if line.is_empty() {
-                ">".to_owned()
-            } else {
-                format!("> {line}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let separator = if draft.is_empty() || draft.ends_with("\n\n") {
-        ""
-    } else if draft.ends_with('\n') {
-        "\n"
-    } else {
-        "\n\n"
-    };
-    format!("{draft}{separator}{quote}\n\n")
-}
-
-#[cfg(test)]
-mod quote_tests {
-    use super::*;
-    #[test]
-    fn quote_preserves_existing_draft_blank_lines_and_unicode() {
-        assert_eq!(
-            append_selection_quote("draft", " one\r\n\r\ncafé 🙂 "),
-            "draft\n\n> one\n>\n> café 🙂\n\n"
-        );
-        assert_eq!(append_selection_quote("draft\n", "x"), "draft\n\n> x\n\n");
-        assert_eq!(append_selection_quote("draft\n\n", "x"), "draft\n\n> x\n\n");
-        assert_eq!(append_selection_quote("unchanged", " \r\n "), "unchanged");
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trigger {
     Skill,
@@ -166,6 +123,138 @@ pub fn validate_attachments(paths: &[PathBuf]) -> Result<(), String> {
     }
     Ok(())
 }
+/// Text a snippet attachment may hold: what `prepare_prompt` inlines.
+pub const MAX_SNIPPET_BYTES: usize = 128 * 1024;
+/// Where a snippet attachment came from, so its chip can say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Snippet {
+    Terminal,
+    Pasted,
+    Quote,
+    Comment,
+    Activity,
+}
+const SNIPPETS: [Snippet; 5] = [
+    Snippet::Terminal,
+    Snippet::Pasted,
+    Snippet::Quote,
+    Snippet::Comment,
+    Snippet::Activity,
+];
+impl Snippet {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Pasted => "pasted",
+            Self::Quote => "quote",
+            Self::Comment => "comment",
+            Self::Activity => "activity",
+        }
+    }
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal",
+            Self::Pasted => "Pasted",
+            Self::Quote => "Quote",
+            Self::Comment => "Comment",
+            Self::Activity => "Activity",
+        }
+    }
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Pasted => "response-copy",
+            Self::Quote => "message-square",
+            Self::Comment => "comment-add",
+            Self::Activity => "response-activity",
+        }
+    }
+    /// How the agent is told what the snippet is.
+    fn intro(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal output the user selected",
+            Self::Pasted => "Text the user pasted",
+            Self::Quote => "A passage the user quoted from this conversation",
+            Self::Comment => "The user's review comment on the diff",
+            Self::Activity => "New activity on the linked work",
+        }
+    }
+}
+/// Pastes this long become a chip rather than filling the draft.
+pub fn is_long_paste(text: &str) -> bool {
+    text.trim().lines().count() > 20 || text.len() > 4_000
+}
+/// A chip's short label as it can sit in a file name: one line, no path
+/// separators, cut at a word within 40 characters.
+fn label_slug(label: &str) -> String {
+    let words: Vec<_> = label
+        .split(|c: char| c.is_whitespace() || c.is_control() || c == '/' || c == ':')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let line = words.join(" ");
+    match line.char_indices().nth(40) {
+        Some((cut, _)) => {
+            let head = &line[..cut];
+            let head = head.rsplit_once(' ').map_or(head, |(words, _)| words);
+            format!("{}…", head.trim_end())
+        }
+        None => line,
+    }
+}
+/// Write `text` as a snippet attachment in `dir`. Its kind, line count and
+/// label go in the file name, so chips are labelled without reading the
+/// file. Text past the inline limit keeps its end, where errors usually are.
+pub fn save_snippet(
+    dir: &Path,
+    kind: Snippet,
+    label: Option<&str>,
+    text: &str,
+) -> Result<PathBuf, String> {
+    let mut text = text.trim_end();
+    if text.len() > MAX_SNIPPET_BYTES {
+        let mut start = text.len() - MAX_SNIPPET_BYTES;
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        text = &text[start..];
+        text = text.split_once('\n').map_or(text, |(_, rest)| rest);
+    }
+    let lines = text.lines().count().max(1);
+    let label = label
+        .map(label_slug)
+        .filter(|label| !label.is_empty())
+        .map(|label| format!("-{label}"))
+        .unwrap_or_default();
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!(
+        "{}-{lines}-lines-{}{label}.txt",
+        kind.slug(),
+        crate::mono::new_id()
+    ));
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+/// A snippet attachment's kind and chip label ("Terminal · 24 lines",
+/// "Comment · main.rs:42"), read from its file name.
+pub fn snippet(path: &Path) -> Option<(Snippet, String)> {
+    let name = path.file_name()?.to_str()?.strip_suffix(".txt")?;
+    let (slug, rest) = name.split_once('-')?;
+    let kind = SNIPPETS.into_iter().find(|k| k.slug() == slug)?;
+    let (lines, rest) = rest.split_once("-lines-")?;
+    let lines: usize = lines.parse().ok()?;
+    let id = rest.get(..32)?;
+    if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let detail = match rest[32..].strip_prefix('-') {
+        Some(label) => label.to_owned(),
+        None if rest.len() == 32 => {
+            format!("{lines} {}", if lines == 1 { "line" } else { "lines" })
+        }
+        None => return None,
+    };
+    Some((kind, format!("{} · {detail}", kind.title())))
+}
 pub fn image_mime(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "png" => Some("image/png"),
@@ -259,7 +348,10 @@ pub fn prepare_prompt(text: &str, cwd: &str, attachments: &[PathBuf]) -> Result<
         }
     }
     for path in attachments {
-        let mut block = format!("Attached file: {}", path.display());
+        let mut block = match snippet(path) {
+            Some((kind, _)) => format!("{} (saved at {}):", kind.intro(), path.display()),
+            None => format!("Attached file: {}", path.display()),
+        };
         if image_mime(path).is_none() {
             if let Ok(body) = read_text(path, 128 * 1024) {
                 if !body.contains('\0') {
@@ -277,7 +369,11 @@ pub fn prepare_prompt(text: &str, cwd: &str, attachments: &[PathBuf]) -> Result<
         blocks.push(block);
     }
     let text = if text.trim().is_empty() && !attachments.is_empty() {
-        "The user attached these files. Use the conversation to determine what to do with them; ask if the intent is unclear."
+        if attachments.iter().all(|path| snippet(path).is_some()) {
+            "The user shared the context above. Use the conversation to determine what to do with it; ask if the intent is unclear."
+        } else {
+            "The user attached these files. Use the conversation to determine what to do with them; ask if the intent is unclear."
+        }
     } else {
         text
     };
@@ -379,6 +475,36 @@ fn mentions_in_line(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snippets_carry_their_kind_and_line_count_and_reach_the_prompt() {
+        let dir = std::env::temp_dir().join(format!("snippet-{}", crate::mono::new_id()));
+        let path = save_snippet(&dir, Snippet::Terminal, None, "$ npm test\nFAIL\n\n").unwrap();
+        assert_eq!(
+            snippet(&path),
+            Some((Snippet::Terminal, "Terminal · 2 lines".into()))
+        );
+        assert_eq!(snippet(Path::new("terminal-3-lines-notes.txt")), None);
+        let comment = save_snippet(&dir, Snippet::Comment, Some("main.rs L42"), "x").unwrap();
+        assert_eq!(
+            snippet(&comment),
+            Some((Snippet::Comment, "Comment · main.rs L42".into()))
+        );
+        let quote = "the build fails\nbecause the cache is stale and the lockfile drifted";
+        let quote = save_snippet(&dir, Snippet::Quote, Some(quote), quote).unwrap();
+        assert_eq!(
+            snippet(&quote).unwrap().1,
+            "Quote · the build fails because the cache is…"
+        );
+        assert!(!is_long_paste("one\ntwo"));
+        assert!(is_long_paste(&"line\n".repeat(21)));
+        let prompt = prepare_prompt("why?", dir.to_str().unwrap(), &[path]).unwrap();
+        assert!(prompt.starts_with("Terminal output the user selected"));
+        assert!(prompt.contains("<attached_file>\n$ npm test\nFAIL\n</attached_file>"));
+        let long = format!("head\n{}\ntail", "x".repeat(MAX_SNIPPET_BYTES));
+        let path = save_snippet(&dir, Snippet::Terminal, None, &long).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "tail");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn thumbnails_cover_the_chip_and_swap_to_bgra() {
         let mut png = Vec::new();

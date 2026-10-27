@@ -79,7 +79,7 @@ impl TranscriptView {
                 .map(|selection| selection.with_text(text.clone())),
         };
         let Some(work) = link.link.github_work_item.clone() else {
-            return pieces.piece(0..text.len());
+            return pieces.block(0..text.len());
         };
         let url = link.range.clone();
         let line_start = text[..url.start].rfind('\n').map_or(0, |i| i + 1);
@@ -103,10 +103,10 @@ impl TranscriptView {
             .min_w_0()
             .flex()
             .flex_col()
-            .when(line_start > 0, |d| d.child(pieces.piece(0..line_start - 1)))
+            .when(line_start > 0, |d| d.child(pieces.block(0..line_start - 1)))
             .child(line)
             .when(line_end < text.len(), |d| {
-                d.child(pieces.piece(line_end + 1..text.len()))
+                d.child(pieces.block(line_end + 1..text.len()))
             })
             .into_any_element()
     }
@@ -575,34 +575,41 @@ struct Pieces {
     selection: Option<crate::transcript::selection::TextSelection>,
 }
 impl Pieces {
-    /// `range` of the chunk, selectable and search-highlighted in place.
+    /// Whole lines of the chunk as one wrapping text run. A flex row would
+    /// size the text to its unwrapped width and spill out of the bubble.
+    fn block(&self, range: Range<usize>) -> AnyElement {
+        div().child(self.text_run(range)).into_any_element()
+    }
+    /// A word of the link's line: a flex item with its trailing gap.
     fn piece(&self, range: Range<usize>) -> AnyElement {
         let piece = &self.text[range.clone()];
         // A word's trailing whitespace is the gap after it, as rich_inline's.
         let word = piece.trim_end_matches([' ', '\t']);
         let gap = word.len() < piece.len();
-        let end = range.start + word.len();
+        div()
+            .flex()
+            .child(self.text_run(range.start..range.start + word.len()))
+            .when(gap, |d| d.child(space()))
+            .into_any_element()
+    }
+    /// `range` of the chunk, selectable and search-highlighted in place.
+    fn text_run(&self, range: Range<usize>) -> AnyElement {
         let highlights = self
             .highlights
             .iter()
             .filter_map(|(r, style)| {
-                let (start, stop) = (r.start.max(range.start), r.end.min(end));
+                let (start, stop) = (r.start.max(range.start), r.end.min(range.end));
                 (start < stop).then(|| (start - range.start..stop - range.start, *style))
             })
             .collect::<Vec<_>>();
-        let word: SharedString = word.to_owned().into();
-        let styled = StyledText::new(word.clone()).with_highlights(highlights);
+        let run: SharedString = self.text[range.clone()].to_owned().into();
+        let styled = StyledText::new(run.clone()).with_highlights(highlights);
         let layout = styled.layout().clone();
         let child = styled.into_any_element();
-        let child = match &self.selection {
-            Some(selection) => selection.offset(range.start).wrap(word, layout, child),
+        match &self.selection {
+            Some(selection) => selection.offset(range.start).wrap(run, layout, child),
             None => child,
-        };
-        div()
-            .flex()
-            .child(child)
-            .when(gap, |d| d.child(space()))
-            .into_any_element()
+        }
     }
 }
 

@@ -8,6 +8,12 @@ use serde_json::Value;
 /// and MCP/ACP `{type:image, data, mimeType}` blocks, including ACP's
 /// `{type:content, content:…}` wrappers.
 pub(super) fn collect(value: &Value, title: &str, events: &mut Vec<Event>) {
+    // Every draft_preview call returns the page's screenshot for the agent.
+    // The person watches the page in the Draft panel; only a kept draft
+    // becomes a picture in the conversation.
+    if title.ends_with("draft_preview") {
+        return;
+    }
     match value {
         Value::Array(values) => {
             for value in values {
@@ -67,6 +73,19 @@ mod tests {
                 _ => panic!("only images are collected"),
             })
             .collect()
+    }
+
+    #[test]
+    fn draft_screenshots_stay_out_of_the_transcript() {
+        let result = json!([{"type":"image","data":"AAA","mimeType":"image/png"}]);
+        for tool in ["mcp__monocode__draft_preview", "monocode:draft_preview"] {
+            let mut events = Vec::new();
+            collect(&result, tool, &mut events);
+            assert!(events.is_empty(), "{tool}");
+        }
+        let mut events = Vec::new();
+        collect(&result, "mcp__browser__screenshot", &mut events);
+        assert_eq!(events.len(), 1);
     }
 
     #[test]

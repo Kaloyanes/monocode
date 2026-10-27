@@ -25,6 +25,12 @@ impl ImageDocument {
         }
         Ok(())
     }
+
+    /// The page this picture is a snapshot of, when it was kept from a draft.
+    pub fn draft(&self) -> Option<PathBuf> {
+        let page = self.path.with_extension("html");
+        page.is_file().then_some(page)
+    }
 }
 
 pub struct Inspected {

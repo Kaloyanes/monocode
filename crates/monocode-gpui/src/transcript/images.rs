@@ -87,6 +87,13 @@ impl TranscriptView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let path = document.path.clone();
+        if let Some(page) = document.draft() {
+            self.watch_drafts(cx);
+            // "Open draft" turns the card into the page itself.
+            if let Some(draft) = crate::draft::live(&crate::draft::kept_id(&page), cx) {
+                return draft.into_any_element();
+            }
+        }
         if !self.pictures.contains_key(&path) {
             if self.pictures.len() >= RETAINED_PICTURES
                 && let Some(oldest) = self
@@ -113,43 +120,121 @@ impl TranscriptView {
         let width = (document.width as f32 / 2.).clamp(48., MAX_WIDTH);
         let title: SharedString = document.title.clone().into();
         let alt = title.clone();
+        let page = document.draft();
+        let card_id = SharedString::from(format!("open-draft-{}", path.display()));
+        let open_picture = div()
+            .id(SharedString::from(format!("image-{}", path.display())))
+            .debug_selector(|| "transcript-agent-image".into())
+            .w_full()
+            .aspect_ratio(document.width as f32 / document.height as f32)
+            .role(Role::Button)
+            .focusable()
+            .aria_label(format!("Open {title} full screen"))
+            .cursor(gpui::CursorStyle::PointingHand)
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                window.dispatch_action(
+                    Box::new(crate::image_lightbox::Open {
+                        source: crate::image_lightbox::Source::Path(path.clone()),
+                        alt: alt.clone(),
+                    }),
+                    cx,
+                );
+            })
+            .child(cached.view.clone());
+        let Some(page) = page else {
+            return div()
+                .w_full()
+                .min_w_0()
+                .py_3()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(div().w_full().max_w(px(width)).child(open_picture))
+                .child(
+                    div()
+                        .max_w(px(width))
+                        .text_size(px(11.))
+                        .text_color(content(0.55))
+                        .truncate()
+                        .child(title),
+                )
+                .into_any_element();
+        };
+        // A kept design draft is a card like the app's others: the picture,
+        // then its name and a way back into the page in the Draft panel.
         div()
             .w_full()
             .min_w_0()
             .py_3()
-            .flex()
-            .flex_col()
-            .gap_1p5()
             .child(
                 div()
-                    .id(SharedString::from(format!("image-{}", path.display())))
-                    .debug_selector(|| "transcript-agent-image".into())
+                    .debug_selector(|| "transcript-draft-card".into())
                     .w_full()
                     .max_w(px(width))
-                    .aspect_ratio(document.width as f32 / document.height as f32)
-                    .role(Role::Button)
-                    .focusable()
-                    .aria_label(format!("Open {title} full screen"))
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(move |_, window, cx| {
-                        cx.stop_propagation();
-                        window.dispatch_action(
-                            Box::new(crate::image_lightbox::Open {
-                                source: crate::image_lightbox::Source::Path(path.clone()),
-                                alt: alt.clone(),
-                            }),
-                            cx,
-                        );
-                    })
-                    .child(cached.view.clone()),
-            )
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(content(0.55))
-                    .truncate()
-                    .child(title),
+                    .flex()
+                    .flex_col()
+                    .rounded_xl()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(content(0.08))
+                    .bg(content(0.03))
+                    .child(
+                        div()
+                            .w_full()
+                            .border_b_1()
+                            .border_color(content(0.08))
+                            .child(open_picture),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(40.))
+                            .px_3()
+                            .child(icon("app-window", 14.).text_color(content(0.55)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.))
+                                    .text_color(content(0.8))
+                                    .truncate()
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .id(card_id)
+                                    .debug_selector(|| "transcript-open-draft".into())
+                                    .role(Role::Button)
+                                    .aria_label("Open draft")
+                                    .flex_shrink_0()
+                                    .h(px(24.))
+                                    .px_2p5()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(content(0.12))
+                                    .text_size(px(12.))
+                                    .text_color(content(0.8))
+                                    .hover(|s| s.bg(content(0.06)))
+                                    .cursor(gpui::CursorStyle::PointingHand)
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        window.dispatch_action(
+                                            Box::new(crate::draft::OpenKept { page: page.clone() }),
+                                            cx,
+                                        );
+                                    })
+                                    .child("Open draft"),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -222,6 +307,31 @@ mod tests {
                 matches!(&row.body, Body::Plain(text) if text.as_ref() == "This image could not be loaded.")
             }));
         });
+    }
+
+    #[gpui::test]
+    fn a_kept_draft_is_a_card_and_a_plain_image_stays_a_picture(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("monocode-draft-card-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kept = dir.join("a.png");
+        std::fs::write(dir.join("a.html"), "<p>Hi</p>").unwrap();
+        let document = |path: PathBuf| {
+            Arc::new(ImageDocument {
+                title: "Sign-up".into(),
+                path,
+                mime_type: "image/png".into(),
+                width: 800,
+                height: 400,
+            })
+        };
+        assert!(document(kept.clone()).draft().is_some());
+        assert!(document(dir.join("b.png")).draft().is_none());
+        let view = cx.new(|_| TranscriptView::new());
+        view.update(cx, |view, cx| {
+            let _ = view.image_row(document(kept), cx);
+            let _ = view.image_row(document(dir.join("b.png")), cx);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui::test]
