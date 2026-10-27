@@ -65,6 +65,7 @@ mod quick_open;
 mod reflow_motion;
 mod resource_pressure;
 mod response_actions;
+mod restart_resume;
 mod reveal;
 mod review;
 mod right_panel;
@@ -394,15 +395,8 @@ fn main() {
         db.write_rows(s.id, 0, &fixtures::visual_story().rows)
             .unwrap();
     }
-    // A crash, force-quit or kill leaves provider processes running. Stop them
-    // off the launch path.
-    std::thread::spawn(|| {
-        let reaped = monocode_core::orphans::reap();
-        if reaped > 0 {
-            eprintln!("Stopped {reaped} provider processes left by the previous run");
-        }
-    });
     let mut sessions = db.sessions().expect("read native sessions");
+    restart_resume::prepare(&mut db, &sessions);
     if sessions.is_empty() {
         sessions.push(db.create("codex", &cwd).expect("create initial session"));
     }
