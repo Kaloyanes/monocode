@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { textBytes } from "@/features/terminal/base64";
+import { actionBytes, withCtrl } from "@/features/terminal/keys";
+
 vi.mock("expo-sqlite/kv-store", () => ({
   default: { getItem: vi.fn(), setItem: vi.fn() },
 }));
 vi.mock("@/features/connection/ConnectionProvider", () => ({
   useConnection: () => ({ pairing: null }),
 }));
-
-import { textBytes } from "@/features/terminal/base64";
-import { actionBytes, withCtrl } from "@/features/terminal/keys";
 
 describe("terminal keys", () => {
   it("turns a letter into its control code and leaves the rest alone", () => {
@@ -21,6 +21,8 @@ describe("terminal keys", () => {
   });
 
   it("types an action and presses return", () => {
-    expect(new TextDecoder().decode(actionBytes("git status"))).toBe("git status\r");
+    expect(new TextDecoder().decode(actionBytes("git status"))).toBe(
+      "git status\r",
+    );
   });
 });

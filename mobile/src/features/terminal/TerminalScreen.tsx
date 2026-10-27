@@ -21,6 +21,7 @@ import { themedStyles, useColors, useScheme } from "@/ui/theme";
 import { fromBase64, textBytes, toBase64 } from "./base64";
 import { actionBytes, withCtrl } from "./keys";
 import { useTerminalActions } from "./terminalActions";
+import { canSwipeAway, type Holds } from "./swipeAway";
 import { TerminalKeys } from "./TerminalKeys";
 import {
   TerminalSession,
@@ -183,16 +184,10 @@ export function TerminalPane({
     await open?.close();
   };
 
-  // A drag swipes a sheet away anywhere iOS sees it isn't a scroll, but not
-  // in a full-screen program, which scrolls in the page where iOS can't see
-  // it, unless it starts on the header or keys; nor on the arrow pad. Each is
-  // known before the drag moves far enough to be a swipe, but for a finger on
-  // the chrome or pad, only just.
-  const holds = useRef({ full: false, chrome: false, pad: false });
-  const hold = (next: Partial<typeof holds.current>) => {
+  const holds = useRef<Holds>({ full: false, chrome: false, pad: false });
+  const hold = (next: Partial<Holds>) => {
     holds.current = { ...holds.current, ...next };
-    const { full, chrome, pad } = holds.current;
-    onSwipeAway?.(!pad && (!full || chrome));
+    onSwipeAway?.(canSwipeAway(holds.current));
   };
   const chromeTouches = {
     onTouchStart: () => hold({ chrome: true }),

@@ -15,9 +15,10 @@ import { themedStyles, useColors } from "@/ui/theme";
 import { type NewAction, useTerminalActions } from "./terminalActions";
 
 /**
- * The commands a project's terminal menu offers, kept on this phone, in a
- * native sheet the height of the list. Each runs in the project's folder when
- * picked from the session's terminal button.
+ * The commands a project's terminal menu offers, in a native sheet the height
+ * of the list. They are the desktop footer's actions: a change here is sent
+ * to the desktop, and one made there shows here. Each runs in the project's
+ * folder when picked from the session's terminal button.
  */
 export function TerminalActionsSheet({
   projectId,

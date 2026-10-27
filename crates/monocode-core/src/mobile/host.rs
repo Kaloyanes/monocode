@@ -1041,6 +1041,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actions_reach_the_phone_in_the_catalog_and_its_edits_reach_the_app() {
+        let (host, events, peer) = paired();
+        let device_id = host.inner.lock().unwrap().config.devices[0].id.clone();
+        let actions =
+            json!([{"id":"dev","name":"Run Dev","command":"npm run dev","icon":"rocket"}]);
+        host.publish(json!({
+            "projects": [{"id":"p","name":"monocode","actions": actions}],
+            "monos": [],
+            "sessions": [],
+        }))
+        .unwrap();
+        let list = json!({"version":VERSION,"id":"c","method":"workspace.list","params":{}});
+        let catalog = host.handle(&peer, list).await.unwrap();
+        assert_eq!(catalog["projects"][0]["actions"], actions);
+
+        // The phone's whole list goes to the app as sent, naming the device.
+        let edited = json!([{"id":"dev","name":"Run Dev","command":"npm run dev","icon":"rocket"},{"name":"Test","command":"cargo test","icon":"play"}]);
+        let answering = {
+            let events = events.clone();
+            tokio::spawn(async move {
+                let Ok(Event::Request(request)) = events.recv().await else {
+                    panic!("expected a request");
+                };
+                assert_eq!(request.method, "terminal.actions.save");
+                let seen = (request.device_id.clone(), request.params.clone());
+                request.reply(Ok(json!({"actions": seen.1["actions"]})));
+                seen
+            })
+        };
+        let save = json!({"version":VERSION,"id":"a1","method":"terminal.actions.save","params":{"projectId":"p","actions":edited}});
+        let reply = host.handle(&peer, save.clone()).await.unwrap();
+        assert_eq!(reply["actions"], edited);
+        let (device, params) = answering.await.unwrap();
+        assert_eq!(device, device_id);
+        assert_eq!(params, json!({"projectId":"p","actions":edited}));
+
+        // With terminals off, the phone can't change what they run.
+        host.set_terminal(false).unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Ok(Event::TerminalsClosed(None))
+        ));
+        let mut again = save;
+        again["id"] = json!("a2");
+        assert!(host.handle(&peer, again).await.is_err());
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_terminal_watch_reaches_the_app_and_each_device_has_two() {
         let (host, events, peer) = paired();
         let app = tokio::spawn(async move {

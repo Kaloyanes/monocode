@@ -413,6 +413,37 @@ impl Shell {
             .collect()
     }
 
+    /// A project as the phone lists it, with what a new session there starts
+    /// with and the footer's actions.
+    fn mobile_catalog_project(&self, path: &str, cx: &App) -> Value {
+        let appearance = self.appearance(path);
+        let (kind, model, access) = self.mobile_defaults(path, cx);
+        let mut project = json!({
+            "id": project_id(path),
+            "path": path,
+            "name": appearance.label(path),
+            "machine": "Desktop",
+            "branch": "",
+            "color": hex(appearance.color(path)),
+            "additions": 0,
+            "deletions": 0,
+            "defaultHarness": kind.id(),
+            "defaultModelName": pickers::cached_model_name(kind, model.as_deref()).to_string(),
+            "defaultRuntimeMode": access.id(),
+        });
+        if let Some(model) = model {
+            project["defaultModel"] = json!(mobile_catalog::model_id(kind, Some(&model)));
+        }
+        if let Some(mascot) = appearance.mascot {
+            project["mascot"] = json!(mascot);
+        }
+        // The footer's actions, which the phone's terminal runs too.
+        if let Some(actions) = self.workspace.actions.get(path) {
+            project["actions"] = json!(actions);
+        }
+        project
+    }
+
     fn publish_mobile_catalog(&mut self, cx: &mut Context<Self>) {
         let Some(host) = self.mobile.host.clone() else {
             return;
@@ -423,34 +454,7 @@ impl Shell {
         let paths = self.mobile_projects(cx);
         let projects: Vec<Value> = paths
             .iter()
-            .map(|path| {
-                let appearance = self.appearance(path);
-                let (kind, model, access) = self.mobile_defaults(path, cx);
-                let mut project = json!({
-                    "id": project_id(path),
-                    "path": path,
-                    "name": appearance.label(path),
-                    "machine": "Desktop",
-                    "branch": "",
-                    "color": hex(appearance.color(path)),
-                    "additions": 0,
-                    "deletions": 0,
-                    "defaultHarness": kind.id(),
-                    "defaultModelName": pickers::cached_model_name(kind, model.as_deref()).to_string(),
-                    "defaultRuntimeMode": access.id(),
-                });
-                if let Some(model) = model {
-                    project["defaultModel"] = json!(mobile_catalog::model_id(kind, Some(&model)));
-                }
-                if let Some(mascot) = appearance.mascot {
-                    project["mascot"] = json!(mascot);
-                }
-                // The footer's actions, which the phone's terminal runs too.
-                if let Some(actions) = self.workspace.actions.get(path) {
-                    project["actions"] = json!(actions);
-                }
-                project
-            })
+            .map(|path| self.mobile_catalog_project(path, cx))
             .collect();
         let entries = self.mobile_catalog_sessions(&paths, cx);
         let monos: Vec<(monocode_core::mono::Mono, Option<Value>)> = self
@@ -1952,6 +1956,90 @@ mod tests {
         assert_ne!(saved[1].id, saved[2].id);
         assert!(mobile_actions(&json!([{"name": "", "command": "ls"}])).is_err());
         assert!(mobile_actions(&json!({})).is_err());
+    }
+
+    #[gpui::test]
+    fn the_phone_and_the_desktop_keep_one_list_of_actions(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let path = "/work/monocode".to_string();
+                let project = json!(project_id(&path));
+                let listed = |shell: &Shell, cx: &App| {
+                    shell.mobile_catalog_project(&path, cx)["actions"]
+                        .as_array()
+                        .map(|actions| {
+                            actions
+                                .iter()
+                                .map(|action| action["name"].as_str().unwrap().to_owned())
+                                .collect::<Vec<_>>()
+                        })
+                };
+                // Made on the desktop and last run there: the phone lists it.
+                shell.workspace.actions.insert(
+                    path.clone(),
+                    vec![crate::workspace::ProjectAction {
+                        id: "dev".into(),
+                        name: "Run Dev".into(),
+                        command: "npm run dev".into(),
+                        icon: "rocket".into(),
+                    }],
+                );
+                shell.workspace.last_actions.insert(path.clone(), "dev".into());
+                assert_eq!(listed(shell, cx), Some(vec!["Run Dev".to_owned()]));
+
+                // The phone adds one: the desktop keeps its own and gives the
+                // new one an ID.
+                let saved = shell
+                    .save_mobile_actions(
+                        &json!({"projectId": project, "actions": [
+                            {"id": "dev", "name": "Run Dev", "command": "npm run dev", "icon": "rocket"},
+                            {"name": "Test", "command": "cargo test", "icon": "play"},
+                        ]}),
+                        cx,
+                    )
+                    .unwrap();
+                let actions = &shell.workspace.actions[&path];
+                assert_eq!(actions.len(), 2);
+                assert_eq!((actions[0].id.as_str(), actions[0].icon()), ("dev", "rocket"));
+                assert!(!actions[1].id.is_empty());
+                assert_eq!(saved["actions"][1]["id"], json!(actions[1].id));
+                assert_eq!(shell.workspace.last_actions[&path], "dev");
+                assert_eq!(
+                    listed(shell, cx),
+                    Some(vec!["Run Dev".to_owned(), "Test".to_owned()])
+                );
+
+                // The phone removes the one the desktop ran last, which the
+                // footer then stops offering to run again.
+                let test = shell.workspace.actions[&path][1].clone();
+                shell
+                    .save_mobile_actions(
+                        &json!({"projectId": project, "actions": [
+                            {"id": test.id, "name": test.name, "command": test.command, "icon": "play"},
+                        ]}),
+                        cx,
+                    )
+                    .unwrap();
+                assert!(!shell.workspace.last_actions.contains_key(&path));
+                assert_eq!(listed(shell, cx), Some(vec!["Test".to_owned()]));
+
+                // A list the dialog would refuse, or another project, changes
+                // nothing.
+                let bad = json!({"projectId": project, "actions": [{"name": "", "command": "ls"}]});
+                assert!(shell.save_mobile_actions(&bad, cx).is_err());
+                let elsewhere = json!({"projectId": "gone", "actions": []});
+                assert!(shell.save_mobile_actions(&elsewhere, cx).is_err());
+                assert_eq!(listed(shell, cx), Some(vec!["Test".to_owned()]));
+
+                // Removing the last leaves the project without actions.
+                shell
+                    .save_mobile_actions(&json!({"projectId": project, "actions": []}), cx)
+                    .unwrap();
+                assert!(!shell.workspace.actions.contains_key(&path));
+                assert_eq!(listed(shell, cx), None);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

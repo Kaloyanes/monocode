@@ -22,7 +22,7 @@ const desktop = vi.hoisted(() => ({
   },
   existing: { path: "/repo/.worktrees/mobile", name: "feature/mobile" },
   terminal: undefined as boolean | undefined,
-  toolbar: [] as Array<{ terminal?: boolean }>,
+  toolbar: [] as { terminal?: boolean }[],
 }));
 
 vi.mock("react-native-svg", () => ({ default: () => <svg />, Path: () => null }));

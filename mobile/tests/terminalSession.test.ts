@@ -27,7 +27,7 @@ const hello = (over: Partial<TerminalFrame> = {}): TerminalFrame => ({
 });
 
 /** A desktop that answers each poll from a script, then waits. */
-function desktop(script: Array<TerminalFrame[] | Error>) {
+function desktop(script: (TerminalFrame[] | Error)[]) {
   let watches = 0;
   link.openWatch.mockImplementation(async () => ++watches);
   link.nextUpdates.mockImplementation(async () => {
@@ -39,7 +39,7 @@ function desktop(script: Array<TerminalFrame[] | Error>) {
 }
 
 function run(resume?: ConstructorParameters<typeof TerminalSession>[4]) {
-  const output: Array<[string, boolean]> = [];
+  const output: [string, boolean][] = [];
   const states: TerminalState[] = [];
   const session = new TerminalSession(
     pairing,
@@ -69,14 +69,19 @@ describe("base64", () => {
     for (const text of ["", "a", "ab", "abc", "\x1b[A", "héllo ☃"]) {
       const bytes = textBytes(text);
       expect(toBase64(bytes)).toBe(Buffer.from(bytes).toString("base64"));
-      expect(Array.from(fromBase64(toBase64(bytes)))).toEqual(Array.from(bytes));
+      expect(Array.from(fromBase64(toBase64(bytes)))).toEqual(
+        Array.from(bytes),
+      );
     }
   });
 });
 
 describe("a terminal session", () => {
   it("opens the shell in the project's folder and draws what arrives", async () => {
-    desktop([[hello({ data: "aGk=", seq: 2 })], [{ shellId: "s1", seq: 5, data: "eW8=" }]]);
+    desktop([
+      [hello({ data: "aGk=", seq: 2 })],
+      [{ shellId: "s1", seq: 5, data: "eW8=" }],
+    ]);
     const { output, states } = run();
     await vi.advanceTimersByTimeAsync(0);
     expect(link.openWatch).toHaveBeenCalledWith(pairing, "terminal.watch", {
@@ -100,9 +105,15 @@ describe("a terminal session", () => {
     session.input(textBytes("s"));
     session.input(textBytes("\r"));
     await vi.advanceTimersByTimeAsync(20);
-    const typed = link.request.mock.calls.filter(([, method]) => method === "terminal.input");
+    const typed = link.request.mock.calls.filter(
+      ([, method]) => method === "terminal.input",
+    );
     expect(typed).toHaveLength(1);
-    expect(typed[0][2]).toEqual({ shellId: "s1", seq: 7, data: toBase64(textBytes("ls\r")) });
+    expect(typed[0][2]).toEqual({
+      shellId: "s1",
+      seq: 7,
+      data: toBase64(textBytes("ls\r")),
+    });
     session.input(textBytes("x"));
     await vi.advanceTimersByTimeAsync(20);
     expect(link.request.mock.calls.at(-1)![2].seq).toBe(8);
@@ -117,7 +128,9 @@ describe("a terminal session", () => {
     await vi.advanceTimersByTimeAsync(0);
     session.input(textBytes("b"));
     await vi.advanceTimersByTimeAsync(0);
-    const typed = link.request.mock.calls.filter(([, method]) => method === "terminal.input");
+    const typed = link.request.mock.calls.filter(
+      ([, method]) => method === "terminal.input",
+    );
     expect(typed.map(([, , params]) => params.seq)).toEqual([3, 4]);
   });
 
@@ -129,7 +142,9 @@ describe("a terminal session", () => {
     session.input(textBytes("a"));
     await vi.advanceTimersByTimeAsync(20);
     await vi.advanceTimersByTimeAsync(1100);
-    const typed = link.request.mock.calls.filter(([, method]) => method === "terminal.input");
+    const typed = link.request.mock.calls.filter(
+      ([, method]) => method === "terminal.input",
+    );
     expect(typed).toHaveLength(2);
     expect(typed[1][2]).toEqual(typed[0][2]);
   });
@@ -141,35 +156,46 @@ describe("a terminal session", () => {
     session.resize(80, 24);
     session.resize(100, 30);
     await vi.advanceTimersByTimeAsync(0);
-    const resized = link.request.mock.calls.filter(([, method]) => method === "terminal.resize");
+    const resized = link.request.mock.calls.filter(
+      ([, method]) => method === "terminal.resize",
+    );
     expect(resized.map(([, , params]) => params)).toEqual([
       { shellId: "s1", cols: 100, rows: 30 },
     ]);
   });
 
   it("reattaches after a dropped connection from the last output it drew", async () => {
-    desktop([[hello({ data: "YQ==", seq: 1 })], new Error("Desktop stopped answering")]);
+    desktop([
+      [hello({ data: "YQ==", seq: 1 })],
+      new Error("Desktop stopped answering"),
+    ]);
     const { states } = run();
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(600);
     expect(states).toContain("reconnecting");
     expect(link.openWatch).toHaveBeenCalledTimes(2);
-    expect(link.openWatch.mock.calls[1][2]).toMatchObject({ shellId: "s1", after: 1 });
+    expect(link.openWatch.mock.calls[1][2]).toMatchObject({
+      shellId: "s1",
+      after: 1,
+    });
   });
 
   it("carries on from a saved shell, and gives up when it has ended", async () => {
     link.openWatch.mockRejectedValue(new Error("That terminal has ended"));
     const { states } = run({ shellId: "old", seq: 40, next: 9 });
     await vi.advanceTimersByTimeAsync(0);
-    expect(link.openWatch.mock.calls[0][2]).toMatchObject({ shellId: "old", after: 40 });
+    expect(link.openWatch.mock.calls[0][2]).toMatchObject({
+      shellId: "old",
+      after: 40,
+    });
     expect(states.at(-1)).toBe("ended");
     expect(link.openWatch).toHaveBeenCalledTimes(1);
   });
 
   it("draws the shell again from the start when the screen was lost", async () => {
     let watches = 0;
-    const polls: Array<(frames: TerminalFrame[]) => void> = [];
-    const rejects: Array<(error: Error) => void> = [];
+    const polls: ((frames: TerminalFrame[]) => void)[] = [];
+    const rejects: ((error: Error) => void)[] = [];
     link.openWatch.mockImplementation(async () => ++watches);
     link.nextUpdates.mockImplementation(
       () =>
@@ -179,7 +205,9 @@ describe("a terminal session", () => {
         }),
     );
     // Closing a watch ends the poll waiting on it.
-    link.closeWatch.mockImplementation(async () => rejects.pop()?.(new Error("Watch closed")));
+    link.closeWatch.mockImplementation(async () =>
+      rejects.pop()?.(new Error("Watch closed")),
+    );
     const { session } = run();
     await vi.advanceTimersByTimeAsync(0);
     polls.shift()!([hello({ data: "YQ==", seq: 4 })]);
@@ -187,7 +215,10 @@ describe("a terminal session", () => {
     session.replay();
     await vi.advanceTimersByTimeAsync(600);
     expect(link.openWatch).toHaveBeenCalledTimes(2);
-    expect(link.openWatch.mock.calls[1][2]).toMatchObject({ shellId: "s1", after: 0 });
+    expect(link.openWatch.mock.calls[1][2]).toMatchObject({
+      shellId: "s1",
+      after: 0,
+    });
   });
 
   it("reports the shell exiting and closes the shell when asked", async () => {
@@ -196,6 +227,8 @@ describe("a terminal session", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(states.at(-1)).toBe("ended");
     await session.close();
-    expect(link.request).toHaveBeenCalledWith(pairing, "terminal.close", { shellId: "s1" });
+    expect(link.request).toHaveBeenCalledWith(pairing, "terminal.close", {
+      shellId: "s1",
+    });
   });
 });
