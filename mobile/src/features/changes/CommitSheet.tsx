@@ -320,7 +320,7 @@ export function CommitSheet({
     (status
       ? MESSAGE +
         GAP +
-        (showAi ? BUTTON + GAP : 0) +
+        (showAi ? 2 * (BUTTON + GAP) : 0) +
         BUTTON +
         (secondary.length ? GAP + BUTTON : 0)
       : BUTTON) +
@@ -449,21 +449,25 @@ export function CommitSheet({
               {/* Pinned to the sheet's bottom edge, whatever is above them. */}
               <View style={styles.footer}>
                 {showAi ? (
-                  <View style={styles.row}>
-                    <Action
-                      icon="list"
-                      label="Group Commits"
-                      disabled={!!busy}
-                      onPress={groupCommits}
-                    />
-                    <Action
-                      icon="sparkle"
-                      label={busy === "auto" ? "Committing…" : "Commit with AI"}
-                      busy={busy === "auto"}
-                      disabled={!!busy && busy !== "auto"}
-                      onPress={() => void autoCommit()}
-                    />
-                  </View>
+                  <>
+                    <View style={styles.row}>
+                      <Action
+                        icon="list"
+                        label="Group Commits"
+                        disabled={!!busy}
+                        onPress={groupCommits}
+                      />
+                    </View>
+                    <View style={styles.row}>
+                      <Action
+                        icon="sparkle"
+                        label={busy === "auto" ? "Committing…" : "Commit with AI"}
+                        busy={busy === "auto"}
+                        disabled={!!busy && busy !== "auto"}
+                        onPress={() => void autoCommit()}
+                      />
+                    </View>
+                  </>
                 ) : null}
                 <View style={styles.row}>
                   <Pressable
