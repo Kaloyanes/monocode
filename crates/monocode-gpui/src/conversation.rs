@@ -1325,7 +1325,13 @@ impl Conversation {
                             this.approvals.extend(update.approvals);
                         }
                         for id in update.approvals_resolved {
+                            this.approval_ui.saving.remove(&id);
+                            this.approval_ui.errors.remove(&id);
                             this.approvals.retain(|approval| approval.id != id);
+                        }
+                        for (id, error) in update.approvals_save_failed {
+                            this.approval_ui.saving.remove(&id);
+                            this.approval_ui.errors.insert(id, error);
                         }
                         for id in update.questions_resolved {
                             this.questions.retain(|(card, _)| card.read(cx).id() != id);

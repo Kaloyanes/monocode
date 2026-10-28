@@ -627,6 +627,7 @@ impl Protocol {
                             .into(),
                         detail: v["message"].as_str().unwrap_or("").into(),
                         can_remember: false,
+                        remember_scope: None,
                     }));
                 } else if matches!(method, "select" | "input" | "editor") {
                     self.question(v["id"].clone(), "pi", v.clone(), &mut events, stdin)?;

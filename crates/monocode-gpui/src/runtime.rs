@@ -47,6 +47,7 @@ pub(crate) struct Update {
     pub(crate) background: Option<Vec<provider::BackgroundTask>>,
     pub(crate) approvals: Vec<Approval>,
     pub(crate) approvals_resolved: Vec<String>,
+    pub(crate) approvals_save_failed: Vec<(String, String)>,
     pub(crate) questions: Vec<monocode_core::agent::Question>,
     pub(crate) questions_resolved: Vec<String>,
     pub(crate) handoff: Option<Option<monocode_core::agent::Handoff>>,
@@ -247,6 +248,7 @@ fn run_turn_using(
                 background: None,
                 approvals: Vec::new(),
                 approvals_resolved: Vec::new(),
+                approvals_save_failed: Vec::new(),
                 questions: Vec::new(),
                 questions_resolved: Vec::new(),
                 handoff: None,
@@ -301,6 +303,7 @@ fn run_turn_using(
                     background: None,
                     approvals: Vec::new(),
                     approvals_resolved: Vec::new(),
+                    approvals_save_failed: Vec::new(),
                     questions: Vec::new(),
                     questions_resolved: Vec::new(),
                     handoff: None,
@@ -348,6 +351,7 @@ fn run_turn_using(
                     background: None,
                     approvals: Vec::new(),
                     approvals_resolved: Vec::new(),
+                    approvals_save_failed: Vec::new(),
                     questions: Vec::new(),
                     questions_resolved: Vec::new(),
                     handoff: None,
@@ -407,6 +411,7 @@ fn run_turn_using(
                     background: None,
                     approvals: Vec::new(),
                     approvals_resolved: Vec::new(),
+                    approvals_save_failed: Vec::new(),
                     questions: Vec::new(),
                     questions_resolved: Vec::new(),
                     handoff: Some(Some(prepared)),
@@ -594,6 +599,7 @@ fn run_turn_using(
                 let mut background = None;
                 let mut approvals = Vec::new();
                 let mut approvals_resolved = Vec::new();
+                let mut approvals_save_failed = Vec::new();
                 let mut questions = Vec::new();
                 let mut questions_resolved = Vec::new();
                 let mut handoff = None;
@@ -807,6 +813,11 @@ fn run_turn_using(
                             approvals_resolved.push(id);
                             boundary = true;
                         }
+                        Event::ApprovalSaveFailed { id, error } => {
+                            status = error.clone();
+                            approvals_save_failed.push((id, error));
+                            boundary = true;
+                        }
                         Event::Question(question) => {
                             status = "Waiting for your answer".into();
                             questions.push(question);
@@ -862,6 +873,7 @@ fn run_turn_using(
                             background,
                             approvals,
                             approvals_resolved,
+                            approvals_save_failed,
                             questions,
                             questions_resolved,
                             handoff,
@@ -1052,6 +1064,7 @@ fn run_turn_using(
         background: None,
         approvals: Vec::new(),
         approvals_resolved: Vec::new(),
+        approvals_save_failed: Vec::new(),
         questions: Vec::new(),
         questions_resolved: Vec::new(),
         handoff,

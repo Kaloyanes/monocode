@@ -90,6 +90,10 @@ pub enum Event {
     Metrics(TurnMetrics),
     Approval(Approval),
     ApprovalResolved(String),
+    ApprovalSaveFailed {
+        id: String,
+        error: String,
+    },
     Question(crate::agent::Question),
     QuestionResolved(String),
     BeginAssistant,
@@ -272,6 +276,7 @@ struct Protocol {
     claude_tools: HashMap<u64, (String, String)>,
     text_key: Option<String>,
     approvals: HashMap<String, (Value, String, Value)>,
+    permissions: crate::permissions::Store,
     metrics: TurnMetrics,
     usage_total: u64,
     acp: acp::State,
@@ -311,6 +316,7 @@ impl Protocol {
             claude_tools: HashMap::new(),
             text_key: None,
             approvals: HashMap::new(),
+            permissions: Default::default(),
             metrics: TurnMetrics::default(),
             usage_total: 0,
             acp: Default::default(),
@@ -1059,6 +1065,7 @@ impl Protocol {
             title,
             detail,
             can_remember: self.request.kind != Kind::Codex && !file_change,
+            remember_scope: None,
         }));
         Ok(())
     }
@@ -1600,6 +1607,8 @@ fn run_operation(
                                 Ok(events) => pending.extend(events),
                                 Err(error) => pending.push(Event::FollowUpFailed { id, error }),
                             }
+                        } else if matches!(control.decision, Decision::Always) {
+                            pending.extend(protocol.remember_approval(&control.id, &mut stdin)?);
                         } else {
                             protocol.respond(control, &mut stdin)?;
                         }
