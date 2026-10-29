@@ -1151,6 +1151,7 @@ impl Conversation {
         let (controls, control_rx) = std::sync::mpsc::channel();
         self.controls = Some(controls);
         self.approvals.clear();
+        self.approval_ui.clear();
         self.questions.clear();
         let (tx, rx) = async_channel::bounded(8);
         let mut turn_model_id = settings
@@ -1330,8 +1331,11 @@ impl Conversation {
                             this.approvals.retain(|approval| approval.id != id);
                         }
                         for (id, error) in update.approvals_save_failed {
-                            this.approval_ui.saving.remove(&id);
-                            this.approval_ui.errors.insert(id, error);
+                            if this.approval_ui.saving.remove(&id)
+                                && this.approvals.iter().any(|approval| approval.id == id)
+                            {
+                                this.approval_ui.errors.insert(id, error);
+                            }
                         }
                         for id in update.questions_resolved {
                             this.questions.retain(|(card, _)| card.read(cx).id() != id);
@@ -1451,6 +1455,7 @@ impl Conversation {
                                 this.save_follow_ups(cx);
                             }
                             this.approvals.clear();
+                            this.approval_ui.clear();
                             this.questions.clear();
                             this.controls = None;
                             this.transcript.update(cx, |v, cx| v.streaming(false, cx));
@@ -2689,6 +2694,7 @@ impl Conversation {
         self.follow_ups.ready = false;
         self.clear_background();
         self.approvals.clear();
+        self.approval_ui.clear();
         self.questions.clear();
         self.controls = None;
         self.status = "Ready".into();

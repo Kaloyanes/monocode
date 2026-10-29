@@ -12,6 +12,11 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn clear(&mut self) {
+        self.saving.clear();
+        self.errors.clear();
+    }
+
     fn sync(&self, id: Option<&str>, animate: bool) {
         let mut current = self.current.borrow_mut();
         if current.as_deref() != id {

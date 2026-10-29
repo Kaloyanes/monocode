@@ -57,6 +57,7 @@ impl Conversation {
         ) || (matches!(decision, Decision::Session) && !self.approvals[index].can_remember)
             || (matches!(decision, Decision::Always)
                 && self.approvals[index].remember_scope.is_none())
+            || self.approval_ui.saving.contains(request_id)
         {
             return false;
         }
