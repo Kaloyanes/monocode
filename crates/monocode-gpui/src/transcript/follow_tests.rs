@@ -2107,7 +2107,10 @@ fn a_mono_opening_sentence_already_shown_does_not_enter_again_when_the_run_ends(
                 ],
                 cx,
             );
-            assert!(!view.mono_prose_hidden(1), "the opening sentence is on screen");
+            assert!(
+                !view.mono_prose_hidden(1),
+                "the opening sentence is on screen"
+            );
             view.patch(3, vec![row("assistant", "Started it.")], cx);
             view.entrances.clear();
             view.streaming(false, cx);

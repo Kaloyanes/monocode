@@ -1622,8 +1622,7 @@ impl TranscriptView {
                 // A steer stays beside the prompt it joins only until the
                 // Mono has replied in words; after that, the chat reads in order.
                 .filter(|&root| {
-                    root < turn
-                        && !mono_spoke(&self.source, root, prompt_start(&self.source, turn))
+                    root < turn && !mono_spoke(&self.source, root, prompt_start(&self.source, turn))
                 })
                 .or_else(|| mono_continues(&self.source, turn))
             {

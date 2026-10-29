@@ -1335,25 +1335,19 @@ impl Monos {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .child(
-                        self.page_header(&document.title, cx).when(
-                            document.kind != "visual",
-                            |header| {
-                                header.child(
-                                    icon_button(
-                                        "mono-document-copy",
-                                        "Copy document",
-                                        "response-copy",
-                                    )
+                    .child(self.page_header(&document.title, cx).when(
+                        document.kind != "visual",
+                        |header| {
+                            header.child(
+                                icon_button("mono-document-copy", "Copy document", "response-copy")
                                     .on_click(move |_, _, cx| {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                             document.body.clone(),
                                         ))
                                     }),
-                                )
-                            },
-                        ),
-                    )
+                            )
+                        },
+                    ))
                     .child(div().flex_1().min_h_0().child(view))
                     .into_any_element()
             }
