@@ -461,7 +461,9 @@ fn run_turn_using(
             } else {
                 prompt
             };
-            format!("{intro}\n\n{brief}\n\n{prompt}")
+            // Outside the hashed context, so the clock never resends it.
+            let now = chrono::Local::now().format("%A %-d %B %Y, %H:%M");
+            format!("{intro}\n\n{brief}\n\n<local_time>{now}</local_time>\n{prompt}")
         } else if let Some(handoff) = &settings.handoff {
             monocode_core::response::wrap_handoff_prompt(&handoff.from, &handoff.brief, &prompt)
         } else if provider_id.is_none() && turn_start > 0 {

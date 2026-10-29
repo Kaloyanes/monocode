@@ -1827,7 +1827,7 @@ mod tests {
                             && quad
                                 .background
                                 .as_solid()
-                                .is_some_and(|color| color == gpui::Hsla::from(rgb(0x323232)))
+                                .is_some_and(|color| color == crate::theme::rail_color())
                     }),
                     "the same spine as Operator rows connects folder members"
                 );
@@ -2070,6 +2070,34 @@ mod tests {
                 assert_eq!(shell.sessions[&a].read(cx).summary.title, "First name");
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn editing_a_link_keeps_remove_link_inside_the_dialog(cx: &mut TestAppContext) {
+        let (window, a, _) = setup(cx);
+        let open_picker = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |shell, w, cx| {
+                    shell.run_menu(MenuTarget::Session(a), "link-work-item", None, w, cx);
+                    shell.link_dialog.as_ref().unwrap().picker.clone()
+                })
+                .unwrap()
+        };
+        open_picker(cx).update(cx, |p, cx| {
+            p.search_for("https://github.com/acme/app/pull/42", cx);
+            p.pick(0, cx);
+        });
+        cx.run_until_parked();
+        open_picker(cx);
+        cx.run_until_parked();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        let dialog = visual.debug_bounds("work-item-picker").unwrap();
+        let remove = visual.debug_bounds("work-item-remove").unwrap();
+        assert!(
+            remove.right() <= dialog.right(),
+            "Remove link at {remove:?} overflows the dialog at {dialog:?}"
+        );
     }
 
     #[gpui::test]

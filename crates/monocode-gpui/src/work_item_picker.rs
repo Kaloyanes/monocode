@@ -296,6 +296,7 @@ impl gpui::Render for WorkItemPicker {
         };
         div()
             .id("work-item-picker")
+            .debug_selector(|| "work-item-picker".into())
             .role(Role::Dialog)
             .aria_label(if self.current.is_some() {
                 "Edit GitHub link"
@@ -413,6 +414,7 @@ impl gpui::Render for WorkItemPicker {
                         d.child(
                             div()
                                 .id("work-item-remove")
+                                .debug_selector(|| "work-item-remove".into())
                                 .role(Role::Button)
                                 .cursor_pointer()
                                 .flex_shrink_0()

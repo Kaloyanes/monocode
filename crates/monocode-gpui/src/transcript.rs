@@ -45,6 +45,17 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+/// Animates the transcript on the first display frame at or after `due`.
+fn motion_frame(view: gpui::WeakEntity<TranscriptView>, due: Option<Instant>, window: &Window) {
+    window.on_next_frame(move |window, cx| {
+        if due.is_some_and(|due| Instant::now() < due) {
+            motion_frame(view, due, window);
+        } else {
+            let _ = view.update(cx, |this, cx| this.animate_frame(cx));
+        }
+    });
+}
+
 /// Where a launched session stands, for its card in the chat.
 #[derive(Clone, PartialEq)]
 pub(crate) struct LaunchView {
@@ -232,6 +243,9 @@ struct Follow {
 }
 /// Units are px per 60fps frame, as in useBottomChatMotion.ts.
 const SPRING_FRAME: f32 = 1000. / 60.;
+/// Row motion redraws the whole transcript, so it runs at no more than 60fps
+/// even on 120Hz displays; the slack keeps a 60Hz display at its full rate.
+const MOTION_FRAME: std::time::Duration = std::time::Duration::from_millis(15);
 /// Mono replies can appear together; keep their glide below 1080px/second.
 const CHAT_FOLLOW_MAX_SPEED: f32 = 18.;
 /// Steady frames only measure the tail. A large reveal measures its full
@@ -343,6 +357,32 @@ impl Follow {
     }
 }
 
+/// Whether the Mono has said something the user can read in `from..to`: the
+/// opening sentence of any run there. A message the user sends after it reads
+/// as the next line of the chat, not as part of the prompt above.
+pub(crate) fn mono_spoke(source: &[Row], from: usize, to: usize) -> bool {
+    let mut working = false;
+    for (at, row) in source[from.min(to)..to].iter().enumerate() {
+        if row.is_prompt() {
+            working = false;
+        } else if row.first && row.role != "reasoning" {
+            if !working && row.role == "assistant" {
+                // One message spans its first row and the continuations after it.
+                let at = from.min(to) + at;
+                let text: String = std::iter::once(row)
+                    .chain(source[at + 1..to].iter().take_while(|r| !r.first))
+                    .map(|r| r.text.as_str())
+                    .collect();
+                let text = text.trim();
+                if !text.is_empty() && !text.starts_with("<reaction>") {
+                    return true;
+                }
+            }
+            working = true;
+        }
+    }
+    false
+}
 /// The first row of the prompt block that opens `turn`.
 pub(crate) fn prompt_start(source: &[Row], turn: usize) -> usize {
     let mut at = turn.min(source.len());
@@ -575,6 +615,7 @@ pub(crate) struct TranscriptView {
     motions: HashMap<(usize, usize), Motion>,
     reflow: crate::reflow_motion::ReflowMotion,
     frame_scheduled: bool,
+    last_motion_frame: Option<Instant>,
     visible: bool,
     viewport: Bounds<Pixels>,
     anchor_turn: Option<usize>,
@@ -1556,7 +1597,14 @@ impl TranscriptView {
                 .source
                 .iter()
                 .rposition(Row::is_prompt)
-                .is_some_and(|prompt| prompt >= self.live_start)
+                .is_some_and(|prompt| {
+                    prompt >= self.live_start
+                        && !mono_spoke(
+                            &self.source,
+                            self.mono_group_start(prompt + 1),
+                            self.source.len(),
+                        )
+                })
     }
     /// Whether `at` sits in a completion run that continues the turn above,
     /// returning the turn that opens the group: groupMonoChatTurns.
@@ -1571,7 +1619,12 @@ impl TranscriptView {
                 .turns
                 .get(&turn)
                 .and_then(|info| info.joined_turn)
-                .filter(|&root| root < turn)
+                // A steer stays beside the prompt it joins only until the
+                // Mono has replied in words; after that, the chat reads in order.
+                .filter(|&root| {
+                    root < turn
+                        && !mono_spoke(&self.source, root, prompt_start(&self.source, turn))
+                })
                 .or_else(|| mono_continues(&self.source, turn))
             {
                 Some(previous) => turn = previous,
@@ -1606,6 +1659,22 @@ impl TranscriptView {
             .iter()
             .rposition(Row::is_prompt)
             .map_or(0, |prompt| prompt + 1);
+        // The Mono answers before it works: its opening sentence is a message
+        // as soon as it is complete, and stays one when the run goes on or the
+        // user steers it. Like every Mono message it appears whole, never
+        // streamed. Later commentary is work.
+        let start = self.source[..=at]
+            .iter()
+            .rposition(|r| r.first)
+            .unwrap_or(at);
+        let complete = (start + 1..self.source.len()).any(|i| self.source[i].first)
+            || !(self.streaming && start >= self.live_start);
+        if self.source[turn..start]
+            .iter()
+            .all(|r| !r.first || r.role == "reasoning")
+        {
+            return !complete;
+        }
         // Starting a request precedes delivery of its prompt. History remains
         // settled during that gap, even though it is still the source's tail.
         (self.streaming && at >= self.live_start && end == self.source.len())
@@ -2384,6 +2453,7 @@ impl TranscriptView {
             motions: HashMap::new(),
             reflow: Default::default(),
             frame_scheduled: false,
+            last_motion_frame: None,
             visible: true,
             viewport: Bounds::default(),
             anchor_turn: None,
@@ -2489,6 +2559,20 @@ impl TranscriptView {
         if self.streaming == streaming {
             return;
         }
+        // What the user already reads while the Mono works, such as its
+        // opening sentence, must not enter again when the run settles.
+        let shown: HashSet<usize> = if self.mono && !streaming {
+            let run = self
+                .source
+                .iter()
+                .rposition(|r| r.is_prompt())
+                .map_or(0, |i| i + 1);
+            (run..self.source.len())
+                .filter(|&at| self.source[at].first && !self.mono_prose_hidden(at))
+                .collect()
+        } else {
+            HashSet::new()
+        };
         self.streaming = streaming;
         if streaming {
             self.active_provider_turn_id = None;
@@ -2510,8 +2594,10 @@ impl TranscriptView {
                         .await;
                     let keep = this
                         .update(cx, |this, cx| {
-                            if this.streaming {
-                                cx.notify();
+                            // The working time redraws the whole transcript;
+                            // skip it while the tab or the app is out of view.
+                            if this.streaming && this.visible && crate::pulse::app_active(cx) {
+                                cx.notify_paint();
                             }
                             this.streaming
                         })
@@ -2552,6 +2638,7 @@ impl TranscriptView {
                 let row = &self.source[at];
                 if row.first
                     && row.role == "assistant"
+                    && !shown.contains(&at)
                     && !row.text.trim_start().starts_with("<reaction>")
                 {
                     self.entrances.insert(at, now);
@@ -2891,6 +2978,11 @@ impl TranscriptView {
         self.rebuild(start, cx);
     }
     fn rebuild(&mut self, start: usize, cx: &mut Context<Self>) {
+        self.rebuild_rows(start, cx);
+        cx.notify();
+    }
+    /// `rebuild` for a caller that notifies itself.
+    fn rebuild_rows(&mut self, start: usize, cx: &mut Context<Self>) {
         #[cfg(test)]
         {
             self.rebuild_passes += 1;
@@ -3804,7 +3896,6 @@ impl TranscriptView {
             });
         }
         self.prune_reveals(now);
-        cx.notify();
     }
     fn prune_reveals(&mut self, now: Instant) {
         let latest = self
@@ -3884,6 +3975,22 @@ impl TranscriptView {
         pinned_answers: &HashMap<usize, usize>,
         replaced_work: Option<std::ops::Range<usize>>,
     ) -> Vec<UiRow> {
+        // Exit rows outlive a source patch, but message ordinals do not.
+        let owners: HashMap<_, _> = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| (message.start, index))
+            .collect();
+        old.retain_mut(|row| {
+            if let Some(&message) = owners.get(&row.key.0) {
+                row.message = message;
+                true
+            } else {
+                self.motions.remove(&row.key);
+                false
+            }
+        });
         let phase_toggle = self.phase_toggle.take();
         if old.is_empty() && !self.streaming && self.motions.is_empty() {
             return target;
@@ -4036,10 +4143,8 @@ impl TranscriptView {
             || self.chat_animating();
         if smooth {
             self.frame_scheduled = true;
-            let view = cx.entity().downgrade();
-            window.on_next_frame(move |_, cx| {
-                let _ = view.update(cx, |this, cx| this.animate_frame(cx));
-            });
+            let due = self.last_motion_frame.map(|at| at + MOTION_FRAME);
+            motion_frame(cx.entity().downgrade(), due, window);
         } else if self.stream_animating(now) {
             // Stream presentation keeps the shared 30Hz budget. Pure fade
             // frames reuse the parsed blocks, prepared text and measured rows.
@@ -4051,6 +4156,7 @@ impl TranscriptView {
         }
     }
     fn animate_frame(&mut self, cx: &mut Context<Self>) {
+        self.last_motion_frame = Some(Instant::now());
         self.frame_scheduled = false;
         // A frame queued before switching tabs must not invalidate the hidden
         // transcript's retained layout or advance its presentation animations.
@@ -4058,6 +4164,9 @@ impl TranscriptView {
             return;
         }
         let mut changed_phases = HashSet::new();
+        // Revealing words keeps every size but the revealed rows', which
+        // measure again by their content; anything else here resizes rows.
+        let mut resized = self.agent_panels.animating() || !self.motions.is_empty();
         for start in self.agent_panels.animate() {
             for (ix, row) in self.rows.iter().enumerate() {
                 if row.key.0 == start {
@@ -4074,7 +4183,7 @@ impl TranscriptView {
             }
         }
         if let Some(start) = changed {
-            self.rebuild(start, cx);
+            self.rebuild_rows(start, cx);
         }
         let mut removed = Vec::new();
         let offset = self.list.logical_scroll_top();
@@ -4125,7 +4234,12 @@ impl TranscriptView {
         self.list
             .remeasure_items(self.footer_ix()..self.footer_ix() + 1);
         self.index_messages();
-        cx.notify();
+        resized |= self.agent_panels.animating() || !self.motions.is_empty();
+        if resized {
+            cx.notify();
+        } else {
+            cx.notify_paint();
+        }
     }
     fn highlight(&mut self, fence: &Arc<Fence>, cx: &mut Context<Self>) {
         if self.highlights.contains_key(&fence.key) || self.highlighting.contains(&fence.key) {
@@ -5670,15 +5784,13 @@ pub(crate) fn floating_surface() -> impl IntoElement {
         |_, _, _| {},
         |bounds, _, window, _| {
             let radius = bounds.size.height / 2.;
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             window.paint_quad(
                 gpui::fill(bounds, content(0.04))
                     .corner_radii(radius)
-                    .border_color(gpui_apple::metal_renderer::backdrop_blur_marker(
-                        12. * window.scale_factor(),
-                    )),
+                    .border_color(gpui::backdrop_blur_marker(12. * window.scale_factor())),
             );
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             window.paint_quad(gpui::fill(bounds, rgb(CHAT)).corner_radii(radius));
         },
     )
@@ -5876,6 +5988,47 @@ mod scroll_tests {
             assert_eq!(restored.offset_in_item, position.offset_in_item);
             assert!(!view.list.is_following_tail());
         });
+    }
+
+    #[gpui::test]
+    fn exit_rows_survive_a_patch_that_merges_messages(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(false));
+        let window = cx.update(|cx| {
+            cx.open_window(WindowOptions::default(), |_, cx| {
+                cx.new(|_| TranscriptView::new())
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.patch(
+                    0,
+                    vec![row("user", "Question"), row("assistant", "Answer")],
+                    cx,
+                );
+                settle(view, cx);
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                // The second source row now continues the first message, so
+                // the answer's row exits while only one message remains.
+                assert!(view.rows.iter().any(|r| r.key.0 == 1));
+                let mut continuation = row("assistant", " continued");
+                continuation.first = false;
+                view.patch(0, vec![row("assistant", "Answer"), continuation], cx);
+                assert_eq!(view.messages.len(), 1);
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.rows.iter().all(|r| r.message < view.messages.len()));
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -6471,8 +6624,8 @@ mod scroll_tests {
                 "one set of actions, at the end of the group"
             );
             assert!(
-                view.mono_prose_hidden(1),
-                "prose before later work stays in the trail"
+                !view.mono_prose_hidden(1),
+                "the opening sentence shows before the work"
             );
             assert!(!view.mono_prose_hidden(3));
             assert!(
@@ -6484,7 +6637,15 @@ mod scroll_tests {
             view.streaming(true, cx);
             view.patch(6, vec![row("user", "And another thing")], cx);
             view.patch(7, vec![row("assistant", "Working on it")], cx);
-            assert!(view.mono_prose_hidden(7), "live prose waits in the trail");
+            assert!(
+                view.mono_prose_hidden(7),
+                "a Mono message appears whole, not while it streams"
+            );
+            view.patch(8, vec![row("tool", &start)], cx);
+            assert!(
+                !view.mono_prose_hidden(7),
+                "the finished opening sentence shows while the Mono works"
+            );
             view.set_pending(
                 vec![PendingMessage {
                     id: "q".into(),
@@ -6506,8 +6667,8 @@ mod scroll_tests {
                 .rposition(|r| matches!(r.body, Body::WorkLine { .. }))
                 .unwrap();
             assert!(
-                pending < header,
-                "a queued message sits above the running turn's work"
+                pending > header,
+                "a message queued after the Mono spoke follows its words"
             );
         });
     }

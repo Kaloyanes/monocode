@@ -5,6 +5,7 @@ use crate::{
     project_settings::{BackgroundDialog, Event as BackgroundEvent},
 };
 use gpui::{AnyView, Div, FontWeight, Stateful};
+use monocode_core::mono::heartbeat;
 use monocode_core::project_appearance::{MASCOTS, ProjectAppearance};
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum OverviewTab {
@@ -810,7 +811,8 @@ impl Monos {
             // MonoSidebarHeader's pl-4 and OverviewTabs' -ml-2 combine
             // into an 8px inset, keeping the tab icons aligned with actions.
             .pl(px(8.))
-            .pr_3()
+            // The window's top-right corner: clear of client-drawn controls.
+            .pr(px(12. + crate::shell::corner_controls_width(window)))
             .border_b_1()
             .border_color(content(0.07))
             .flex()
@@ -1099,11 +1101,8 @@ impl Monos {
             .children(documents.into_iter().map(|document| {
                 // MonoOverview's DocumentRow: laid out like a habit.
                 let id = document.id.clone();
-                let label = if document.kind == "html" {
-                    "Visual"
-                } else {
-                    "Document"
-                };
+                let visual = matches!(document.kind.as_str(), "html" | "visual");
+                let label = if visual { "Visual" } else { "Document" };
                 div()
                     .id(SharedString::from(format!("mono-document-{id}")))
                     .debug_selector({
@@ -1131,14 +1130,7 @@ impl Monos {
                             .items_center()
                             .justify_center()
                             .child(
-                                icon(
-                                    if document.kind == "html" {
-                                        "chart-square"
-                                    } else {
-                                        "file"
-                                    },
-                                    14.,
-                                )
+                                icon(if visual { "chart-square" } else { "file" }, 14.)
                                 .text_color(content(0.6)),
                             ),
                     )
@@ -1269,9 +1261,10 @@ impl Monos {
                     .documents
                     .get(&id)
                     .or_else(|| {
-                        mono.documents
-                            .iter()
-                            .find(|d| d.id == id && !mono.desktop_document_ids.contains(&id))
+                        mono.documents.iter().find(|d| {
+                            d.id == id
+                                && (d.kind == "visual" || !mono.desktop_document_ids.contains(&id))
+                        })
                     })
                     .cloned()
                 else {
@@ -1298,6 +1291,32 @@ impl Monos {
                         .clone();
                     html.update(cx, |html, _| html.set_interactive(interactive));
                     html.into_any_element()
+                } else if document.kind == "visual" {
+                    // The same native dither visual the chat shows, on its own page.
+                    let visual = match self.visual_documents.get(&id) {
+                        Some(view) => Some(view.clone()),
+                        None => serde_json::from_str(&document.body).ok().map(|visual| {
+                            // The page header already titles it.
+                            let view = cx.new(|cx| {
+                                let mut view = crate::visuals::VisualView::new(visual, cx);
+                                view.set_inline(Some(String::new()), cx);
+                                view
+                            });
+                            self.visual_documents.insert(id.clone(), view.clone());
+                            view
+                        }),
+                    };
+                    match visual {
+                        Some(view) => div()
+                            .id("mono-visual-document")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .px_4()
+                            .py_3()
+                            .child(view)
+                            .into_any_element(),
+                        None => empty("Visual unavailable"),
+                    }
                 } else {
                     self.documents
                         .entry(id.clone())
@@ -1317,13 +1336,22 @@ impl Monos {
                     .flex()
                     .flex_col()
                     .child(
-                        self.page_header(&document.title, cx).child(
-                            icon_button("mono-document-copy", "Copy document", "response-copy")
-                                .on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        document.body.clone(),
-                                    ))
-                                }),
+                        self.page_header(&document.title, cx).when(
+                            document.kind != "visual",
+                            |header| {
+                                header.child(
+                                    icon_button(
+                                        "mono-document-copy",
+                                        "Copy document",
+                                        "response-copy",
+                                    )
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            document.body.clone(),
+                                        ))
+                                    }),
+                                )
+                            },
                         ),
                     )
                     .child(div().flex_1().min_h_0().child(view))
@@ -1717,10 +1745,56 @@ impl Monos {
                 .child(switch_setting("Group in a folder",&format!("Sessions it starts go in a “{}” folder in your project sidebar.",mono.label()),!mono.show_started_sessions_in_sidebar,
                     self.switch("mono-group-started",mono.show_started_sessions_in_sidebar&&mono.use_sidebar_folders,!mono.show_started_sessions_in_sidebar,|m,on|m.use_sidebar_folders=on,cx))
                     .border_t_1().border_color(content(0.04))))
+            .child(heading("Heartbeat",Some("When it has been quiet for a while, it looks over its recent work, sessions you left, your notes and inbox, and suggests what to do next. It never acts without asking.")))
+            .child(card()
+                .child(switch_setting("Check in on its own","Quiet check-ins leave nothing behind; you only hear from it when it has an idea.",false,
+                    self.switch("mono-heartbeat",mono.heartbeat_minutes>0,false,|m,on|m.heartbeat_minutes=if on {heartbeat::DEFAULT_MINUTES} else {0},cx)))
+                .child(setting("After it has been quiet for",None,self.heartbeat_intervals(mono,cx))
+                    .when(mono.heartbeat_minutes==0,|d|d.opacity(0.4)).border_t_1().border_color(content(0.04))))
             .child(heading("Conversation",None))
             .child(card().child(setting("Reset conversation",Some("Clear all messages and start fresh. Its soul, memory and habits stay."),
                 div().id("mono-reset").role(Role::Button).aria_label("Reset").flex().items_center().px_3().py_1p5().rounded_md().text_size(px(12.)).border_1().border_color(content(0.04)).text_color(rgb(0xff6467)).hover(|s|s.bg(rgb(0xfb2c36).opacity(0.1))).child("Reset")
                     .on_click(cx.listener(move |this,_,w,cx|this.reset_conversation(&reset,w,cx))).into_any_element())))
+            .into_any_element()
+    }
+    fn heartbeat_intervals(&self, mono: &Mono, cx: &mut Context<Self>) -> AnyElement {
+        let enabled = mono.heartbeat_minutes > 0;
+        div()
+            .flex()
+            .gap_1()
+            .children(heartbeat::INTERVALS.iter().map(|&minutes| {
+                let selected = enabled && mono.heartbeat_minutes == minutes;
+                let label = if minutes < 60 {
+                    format!("{minutes}m")
+                } else {
+                    format!("{}h", minutes / 60)
+                };
+                div()
+                    .id(("mono-heartbeat-interval", minutes as usize))
+                    .role(Role::Button)
+                    .aria_label(label.clone())
+                    .aria_selected(selected)
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .border_1()
+                    .border_color(content(if selected { 0.2 } else { 0.06 }))
+                    .when(selected, |d| d.bg(content(0.08)).text_color(content(1.)))
+                    .when(!selected, |d| d.text_color(content(0.55)))
+                    .when(enabled, |d| d.hover(|s| s.bg(content(0.05))))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(id) = this.active.clone()
+                            && let Some(m) = this.roster.get_mut(&id)
+                            && m.heartbeat_minutes > 0
+                        {
+                            m.heartbeat_minutes = minutes;
+                            this.save(cx);
+                            cx.notify();
+                        }
+                    }))
+            }))
             .into_any_element()
     }
     fn switch(
