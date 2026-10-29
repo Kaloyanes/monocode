@@ -232,9 +232,10 @@ pub(crate) struct SettingsView {
     mcp_show_all: bool,
     mcp_remove_scopes: HashMap<String, String>,
     mcp_busy: bool,
-    mcp_grants: Vec<monocode_core::permissions::Grant>,
-    mcp_grants_error: Option<String>,
-    mcp_grants_task: Option<Task<()>>,
+    grants: Vec<monocode_core::permissions::Grant>,
+    grants_error: Option<String>,
+    grants_busy: bool,
+    grants_task: Option<Task<()>>,
     mcp_health: Option<Task<()>>,
     discovery: data::Discovery,
     discovery_loading: bool,
@@ -370,9 +371,10 @@ impl SettingsView {
             mcp_show_all: false,
             mcp_remove_scopes: HashMap::new(),
             mcp_busy: false,
-            mcp_grants: Vec::new(),
-            mcp_grants_error: None,
-            mcp_grants_task: None,
+            grants: Vec::new(),
+            grants_error: None,
+            grants_busy: false,
+            grants_task: None,
             mcp_health: None,
             discovery: data::Discovery::default(),
             discovery_loading: false,
@@ -431,12 +433,12 @@ impl SettingsView {
                 this.discovery_loading = false;
                 match grants {
                     Ok(grants) => {
-                        this.mcp_grants = grants;
-                        this.mcp_grants_error = None;
+                        this.grants = grants;
+                        this.grants_error = None;
                     }
                     Err(error) => {
-                        this.mcp_grants.clear();
-                        this.mcp_grants_error = Some(error);
+                        this.grants.clear();
+                        this.grants_error = Some(error);
                     }
                 }
                 if this.section == Section::Mcp {
@@ -484,6 +486,9 @@ impl SettingsView {
             self.watch_connections(cx);
             if section == Section::Mcp {
                 self.refresh_mcp_health(cx);
+            }
+            if section == Section::Permissions {
+                self.refresh_grants(cx);
             }
             self.select_open = None;
             self.recording = None;

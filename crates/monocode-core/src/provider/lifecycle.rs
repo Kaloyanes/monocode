@@ -18,47 +18,39 @@ impl Protocol {
                 json!({"id":wire,"result":{"action":"cancel","content":null,"_meta":null}}),
             );
         };
-        let grant = self.mcp_grant(&request);
-        let restricted =
-            self.request.settings.plan || self.request.settings.access == AccessMode::ReadOnly;
-        if !restricted
-            && (self.request.settings.access == AccessMode::FullAccess
-                || grant
-                    .as_ref()
-                    .is_some_and(|grant| self.permissions.contains(&grant.key)))
-        {
+        if self.grants_apply() && self.request.settings.access == AccessMode::FullAccess {
             return write_json(
                 stdin,
                 json!({"id":wire,"result":{"action":"accept","content":content,"_meta":null}}),
             );
         }
+        let subjects = self.mcp_subject(&request).into_iter().collect();
         request["nativeContent"] = content;
         let id = wire.to_string();
-        let computer_use = request["_meta"]["connector_id"] == "computer-use"
-            && request["_meta"]["codex_approval_kind"] == "mcp_tool_call"
-            && request["_meta"]["tool_params"]["app"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty());
         self.approvals
             .insert(id.clone(), (wire, "codex-mcp".into(), request));
+        if self.offer(&id, subjects, &title) {
+            return self.respond(
+                Control {
+                    id,
+                    decision: Decision::Allow,
+                },
+                stdin,
+            );
+        }
         events.push(Event::Approval(Approval {
+            remember_scope: self.remember_scope(&id),
             id,
             title,
             detail: String::new(),
             can_remember: false,
-            remember_scope: (!restricted && grant.is_some()).then(|| {
-                if computer_use {
-                    "Allow Computer Use actions for this app in this project, across worktrees, chats and restarts. Remove it in Settings → MCP connections.".into()
-                } else {
-                    "Remember this exact confirmation in this project, across worktrees, chats and restarts. Remove it in Settings → MCP connections.".into()
-                }
-            }),
         }));
         Ok(())
     }
 
-    fn mcp_grant(&self, request: &Value) -> Option<crate::permissions::Grant> {
-        let (label, _) = mcp_confirmation(request)?;
+    /// A Codex MCP confirmation without the fields that change on every ask.
+    pub(super) fn mcp_subject(&self, request: &Value) -> Option<crate::permissions::Subject> {
+        mcp_confirmation(request)?;
         let server = request["serverName"]
             .as_str()
             .filter(|s| !s.trim().is_empty())?;
@@ -71,66 +63,10 @@ impl Protocol {
         }
         let mut confirmation = Value::Object(confirmation);
         crate::permissions::stable(&mut confirmation);
-        let settings = &self.request.settings;
-        let mut account_home = settings.account.home(self.request.kind).ok()?;
-        if settings.account.id == crate::accounts::DEFAULT {
-            if let Some(home) = settings
-                .environment
-                .get("CODEX_HOME")
-                .filter(|s| !s.is_empty())
-            {
-                account_home = home.into();
-            }
-        }
-        if let Some(mono) = &settings.mono {
-            if let Some(home) = crate::mono::codex_home(&mono.root, &settings.account.id).ok()? {
-                account_home = home;
-            }
-        }
-        Some(crate::permissions::Grant {
-            label,
-            key: crate::permissions::Key {
-                provider: self.request.kind.id().into(),
-                account: self.request.settings.account.id.clone(),
-                account_home: crate::permissions::project(&account_home),
-                binary: crate::permissions::codex_binary(&self.request.binary),
-                project: crate::permissions::repository(&self.request.cwd),
-                server: server.into(),
-                confirmation,
-            },
+        Some(crate::permissions::Subject::McpConfirmation {
+            server: server.into(),
+            confirmation,
         })
-    }
-
-    pub(super) fn remember_approval(
-        &mut self,
-        id: &str,
-        stdin: &mut impl Write,
-    ) -> Result<Vec<Event>, String> {
-        let Some((_, kind, request)) = self.approvals.get(id) else {
-            return Ok(Vec::new());
-        };
-        let grant = (kind == "codex-mcp"
-            && !self.request.settings.plan
-            && self.request.settings.access != AccessMode::ReadOnly)
-            .then(|| self.mcp_grant(request))
-            .flatten();
-        let result = grant
-            .ok_or_else(|| "This request cannot be remembered".to_owned())
-            .and_then(|grant| self.permissions.allow(grant));
-        if let Err(error) = result {
-            return Ok(vec![Event::ApprovalSaveFailed {
-                id: id.into(),
-                error: format!("{error}. The request is still waiting for your decision."),
-            }]);
-        }
-        self.respond(
-            Control {
-                id: id.into(),
-                decision: Decision::Allow,
-            },
-            stdin,
-        )?;
-        Ok(vec![Event::ApprovalResolved(id.into())])
     }
 
     pub(super) fn claude_prompt(&mut self, stdin: &mut impl Write) -> Result<(), String> {
@@ -675,10 +611,10 @@ mod permission_tests {
         let mut p = protocol(&dir.path().join("permissions.json"));
         let mut form = request();
         form["requestedSchema"]["properties"]["secret"] = json!({"type":"string"});
-        assert!(p.mcp_grant(&form).is_none());
+        assert!(p.mcp_subject(&form).is_none());
         let mut missing = request();
         missing.as_object_mut().unwrap().remove("serverName");
-        assert!(p.mcp_grant(&missing).is_none());
+        assert!(p.mcp_subject(&missing).is_none());
         assert!(ask(&mut p, form, &mut Vec::new())
             .iter()
             .all(|e| !matches!(e, Event::Approval(_))));
