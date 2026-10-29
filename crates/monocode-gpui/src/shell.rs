@@ -109,6 +109,7 @@ actions!(
         PreviousProject,
         NextProject,
         SwitchModel,
+        ChangeEffort,
         ToggleRightPanel,
         SplitRight,
         SplitDown,
@@ -234,6 +235,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-shift-left"), PreviousProject, context),
         KeyBinding::new(&format!("{modifier}-shift-right"), NextProject, context),
         KeyBinding::new(&format!("{modifier}-."), SwitchModel, context),
+        KeyBinding::new(&format!("{modifier}-/"), ChangeEffort, context),
         KeyBinding::new(&format!("{modifier}-shift-b"), ToggleRightPanel, context),
         KeyBinding::new(&format!("{modifier}-d"), SplitRight, context),
         KeyBinding::new(&format!("{modifier}-j"), ToggleTerminal, context),
@@ -8473,6 +8475,11 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &SwitchModel, window, cx| {
                 if let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id)) {
                     view.update(cx, |v, cx| v.toggle_recent_models(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ChangeEffort, window, cx| {
+                if let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id)) {
+                    view.update(cx, |v, cx| v.toggle_effort_menu(window, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &DismissMenu, window, cx| {

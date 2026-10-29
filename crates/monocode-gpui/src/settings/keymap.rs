@@ -60,6 +60,7 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         "workspace::ToggleSidebar" => "App: Toggle Sidebar",
         "workspace::ToggleRightPanel" => "App: Toggle Session Sidebar",
         "workspace::SwitchModel" => "App: Switch Model",
+        "workspace::ChangeEffort" => "App: Change Effort",
         "workspace::NewCodex" if keys.ends_with("-t") => "Tab: New",
         "workspace::CloseOtherTabs" => "Tab: Close Others",
         "workspace::CloseAllTabs" => "Tab: Close All",

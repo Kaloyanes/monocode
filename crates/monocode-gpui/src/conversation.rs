@@ -2603,6 +2603,33 @@ impl Conversation {
         self.mono_ui.models = None;
         self.toggle_menu(ComposerMenu::Recent, window, cx);
     }
+    /// `App: Change Effort` (Cmd+/): toggles the effort pill's menu, or the
+    /// provider's effort control when the model has no efforts of its own.
+    pub(crate) fn toggle_effort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(model) = self.model_info() else {
+            return;
+        };
+        let ix = if !model.efforts.is_empty() {
+            0
+        } else if let Some(ix) = model
+            .controls
+            .iter()
+            .position(|control| !model_control_toggle(control) && is_effort_key(&control.id))
+        {
+            ix + 1
+        } else {
+            return;
+        };
+        let beside = cx
+            .try_global::<crate::settings::Preferences>()
+            .is_some_and(|p| p.model_controls == "beside");
+        // Without the pills their anchors are stale, so open at the model trigger.
+        if self.settings.mono.is_none() && !beside {
+            self.mono_ui.setting_anchors.clear();
+        }
+        self.mono_ui.models = None;
+        self.toggle_menu(ComposerMenu::Setting(ix), window, cx);
+    }
     /// Right-clicking the model trigger opens the recent models over any menu.
     fn open_recent_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.menu_is(ComposerMenu::Recent) {
@@ -3979,6 +4006,23 @@ mod menu_tests {
                     "beside mode paints its effort control"
                 );
             })
+            .unwrap();
+        // App: Change Effort toggles the effort menu, and picking sets it.
+        window
+            .update(visual, |c, w, cx| c.toggle_effort_menu(w, cx))
+            .unwrap();
+        window
+            .update(visual, |c, _, cx| {
+                assert!(c.menu_is(ComposerMenu::Setting(0)));
+                c.menu_choice("effort:high", cx);
+                assert_eq!(c.selected_effort(), Some("high"));
+            })
+            .unwrap();
+        window
+            .update(visual, |c, w, cx| c.toggle_effort_menu(w, cx))
+            .unwrap();
+        window
+            .update(visual, |c, _, _| assert!(c.menu.is_none()))
             .unwrap();
     }
 
