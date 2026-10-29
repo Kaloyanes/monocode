@@ -2824,8 +2824,18 @@ impl gpui::Render for Inbox {
             self.focus_comment = false;
             window.focus(&self.comment.focus_handle(cx), cx);
         }
-        let list = self.list_view(cx);
-        let detail = self.detail_view(window, cx);
+        let list = (!self.detail_only).then(|| self.list_view(cx));
+        let detail = match self.link_notice_view(cx) {
+            Some(notice) if self.detail_only && self.item().is_none() => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(16.))
+                .child(notice)
+                .into_any_element(),
+            _ => self.detail_view(window, cx),
+        };
         div()
             .id("inbox-view")
             .role(Role::Group)
@@ -2892,7 +2902,7 @@ impl gpui::Render for Inbox {
                     .min_h_0()
                     .min_w_0()
                     .flex()
-                    .child(list)
+                    .children(list)
                     .child(div().flex_1().min_w_0().min_h_0().child(detail)),
             )
             .when_some(self.error.clone(), |d, text| d.child(error(text)))
@@ -3341,7 +3351,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn work_links_reach_the_shell_from_a_window_and_from_code_without_one(cx: &mut TestAppContext) {
+    fn work_links_reach_the_shell(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
             cx.open_window(WindowOptions::default(), |_, cx| {
                 cx.new(|cx| Shell {
@@ -3363,17 +3373,10 @@ mod tests {
             })
             .unwrap();
         assert!(shown, "the shell's handler makes the action available");
-        cx.update(|cx| crate::inbox::open_link_later("https://github.com/acme/app/pull/2", cx));
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| {
-                assert_eq!(
-                    shell.opened,
-                    [
-                        "https://github.com/acme/app/pull/1",
-                        "https://github.com/acme/app/pull/2"
-                    ]
-                )
+                assert_eq!(shell.opened, ["https://github.com/acme/app/pull/1"])
             })
             .unwrap();
     }
