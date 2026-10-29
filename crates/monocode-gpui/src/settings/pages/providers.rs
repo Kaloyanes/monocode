@@ -342,13 +342,7 @@ impl SettingsView {
                     }
                     text + "."
                 })
-                .unwrap_or_else(|| {
-                    format!(
-                        "Install {} and sign in with {}.",
-                        kind.label(),
-                        kind.login_hint()
-                    )
-                });
+                .unwrap_or_else(|| kind.unavailable_hint());
             clis.push(self.row(None, false, label, Some(description.into()), controls));
             if open && installed.is_some() {
                 clis.push(self.model_visibility(kind, &scope, &models, cx));
