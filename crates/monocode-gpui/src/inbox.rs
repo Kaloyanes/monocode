@@ -543,8 +543,6 @@ impl Inbox {
                         .item()
                         .is_none_or(|item| item.provider != this.state.source)
                 {
-                    this.pinned = None;
-                    this.back.clear();
                     this.deselect(cx);
                 }
                 if this.active
@@ -763,6 +761,8 @@ impl Inbox {
     }
     fn deselect(&mut self, cx: &mut Context<Self>) {
         self.selected = None;
+        self.pinned = None;
+        self.back.clear();
         self.reset_detail(cx);
         cx.notify();
     }
