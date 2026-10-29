@@ -23,7 +23,8 @@ const ENV_SESSION: &str = "MONOCODE_VISUAL_SESSION";
 const ENV_EXECUTABLE: &str = "MONOCODE_VISUAL_EXECUTABLE";
 
 /// Loaded through visual_docs or the CLI only when authoring a visual. Keep the
-/// SDK out of ordinary prompts, server instructions and tool descriptions.
+/// SDK out of ordinary prompts, server instructions and tool descriptions; only
+/// the short USAGE trigger is part of the system prompt.
 const DOCUMENTATION: &str = r#"Native session visuals
 Use visual_check to validate a visual, then visual_show to publish it into this
 conversation. They accept {source}; visual_show also accepts {title?,id?}.
@@ -35,15 +36,35 @@ return () => visual.column([
   visual.button('Add', () => { state.count += 1; })
 ], {gap: 12});
 
+Answers that tell a story: publish one small visual per idea (a single chart,
+a stat row, a gauge) rather than one dashboard holding everything. Each
+visual_show returns an embed line such as ![Deploys per week](visual:deploys).
+Write your final reply as prose and put each embed line on its own line
+directly after the sentence it supports, so text and visuals alternate. The
+title becomes the caption; do not restate what the visual already shows.
+Visuals you never place appear above your reply. Choose short, readable ids.
+
 Native components:
 visual.column(children,{gap?}), row(children,{gap?}), grid(children,{columns?,gap?})
-visual.text(text,{size?,color?}), stat(label,value,{detail?,color?})
+visual.card(children,{gap?}) groups a chart or stats on a raised panel.
+visual.text(text,{size?,color?})
+visual.stat(label,value,{detail?,delta?,trend?,better?,color?}): delta is a signed
+change such as '+12.4%'; trend is an array of numbers drawn as a sparkline;
+better:'lower' colors a falling delta as good (latency, errors, cost).
 visual.table(columns,rows)
 visual.chart('bar'|'line'|'area',[{label,values,color?}],{labels?,height?})
+A single-series bar chart labels its latest bar; give each series its own color.
+visual.gauge(label,value,{min?,max?,unit?,color?}) for a reading against a range.
+visual.donut([{label,value,color?}],{label?,value?}) for parts of a whole;
+label and value are written in the middle (default: the total).
+visual.heatmap(rows,{rows?,columns?,color?}): rows is an array of equal-length
+number arrays, such as weekdays by weeks; labels are optional.
+visual.progress(label,value,{max?,detail?,color?})
 visual.button(label,onClick,{disabled?}), toggle(label,value,onChange)
 visual.slider(label,value,min,max,onChange,{step?}), tabs(labels,selected,onChange)
 visual.input(label,value,onChange,{placeholder?}), select(label,options,selectedIndex,onChange)
 Input handlers receive a string (up to 4096 bytes); select handlers receive an index.
+Select and input labels are not shown: make options and placeholders self-explanatory.
 visual.canvas(shapes,{width?,height?})
 Canvas shapes: visual.rect(x,y,w,h,{color?}), circle(x,y,r,{color?}),
 line(x1,y1,x2,y2,{color?,width?}), polyline([[x,y],...],{color?,width?}),
@@ -71,6 +92,42 @@ scripts compact. Check validates execution, the initial component tree, and repr
 it does not capture a screenshot. Fix errors before publishing. Set a concise
 title for the published visual. Never expose capability environment variables.
 "#;
+
+/// The system-prompt rule for when to reach for a visual. Only the trigger
+/// lives here; the SDK stays behind visual_docs.
+const USAGE: &str = "### Native visuals\n\nAnswer data with a trend, comparison or breakdown with an inline visual, and show any chart, diagram or visualizer the user asks for the same way: read `visual_docs` once, then `visual_check` and `visual_show`. Never start a server, open a browser or write an HTML file to show it. Ordinary coding answers need no visual.";
+
+/// Usage guidance for a provider that received the visual MCP server. Claude
+/// Code may defer MCP tools behind ToolSearch, so it is told how to load them.
+pub fn instructions(environment: &HashMap<String, String>, deferred: bool) -> Option<String> {
+    configured(environment).then(|| {
+        if deferred {
+            format!("{USAGE} The monocode_visual tools may be deferred: load them with ToolSearch before you call them.")
+        } else {
+            USAGE.to_owned()
+        }
+    })
+}
+
+/// The explicit composer command requires a publication even when the ordinary
+/// automatic trigger would leave the answer in prose. Keep the SDK on demand.
+pub fn requested_prompt(request: &str) -> String {
+    let request = if request.trim().is_empty() {
+        "Visualize the current topic using the conversation so far."
+    } else {
+        request
+    };
+    format!(
+        "Create and publish at least one native inline visual in this conversation during this turn. The user invoked the visualization command, so a visual is required even if you would normally answer only in prose.\n\n\
+         Read `visual_docs`, build the visual, run `visual_check`, fix any errors, and call `visual_show` before finishing. The monocode_visual MCP tools may be deferred; load them with ToolSearch if needed. If these tools are unavailable, use the executable in MONOCODE_VISUAL_EXECUTABLE: run `\"$MONOCODE_VISUAL_EXECUTABLE\" visual docs`, write the JavaScript source to a file, then run `\"$MONOCODE_VISUAL_EXECUTABLE\" visual check --input FILE` and `\"$MONOCODE_VISUAL_EXECUTABLE\" visual show --input FILE --title TITLE`.\n\n\
+         Use the native visual SDK, never a server, browser or HTML file. Include the embed line returned by visual_show in your reply, alongside concise supporting prose. If publication fails, explain the failure; do not claim a visual was shown. Never print capability environment variables.\n\n\
+         User request:\n{request}"
+    )
+}
+
+/// Claude permission rule that pre-approves every visual tool. Publishing
+/// only affects this conversation, so read-only and plan turns may use it.
+pub const CLAUDE_ALLOWED_TOOLS: &str = "mcp__monocode_visual";
 
 #[derive(Serialize, Deserialize)]
 struct Wire {
@@ -512,7 +569,28 @@ fn publish_with_environment(
             .unwrap_or("Visual publication failed")
             .into());
     }
+    let mut response = response;
+    response["embed"] = json!(embed(&wire.document));
+    response["placement"] = json!(
+        "Put the embed line on its own line in your final reply, where this visual belongs. Do not describe or restate the visual around it."
+    );
     Ok(response)
+}
+
+/// The Markdown line that places a published visual in an answer's prose.
+fn embed(document: &VisualDocument) -> String {
+    let caption: String = document
+        .title
+        .chars()
+        .map(|c| {
+            if matches!(c, '[' | ']' | '\n' | '\r') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!("![{}](visual:{})", caption.trim(), document.id)
 }
 
 fn current_environment() -> HashMap<String, String> {
@@ -671,9 +749,9 @@ pub fn tool_definitions() -> Vec<Value> {
     show_properties["id"] = json!({"type":"string","maxLength":96,"description":"Optional document identifier. A new request appends a new visual; reuse requestId to retry a publication."});
     show_properties["requestId"] = json!({"type":"string","maxLength":128,"description":"Reuse when retrying an uncertain publication"});
     vec![
-        json!({"name":"visual_docs","description":"Read the native visual SDK reference, examples and styling rules when preparing an inline visual. Does not publish.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"visual_docs","description":"Read the native visual SDK reference, examples and styling rules before building an inline chart, diagram or visualizer. Does not publish.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
         json!({"name":"visual_check","description":"Validate a native visual program and representative controls without publishing. Returns its component tree. Read visual_docs for the SDK reference.","inputSchema":{"type":"object","properties":properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
-        json!({"name":"visual_show","description":"Publish an interactive native visual into the current conversation and save it with the transcript. Read visual_docs for the SDK reference; validate with visual_check before publishing.","inputSchema":{"type":"object","properties":show_properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
+        json!({"name":"visual_show","description":"Publish a native visual (chart, stat row, diagram, interactive explainer) inline in this conversation. Use it for data with a trend, comparison or breakdown, and whenever the user asks for a visual. Returns an embed line: put it on its own line in your final reply where the visual belongs, between the sentences it supports. Read visual_docs first; validate with visual_check.","inputSchema":{"type":"object","properties":show_properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
     ]
 }
 
@@ -748,6 +826,43 @@ mod tests {
 
     fn input() -> Value {
         json!({"source":"return () => visual.text('Hello');","title":"Hello","requestId":"test-request","id":"hello"})
+    }
+
+    #[test]
+    fn visualize_prompt_uses_native_tools_without_invoking_a_same_named_skill() {
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join(".agents/skills/visualize");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: visualize\n---\nUse a different visualization system.",
+        )
+        .unwrap();
+        let cwd = root.path().to_str().unwrap();
+        for request in ["", "Compare the two approaches"] {
+            let prompt = requested_prompt(request);
+            assert!(prompt.contains("a visual is required"));
+            assert!(prompt.contains("visual_docs"));
+            assert!(prompt.contains("visual_check"));
+            assert!(prompt.contains("visual_show"));
+            assert!(prompt.contains("MONOCODE_VISUAL_EXECUTABLE"));
+            assert!(prompt.ends_with(if request.is_empty() {
+                "Visualize the current topic using the conversation so far."
+            } else {
+                request
+            }));
+            for kind in [
+                crate::provider::Kind::Codex,
+                crate::provider::Kind::Omp,
+                crate::provider::Kind::Devin,
+            ] {
+                assert_eq!(
+                    crate::provider::prepare_prompt(kind, &prompt, cwd, &[]).unwrap(),
+                    prompt,
+                    "The local command must not expand a same-named skill or reach a provider as a raw slash command"
+                );
+            }
+        }
     }
 
     #[test]
