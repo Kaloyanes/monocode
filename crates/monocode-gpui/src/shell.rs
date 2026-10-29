@@ -19,6 +19,7 @@ pub(crate) mod monos;
 mod notifications;
 mod orchestration;
 mod picker_preferences;
+mod project_picker;
 mod project_rail;
 mod project_removal;
 mod project_settings;
@@ -87,6 +88,7 @@ actions!(
     [
         NewCodex,
         NewClaude,
+        NewInProject,
         OpenProject,
         CloseTab,
         CloseAllTabs,
@@ -195,7 +197,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-n"), NewCodex, context),
         KeyBinding::new(&format!("{modifier}-t"), NewCodex, context),
-        KeyBinding::new(&format!("{modifier}-shift-n"), NewClaude, context),
+        KeyBinding::new(&format!("{modifier}-shift-n"), NewInProject, context),
         KeyBinding::new(&format!("{modifier}-o"), OpenProject, context),
         KeyBinding::new(&format!("{modifier}-p"), GoToFile, context),
         KeyBinding::new(&format!("{modifier}-shift-p"), OpenCommandPalette, context),
@@ -581,6 +583,7 @@ struct SessionPreview {
 pub(crate) struct Shell {
     monos: Option<Entity<crate::monos::Monos>>,
     quick_open: Option<quick_open::Open>,
+    project_picker: Option<project_picker::Open>,
     image_lightbox: Option<(Entity<crate::image_lightbox::ImageLightbox>, Subscription)>,
     app_bridge: Option<monocode_core::mono::bridge::Server>,
     mobile: mobile_host::Mobile,
@@ -957,6 +960,7 @@ impl Shell {
         let mut this = Self {
             monos: None,
             quick_open: None,
+            project_picker: None,
             image_lightbox: None,
             app_bridge: None,
             mobile: mobile_host::Mobile::default(),
@@ -8397,6 +8401,9 @@ impl Render for Shell {
                 }),
             )
             .on_action(cx.listener(|this, _: &NewClaude, _, cx| this.create(Kind::Claude, cx)))
+            .on_action(cx.listener(|this, _: &NewInProject, window, cx| {
+                this.open_project_picker(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenProject, _, cx| this.open_project(cx)))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 if let Some(view) = this.active_app_view.filter(|_| this.settings.is_none()) {
@@ -8488,6 +8495,10 @@ impl Render for Shell {
                 }
                 if this.quick_open.is_some() {
                     this.close_quick_open(window, cx);
+                    return;
+                }
+                if this.project_picker.is_some() {
+                    this.close_project_picker(window, cx);
                     return;
                 }
                 if this.app_search.is_some() {
@@ -8709,6 +8720,7 @@ impl Render for Shell {
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))
             .children(self.quick_open_modal(window, cx))
+            .children(self.project_picker_modal(window, cx))
             .children(self.remote_project_modal(window, cx))
             .children(self.notice_modals(window, cx))
             .children(self.folder_picker_popover(window, cx))
