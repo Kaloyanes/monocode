@@ -64,7 +64,9 @@ impl Subject {
         if path.is_empty() {
             return None;
         }
-        let absolute = cwd.join(path);
+        // Resolve `..` before matching, so a path that does not exist yet
+        // cannot keep a relative key that points outside the worktree.
+        let absolute = lexical(&cwd.join(path));
         let root = worktree(cwd);
         let path = [project(&absolute), absolute.clone()]
             .into_iter()
@@ -366,6 +368,23 @@ pub fn project(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Resolves `.` and `..` without touching the file system.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(part);
+                }
+            }
+            part => out.push(part),
+        }
+    }
+    out
+}
+
 /// The checkout that contains `path`: a worktree root or the main repository.
 fn worktree(path: &Path) -> PathBuf {
     path.ancestors()
@@ -590,6 +609,16 @@ mod tests {
             Some(Subject::Edit {
                 path: "src/new.rs".into()
             })
+        );
+        assert_eq!(
+            Subject::edit(&root.join("src"), "../../outside/new.rs"),
+            Some(Subject::Edit {
+                path: dir.path().join("outside/new.rs")
+            })
+        );
+        assert_eq!(
+            Subject::edit(&root.join("src"), "./../src/new.rs"),
+            Subject::edit(&root, "src/new.rs")
         );
         assert_eq!(
             Subject::edit(&root, "/elsewhere/x.rs"),
