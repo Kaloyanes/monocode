@@ -31,6 +31,7 @@ import { useModelCatalog } from "@/features/models/useModelCatalog";
 import { useOpenSessionAfterStarting } from "@/features/settings/newSessions";
 import type { Attachment } from "@/features/sessions/attachments";
 import { Composer } from "@/features/sessions/Composer";
+import { QuestionCard } from "@/features/sessions/QuestionCard";
 import { EmptySession } from "@/features/sessions/EmptySession";
 import {
   latestSessionError,
@@ -360,50 +361,53 @@ export function ProjectScreen({
               enabled={!conversation.busy && !offline}
             />
           ) : null}
-        <Composer
-          key={sessionId ?? project.id}
-          notice={sessionNotice}
-          context={project.name}
-          branch={sessionId ? (session?.branch ?? project.branch) : branch}
-          model={model}
-          effort={effort}
-          harness={harness}
-          onModelPress={() =>
-            router.push({
-              pathname: "/models",
-              params: {
-                projectId: project.id,
-                ...(sessionId ? { sessionId } : {}),
-              },
-            })
-          }
-          {...(sessionId
-            ? {
-                busy: conversation.busy,
-                onStop: () => stop(sessionId),
-                onSend: (text: string, attachments: Attachment[]) => {
-                  markStartedHere(sessionId);
-                  return sendMessage(sessionId, text, attachments);
+          {sessionId && conversation.question ? (
+            <QuestionCard conversationId={sessionId} prompt={conversation.question} />
+          ) : null}
+          <Composer
+            key={sessionId ?? project.id}
+            notice={sessionNotice}
+            context={project.name}
+            branch={sessionId ? (session?.branch ?? project.branch) : branch}
+            model={model}
+            effort={effort}
+            harness={harness}
+            onModelPress={() =>
+              router.push({
+                pathname: "/models",
+                params: {
+                  projectId: project.id,
+                  ...(sessionId ? { sessionId } : {}),
                 },
-                workspace: (
-                  <WorkspaceLine
-                    current={!worktreePath}
-                    branch={branch}
-                    summary={changes}
-                  />
-                ),
-              }
-            : {
-                onSend: start,
-                workspace: (
-                  <ComposerWorkspace
-                    value={workspace}
-                    onChange={setWorkspace}
-                    disabled={offline}
-                  />
-                ),
-              })}
-        />
+              })
+            }
+            {...(sessionId
+              ? {
+                  busy: conversation.busy,
+                  onStop: () => stop(sessionId),
+                  onSend: (text: string, attachments: Attachment[]) => {
+                    markStartedHere(sessionId);
+                    return sendMessage(sessionId, text, attachments);
+                  },
+                  workspace: (
+                    <WorkspaceLine
+                      current={!worktreePath}
+                      branch={branch}
+                      summary={changes}
+                    />
+                  ),
+                }
+              : {
+                  onSend: start,
+                  workspace: (
+                    <ComposerWorkspace
+                      value={workspace}
+                      onChange={setWorkspace}
+                      disabled={offline}
+                    />
+                  ),
+                })}
+          />
         </>
       }
     >
