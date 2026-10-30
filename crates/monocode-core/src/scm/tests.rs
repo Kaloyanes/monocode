@@ -132,11 +132,9 @@ fn review_versions_support_repositories_with_only_untracked_files() {
     assert!(init_git(dir.path(), "main"));
     std::fs::write(dir.path().join("new.txt"), "new\n").unwrap();
     let snapshot = review_index(dir.path(), None).unwrap();
-    assert!(
-        file_diff_versions(dir.path(), &snapshot)
-            .unwrap()
-            .contains_key("unstaged:new.txt")
-    );
+    assert!(file_diff_versions(dir.path(), &snapshot)
+        .unwrap()
+        .contains_key("unstaged:new.txt"));
 }
 
 #[test]
@@ -351,12 +349,10 @@ fn history_lists_commits_parents_and_head() {
     assert!(history.commits[0].head);
     assert!(!history.commits[1].head);
     assert_eq!(history.commits[0].author, "MonoCode");
-    assert!(
-        history.commits[0]
-            .refs
-            .iter()
-            .any(|r| r.kind == "local" && r.name == "main")
-    );
+    assert!(history.commits[0]
+        .refs
+        .iter()
+        .any(|r| r.kind == "local" && r.name == "main"));
     assert_eq!(super::history(dir, Some(1)).unwrap().commits.len(), 1);
 }
 
@@ -417,11 +413,9 @@ fn history_skips_stash_and_unmerged_branches() {
     assert!(subjects.contains(&"main only"));
     assert!(subjects.contains(&"init"));
     assert!(!subjects.iter().any(|s| s.contains("feature only")));
-    assert!(
-        !subjects
-            .iter()
-            .any(|s| s.contains("wip stash") || s.contains("WIP on"))
-    );
+    assert!(!subjects
+        .iter()
+        .any(|s| s.contains("wip stash") || s.contains("WIP on")));
 }
 
 #[test]

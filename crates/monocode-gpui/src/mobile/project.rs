@@ -500,37 +500,36 @@ pub(crate) fn git_action(root: &Path, params: &Value) -> Result<Value, String> {
     }
 }
 
-/// Makes a plan's commits one after another, each from only its own files. It
-/// stops at the first that fails and says how many were made.
+/// Makes a plan's commits one after another, each from only its own files,
+/// leaving anything else staged as it was. It checks the whole plan first,
+/// stops at the first commit that fails and says how many were made.
 fn commit_plan(root: &Path, commits: &Value) -> Result<Value, String> {
-    let commits = commits
+    let steps = commits
         .as_array()
-        .filter(|commits| !commits.is_empty())
-        .ok_or("There are no commits to make.")?;
-    scm::unstage_all(root)?;
-    for (made, commit) in commits.iter().enumerate() {
-        let message = commit["message"].as_str().unwrap_or_default().trim();
-        let paths = commit["paths"]
-            .as_array()
-            .map(|paths| paths.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-            .unwrap_or_default();
-        let step = if message.is_empty() || paths.is_empty() {
-            Err("A commit needs a message and files.".to_string())
-        } else {
-            paths
+        .map(|commits| {
+            commits
                 .iter()
-                .try_for_each(|path| scm::stage_file(root, path))
-                .and_then(|()| scm::commit(root, message, false))
-        };
-        if let Err(reason) = step {
-            let _ = scm::unstage_all(root);
-            return Err(format!(
-                "Made {made} of {} commits. {reason}",
-                commits.len()
-            ));
-        }
+                .map(|commit| scm::PlanStep {
+                    message: commit["message"].as_str().unwrap_or_default().to_string(),
+                    paths: commit["paths"]
+                        .as_array()
+                        .map(|paths| {
+                            paths
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    match scm::commit_plan(root, &steps) {
+        Ok(made) => Ok(json!({ "committed": made })),
+        Err((0, reason)) => Err(reason),
+        Err((made, reason)) => Err(format!("Made {made} of {} commits. {reason}", steps.len())),
     }
-    Ok(json!({ "committed": commits.len() }))
 }
 
 /// createMobilePr: the Changes panel's generated title and body (or the
@@ -1150,6 +1149,106 @@ mod tests {
         .unwrap_err();
         assert!(failed.starts_with("Made 1 of 2 commits."), "{failed}");
         assert!(git_action(root, &json!({ "action": "commitPlan", "commits": [] }),).is_err());
+    }
+
+    /// A repo with `part.rs` partly staged, `kept.rs` staged and `new.rs`
+    /// untracked, and a reader of git's output in it.
+    fn partly_staged(name: &str) -> (Temp, impl Fn(&[&str]) -> String) {
+        let dir = Temp::new(name);
+        let root = dir.0.clone();
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.email", "t@t"]);
+        run_git(&root, &["config", "user.name", "t"]);
+        run_git(&root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("part.rs"), "one\ntwo\n").unwrap();
+        run_git(&root, &["add", "part.rs"]);
+        run_git(&root, &["commit", "-qm", "init"]);
+        std::fs::write(root.join("part.rs"), "ONE\ntwo\n").unwrap();
+        run_git(&root, &["add", "part.rs"]);
+        std::fs::write(root.join("part.rs"), "ONE\nTWO\n").unwrap();
+        std::fs::write(root.join("kept.rs"), "kept").unwrap();
+        run_git(&root, &["add", "kept.rs"]);
+        std::fs::write(root.join("new.rs"), "new").unwrap();
+        let git = move |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        (dir, git)
+    }
+
+    #[test]
+    fn a_plan_with_a_blank_message_changes_nothing() {
+        let (dir, git) = partly_staged("commit-plan-blank");
+        let (head, staged, unstaged) = (
+            git(&["rev-parse", "HEAD"]),
+            git(&["diff", "--cached"]),
+            git(&["diff"]),
+        );
+        let failed = git_action(
+            &dir.0,
+            &json!({ "action": "commitPlan", "commits": [
+                { "message": "Add new", "paths": ["new.rs"] },
+                { "message": "  ", "paths": ["part.rs"] },
+            ] }),
+        )
+        .unwrap_err();
+        assert!(!failed.starts_with("Made"), "{failed}");
+        assert_eq!(git(&["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&["diff", "--cached"]), staged);
+        assert_eq!(git(&["diff"]), unstaged);
+    }
+
+    #[test]
+    fn a_plan_whose_first_commit_fails_puts_the_staging_back() {
+        let (dir, git) = partly_staged("commit-plan-hook");
+        let hooks = dir.0.join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(hooks.join("pre-commit"), mode).unwrap();
+        }
+        run_git(&dir.0, &["config", "core.hooksPath", "hooks"]);
+        let (head, staged, unstaged) = (
+            git(&["rev-parse", "HEAD"]),
+            git(&["diff", "--cached"]),
+            git(&["diff"]),
+        );
+        assert!(
+            git_action(
+                &dir.0,
+                &json!({ "action": "commitPlan", "commits": [
+                    { "message": "Change part, add new", "paths": ["part.rs", "new.rs"] },
+                ] }),
+            )
+            .is_err()
+        );
+        assert_eq!(git(&["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&["diff", "--cached"]), staged);
+        assert_eq!(git(&["diff"]), unstaged);
+        assert!(git(&["status", "--porcelain"]).contains("?? new.rs"));
+    }
+
+    #[test]
+    fn a_plan_leaves_files_outside_it_staged() {
+        let (dir, git) = partly_staged("commit-plan-outside");
+        let done = git_action(
+            &dir.0,
+            &json!({ "action": "commitPlan", "commits": [
+                { "message": "Add new", "paths": ["new.rs"] },
+            ] }),
+        )
+        .unwrap();
+        assert_eq!(done["committed"], 1);
+        assert_eq!(git(&["show", "--name-only", "--format=", "HEAD"]), "new.rs");
+        assert_eq!(git(&["status", "--porcelain"]), "A  kept.rs\nMM part.rs");
+        assert_eq!(git(&["show", ":part.rs"]), "ONE\ntwo");
     }
 
     #[test]

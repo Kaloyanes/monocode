@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use review::{
-    FileDiff, FileDiffVersion, MAX_TEXT_FILE_BYTES, commit_file_diff, commit_files, diff_files,
-    file_diff, file_diff_versions, review_index, stage_contents,
+    commit_file_diff, commit_files, diff_files, file_diff, file_diff_versions, review_index,
+    stage_contents, FileDiff, FileDiffVersion, MAX_TEXT_FILE_BYTES,
 };
 pub(crate) use shell::{expand_home, path_to_js};
 
@@ -31,8 +31,8 @@ pub fn resolve_gui_binary(name: &str) -> Option<std::path::PathBuf> {
     shell::resolve_gui_binary(name)
 }
 pub use text::{
-    PlannedCommit, commit_message_prompt, commit_plan_prompt, parse_commit_message,
-    parse_commit_plan, parse_pr_content, pr_content_prompt,
+    commit_message_prompt, commit_plan_prompt, parse_commit_message, parse_commit_plan,
+    parse_pr_content, pr_content_prompt, PlannedCommit,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -245,6 +245,85 @@ pub fn commit(cwd: &Path, message: &str, amend: bool) -> Result<(), String> {
     }
     let extra: &[&str] = if amend { &["--amend"] } else { &[] };
     commit_args(&expand_home(cwd), message, extra)
+}
+
+/// One commit of a plan: its message and the files it takes, whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanStep {
+    pub message: String,
+    pub paths: Vec<String>,
+}
+
+/// Makes a plan's commits one after another, each from the working copy of
+/// only its own files; whatever else is staged stays staged and out of them.
+/// The whole plan is checked before anything changes. When a commit fails,
+/// its files go back to how they were staged, so a plan that made nothing
+/// leaves the index as it found it. Errors carry how many commits were made.
+pub fn commit_plan(cwd: &Path, steps: &[PlanStep]) -> Result<usize, (usize, String)> {
+    if remote_workspace::is_remote(cwd) {
+        return Err((0, "A commit plan needs a local project.".into()));
+    }
+    let root = expand_home(cwd);
+    let steps = checked_plan(&root, steps).map_err(|reason| (0, reason))?;
+    let original = git_stdout(&root, &["write-tree"]).ok_or((
+        0,
+        "Resolve the conflicted files before committing.".to_string(),
+    ))?;
+    for (made, (message, paths)) in steps.iter().enumerate() {
+        let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
+        add.extend(paths.iter().map(String::as_str));
+        let mut commit = vec![
+            "--literal-pathspecs",
+            "commit",
+            "--cleanup=strip",
+            "-m",
+            message,
+            "--only",
+            "--",
+        ];
+        commit.extend(paths.iter().map(String::as_str));
+        let step = git_checked(&root, &add)
+            .and_then(|()| git_checked(&root, &commit).map_err(with_signing_hint));
+        if let Err(reason) = step {
+            if made == 0 {
+                let _ = git_checked(&root, &["read-tree", &original]);
+            } else {
+                let source = format!("--source={original}");
+                for path in paths {
+                    let restore = ["--literal-pathspecs", "restore", "--staged", &source, "--"];
+                    let _ = git_checked(&root, &[&restore[..], &[path.as_str()]].concat());
+                }
+            }
+            return Err((made, reason));
+        }
+    }
+    Ok(steps.len())
+}
+
+/// The plan's messages trimmed and paths made repo-relative, or why it can't run.
+fn checked_plan(root: &Path, steps: &[PlanStep]) -> Result<Vec<(String, Vec<String>)>, String> {
+    if steps.is_empty() {
+        return Err("There are no commits to make.".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    steps
+        .iter()
+        .map(|step| {
+            let message = step.message.trim();
+            if message.is_empty() || step.paths.is_empty() {
+                return Err("Every commit needs a message and files.".to_string());
+            }
+            let paths = step
+                .paths
+                .iter()
+                .map(|path| resolve_repo_path(root, path))
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(path) = paths.iter().find(|path| !seen.insert((*path).clone())) {
+                return Err(format!("{path} is in more than one commit."));
+            }
+            Ok((message.to_string(), paths))
+        })
+        .collect()
 }
 
 /// Full message (subject and body) of the commit at HEAD.
@@ -749,10 +828,13 @@ fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>) {
     }
 }
 
+/// A file's size and modified time, and the lines it had then.
+type CountedLines = (u64, SystemTime, i64);
+
 /// Untracked files' line counts by path, with the size and modified time they
 /// were counted at. A build folder nobody ignored can hold tens of thousands of
 /// files and gigabytes; each refresh then only reads their metadata.
-static UNTRACKED_LINES: LazyLock<Mutex<HashMap<PathBuf, (u64, SystemTime, i64)>>> =
+static UNTRACKED_LINES: LazyLock<Mutex<HashMap<PathBuf, CountedLines>>> =
     LazyLock::new(Default::default);
 /// Past this many entries the cache starts over, rather than grow for good.
 const UNTRACKED_LINES_CAP: usize = 200_000;
@@ -1418,7 +1500,11 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 #[cfg(test)]
