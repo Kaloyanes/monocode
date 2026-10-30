@@ -620,11 +620,10 @@ mod tests {
             Subject::edit(&root.join("src"), "./../src/new.rs"),
             Subject::edit(&root, "src/new.rs")
         );
+        let elsewhere = dir.path().join("elsewhere").join("x.rs");
         assert_eq!(
-            Subject::edit(&root, "/elsewhere/x.rs"),
-            Some(Subject::Edit {
-                path: "/elsewhere/x.rs".into()
-            })
+            Subject::edit(&root, &elsewhere.display().to_string()),
+            Some(Subject::Edit { path: elsewhere })
         );
         assert_eq!(
             Subject::fetch("https://Docs.rs/serde?x=1"),
