@@ -305,7 +305,7 @@ impl Monos {
         views
     }
 
-    fn habit_running_since(&self, habit: &Habit) -> Option<u64> {
+    pub(super) fn habit_running_since(&self, habit: &Habit) -> Option<u64> {
         self.running
             .values()
             .find(|r| r.habit == habit.id && self.active.as_deref() == Some(r.mono.as_str()))
@@ -374,8 +374,7 @@ impl Monos {
         } else {
             format!("Paused · {}", h.schedule.label())
         };
-        div()
-            .id(SharedString::from(format!("mono-habit-{id}")))
+        super::panels::outlined(div().id(SharedString::from(format!("mono-habit-{id}"))))
             .debug_selector({
                 let id = id.clone();
                 move || format!("mono-habit-{id}")
@@ -384,10 +383,8 @@ impl Monos {
             .w_full()
             .min_w_0()
             .flex_shrink_0()
-            .rounded_md()
             .flex()
             .items_center()
-            .hover(|s| s.bg(content(0.05)))
             .child(
                 div()
                     .id(SharedString::from(format!("mono-habit-open-{id}")))
@@ -398,7 +395,7 @@ impl Monos {
                     .flex()
                     .items_center()
                     .gap_2p5()
-                    .px_2()
+                    .px(px(10.))
                     .py_2()
                     .child(
                         div()
@@ -1494,7 +1491,7 @@ impl Monos {
         );
         self.start_run(id, habit.id, habit.name, text, false, cx);
     }
-    fn start_heartbeat(&mut self, id: &str, text: String, cx: &mut Context<Self>) {
+    pub(super) fn start_heartbeat(&mut self, id: &str, text: String, cx: &mut Context<Self>) {
         self.start_run(
             id,
             heartbeat::RUN_ID.into(),
@@ -1539,7 +1536,7 @@ impl Monos {
             s.title = format!("{} · {}", mono.label(), name);
             db.title(s.id, &s.title)?;
             drop(db);
-            if triage {
+            if triage && inherited.usage_limit.is_none() {
                 // The catalog is cached for a few minutes; a miss keeps the Mono's model.
                 let models = Kind::parse(&provider)
                     .and_then(|kind| {
@@ -1575,7 +1572,9 @@ impl Monos {
                             .as_ref()
                             .map(|b| b.environment(session))
                             .unwrap_or_default();
-                        settings.access = AccessMode::FullAccess;
+                        if !triage {
+                            settings.access = AccessMode::FullAccess;
+                        }
                         settings.internal_message = true;
                         settings.mono = None;
                         settings.environment.clear();
@@ -1686,7 +1685,7 @@ impl Monos {
         }
         let report = ok
             .then(|| {
-                habits::report(&monocode_core::response::prose(
+                habits::report(&monocode_core::response::final_prose(
                     run.view.read(cx).mono_rows(cx),
                 ))
             })
