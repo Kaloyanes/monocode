@@ -4664,9 +4664,7 @@ mod menu_tests {
     }
 
     #[gpui::test]
-    fn switch_model_leaves_out_hidden_recents_but_keeps_the_current_one(
-        cx: &mut TestAppContext,
-    ) {
+    fn switch_model_leaves_out_hidden_recents_but_keeps_the_current_one(cx: &mut TestAppContext) {
         let window = conversation(cx);
         let choice = |provider: &str, model: &str| crate::settings::ModelChoice {
             provider: provider.into(),
