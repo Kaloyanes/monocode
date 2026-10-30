@@ -21,6 +21,7 @@ fn write(file: &mut BufWriter<File>, value: Value) -> io::Result<()> {
     serde_json::to_writer(&mut *file, &value).map_err(io::Error::other)?;
     file.write_all(b"\n")
 }
+#[cfg(unix)]
 fn cpu_seconds() -> Option<f64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: getrusage initializes this buffer on success, for this process only.
@@ -33,6 +34,11 @@ fn cpu_seconds() -> Option<f64> {
         (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
             + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1_000_000.,
     )
+}
+/// libc has no getrusage on Windows, so traces there carry no CPU samples.
+#[cfg(not(unix))]
+fn cpu_seconds() -> Option<f64> {
+    None
 }
 
 pub(crate) fn start(launched: Instant, cx: &mut App) {

@@ -62,6 +62,50 @@ mod tests {
     }
 
     #[gpui::test]
+    fn refreshing_choices_keeps_the_keyboard_selection_in_view(cx: &mut TestAppContext) {
+        let cwd = "/nonexistent/monocode-refresh-branch-picker";
+        crate::git_cache::remember(
+            cwd,
+            &Snapshot {
+                branches: (0..2_000)
+                    .map(|i| git::Branch {
+                        name: format!("branch-{i}"),
+                        remote: None,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let window = cx.update(|cx| {
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                        gpui::point(px(0.), px(0.)),
+                        gpui::size(px(400.), px(400.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| GitPicker::new(cwd.into(), Mode::Base, None, cx)),
+            )
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+            .update(visual, |view, _, cx| view.step(1_500, cx))
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("git-option-1500").is_some());
+        // A finished background load rebuilds the list under the selection.
+        window
+            .update(visual, |view, _, cx| view.refresh_choices(cx))
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("git-option-1500").is_some());
+        assert!(visual.debug_bounds("git-option-0").is_none());
+    }
+
+    #[gpui::test]
     fn all_picker_modes_start_with_cached_choices_and_keep_them_after_refresh_failure(
         cx: &mut TestAppContext,
     ) {
@@ -228,6 +272,8 @@ impl GitPicker {
         self.active = self.active.min(self.filtered.len().saturating_sub(1));
         self.list
             .reset_with_uniform_height(self.filtered.len(), px(44.));
+        // The reset scrolls to the top; keep the kept selection on screen.
+        self.list.scroll_to_reveal_item(self.active);
         cx.notify();
     }
     fn choices(&self, cx: &gpui::App) -> Vec<Choice> {
