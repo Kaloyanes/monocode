@@ -1442,6 +1442,7 @@ impl Btw {
                                 "btw-send",
                                 if running { "Stop" } else { "Send" },
                                 running,
+                                "send",
                                 running || can_submit,
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
