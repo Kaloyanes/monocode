@@ -305,10 +305,7 @@ const CHUNK: usize = 8192;
 /// receiver is dropped.
 fn read_streams(
     streams: impl IntoIterator<Item = Box<dyn Read + Send>>,
-) -> (
-    mpsc::Receiver<Vec<u8>>,
-    Vec<std::thread::JoinHandle<()>>,
-) {
+) -> (mpsc::Receiver<Vec<u8>>, Vec<std::thread::JoinHandle<()>>) {
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(CHANNEL_CHUNKS);
     let readers = streams
         .into_iter()
