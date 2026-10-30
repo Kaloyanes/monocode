@@ -13,7 +13,9 @@ import {
 import {
   NOTIFICATION_CATEGORIES,
   useNotificationPreferences,
+  type NotificationCategory,
 } from "@/features/settings/notifications";
+import type { SessionSummary } from "@/features/workspace/types";
 
 // In front of the user, the app itself shows what changed; the alert waits
 // in the list.
@@ -29,6 +31,7 @@ Notifications.setNotificationHandler({
   },
 });
 
+type Seen = Pick<SessionSummary, "busy" | "waiting">;
 type Data = { projectId: string; sessionId: string };
 const SESSION_CHANNEL = "sessions";
 
@@ -36,7 +39,9 @@ const SESSION_CHANNEL = "sessions";
  * Alerts for the desktop's sessions: an agent that finishes, or stops for an
  * approval or a question. The desktop sends them as push notifications, so
  * they arrive with the app closed; this registers the phone with it and opens
- * a session when one is tapped.
+ * a session when one is tapped. Android has no push yet, so it raises them
+ * itself from the session list as the phone polls it, while the app runs and
+ * is out of view.
  */
 export function SessionNotifications() {
   const connection = useConnection();
@@ -48,6 +53,14 @@ export function SessionNotifications() {
   const [activityOn] = useLiveActivityPreference();
   // What this desktop last heard, so a poll does not register again.
   const registered = useRef<string | null>(null);
+  const current = useRef(preferences);
+  // Read by the effects below; kept up to date ahead of them.
+  useEffect(() => {
+    current.current = preferences;
+  });
+  // Each session as last seen; null until a list from the desktop itself
+  // arrives, as the one cached from last time is no news.
+  const seen = useRef<Map<string, Seen> | null>(null);
 
   // Ask after pairing, only when alerts are enabled and the OS allows asking.
   useEffect(() => {
@@ -118,6 +131,57 @@ export function SessionNotifications() {
       cancelled = true;
     };
   }, [connection.connected, pairing, wanted, activity]);
+
+  // Android's alerts until push reaches it: raised here from each new list.
+  useEffect(() => {
+    if (!connection.connected) {
+      seen.current = null;
+      return;
+    }
+    if (Platform.OS !== "android") return;
+    const sessions = connection.catalog.sessions;
+    const before = seen.current;
+    seen.current = new Map(
+      sessions.map((session) => [
+        session.id,
+        { busy: session.busy, waiting: session.waiting },
+      ]),
+    );
+    if (!before) return;
+    // In front of the user, the app itself shows what changed.
+    if (AppState.currentState === "active") return;
+    const preferences = current.current;
+    const projects = connection.catalog.projects;
+    for (const session of sessions) {
+      const last = before.get(session.id);
+      if (!last) continue;
+      const category: NotificationCategory | null =
+        session.waiting && session.waiting !== last.waiting
+          ? "agentInput"
+          : last.busy && !session.busy && !session.waiting
+            ? "agentFinished"
+            : null;
+      if (!category || !preferences.enabled(category)) continue;
+      const project = projects.find((entry) => entry.id === session.projectId);
+      void Notifications.scheduleNotificationAsync({
+        content: {
+          title: session.title || "Session",
+          subtitle: project?.name,
+          body:
+            category === "agentFinished"
+              ? "Finished"
+              : session.waiting === "approval"
+                ? "Needs your approval"
+                : "Has a question for you",
+          data: {
+            projectId: session.projectId,
+            sessionId: session.id,
+          } satisfies Data,
+        },
+        trigger: { channelId: SESSION_CHANNEL },
+      });
+    }
+  }, [connection.connected, connection.catalog]);
 
   // A tap opens the session, the app's last one too if it launched it.
   const response = Notifications.useLastNotificationResponse();

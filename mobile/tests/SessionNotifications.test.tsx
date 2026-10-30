@@ -12,7 +12,13 @@ const state = vi.hoisted(() => ({
   appState: "active",
   paired: true,
   enabled: true,
-  sessions: [] as { id: string; projectId: string; busy: boolean; waiting: string | null }[],
+  sessions: [] as {
+    id: string;
+    projectId: string;
+    title?: string;
+    busy: boolean;
+    waiting: string | null;
+  }[],
   settings: { status: "undetermined", canAskAgain: true } as {
     status: string;
     canAskAgain: boolean;
@@ -25,6 +31,7 @@ const state = vi.hoisted(() => ({
   activity: false,
   pushToken: vi.fn(),
   request: vi.fn(),
+  schedule: vi.fn(),
 }));
 
 vi.mock("react-native", () => ({
@@ -43,6 +50,7 @@ vi.mock("expo-notifications", () => ({
   requestPermissionsAsync: state.requestPermissions,
   setNotificationChannelAsync: state.setChannel,
   getExpoPushTokenAsync: state.pushToken,
+  scheduleNotificationAsync: state.schedule,
   useLastNotificationResponse: () => null,
   DEFAULT_ACTION_IDENTIFIER: "default",
   AndroidImportance: { DEFAULT: 3 },
@@ -91,6 +99,7 @@ beforeEach(() => {
   state.setChannel.mockResolvedValue(null);
   state.pushToken.mockResolvedValue({ data: "ExponentPushToken[phone]" });
   state.request.mockResolvedValue(null);
+  state.schedule.mockResolvedValue("notification");
   root = createRoot(document.createElement("div"));
 });
 afterEach(() => act(() => root.unmount()));
@@ -182,6 +191,48 @@ it("registers for silent pushes with alerts off while a Live Activity is wanted"
 it("does not register Android, which has no push service set up", async () => {
   await render();
   expect(state.request).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["finishes", { busy: false, waiting: null }, "Finished"],
+  ["needs approval", { busy: true, waiting: "approval" }, "Needs your approval"],
+  ["asks a question", { busy: true, waiting: "question" }, "Has a question for you"],
+])("raises a local Android alert when a session %s while the app is away", async (_name, next, body) => {
+  const session = { id: "session", projectId: "project", title: "Fix tests", busy: true, waiting: null };
+  state.sessions = [session];
+  await render();
+  state.appState = "background";
+  state.sessions = [{ ...session, ...next }];
+  await render();
+  expect(state.request).not.toHaveBeenCalled();
+  expect(state.schedule).toHaveBeenCalledOnce();
+  expect(state.schedule).toHaveBeenCalledWith({
+    content: {
+      title: "Fix tests",
+      subtitle: undefined,
+      body,
+      data: { projectId: "project", sessionId: "session" },
+    },
+    trigger: { channelId: "sessions" },
+  });
+});
+
+it("keeps Android alerts quiet while the app is in front", async () => {
+  state.sessions = [{ id: "session", projectId: "project", busy: true, waiting: null }];
+  await render();
+  state.sessions = [{ ...state.sessions[0], busy: false }];
+  await render();
+  expect(state.schedule).not.toHaveBeenCalled();
+});
+
+it("leaves iOS alerts to the desktop's pushes", async () => {
+  state.os = "ios";
+  state.sessions = [{ id: "session", projectId: "project", busy: true, waiting: null }];
+  await render();
+  state.appState = "background";
+  state.sessions = [{ ...state.sessions[0], busy: false }];
+  await render();
+  expect(state.schedule).not.toHaveBeenCalled();
 });
 
 it.each([true, false])("reflects Android notification denial with canAskAgain %s and updates after returning from Settings", async (canAskAgain) => {
