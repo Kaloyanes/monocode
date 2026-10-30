@@ -9,10 +9,15 @@ use monocode_core::{
     scm::{self, GithubWorkItem},
     session_groups::{WorkItem, parse_github_work_item},
 };
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 const SEARCH_DELAY: Duration = Duration::from_millis(250);
 const ROW_HEIGHT: f32 = 36.;
+
+type FetchWorkItems = fn(&Path, &str, &str) -> Result<Vec<GithubWorkItem>, String>;
 
 pub(crate) enum Picked {
     Item(WorkItem),
@@ -39,6 +44,10 @@ pub(crate) struct WorkItemPicker {
     search: Entity<input::Input>,
     active: usize,
     lookup: Option<Task<()>>,
+    /// Bumped whenever a lookup starts or is cancelled; a response applies
+    /// only while its id is still current.
+    lookup_id: u64,
+    fetch: FetchWorkItems,
     _changed: Subscription,
 }
 impl EventEmitter<Picked> for WorkItemPicker {}
@@ -98,6 +107,8 @@ impl WorkItemPicker {
             search,
             active: 0,
             lookup: None,
+            lookup_id: 0,
+            fetch: scm::github_work_items,
             _changed: changed,
         };
         this.refresh_choices(cx);
@@ -121,24 +132,29 @@ impl WorkItemPicker {
         let Some(Ok(repo)) = self.repo.clone() else {
             return;
         };
-        if query.is_empty() || parse_github_work_item(&query).is_some() {
-            self.lookup = None;
-            self.searching = false;
+        if query.is_empty()
+            || parse_github_work_item(&query).is_some()
+            || self.found.as_ref().is_some_and(|(q, _)| *q == query)
+        {
+            self.cancel_lookup();
             return;
         }
-        if self.found.as_ref().is_some_and(|(q, _)| *q == query) {
-            return;
-        }
+        self.lookup_id += 1;
+        let id = self.lookup_id;
         self.searching = true;
         let cwd = self.cwd.clone();
+        let fetch = self.fetch;
         self.lookup = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DELAY).await;
             let lookup_query = query.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { scm::github_work_items(&cwd, &repo, &lookup_query) })
+                .spawn(async move { fetch(&cwd, &repo, &lookup_query) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                if this.lookup_id != id {
+                    return;
+                }
                 this.searching = false;
                 match result {
                     Ok(items) => {
@@ -150,6 +166,11 @@ impl WorkItemPicker {
                 this.refresh_choices(cx);
             });
         }));
+    }
+    fn cancel_lookup(&mut self) {
+        self.lookup = None;
+        self.lookup_id += 1;
+        self.searching = false;
     }
     fn refresh_choices(&mut self, cx: &mut Context<Self>) {
         self.filtered = self.choices(cx);
@@ -482,6 +503,56 @@ mod tests {
                 matches!(view.repo, Some(Err(_))),
                 "no folder means no gh lookup"
             );
+        });
+    }
+
+    fn fetch_by_query(_: &Path, _: &str, query: &str) -> Result<Vec<GithubWorkItem>, String> {
+        let number = if query == "alpha" { 100 } else { 200 };
+        Ok(vec![found("issue", number, query)])
+    }
+
+    #[gpui::test]
+    fn returning_to_a_cached_search_cancels_the_pending_one(cx: &mut TestAppContext) {
+        let picker = cx.new(|cx| WorkItemPicker::new("/nonexistent/monocode".into(), None, cx));
+        cx.run_until_parked();
+        picker.update(cx, |view, _| {
+            view.repo = Some(Ok("acme/app".into()));
+            view.fetch = fetch_by_query;
+        });
+        let numbers = |cx: &mut TestAppContext| {
+            picker.update(cx, |view, _| {
+                view.filtered
+                    .iter()
+                    .map(|c| match c {
+                        Choice::Found(f) => f.item.number,
+                        Choice::Url(item) => item.number,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        picker.update(cx, |view, cx| view.search_for("alpha", cx));
+        cx.executor().advance_clock(SEARCH_DELAY);
+        cx.run_until_parked();
+        assert_eq!(numbers(cx), [100]);
+
+        picker.update(cx, |view, cx| view.search_for("beta", cx));
+        cx.run_until_parked();
+        picker.update(cx, |view, cx| {
+            assert!(view.searching);
+            view.search_for("alpha", cx);
+        });
+        cx.run_until_parked();
+        picker.update(cx, |view, _| {
+            assert!(!view.searching, "the cached query isn't searching");
+            assert!(view.lookup.is_none(), "the beta lookup was cancelled");
+        });
+
+        cx.executor().advance_clock(SEARCH_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(numbers(cx), [100]);
+        picker.update(cx, |view, _| {
+            assert_eq!(view.found.as_ref().map(|(q, _)| q.as_str()), Some("alpha"));
         });
     }
 }
