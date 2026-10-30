@@ -317,6 +317,8 @@ fn diff_index_lists_a_staged_rename_as_deleted_and_added() {
     );
 }
 
+// Windows file names can't hold `:` or tabs.
+#[cfg(unix)]
 #[test]
 fn diff_index_reads_names_that_look_like_raw_records() {
     let dir = tmp();
