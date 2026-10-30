@@ -1244,10 +1244,12 @@ fn sync_for(root: &Path) -> Sync {
     } else {
         (0, 0)
     };
-    let ahead_of_default = if let Some(base) = default_ref.as_deref() {
-        git_ahead_behind(root, base).0
-    } else {
-        ahead
+    // Without an upstream, or tracking the default branch, that count is it.
+    let ahead_of_default = match default_ref.as_deref() {
+        Some(base) if upstream.is_some() && upstream.as_deref() != Some(base) => {
+            git_ahead_behind(root, base).0
+        }
+        _ => ahead,
     };
     let head_pushed = git_stdout(
         root,
