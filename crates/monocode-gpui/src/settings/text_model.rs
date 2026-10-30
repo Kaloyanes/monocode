@@ -149,14 +149,24 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Titles only run on providers session_title can drive.
+        let titles = id == "title-model";
         let fallback = self
             .prefs
             .default_provider
             .as_deref()
             .and_then(Kind::parse)
+            .filter(|kind| !titles || monocode_core::session_title::supports(*kind))
             .unwrap_or(Kind::Claude);
+        let unsupported = Kind::ALL
+            .into_iter()
+            .filter(move |kind| titles && !monocode_core::session_title::supports(*kind))
+            .map(|kind| kind.id().to_string());
         let cwd = self.ctx.cwd.clone();
-        let list = cx.new(|cx| ModelList::for_choice(current.as_ref(), fallback, &cwd, cx));
+        let list = cx.new(|cx| {
+            ModelList::for_choice(current.as_ref(), fallback, &cwd, cx)
+                .also_hide_providers(unsupported)
+        });
         let subscription = cx.subscribe_in(
             &list,
             window,

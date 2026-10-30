@@ -506,6 +506,12 @@ impl ModelList {
             .hide_providers(hidden)
             .allow_provider_switch(true)
     }
+    /// Hides `more` providers on top of the ones already hidden.
+    pub(crate) fn also_hide_providers(mut self, more: impl IntoIterator<Item = String>) -> Self {
+        let mut hidden = std::mem::take(&mut self.hidden);
+        hidden.extend(more);
+        self.hide_providers(hidden)
+    }
     pub(crate) fn hide_providers(mut self, hidden: Vec<String>) -> Self {
         if self.remote_project.is_some() {
             return self;

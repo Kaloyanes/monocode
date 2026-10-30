@@ -195,15 +195,21 @@ pub(crate) enum TextTask {
 
 impl Preferences {
     /// The model chosen for `task`, else the general text model; `None` leaves
-    /// the choice to the caller's default.
+    /// the choice to the caller's default. Titles skip providers that cannot
+    /// write them, so a Hermes or Fx choice keeps the session's own provider.
     pub(crate) fn text_model_for(&self, task: TextTask) -> Option<&ModelChoice> {
+        use monocode_core::{provider::Kind, session_title::supports};
+        let usable = |choice: &&ModelChoice| {
+            task != TextTask::Title || supports(Kind::from_id(&choice.provider))
+        };
         match task {
             TextTask::Commit => &self.commit_model,
             TextTask::PullRequest => &self.pr_model,
             TextTask::Title => &self.title_model,
         }
         .as_ref()
-        .or(self.text_model.as_ref())
+        .filter(usable)
+        .or(self.text_model.as_ref().filter(usable))
     }
     /// Choose the model that writes `task`'s text.
     pub(crate) fn set_text_model(&mut self, task: TextTask, choice: Option<ModelChoice>) {
@@ -540,6 +546,31 @@ mod text_model_tests {
         assert_eq!(
             prefs.text_model_for(TextTask::Commit),
             Some(&choice("claude", "haiku"))
+        );
+    }
+
+    #[test]
+    fn titles_skip_providers_that_cannot_write_them() {
+        let mut prefs = Preferences {
+            text_model: Some(choice("hermes", "h1")),
+            ..Default::default()
+        };
+        // An unsupported general model leaves titles to the session's provider.
+        assert_eq!(prefs.text_model_for(TextTask::Title), None);
+        assert_eq!(
+            prefs.text_model_for(TextTask::Commit),
+            Some(&choice("hermes", "h1"))
+        );
+        prefs.text_model = Some(choice("claude", "haiku"));
+        prefs.set_text_model(TextTask::Title, Some(choice("fx", "f1")));
+        assert_eq!(
+            prefs.text_model_for(TextTask::Title),
+            Some(&choice("claude", "haiku"))
+        );
+        prefs.set_text_model(TextTask::Title, Some(choice("codex", "gpt-mini")));
+        assert_eq!(
+            prefs.text_model_for(TextTask::Title),
+            Some(&choice("codex", "gpt-mini"))
         );
     }
 }
