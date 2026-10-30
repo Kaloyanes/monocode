@@ -350,6 +350,39 @@ fn setup(cx: &mut TestAppContext) -> Setup {
         store,
     }
 }
+
+#[gpui::test]
+fn heartbeat_runs_keep_the_monos_selected_permissions(cx: &mut TestAppContext) {
+    for mode in [
+        AccessMode::ReadOnly,
+        AccessMode::Supervised,
+        AccessMode::AutoAcceptEdits,
+        AccessMode::Auto,
+        AccessMode::FullAccess,
+    ] {
+        let s = setup(cx);
+        s.manager.update(cx, |m, cx| {
+            m.chats[&s.id].update(cx, |chat, _| {
+                // Avoid catalog probes or provider requests: exercise the actual
+                // background runner, stopping before it dispatches a prompt.
+                chat.settings.access = mode;
+                chat.settings.usage_limit = Some(Default::default());
+            });
+            m.start_heartbeat(&s.id, "Check for follow-ups".into(), cx);
+        });
+        cx.run_until_parked();
+        s.manager.read_with(cx, |m, cx| {
+            assert!(m.error.is_none(), "heartbeat failed: {:?}", m.error);
+            let run = &m.running[&m.active_run.expect("heartbeat session was created")];
+            assert_eq!(run.view.read(cx).settings.access, mode);
+            assert!(
+                !run.view.read(cx).busy,
+                "the fixture must not start a provider"
+            );
+        });
+    }
+}
+
 fn call(
     s: &Setup,
     request: &str,
