@@ -3497,6 +3497,32 @@ mod tests {
             .unwrap();
     }
 
+    #[gpui::test]
+    fn an_action_on_a_pinned_item_outside_the_list_updates_the_shown_item(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    let listed = github_pr(1);
+                    let linked = Item {
+                        state: "open".into(),
+                        ..github_pr(9)
+                    };
+                    inbox.snapshot.items = vec![listed.clone()];
+                    inbox.go_to(linked.clone(), Tab::Summary, cx);
+                    assert_eq!(inbox.pinned.as_ref().map(Item::key), Some(linked.key()));
+                    let closed = Item {
+                        state: "closed".into(),
+                        ..linked.clone()
+                    };
+                    inbox.replace_item(&linked.key(), closed);
+                    assert_eq!(inbox.item().map(|item| item.state), Some("closed".into()));
+                    assert_eq!(inbox.snapshot.items, vec![listed], "the list is untouched");
+                });
+            })
+            .unwrap();
+    }
+
     fn github_pr(number: i64) -> Item {
         Item {
             provider: "github".into(),

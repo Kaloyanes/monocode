@@ -1146,9 +1146,7 @@ impl Inbox {
                         this.action_notice = (merging
                             && !item.state.eq_ignore_ascii_case("merged"))
                         .then(|| "Merge queued or auto-merge enabled.".into());
-                        if let Some(old) = this.snapshot.items.iter_mut().find(|i| i.key() == key) {
-                            *old = item;
-                        }
+                        this.replace_item(&key, item);
                         this.confirm_action = None;
                         this.load_detail(false, cx);
                         this.refresh(cx);
@@ -1160,5 +1158,15 @@ impl Inbox {
         })
         .detach();
         cx.notify();
+    }
+    /// Puts an item an action returned in place of the one it was run on,
+    /// whether that sits in the list or is pinned from outside it.
+    fn replace_item(&mut self, key: &str, item: Item) {
+        if let Some(pinned) = self.pinned.as_mut().filter(|i| i.key() == key) {
+            *pinned = item.clone();
+        }
+        if let Some(old) = self.snapshot.items.iter_mut().find(|i| i.key() == key) {
+            *old = item;
+        }
     }
 }
