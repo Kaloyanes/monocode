@@ -372,6 +372,17 @@ pub struct Transcript {
     cache: HashMap<String, TurnCache>,
     sent: HashMap<String, Arc<Row>>,
     order: Vec<String>,
+    /// Names this transcript's visual runtimes apart from another's.
+    key: u64,
+    /// What each visual row draws now (`{"tree"}` or `{"error"}`), and the
+    /// program that drew it.
+    visuals: HashMap<String, (String, Value)>,
+}
+
+impl Drop for Transcript {
+    fn drop(&mut self) {
+        crate::visuals::forget(&crate::visuals::key(self.key, ""));
+    }
 }
 
 impl Transcript {
@@ -390,6 +401,11 @@ impl Transcript {
             cache: HashMap::new(),
             sent: HashMap::new(),
             order: Vec::new(),
+            key: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
+            visuals: HashMap::new(),
         }
     }
 
@@ -447,6 +463,37 @@ impl Transcript {
                     }
                 }
                 self.expanded.insert(id, open);
+            }
+            // A control in a visual changed, or the person reset it.
+            "visual" | "visualReset" => {
+                let id = string(&command, "id").to_owned();
+                let source = self
+                    .cache
+                    .values()
+                    .flat_map(|cache| cache.rows.iter())
+                    .find(|row| row.id == id && row.kind == "visual")
+                    .and_then(|row| row.action["source"].as_str().map(str::to_owned));
+                // A row that scrolled out of the window has nothing to change.
+                let Some(source) = source else {
+                    return Ok(self.frame());
+                };
+                let key = crate::visuals::key(self.key, &id);
+                let drawn = if command["type"] == "visualReset" {
+                    crate::visuals::reset(&key, &source)
+                } else {
+                    crate::visuals::dispatch(
+                        &key,
+                        &source,
+                        string(&command, "handler"),
+                        command["value"].clone(),
+                    )
+                };
+                self.visuals.insert(id.clone(), (source, drawn));
+                for (turn_id, cache) in &mut self.cache {
+                    if id.starts_with(&format!("{turn_id}/")) {
+                        cache.source = Value::Null;
+                    }
+                }
             }
             "collapsed" => {
                 self.collapsed = command["value"].as_bool().unwrap_or(true);
@@ -614,6 +661,23 @@ impl Transcript {
             let cache = self.cache.entry(id.into()).or_default();
             if cache.source.is_null() {
                 let mut next = project(turn, &mut cache.markdown, &self.expanded, self.collapsed);
+                for row in next.iter_mut().filter(|row| row.kind == "visual") {
+                    let source = row.action["source"].as_str().unwrap_or_default();
+                    // A republished program starts again; the same one keeps its state.
+                    let drawn = match self.visuals.get(&row.id) {
+                        Some((drew, drawn)) if drew == source => drawn.clone(),
+                        _ => {
+                            let drawn = crate::visuals::render(
+                                &crate::visuals::key(self.key, &row.id),
+                                source,
+                            );
+                            self.visuals
+                                .insert(row.id.clone(), (source.to_owned(), drawn.clone()));
+                            drawn
+                        }
+                    };
+                    Arc::make_mut(row).presentation = drawn;
+                }
                 let previous: HashMap<&str, &Arc<Row>> =
                     cache.rows.iter().map(|r| (r.id.as_str(), r)).collect();
                 // Reuse identical blocks after parsing the mutable tail.
@@ -630,6 +694,10 @@ impl Transcript {
         }
         self.cache.retain(|id, _| live_turns.contains(id));
         let order: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        if !self.visuals.is_empty() {
+            let shown: HashSet<&str> = order.iter().map(String::as_str).collect();
+            self.visuals.retain(|id, _| shown.contains(id.as_str()));
+        }
         let changed: Vec<&Row> = rows
             .iter()
             .filter(|r| self.sent.get(&r.id).is_none_or(|old| !Arc::ptr_eq(old, r)))
@@ -773,6 +841,13 @@ fn project(
                         json!(if under_line { 4 } else { 12 });
                     Arc::make_mut(rows.last_mut().unwrap()).presentation["bottom"] = json!(4);
                 }
+            }
+            // The desktop sends a visual's program with the notice older
+            // phones show; this phone runs it.
+            "notice" if crate::visuals::SUPPORTED && item["visual"]["source"].is_string() => {
+                let mut row = Row::text(id, "visual", string(&item["visual"], "title"));
+                row.action = item["visual"].clone();
+                rows.push(Arc::new(row));
             }
             "notice" => {
                 let mut row = Row::text(
@@ -966,6 +1041,54 @@ mod tests {
             .iter()
             .any(|r| r.code && r.text == "src/main.ts:4"));
         assert!(table[1].runs.is_empty());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_visual_notice_becomes_a_live_row_its_controls_change() {
+        let source = "const s = visual.state({ n: 1 });\nreturn () => visual.column([visual.text('n ' + s.n), visual.button('Add', () => { s.n += 1; })]);";
+        let turn = json!({"id":"t","items":[
+            {"id":"u","type":"user","text":"chart please"},
+            {"id":"v","type":"notice","text":"Counter · Open on desktop to interact",
+             "visual":{"title":"Counter","source":source}},
+            {"id":"a","type":"text","text":"Done"}
+        ]});
+        let mut transcript = Transcript::new(vec![turn], false);
+        let frame = transcript.update(json!({"type":"render"})).unwrap();
+        let row = frame["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "t/v")
+            .unwrap()
+            .clone();
+        assert_eq!(row["kind"], "visual");
+        assert_eq!(row["runs"][0]["text"], "Counter");
+        assert_eq!(
+            row["presentation"]["tree"]["children"][0]["text"],
+            "n 1"
+        );
+        let handler = row["presentation"]["tree"]["children"][1]["handler"].clone();
+        let next = transcript
+            .update(json!({"type":"visual","id":"t/v","handler":handler,"value":null}))
+            .unwrap();
+        let changed = next["rows"].as_array().unwrap();
+        assert_eq!(changed.len(), 1, "only the visual row changes");
+        assert_eq!(
+            changed[0]["presentation"]["tree"]["children"][0]["text"],
+            "n 2"
+        );
+        let reset = transcript
+            .update(json!({"type":"visualReset","id":"t/v"}))
+            .unwrap();
+        assert_eq!(
+            reset["rows"][0]["presentation"]["tree"]["children"][0]["text"],
+            "n 1"
+        );
+        // A row that is gone is not an error.
+        assert!(transcript
+            .update(json!({"type":"visual","id":"t/gone","handler":"x","value":null}))
+            .is_ok());
     }
 
     #[test]

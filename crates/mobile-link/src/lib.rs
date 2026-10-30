@@ -3,6 +3,14 @@ mod ffi;
 mod tls;
 mod transcript;
 mod transport;
+mod visuals;
+
+// The desktop's scene projection names `monocode_core::visual`; on the phone
+// that is the same module, compiled here.
+#[cfg(not(target_os = "android"))]
+extern crate self as monocode_core;
+#[cfg(not(target_os = "android"))]
+pub(crate) use visuals::shared::visual;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use p256::ecdsa::{

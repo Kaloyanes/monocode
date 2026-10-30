@@ -20,5 +20,10 @@ socket2 = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
 x509-parser = "0.18"
 
+# Visuals run the desktop's sandboxed runtime. iOS has no bundled QuickJS
+# bindings, so they are generated with Xcode's libclang at build time.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rquickjs = { version = "0.14.0", features = ["bindgen"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

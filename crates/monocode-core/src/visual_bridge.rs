@@ -121,6 +121,9 @@ accent, positive, negative, warning, series1 through series6. Text sizes are
 caption, small, body, subtitle, title, hero. Choose clear labels and restrained
 headings, use row/column/grid layouts, and allow the host width to determine
 layout. Use gaps around 8–16 and chart/canvas/scene heights around 220–360.
+The same visual also runs on the person's phone, about 360 points wide: rows
+and grids wrap there, so keep each row to a few short items, and keep tables to
+a few columns.
 Do not draw custom buttons, simulate a whole webpage, add a page background, or
 hardcode font families or CSS. Native controls and the app theme own those styles.
 Include units, chart legends, readable labels, and useful empty states. Keep

@@ -204,6 +204,10 @@ final class TranscriptRowModel {
   private(set) var tailRadius: CGFloat = 0
   private(set) var horizontalRect = CGRect.zero
   private(set) var horizontalWidth: CGFloat = 0
+  /// A visual's component tree laid out for this width, or why it failed.
+  private(set) var visual: VisualLayout?
+  private(set) var visualTitle = ""
+  private(set) var visualError: String?
   var group: String? { presentation["group"] as? String }
   var isFirst: Bool { presentation["first"] as? Bool ?? true }
   var isLast: Bool { presentation["last"] as? Bool ?? true }
@@ -257,6 +261,19 @@ final class TranscriptRowModel {
     let muted = presentation["muted"] as? Bool == true
     let hairline: CGFloat = 1 / style.pixelRatio
     switch kind {
+    case "visual":
+      let width = max(1, style.width - 40)
+      let theme = VisualTheme(style: style)
+      visualTitle = plain
+      if let tree = presentation["tree"] as? [String: Any] {
+        let layout = VisualLayout(tree: tree, width: width, theme: theme)
+        visual = layout
+        height = 8 + 32 + layout.height + 20
+      } else {
+        let error = presentation["error"] as? String ?? "This visual could not be drawn."
+        visualError = error
+        height = 8 + 32 + theme.measure(error, font: .systemFont(ofSize: 13 * s), width: width).height + 20
+      }
     case "user":
       let compact = action["compact"] as? Bool == true
       let y: CGFloat = compact ? 4 : 6

@@ -533,7 +533,10 @@ final class NativeTranscriptView: ExpoView, UIScrollViewDelegate {
         }
       }
       row.onAction = { [weak self] action in
-        if action["type"] as? String == "toggle" {
+        // A visual's control runs its program in the native link.
+        if ["visual", "visualReset"].contains(action["type"] as? String ?? "") {
+          self?.session?.command(action)
+        } else if action["type"] as? String == "toggle" {
           if let id = action["id"] as? String {
             self?.toggle = (id, action["open"] as? Bool ?? false)
           }

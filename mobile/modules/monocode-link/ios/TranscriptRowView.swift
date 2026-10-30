@@ -297,6 +297,8 @@ final class TranscriptRowView: UIView, UIScrollViewDelegate {
   private var copiedUntil: Date?
   private(set) var model: TranscriptRowModel?
   private var prepared: TranscriptTextLayout?
+  /// The live controls of a visual row.
+  private var visualView: TranscriptVisualView?
   var onAction: (([String: Any]) -> Void)?
   var onSelection: ((String) -> Void)?
   var onHorizontalScroll: ((String, CGFloat) -> Void)?
@@ -355,6 +357,7 @@ final class TranscriptRowView: UIView, UIScrollViewDelegate {
     if old?.id != model.id { copiedUntil = nil }
     self.model = model
     prepared = layout
+    configureVisual(model)
     clock?.invalidate()
     clock = nil
     for (index, surface) in model.surfaces.enumerated() {
@@ -630,7 +633,31 @@ final class TranscriptRowView: UIView, UIScrollViewDelegate {
       onHorizontalScroll?(group, horizontal.contentOffset.x)
     }
   }
+  private func configureVisual(_ model: TranscriptRowModel) {
+    guard model.kind == "visual" else {
+      visualView?.removeFromSuperview()
+      visualView = nil
+      return
+    }
+    let view = visualView ?? TranscriptVisualView()
+    if visualView == nil {
+      addSubview(view)
+      visualView = view
+    }
+    view.frame = CGRect(x: 20, y: 8, width: max(1, model.style.width - 40), height: max(0, model.height - 28))
+    let id = model.id
+    view.onEvent = { [weak self] handler, value in
+      if let handler {
+        self?.perform(["type": "visual", "id": id, "handler": handler, "value": value])
+      } else {
+        self?.perform(["type": "visualReset", "id": id])
+      }
+    }
+    view.configure(model)
+  }
   func reuse() {
+    visualView?.removeFromSuperview()
+    visualView = nil
     clock?.invalidate()
     clock = nil
     horizontal.setContentOffset(horizontal.contentOffset, animated: false)
@@ -701,6 +728,12 @@ final class TranscriptRowView: UIView, UIScrollViewDelegate {
   }
   private func configureAccessibility() {
     guard let model else { return }
+    // A visual's own controls are what VoiceOver reaches.
+    if let visualView, model.kind == "visual" {
+      isAccessibilityElement = false
+      accessibilityElements = [visualView]
+      return
+    }
     isAccessibilityElement = model.hits.count <= 1
     accessibilityLabel = model.liveLabel?.text ?? model.text.string
     accessibilityTraits = model.hits.isEmpty ? .staticText : .button

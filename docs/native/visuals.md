@@ -2,7 +2,7 @@
 
 An agent can publish an interactive visual into an ordinary conversation. Ask for a chart, comparison, calculator, diagram, or 3D explanation. The visual stays in the transcript with the rest of the reply and remains usable after the turn ends. Monos use the same capability when running a conversation.
 
-Interactive rendering is a native desktop feature. The phone transcript shows the visual's title with an instruction to open it on desktop.
+The visual is also interactive on the paired iPhone. The desktop sends the program with the transcript, and the phone runs it in the same sandboxed runtime, compiled into its native link, then draws the component tree with native controls. Controls run on the phone without a round trip to the desktop. Rows and grids wrap to the phone's width, wide tables scroll sideways, a horizontal drag orbits a 3D scene and a pinch zooms it, and the reset icon starts the program again. Each screen keeps its own control state. Older phone builds and Android show the visual's title with an instruction to open it on desktop.
 
 The app renders visual components directly through GPUI. Programs describe content and interactions; the renderer supplies fonts, colors, control appearance, spacing defaults, and responsive sizing. There is no browser surface or HTML document in this path.
 

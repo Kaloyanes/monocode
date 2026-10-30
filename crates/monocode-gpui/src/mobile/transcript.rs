@@ -260,15 +260,20 @@ fn notice(rows: &[Row], at: usize, end: usize) -> Option<Value> {
             .ok()
             .filter(|note| !note.text.trim().is_empty())
             .map(|note| json!({"type": "notice", "id": id, "text": note.text})),
+        // A phone that runs visuals draws the program; an older one shows
+        // the notice.
         "visual" => {
-            let title = serde_json::from_str::<monocode_core::visual::VisualDocument>(&text)
+            let document = serde_json::from_str::<monocode_core::visual::VisualDocument>(&text)
                 .ok()
-                .filter(|document| document.validate().is_ok())
-                .map(|document| document.title)
-                .unwrap_or_else(|| "Interactive visual".into());
-            Some(
-                json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to interact")}),
-            )
+                .filter(|document| document.validate().is_ok());
+            let title = document
+                .as_ref()
+                .map_or("Interactive visual", |document| document.title.as_str());
+            let mut notice = json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to interact")});
+            if let Some(document) = &document {
+                notice["visual"] = json!({"title": document.title, "source": document.source});
+            }
+            Some(notice)
         }
         monocode_core::visual_bridge::DRAFT_ROLE => {
             let title = serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(&text)
@@ -819,7 +824,7 @@ mod tests {
         build(source, 0..usize::MAX)
     }
     #[test]
-    fn native_visuals_keep_a_readable_phone_fallback_outside_folded_work() {
+    fn native_visuals_reach_the_phone_with_a_readable_fallback_outside_folded_work() {
         let document = monocode_core::visual::VisualDocument {
             id: "phone-example".into(),
             title: "Capacity explorer".into(),
@@ -843,7 +848,12 @@ mod tests {
             notice["text"],
             "Capacity explorer · Open on desktop to interact"
         );
-        assert!(!turns[0].to_string().contains("visual.text"));
+        // The phone runs the program itself; the notice stays for older phones.
+        assert_eq!(notice["visual"]["title"], "Capacity explorer");
+        assert_eq!(
+            notice["visual"]["source"],
+            "return () => visual.text('Example');"
+        );
     }
     fn types(turn: &Value) -> Vec<&str> {
         turn["items"]
