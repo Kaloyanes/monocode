@@ -4028,7 +4028,10 @@ mod menu_tests {
             id: id.into(),
             name: id.into(),
             current: choices[0].into(),
-            choices: choices.iter().map(|c| (c.to_string(), c.to_string())).collect(),
+            choices: choices
+                .iter()
+                .map(|c| (c.to_string(), c.to_string()))
+                .collect(),
         };
         for id in ["thinking", "variant"] {
             window
