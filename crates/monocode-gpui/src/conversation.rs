@@ -2112,18 +2112,7 @@ impl Conversation {
     /// Combined ModelPicker trigger; beside mode renders these as separate pills.
     fn trigger_effort_label(&self) -> Option<SharedString> {
         if let Some(model) = self.model_info() {
-            if let Some(control) = model.controls.iter().find(|control| {
-                !model_control_toggle(control)
-                    && matches!(
-                        control.id.as_str(),
-                        "effort"
-                            | "reasoning"
-                            | "reasoningEffort"
-                            | "reasoning_effort"
-                            | "thinking"
-                            | "variant"
-                    )
-            }) {
+            if let Some((_, control)) = effort_control(model) {
                 let selected = self
                     .settings
                     .model_settings
@@ -2610,14 +2599,11 @@ impl Conversation {
         let Some(model) = self.model_info() else {
             return;
         };
-        let ix = if !model.efforts.is_empty() {
-            0
-        } else if let Some(ix) = model
-            .controls
-            .iter()
-            .position(|control| !model_control_toggle(control) && is_effort_key(&control.id))
-        {
+        // Open whichever control the trigger's effort label shows.
+        let ix = if let Some((ix, _)) = effort_control(model) {
             ix + 1
+        } else if !model.efforts.is_empty() {
+            0
         } else {
             return;
         };
@@ -3397,6 +3383,14 @@ pub(crate) fn effort_name(value: &str) -> String {
     .into()
 }
 
+/// The provider control that stands in for effort, as the trigger shows it
+/// and `App: Change Effort` opens it.
+fn effort_control(model: &Model) -> Option<(usize, &catalog::ModelControl)> {
+    model.controls.iter().enumerate().find(|(_, control)| {
+        !model_control_toggle(control)
+            && (is_effort_key(&control.id) || matches!(control.id.as_str(), "thinking" | "variant"))
+    })
+}
 fn model_control_toggle(control: &catalog::ModelControl) -> bool {
     control.choices.len() == 2
         && control.choices.iter().any(|(value, _)| value == "true")
@@ -4025,6 +4019,55 @@ mod menu_tests {
         window
             .update(visual, |c, _, _| assert!(c.menu.is_none()))
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn change_effort_opens_the_provider_control_the_trigger_shows(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        let control = |id: &str, choices: &[&str]| catalog::ModelControl {
+            id: id.into(),
+            name: id.into(),
+            current: choices[0].into(),
+            choices: choices.iter().map(|c| (c.to_string(), c.to_string())).collect(),
+        };
+        for id in ["thinking", "variant"] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.summary.provider = "opencode".into();
+                    view.model = Some("custom".into());
+                    view.settings.effort = None;
+                    view.menu = None;
+                    view.catalog = vec![Model {
+                        alias_target: None,
+                        id: "custom".into(),
+                        name: "Custom".into(),
+                        efforts: Vec::new(),
+                        default_effort: None,
+                        fast: false,
+                        thinking: false,
+                        default: true,
+                        tiers: Vec::new(),
+                        controls: vec![
+                            control("thinking", &["true", "false"]),
+                            control(id, &["low", "high"]),
+                        ],
+                    }];
+                    cx.set_global(crate::settings::Preferences::default());
+                    assert_eq!(view.trigger_effort_label().as_deref(), Some("low"));
+                })
+                .unwrap();
+            window
+                .update(cx, |view, window, cx| view.toggle_effort_menu(window, cx))
+                .unwrap();
+            window
+                .update(cx, |view, _, _| {
+                    assert!(
+                        view.menu_is(ComposerMenu::Setting(2)),
+                        "{id} control opens from App: Change Effort"
+                    );
+                })
+                .unwrap();
+        }
     }
 
     #[gpui::test]
