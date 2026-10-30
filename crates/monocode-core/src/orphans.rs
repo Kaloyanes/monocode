@@ -3,8 +3,10 @@
 //! harness reaper. Every provider child carries `MONOCODE_HARNESS_PARENT`, so
 //! only agent CLIs whose recorded parent is gone are killed.
 
+#[cfg(any(unix, test))]
 const PARENT: &str = "MONOCODE_HARNESS_PARENT";
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone)]
 struct Snapshot {
     pid: u32,
@@ -33,6 +35,7 @@ pub fn reap() -> usize {
     }
 }
 
+#[cfg(any(unix, test))]
 fn should_reap(row: &Snapshot, ours: u32, parent_alive: impl Fn(u32) -> bool) -> bool {
     if row.pid == ours || row.pid <= 1 || row.ppid == ours {
         return false;
@@ -42,6 +45,7 @@ fn should_reap(row: &Snapshot, ours: u32, parent_alive: impl Fn(u32) -> bool) ->
     })
 }
 
+#[cfg(any(unix, test))]
 /// An agent CLI we spawned, not a shell or dev server one of its tools started.
 fn looks_like_agent(args: &str) -> bool {
     args.split_whitespace().any(|part| {
@@ -69,6 +73,7 @@ fn looks_like_agent(args: &str) -> bool {
     })
 }
 
+#[cfg(any(unix, test))]
 fn parent_from(buf: &[u8]) -> Option<u32> {
     let needle = format!("{PARENT}=");
     let start = buf
