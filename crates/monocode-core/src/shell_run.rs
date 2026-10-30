@@ -295,6 +295,38 @@ fn shell_command(command: &str) -> Command {
     }
 }
 
+/// Chunks in flight between the pipe readers and the run loop. A command
+/// that writes faster than the loop keeps up blocks on its pipe instead of
+/// queueing its output in memory.
+const CHANNEL_CHUNKS: usize = 64;
+const CHUNK: usize = 8192;
+
+/// One thread per stream, each sending what it reads. Readers stop once the
+/// receiver is dropped.
+fn read_streams(
+    streams: impl IntoIterator<Item = Box<dyn Read + Send>>,
+) -> (
+    mpsc::Receiver<Vec<u8>>,
+    Vec<std::thread::JoinHandle<()>>,
+) {
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(CHANNEL_CHUNKS);
+    let readers = streams
+        .into_iter()
+        .map(|mut stream| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; CHUNK];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 || tx.send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            })
+        })
+        .collect();
+    (rx, readers)
+}
+
 fn spawn_and_wait(
     run: &mut ShellRun,
     cancel: &AtomicBool,
@@ -319,32 +351,20 @@ fn spawn_and_wait(
     crate::process::isolate(&mut command);
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let _registration = crate::process::register(child.id());
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let readers: Vec<_> = [
-        child
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-        child
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|mut stream| {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 8192];
-            while let Ok(read) = stream.read(&mut buffer) {
-                if read == 0 || tx.send(buffer[..read].to_vec()).is_err() {
-                    break;
-                }
-            }
-        })
-    })
-    .collect();
-    drop(tx);
+    let (rx, readers) = read_streams(
+        [
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        ]
+        .into_iter()
+        .flatten(),
+    );
     let mut output = Output::default();
     let mut pending = Vec::new();
     let mut last_paint = Instant::now();
@@ -471,6 +491,55 @@ mod tests {
         canceller.join().unwrap();
         assert_eq!(shell.state, State::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Counts what a never-ending stream has handed out.
+    struct Endless(Arc<std::sync::atomic::AtomicUsize>);
+    impl Read for Endless {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            buffer.fill(b'y');
+            self.0.fetch_add(buffer.len(), Ordering::Relaxed);
+            Ok(buffer.len())
+        }
+    }
+
+    #[test]
+    fn readers_wait_for_a_slow_consumer() {
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (rx, readers) = read_streams([Box::new(Endless(read.clone())) as Box<dyn Read + Send>]);
+        std::thread::sleep(Duration::from_millis(300));
+        let bound = (CHANNEL_CHUNKS + 2) * CHUNK;
+        assert!(read.load(Ordering::Relaxed) <= bound);
+        drop(rx);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn sustained_output_stays_bounded_and_cancels() {
+        let dir = std::env::temp_dir();
+        let mut shell = ShellRun::new("yes", dir.to_str().unwrap());
+        let id = shell.id.clone();
+        let started = Instant::now();
+        let mut largest = 0;
+        let mut cancelled_at = None;
+        execute(&mut shell, |run| {
+            largest = largest.max(run.output.len());
+            // Stop once the output has overflowed its bound a few times over,
+            // or give up so a stuck run still ends.
+            let omitted = run.output.contains("bytes omitted");
+            if cancelled_at.is_none() && (omitted || started.elapsed() > Duration::from_secs(10)) {
+                cancelled_at = Some(Instant::now());
+                cancel(&id);
+            }
+        });
+        let cancelled_at = cancelled_at.unwrap();
+        assert_eq!(shell.state, State::Cancelled);
+        assert!(shell.output.contains("bytes omitted"));
+        assert!(cancelled_at.elapsed() < Duration::from_secs(5));
+        assert!(shell.output.starts_with("y\ny\n"));
+        assert!(largest < STORED_HEAD + STORED_TAIL + 64);
     }
 
     #[test]

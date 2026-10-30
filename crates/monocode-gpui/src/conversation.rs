@@ -2671,13 +2671,15 @@ impl Conversation {
             })
             .collect()
     }
-    /// `Session: Stop` on Escape: cancels a running turn.
+    /// `Session: Stop` on Escape: cancels a running turn or `!command`.
     pub(crate) fn stop_if_busy(&mut self, cx: &mut Context<Self>) {
         if self.cancel_edit_last_turn(cx) {
             return;
         }
         if self.busy {
             self.stop(cx);
+        } else if self.shell_running() {
+            self.cancel_shell();
         }
     }
     fn stop(&mut self, cx: &mut Context<Self>) {

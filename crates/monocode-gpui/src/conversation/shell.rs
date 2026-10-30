@@ -535,6 +535,30 @@ mod tests {
     }
 
     #[gpui::test]
+    fn escape_stops_a_running_command(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_text("!sleep 30".into(), cx));
+                view.submit_shell(cx);
+                assert!(view.shell_running() && !view.busy);
+                view.stop_if_busy(cx);
+            })
+            .unwrap();
+        let started = Instant::now();
+        cx.run_until_parked();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        window
+            .update(cx, |view, _, cx| {
+                assert!(!view.shell_busy());
+                assert_eq!(runs(view, cx)[0].state, shell_run::State::Cancelled);
+                assert!(after_run(view, cx).is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn programmatic_and_escaped_bangs_are_plain_messages(cx: &mut TestAppContext) {
         for (text, sent) in [
             ("!rm -rf nothing", "!rm -rf nothing"),
