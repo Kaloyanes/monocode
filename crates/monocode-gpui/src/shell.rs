@@ -1464,9 +1464,7 @@ impl Shell {
                             });
                         }
                         this.refresh_session_mark(id, cx);
-                        if archived {
-                            this.start_archive_exit(id, cx);
-                        }
+                        this.sync_archive_exit(id, archived, cx);
                         if archived && this.workspace.tab_of(id).is_some() {
                             this.close_pane(id, window, cx);
                         } else {
@@ -8860,6 +8858,114 @@ mod tests {
                 assert_eq!(shell.workspace.active, Some(b));
             })
             .unwrap();
+    }
+    /// Archives and restores `a` back to back, as an undo would, and checks the
+    /// row ends up drawn at full height with no exit left over.
+    fn rapid_archive_and_restore(cx: &mut TestAppContext, reduce_motion: bool) {
+        let (window, a, b) = window(cx);
+        cx.update(|cx| cx.set_reduce_motion(reduce_motion));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&a].update(cx, |session, _| {
+                    session.summary.cwd = "/work/monocode".into();
+                    session.summary.has_messages = true;
+                });
+                shell.sessions[&b].update(cx, |session, _| session.summary.has_messages = true);
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let full = visual
+            .debug_bounds("sidebar-session-1")
+            .unwrap()
+            .size
+            .height;
+        let toggle = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |shell, _, cx| shell.toggle_archive(a, cx))
+                .unwrap();
+            visual.run_until_parked();
+        };
+
+        toggle(visual);
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.sessions[&a].read(cx).summary.archived);
+                // With motion the row stays listed while it slides out.
+                assert_eq!(shell.archive_exits.exiting(a), !reduce_motion);
+                assert_eq!(shell.sidebar_session_ids(cx).contains(&a), !reduce_motion);
+            })
+            .unwrap();
+
+        // Restored before the exit finishes.
+        toggle(visual);
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(!shell.sessions[&a].read(cx).summary.archived);
+                assert!(!shell.archive_exits.exiting(a) && !shell.archive_exits.listed(a));
+                assert!(shell.archive_burst_overlay().is_none());
+                assert!(shell.sidebar_session_ids(cx).contains(&a));
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert_eq!(
+            visual
+                .debug_bounds("sidebar-session-1")
+                .unwrap()
+                .size
+                .height,
+            full,
+            "the restored row draws at full height"
+        );
+
+        // Archiving again plays a fresh exit that runs to the end.
+        toggle(visual);
+        window
+            .update(visual, |shell, _, _| {
+                assert_eq!(shell.archive_exits.exiting(a), !reduce_motion);
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        for _ in 0..3 {
+            visual
+                .executor()
+                .advance_clock(std::time::Duration::from_millis(20));
+            visual.run_until_parked();
+        }
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.sessions[&a].read(cx).summary.archived);
+                assert!(!shell.archive_exits.listed(a));
+                assert!(shell.archive_burst_overlay().is_none());
+                assert!(!shell.sidebar_session_ids(cx).contains(&a));
+            })
+            .unwrap();
+
+        toggle(visual);
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(!shell.sessions[&a].read(cx).summary.archived);
+                assert!(shell.sidebar_session_ids(cx).contains(&a));
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert_eq!(
+            visual
+                .debug_bounds("sidebar-session-1")
+                .unwrap()
+                .size
+                .height,
+            full
+        );
+    }
+    #[gpui::test]
+    fn restoring_mid_exit_cancels_the_archive_motion(cx: &mut TestAppContext) {
+        rapid_archive_and_restore(cx, false);
+    }
+    #[gpui::test]
+    fn rapid_archive_and_restore_with_reduced_motion(cx: &mut TestAppContext) {
+        rapid_archive_and_restore(cx, true);
     }
     #[gpui::test]
     fn working_marks_animate_independently_and_completed_replies_clear_when_seen(

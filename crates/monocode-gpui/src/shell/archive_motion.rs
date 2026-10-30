@@ -101,9 +101,23 @@ fn particles(id: i64, origin: Point<Pixels>, elapsed: Duration) -> Vec<Particle>
 }
 
 impl Shell {
+    /// Follows a thread's archived state once it is written: archiving plays
+    /// the exit, and a restore that overtakes a running exit ends it so the
+    /// row draws as a normal row again.
+    pub(super) fn sync_archive_exit(&mut self, id: i64, archived: bool, cx: &mut Context<Self>) {
+        if archived {
+            self.start_archive_exit(id, cx);
+        } else if self.archive_exits.exits.remove(&id).is_some() {
+            // The list may still hold the row at its folded height.
+            self.sidebar_list.invalidate_structure();
+            self.sidebar_list.remeasure();
+            self.sidebar_frame.update(cx, |_, cx| cx.notify());
+        }
+    }
+
     /// Starts the exit for a thread that was just archived. Rows that are not
     /// on screen, or a reduced-motion setting, simply drop out of the list.
-    pub(super) fn start_archive_exit(&mut self, id: i64, cx: &mut Context<Self>) {
+    fn start_archive_exit(&mut self, id: i64, cx: &mut Context<Self>) {
         if cx.reduce_motion() || self.workspace.preferences.show_archived {
             return;
         }
