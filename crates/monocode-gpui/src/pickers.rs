@@ -162,6 +162,34 @@ mod model_label_tests {
         });
     }
 
+    #[gpui::test]
+    fn a_remote_projects_tabs_come_from_its_host(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            // This machine lacks Claude; the remote host has it.
+            remember_missing_providers(vec![Kind::Claude, Kind::Pi], cx);
+            let list = cx.new(|cx| {
+                ModelList::new_for(
+                    Kind::Codex,
+                    None,
+                    "remote://env/home/code",
+                    Default::default(),
+                    cx,
+                )
+                .quick(cx)
+            });
+            list.update(cx, |list, _| {
+                assert!(list.missing.is_empty(), "local installs don't apply");
+                // Before the host answers, only the session's provider shows.
+                assert!(list.listed(Kind::Codex));
+                assert!(!list.listed(Kind::Claude));
+                list.remote_providers = Some(vec![Kind::Claude, Kind::Pi]);
+                assert!(list.listed(Kind::Claude));
+                assert!(list.listed(Kind::Pi));
+                assert!(!list.listed(Kind::Cursor));
+            });
+        });
+    }
+
     #[test]
     fn account_metadata_never_becomes_a_model_label() {
         for id in [
@@ -357,7 +385,10 @@ impl ModelList {
             search,
             _changed: changed,
         };
-        if let Some(MissingProviders(missing)) = cx.try_global::<MissingProviders>() {
+        // A remote host's providers come from its catalog, not this machine.
+        if list.remote_project.is_none()
+            && let Some(MissingProviders(missing)) = cx.try_global::<MissingProviders>()
+        {
             list.missing = missing.clone();
             list.probed = true;
         }
@@ -673,8 +704,16 @@ impl ModelList {
                     .as_ref()
                     .is_some_and(|providers| providers.contains(&kind)))
     }
-    /// A local provider's tab: shown in Settings and known to be installed.
+    /// A provider's tab. A remote project lists what its host reported; a
+    /// local one, providers shown in Settings and known to be installed.
     fn listed(&self, kind: Kind) -> bool {
+        if self.remote_project.is_some() {
+            return kind == self.provider
+                || self
+                    .remote_providers
+                    .as_ref()
+                    .is_some_and(|providers| providers.contains(&kind));
+        }
         kind == self.provider
             || (self.probed
                 && !self.hidden.iter().any(|id| id == kind.id())
@@ -906,17 +945,7 @@ impl Render for ModelList {
                     .children(
                         Kind::ALL
                             .into_iter()
-                            .filter(|kind| {
-                                if self.remote_project.is_some() {
-                                    *kind == self.provider
-                                        || self
-                                            .remote_providers
-                                            .as_ref()
-                                            .is_some_and(|providers| providers.contains(kind))
-                                } else {
-                                    self.listed(*kind)
-                                }
-                            })
+                            .filter(|kind| self.listed(*kind))
                             .map(|kind| self.tab(ModelTab::Harness(kind), cx)),
                     ),
             )
