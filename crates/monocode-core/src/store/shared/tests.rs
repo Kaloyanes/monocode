@@ -70,6 +70,39 @@ fn reported_cache_lifetime_survives_reopening_the_store() {
 }
 
 #[test]
+fn a_reloaded_five_minute_cache_still_compacts_after_it_lapses() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("monocode.db");
+    let store = Store::open_monocode(&path).unwrap();
+    let id = store.create("claude", "/project").unwrap().id;
+    let usage = crate::context::Usage {
+        used: 150_000,
+        window: Some(200_000),
+        cache_ttl_ms: Some(5 * 60_000),
+        cost_total_usd: None,
+    };
+    store.save_context_usage(id, &usage).unwrap();
+    drop(store);
+    let store = Store::open_monocode(&path).unwrap();
+    let reloaded = store.context_usage(id).unwrap().unwrap();
+    assert_eq!(reloaded.cache_ttl_ms, Some(5 * 60_000));
+    // Seven idle minutes is past the five-minute cache but well inside the
+    // 70-minute fallback a lost lifetime would use.
+    let preferences = crate::context::ClaudeAutoCompact {
+        enabled: true,
+        window: None,
+    };
+    let last_activity = 1_000_000;
+    assert!(crate::context::compact_before_send(
+        preferences,
+        reloaded.used,
+        reloaded.cache_ttl_ms,
+        last_activity,
+        last_activity + 7 * 60_000,
+    ));
+}
+
+#[test]
 fn streamed_indexed_mono_load_preserves_projection_and_revision_guards() {
     let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
     let legacy = include_str!("../../../../../src-tauri/src/mono_transcript.rs");
