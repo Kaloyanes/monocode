@@ -944,10 +944,13 @@ impl Store {
             [self.persisted_session_id(id)?],
             |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
         ))?;
+        let cache_ttl_ms = self
+            .shared_setting(&format!("cache-ttl:{id}"))?
+            .and_then(|ttl| ttl.parse().ok());
         Ok(used.filter(|u| *u >= 0).map(|used| Usage {
             used: used as u64,
             window: window.filter(|w| *w > 0).map(|w| w as u64),
-            cache_ttl_ms: None,
+            cache_ttl_ms,
             cost_total_usd: None,
         }))
     }
