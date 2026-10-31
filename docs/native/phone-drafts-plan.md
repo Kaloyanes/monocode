@@ -134,7 +134,8 @@ changed.
   in a real thread. The radius slider (28, 18, 0, 16) and the glow toggle moved
   on the phone changed the desktop's record and its card followed; a note typed
   with the keyboard and pinned on the price showed its pin on the desktop's
-  copy. Temporary logging in the phone's sheet showed each tap's report
+  copy, and Send on the phone delivered its text to the agent as draft
+  feedback, on the price's element. Temporary logging in the phone's sheet showed each tap's report
   arriving about 200 ms after the touch and passing the touch gate. Toggling
   quickly back and forth reads as if the toggle did nothing, because the
   record ends where the last tap left it.
@@ -142,8 +143,7 @@ changed.
 ## Left to do
 
 1. **Finish the device checks.** Untried: Android at all, and a dev server's
-   pictures on a device. On the iPhone, Send was tapped but the note's text was
-   not seen reaching the agent, so Send from the phone is unconfirmed.
+   pictures on a device.
 
 Not planned: running drafts without the desktop app. The agents run in the
 desktop app, and the phone reaches everything through it, so with the app
