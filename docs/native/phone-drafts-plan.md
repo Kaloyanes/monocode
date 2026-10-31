@@ -120,14 +120,23 @@ changed.
 - Tests: the record and anchors (core), the desktop sync, the phone handlers
   end to end (including a dev-server draft), the transcript items, the
   mobile-link row, the phone's sync rules, and the draft sheet and the picture
-  view as components. An iOS simulator build succeeds.
+  view as components.
+- Tried on the iOS simulator, paired with a desktop dev build: the thread's
+  draft card opens the sheet with the desktop's values, the glow toggle and
+  the radius slider moved on the phone change the desktop's record, and a note
+  pinned on the price lands in the desktop's record as pending, on the same
+  element (`at.path`). That run fixed three things: the page started under the
+  sheet's see-through header; iOS sends no click for a tap on plain text, so
+  comment mode now puts a click handler on the body; and the note field is
+  16 px on touch screens, so focusing it no longer zooms the page.
 
 ## Left to do
 
 1. **Try it on a real phone.** `react-native-webview` is a new native
-   dependency, so this needs a new app build and cannot ship over the air. Check
-   the sheet's layout, the keyboard over a note, the comment-mode tap and a
-   dev server's pictures on iOS and Android.
+   dependency, so this needs a new app build and cannot ship over the air.
+   Untried: Android at all, the keyboard typing into a note (the simulator's
+   input tool reaches the page but not the keyboard; the note was pasted), Send
+   from the phone, and a dev server's pictures on a device.
 
 Not planned: running drafts without the desktop app. The agents run in the
 desktop app, and the phone reaches everything through it, so with the app

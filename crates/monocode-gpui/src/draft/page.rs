@@ -178,7 +178,7 @@ new ResizeObserver(replace).observe(document.documentElement);addEventListener('
 const pin=(q,n)=>{const w=where(q);const p=ui('div',{position:'absolute',left:w.x-11+'px',top:w.y-11+'px',width:'22px',height:'22px',borderRadius:'11px',background:'var(--accent,#4da3f5)',color:'#fff',font:'600 12px/22px system-ui',textAlign:'center',zIndex:'2147483646',pointerEvents:'none',boxShadow:'0 2px 8px rgba(0,0,0,.35)'},String(n));document.documentElement.appendChild(p);placed.push({p,q})};
 const open=e=>{close();const el=e.target;pending={el,x:e.pageX,y:e.pageY};
 box=ui('div',{position:'absolute',left:Math.max(8,Math.min(e.pageX+12,document.documentElement.clientWidth-268))+'px',top:e.pageY+12+'px',width:'256px',padding:'8px',background:sheet,color:ink,border:'1px solid '+line,borderRadius:'12px',boxShadow:'0 20px 25px -5px rgba(0,0,0,.25)',font:'13px system-ui',zIndex:'2147483647',display:'flex',flexDirection:'column',gap:'8px'});
-note=ui('textarea',{width:'100%',boxSizing:'border-box',minHeight:'56px',resize:'none',background:'transparent',color:'inherit',border:'1px solid '+line,borderRadius:'8px',padding:'6px 8px',font:'inherit',outline:'none'});note.placeholder='What should change here?';
+note=ui('textarea',{width:'100%',boxSizing:'border-box',minHeight:'56px',resize:'none',background:'transparent',color:'inherit',border:'1px solid '+line,borderRadius:'8px',padding:'6px 8px',font:'inherit',fontSize:matchMedia('(hover:none)').matches?'16px':'inherit',outline:'none'});note.placeholder='What should change here?';
 const row=ui('div',{display:'flex',gap:'6px',justifyContent:'flex-end'});
 const cancel=ui('button',{background:'transparent',color:'inherit',border:'1px solid '+line,borderRadius:'6px',padding:'0 10px',height:'26px',font:'12px system-ui',cursor:'pointer'},'Cancel');
 const add=ui('button',{background:ink,color:sheet,border:'0',borderRadius:'6px',padding:'0 10px',height:'26px',font:'12px system-ui',cursor:'pointer'},'Add');
@@ -187,7 +187,10 @@ post({k:'f',f:{note:text.slice(0,600),tag:el.tagName.toLowerCase(),name:label(el
 cancel.onclick=close;add.onclick=commit;
 note.addEventListener('keydown',k=>{k.stopPropagation();if(k.key==='Enter'&&!k.shiftKey){k.preventDefault();commit()}else if(k.key==='Escape')close()},true);
 row.append(cancel,add);box.append(note,row);document.documentElement.appendChild(box);note.focus()};
+/* iOS clicks only what has a click handler of its own or an ancestor's below the window: one on the body makes all of it a place for a note. */
+const tappable=()=>{};
 const setMode=on=>{mode=!!on;if(!mode){close();if(hl)hl.style.display='none'}
+if(document.body)document.body[mode?'addEventListener':'removeEventListener']('click',tappable);
 let s=document.getElementById('__mcmode');if(on&&!s){s=document.createElement('style');s.id='__mcmode';s.setAttribute('data-mc-ui','');s.textContent='html,html *{cursor:crosshair!important}';document.head.appendChild(s)}else if(!on&&s)s.remove();
 if(on&&!hl){hl=ui('div',{position:'fixed',pointerEvents:'none',border:'2px solid var(--accent,#4da3f5)',borderRadius:'4px',background:'rgba(77,163,245,.12)',zIndex:'2147483645',display:'none'});document.documentElement.appendChild(hl)}};
 addEventListener('mousemove',e=>{if(!mode||pending||!hl)return;const t=e.target;if(!t||!t.closest||t.closest('[data-mc-ui]')||t===document.documentElement){hl.style.display='none';return}const r=t.getBoundingClientRect();css(hl,{display:'block',left:r.left+'px',top:r.top+'px',width:r.width+'px',height:r.height+'px'})},true);

@@ -3,8 +3,6 @@
 //! the same paths as the sidebar, composer and Changes panel.
 mod composer;
 mod drafts;
-#[cfg(debug_assertions)]
-mod phone_check;
 
 use super::*;
 use crate::{
@@ -208,8 +206,6 @@ impl Shell {
             }
         })
         .detach();
-        #[cfg(debug_assertions)]
-        self.phone_check(cx);
     }
 
     pub(super) fn shutdown_mobile_host(&mut self) {
