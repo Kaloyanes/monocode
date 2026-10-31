@@ -30,7 +30,9 @@ impl Conversation {
             self.network_drop.waiting = None;
             return;
         }
+        // macOS only, like its switch in Settings.
         if cfg!(test)
+            || !crate::keep_awake::KeepAwake::supported()
             || !crate::keep_awake::continue_after_drop()
             || self.network_drop.resumes >= MAX_RESUMES
         {
