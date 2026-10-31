@@ -631,42 +631,6 @@ fn operator_creates_selects_and_validates_real_worktrees(cx: &mut TestAppContext
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[gpui::test]
-fn app_launch_submission_uses_the_saved_message_identity(cx: &mut TestAppContext) {
-    let (window, _, caller) = setup(cx);
-    let child = launch(window, caller, "queued-seed", json!({}), cx);
-    let expected = window
-        .update(cx, |shell, _, cx| {
-            let view = shell.sessions[&child].clone();
-            let expected = locked(&shell.store)
-                .unwrap()
-                .follow_ups(child)
-                .unwrap()
-                .draft
-                .unwrap()
-                .id;
-            view.update(cx, |v, cx| {
-                // Hold the provider boundary: verify queue acceptance without starting
-                // a real CLI or making an inference request.
-                v.busy = true;
-                v.install_app_launch(v.settings.clone(), true, cx);
-            });
-            expected
-        })
-        .unwrap();
-    cx.run_until_parked();
-    window
-        .update(cx, |shell, _, cx| {
-            let state = locked(&shell.store).unwrap().follow_ups(child).unwrap();
-            assert!(state.draft.is_none());
-            assert_eq!(state.messages.len(), 1);
-            assert_eq!(state.messages[0].id, expected);
-            assert_eq!(state.messages[0].text, "Review this project");
-            shell.sessions[&child].update(cx, |v, _| v.busy = false);
-        })
-        .unwrap();
-}
-
 /// Agents' device tools against the real hub and a booted iOS Simulator:
 /// `cargo test device_tools -- --ignored --nocapture`.
 #[gpui::test]

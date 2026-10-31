@@ -1240,6 +1240,60 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
+    /// A launched thread as `sessions.start` leaves it: the prompt saved under
+    /// the launch's message id, then the view loaded.
+    fn launched(cx: &mut TestAppContext) -> (Entity<Conversation>, String) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let session = store.create("codex", "/project").unwrap();
+        store
+            .prepare_app_prompt(session.id, "queued-seed", "Review this project")
+            .unwrap();
+        let state = store.follow_ups(session.id).unwrap();
+        let id = state.draft.as_ref().unwrap().id.clone();
+        let chat = cx.new(|cx| {
+            let mut chat = Conversation::new(session, Arc::new(Mutex::new(store)), cx);
+            chat.loaded = true;
+            chat.follow_ups.state = state;
+            chat
+        });
+        (chat, id)
+    }
+
+    #[gpui::test]
+    fn a_sent_launch_queues_the_saved_message_under_its_id(cx: &mut TestAppContext) {
+        let (chat, id) = launched(cx);
+        chat.update(cx, |chat, cx| {
+            // Hold the provider boundary: check the queue without starting a CLI.
+            chat.busy = true;
+            chat.install_app_launch(chat.settings.clone(), true, cx);
+        });
+        cx.run_until_parked();
+        chat.update(cx, |chat, _| {
+            let state = locked(&chat.store).unwrap().follow_ups(chat.summary.id).unwrap();
+            assert!(state.draft.is_none());
+            assert_eq!(state.messages.len(), 1);
+            assert_eq!(state.messages[0].id, id);
+            assert_eq!(state.messages[0].text, "Review this project");
+            chat.busy = false;
+        });
+    }
+
+    #[gpui::test]
+    fn a_draft_launch_opens_its_prompt_in_the_composer(cx: &mut TestAppContext) {
+        let (chat, _) = launched(cx);
+        chat.update(cx, |chat, cx| chat.install_app_launch(chat.settings.clone(), false, cx));
+        cx.run_until_parked();
+        chat.update(cx, |chat, cx| {
+            assert_eq!(chat.input.read(cx).content.as_ref(), "Review this project");
+            let store = locked(&chat.store).unwrap();
+            assert!(store.follow_ups(chat.summary.id).unwrap().draft.is_none());
+            assert_eq!(
+                store.composer_draft(chat.summary.id).unwrap().unwrap().text,
+                "Review this project"
+            );
+        });
+    }
+
     #[gpui::test]
     fn long_reports_preserve_card_and_follow_up_positions(cx: &mut TestAppContext) {
         for report in [

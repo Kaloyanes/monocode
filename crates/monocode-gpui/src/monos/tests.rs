@@ -1839,7 +1839,9 @@ fn duplicating_to_a_project_copies_identity_and_model_into_a_fresh_mono(cx: &mut
         .update(cx, |shell, _, _| assert!(shell.project_picker_open()))
         .unwrap();
     // The source's own project is listed but cannot be picked, so Enter
-    // lands on the other one even when the search matches both.
+    // lands on the other one even when the search matches both. The search
+    // also leaves out the rail's other folders, such as the home folder.
+    cx.simulate_input(handle, "native-monos");
     cx.simulate_keystrokes(handle, "enter");
     cx.run_until_parked();
     let (copy, active, project) = s

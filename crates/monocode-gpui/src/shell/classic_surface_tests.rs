@@ -672,7 +672,15 @@ fn original_layout_hides_saved_mono_tabs_until_returning_to_new_layout(cx: &mut 
 
 #[gpui::test]
 fn original_app_surfaces_keep_icon_rail_and_remember_closed_sessions(cx: &mut TestAppContext) {
-    crate::theme::configure(&crate::settings::Preferences::default(), false);
+    // A solid body: with body glass on, Classic's content card is clear by
+    // design and paints no tint to check.
+    let preferences = crate::settings::Preferences {
+        theme: "dark".into(),
+        sidebar_opacity: 80,
+        body_glass: false,
+        ..Default::default()
+    };
+    crate::theme::configure(&preferences, false);
     let (window, session) = setup(cx, true, false);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     window
@@ -681,7 +689,7 @@ fn original_app_surfaces_keep_icon_rail_and_remember_closed_sessions(cx: &mut Te
             shell.workspace.sidebar_visible = false;
             shell.workspace.preferences.theme = "dark".into();
             shell.workspace.preferences.sidebar_opacity = 80;
-            shell.workspace.preferences.body_glass = true;
+            shell.workspace.preferences.body_glass = false;
             shell.layout_changed(cx);
         })
         .unwrap();

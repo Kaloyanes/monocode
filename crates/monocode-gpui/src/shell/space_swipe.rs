@@ -714,6 +714,13 @@ mod tests {
             })
             .unwrap();
         visual.run_until_parked();
+        // The window drew its first project before this one was set, so the
+        // pill starts behind; let it land before a test measures it.
+        visual.executor().advance_clock(std::time::Duration::from_secs(2));
+        window
+            .update(&mut visual, |shell, _, cx| shell.invalidate_chrome(cx))
+            .unwrap();
+        visual.run_until_parked();
         (window, visual, next_session, width)
     }
 
