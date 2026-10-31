@@ -129,14 +129,21 @@ changed.
   sheet's see-through header; iOS sends no click for a tap on plain text, so
   comment mode now puts a click handler on the body; and the note field is
   16 px on touch screens, so focusing it no longer zooms the page.
+- Tried on a real iPhone 15 Pro Max (a signed Release build of 09567431's
+  phone app), paired with the release desktop app, on a draft an agent opened
+  in a real thread. The radius slider (28, 18, 0, 16) and the glow toggle moved
+  on the phone changed the desktop's record and its card followed; a note typed
+  with the keyboard and pinned on the price showed its pin on the desktop's
+  copy. Temporary logging in the phone's sheet showed each tap's report
+  arriving about 200 ms after the touch and passing the touch gate. Toggling
+  quickly back and forth reads as if the toggle did nothing, because the
+  record ends where the last tap left it.
 
 ## Left to do
 
-1. **Try it on a real phone.** `react-native-webview` is a new native
-   dependency, so this needs a new app build and cannot ship over the air.
-   Untried: Android at all, the keyboard typing into a note (the simulator's
-   input tool reaches the page but not the keyboard; the note was pasted), Send
-   from the phone, and a dev server's pictures on a device.
+1. **Finish the device checks.** Untried: Android at all, and a dev server's
+   pictures on a device. On the iPhone, Send was tapped but the note's text was
+   not seen reaching the agent, so Send from the phone is unconfirmed.
 
 Not planned: running drafts without the desktop app. The agents run in the
 desktop app, and the phone reaches everything through it, so with the app
