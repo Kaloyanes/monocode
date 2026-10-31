@@ -213,7 +213,7 @@ fn message(text: impl Into<SharedString>) -> Div {
 fn error(text: impl Into<SharedString>) -> Div {
     message(text).text_color(rgb(0xf87171))
 }
-fn provider_mark(provider: &str) -> gpui::Svg {
+pub(crate) fn provider_mark(provider: &str) -> gpui::Svg {
     let (path, color) = match provider {
         "linear" => ("inbox-linear", content(0.8)),
         "jira" => ("inbox-jira", rgb(0x2684ff).into()),
@@ -2103,6 +2103,7 @@ impl Inbox {
     fn filters_active(&self) -> bool {
         let f = &self.state.filters;
         f.assigned_to_me
+            || (model::has_authors(&self.state.source) && !f.authors.is_empty())
             || !f.hidden_projects.is_empty()
             || !f.hidden_linear_projects.is_empty()
             || !f.hidden_kinds.is_empty()
@@ -2127,7 +2128,85 @@ impl Inbox {
         }
         cx.notify();
     }
-    fn filters_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Only a change to the single fetched author needs a new fetch.
+    fn set_authors(&mut self, change: impl FnOnce(&mut Vec<String>), cx: &mut Context<Self>) {
+        let before = self.state.filters.fetch_author().map(str::to_owned);
+        change(&mut self.state.filters.authors);
+        let refetch = before.as_deref() != self.state.filters.fetch_author();
+        self.filters_changed(refetch, cx);
+    }
+    fn author_rows(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let source = self.state.source.clone();
+        let f = &self.state.filters;
+        let viewer = self.viewer().to_owned();
+        let mut rows = vec![
+            caption("AUTHOR").into_any_element(),
+            menu_row("inbox-author-any", "Anyone", f.authors.is_empty())
+                .on_click(cx.listener(|this, _, _, cx| this.set_authors(Vec::clear, cx)))
+                .into_any_element(),
+            menu_row(
+                "inbox-author-me",
+                "Created by me",
+                f.authors.iter().any(|a| a == model::ME),
+            )
+            .when(!viewer.is_empty(), |row| {
+                row.child(avatar::image(&source, &viewer, "", 14., window, cx))
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.set_authors(|authors| toggle(authors, model::ME.into()), cx)
+            }))
+            .into_any_element(),
+        ];
+        let mut people = self
+            .authors
+            .iter()
+            .filter(|p| !p.login.eq_ignore_ascii_case(&viewer))
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>();
+        for login in &f.authors {
+            if login != model::ME && !people.iter().any(|p| p.login.eq_ignore_ascii_case(login)) {
+                people.push(model::Person {
+                    login: login.clone(),
+                    avatar_url: String::new(),
+                });
+            }
+        }
+        for (ix, person) in people.into_iter().enumerate() {
+            let login = person.login.clone();
+            rows.push(
+                menu_row(
+                    format!("inbox-author-{ix}"),
+                    person.login.clone(),
+                    f.authors.iter().any(|a| a.eq_ignore_ascii_case(&login)),
+                )
+                .child(avatar::image(
+                    &source,
+                    &person.login,
+                    &person.avatar_url,
+                    14.,
+                    window,
+                    cx,
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let login = login.clone();
+                    this.set_authors(
+                        |authors| match authors.iter().position(|a| a.eq_ignore_ascii_case(&login))
+                        {
+                            Some(ix) => {
+                                authors.remove(ix);
+                            }
+                            None => authors.push(login),
+                        },
+                        cx,
+                    )
+                }))
+                .into_any_element(),
+            );
+        }
+        rows
+    }
+    fn filters_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
         let f = &self.state.filters;
         let tracker = model::is_tracker(&self.state.source);
@@ -2147,8 +2226,11 @@ impl Inbox {
                 this.filters_changed(true, cx);
             }))
             .into_any_element(),
-            caption("UPDATED").into_any_element(),
         ];
+        if model::has_authors(&self.state.source) {
+            rows.extend(self.author_rows(window, cx));
+        }
+        rows.push(caption("UPDATED").into_any_element());
         for (time, label) in [
             ("all", "Any time"),
             ("today", "Today"),
@@ -2834,8 +2916,18 @@ impl gpui::Render for Inbox {
             self.focus_comment = false;
             window.focus(&self.comment.focus_handle(cx), cx);
         }
-        let list = self.list_view(cx);
-        let detail = self.detail_view(window, cx);
+        let list = (!self.detail_only).then(|| self.list_view(cx));
+        let detail = match self.link_notice_view(cx) {
+            Some(notice) if self.detail_only && self.item().is_none() => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(16.))
+                .child(notice)
+                .into_any_element(),
+            _ => self.detail_view(window, cx),
+        };
         div()
             .id("inbox-view")
             .role(Role::Group)
@@ -2902,11 +2994,13 @@ impl gpui::Render for Inbox {
                     .min_h_0()
                     .min_w_0()
                     .flex()
-                    .child(list)
+                    .children(list)
                     .child(div().flex_1().min_w_0().min_h_0().child(detail)),
             )
             .when_some(self.error.clone(), |d, text| d.child(error(text)))
-            .when(self.filters_open, |d| d.child(self.filters_menu(cx)))
+            .when(self.filters_open, |d| {
+                d.child(self.filters_menu(window, cx))
+            })
             .when(self.connections_open, |d| d.child(self.connection_menu(cx)))
             .when(self.project_picker, |d| d.child(self.project_menu(cx)))
             .when(self.action_menu, |d| d.child(self.action_menu_view(cx)))
@@ -3395,7 +3489,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn work_links_reach_the_shell_from_a_window_and_from_code_without_one(cx: &mut TestAppContext) {
+    fn work_links_reach_the_shell(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
             cx.open_window(WindowOptions::default(), |_, cx| {
                 cx.new(|cx| Shell {
@@ -3417,17 +3511,10 @@ mod tests {
             })
             .unwrap();
         assert!(shown, "the shell's handler makes the action available");
-        cx.update(|cx| crate::inbox::open_link_later("https://github.com/acme/app/pull/2", cx));
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| {
-                assert_eq!(
-                    shell.opened,
-                    [
-                        "https://github.com/acme/app/pull/1",
-                        "https://github.com/acme/app/pull/2"
-                    ]
-                )
+                assert_eq!(shell.opened, ["https://github.com/acme/app/pull/1"])
             })
             .unwrap();
     }

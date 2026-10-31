@@ -31,6 +31,7 @@ enum Row {
     },
     ClassicFolderNew(String),
     ClassicGap(usize),
+    ClassicHeading(&'static str),
     Empty,
 }
 
@@ -412,7 +413,7 @@ impl Shell {
 
     pub(super) fn prepare_sidebar_list(&mut self, entries: &[Entry], cx: &App) {
         if self.workspace.classic_layout {
-            self.prepare_classic_sidebar_list(entries);
+            self.prepare_classic_sidebar_list(entries, cx);
             return;
         }
         let groups = self.project_groups();
@@ -519,13 +520,28 @@ impl Shell {
         self.sidebar_list.update(self.sidebar_scope(), rows);
     }
 
-    fn prepare_classic_sidebar_list(&mut self, entries: &[Entry]) {
+    fn prepare_classic_sidebar_list(&mut self, entries: &[Entry], cx: &App) {
         let groups = self.project_groups();
+        // With archived threads shown, the flat archive list at the end sits
+        // under its own heading, as in the new layout.
+        let archived_listed = self.workspace.preferences.show_archived;
+        let mut archive_heading = false;
         // Original Sidebar.tsx: the list has p-1.5, gap-0.5 and pb-10.
         // Its project navigation and Mono roster belong to the first rail.
         let mut rows = vec![Row::ClassicGap(6)];
         for (ix, entry) in entries.iter().enumerate() {
-            if ix > 0 {
+            if let Entry::Session(id) = entry
+                && archived_listed
+                && !archive_heading
+                && self.session_metadata(*id, cx).summary.archived
+                && !self.archive_exits.exiting(*id)
+            {
+                archive_heading = true;
+                if ix > 0 {
+                    rows.push(Row::ClassicGap(8));
+                }
+                rows.push(Row::ClassicHeading("Archived"));
+            } else if ix > 0 {
                 rows.push(Row::ClassicGap(2));
             }
             let (members, collapsed) = match entry {
@@ -794,6 +810,13 @@ impl Shell {
                     .into_any();
             }
             Row::ClassicGap(height) => return div().h(px(height as f32)).into_any(),
+            Row::ClassicHeading(label) => {
+                return div()
+                    .debug_selector(move || format!("sidebar-heading-{label}"))
+                    .px(px(6.))
+                    .child(section_label(label))
+                    .into_any();
+            }
             Row::Empty => div()
                 .px_2()
                 .py_2()
@@ -1439,6 +1462,93 @@ mod tests {
             .unwrap();
         visual.run_until_parked();
         assert!(visual.debug_bounds("sidebar-activity-card").is_none());
+    }
+
+    #[gpui::test]
+    fn classic_lists_archived_threads_under_their_own_heading(cx: &mut TestAppContext) {
+        use super::Row;
+        let (window, a, b) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.classic_layout = true;
+                let project = shell.workspace.project.clone();
+                shell
+                    .groups
+                    .entry(project.clone())
+                    .or_default()
+                    .create_folder(&[a], "f".into());
+                for id in [a, b] {
+                    shell.sessions[&id].update(cx, |s, _| {
+                        s.summary.cwd = project.clone();
+                        s.summary.has_messages = true;
+                        s.summary.archived = id == a;
+                    });
+                }
+                shell.workspace.preferences.show_archived = true;
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                let rows = &shell.sidebar_list.rows;
+                let heading = rows
+                    .iter()
+                    .position(|row| *row == Row::ClassicHeading("Archived"))
+                    .expect("classic shows an Archived heading");
+                let archived = rows.iter().position(|row| *row == Row::Session(a));
+                let active = rows.iter().position(|row| *row == Row::Session(b));
+                assert!(archived.is_some_and(|ix| ix > heading));
+                assert!(active.is_some_and(|ix| ix < heading));
+            })
+            .unwrap();
+        assert!(
+            visual
+                .debug_bounds(Box::leak(format!("session-origin-{a}").into_boxed_str()))
+                .is_some(),
+            "the archived row names the folder it came from"
+        );
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.preferences.show_archived = false;
+                shell.invalidate_chrome(cx);
+                shell.refresh_sidebar_structure(cx);
+                let rows = &shell.sidebar_list.rows;
+                assert!(!rows.contains(&Row::ClassicHeading("Archived")));
+                assert!(!rows.contains(&Row::Session(a)));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn archived_threads_are_listed_by_when_they_were_archived(cx: &mut TestAppContext) {
+        use super::Entry;
+        let (window, a, b) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                for (id, updated_at) in [(a, 2_000), (b, 1_000)] {
+                    shell.sessions[&id].update(cx, |s, _| {
+                        s.summary.has_messages = true;
+                        s.summary.archived = true;
+                        s.summary.updated_at = updated_at;
+                    });
+                }
+                // b was used less recently but archived after a.
+                shell.archive_times.insert(a, 3_000);
+                shell.archive_times.insert(b, 4_000);
+                let order: Vec<_> = shell
+                    .session_entries(&[a, b], cx)
+                    .into_iter()
+                    .filter_map(|entry| match entry {
+                        Entry::Session(id) => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(order, vec![b, a]);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

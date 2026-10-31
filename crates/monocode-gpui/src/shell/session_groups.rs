@@ -490,9 +490,10 @@ impl Shell {
         // Archived threads leave their folders and the Pinned group for the
         // flat archive list at the end; their membership is kept, so
         // unarchiving puts them back. A row still sliding out stays put.
-        let (archived, ids): (Vec<i64>, Vec<i64>) = ids.iter().copied().partition(|id| {
+        let (mut archived, ids): (Vec<i64>, Vec<i64>) = ids.iter().copied().partition(|id| {
             self.session_metadata(*id, cx).summary.archived && !self.archive_exits.exiting(*id)
         });
+        archived.sort_by_cached_key(|id| std::cmp::Reverse(self.archived_at(*id, cx)));
         // Chats without messages lead the list, above pins and folders.
         let (fresh, rest): (Vec<i64>, Vec<i64>) = ids
             .iter()
@@ -509,6 +510,14 @@ impl Shell {
             ))
             .chain(archived.into_iter().map(Entry::Session))
             .collect()
+    }
+    /// When a thread was archived, most recent first in the archive. Threads
+    /// archived before this was recorded fall back to their last activity.
+    pub(super) fn archived_at(&self, id: i64, cx: &App) -> u64 {
+        self.archive_times
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| self.session_metadata(id, cx).summary.updated_at)
     }
     /// The sessions in the order the sidebar shows them, for stepping.
     pub(super) fn sidebar_navigation_ids(&self, cx: &App) -> Vec<i64> {
@@ -998,6 +1007,7 @@ impl Shell {
             self.session_preview = None;
             self.preview_close = None;
         }
+        self.forget_orchestration(id, cx);
         self.sessions.remove(&id);
         self.thread_parents.remove(&id);
         self.agent_summary_writes.remove(&id);

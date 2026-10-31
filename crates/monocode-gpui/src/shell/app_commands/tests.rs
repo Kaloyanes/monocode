@@ -273,15 +273,16 @@ fn operator_children_are_visible_durable_and_do_not_navigate_by_default(cx: &mut
                 view.settings.access,
                 monocode_core::agent::AccessMode::ReadOnly
             );
-            assert!(view.has_saved_draft());
+            assert!(view.has_unsent_draft());
+            assert_eq!(view.input.read(cx).content.as_ref(), "Review this project");
             assert!(!view.busy);
             let db = locked(&shell.store).unwrap();
             assert_eq!(
-                db.follow_ups(child).unwrap().draft.unwrap().text,
+                db.composer_draft(child).unwrap().unwrap().text,
                 "Review this project"
             );
             assert_eq!(db.started_links().unwrap()[&child], caller);
-            assert!(db.draft_sessions().unwrap().contains(&child));
+            assert!(db.composer_draft_sessions().unwrap().contains(&child));
         })
         .unwrap();
     let opened = launch(window, caller, "visible", json!({"reveal":true}), cx);
@@ -664,4 +665,65 @@ fn app_launch_submission_uses_the_saved_message_identity(cx: &mut TestAppContext
             shell.sessions[&child].update(cx, |v, _| v.busy = false);
         })
         .unwrap();
+}
+
+/// Agents' device tools against the real hub and a booted iOS Simulator:
+/// `cargo test device_tools -- --ignored --nocapture`.
+#[gpui::test]
+#[ignore = "runs the real Device Hub against a booted simulator"]
+fn device_tools_list_open_and_screenshot_a_real_simulator(cx: &mut TestAppContext) {
+    let (window, _, caller) = setup(cx);
+    monocode_core::device::set_enabled(true, false);
+    let refused = call(window, caller, "d0", "devices.list", json!({}), cx);
+    assert!(refused.unwrap_err().contains("Agent access to devices is off"));
+    monocode_core::device::set_enabled(true, true);
+    window
+        .update(cx, |shell, _, _| shell.workspace.preferences.devices = true)
+        .unwrap();
+    let list = call(window, caller, "d1", "devices.list", json!({}), cx).unwrap();
+    let booted = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["booted"] == true && d["platform"] == "ios")
+        .expect("a booted simulator")
+        .clone();
+    let unknown = call(window, caller, "d2", "devices.open", json!({"device": "No Such Phone"}), cx);
+    assert!(unknown.unwrap_err().contains("No device matches"));
+    let opened = call(
+        window,
+        caller,
+        "d3",
+        "devices.open",
+        json!({"device": booted["name"]}),
+        cx,
+    )
+    .unwrap();
+    eprintln!("{}", opened["quickStart"].as_str().unwrap());
+    assert_eq!(opened["device"]["id"], booted["id"]);
+    window
+        .update(cx, |shell, _, cx| {
+            let panel = shell.right_panel.as_ref().expect("the right panel opened").read(cx);
+            assert_eq!(panel.tab(), crate::right_panel::RightTab::Device);
+            assert_eq!(
+                panel.device.read(cx).selected().map(|d| d.id.clone()),
+                booted["id"].as_str().map(str::to_owned)
+            );
+        })
+        .unwrap();
+    // No device named: the one in the panel.
+    let shot = call(window, caller, "d4", "devices.screenshot", json!({}), cx).unwrap();
+    let png = std::fs::read(shot["path"].as_str().unwrap()).unwrap();
+    assert!(png.starts_with(b"\x89PNG"));
+    eprintln!("screenshot {} bytes at {}", png.len(), shot["path"]);
+    // A read-only thread can look but not open or close.
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&caller].update(cx, |v, _| v.app_read_only = true)
+        })
+        .unwrap();
+    assert!(call(window, caller, "d5", "devices.screenshot", json!({}), cx).is_ok());
+    let denied = call(window, caller, "d6", "devices.close", json!({"device": booted["id"]}), cx);
+    assert!(denied.unwrap_err().contains("only device_list and device_screenshot"));
+    monocode_core::device::hub::stop();
 }

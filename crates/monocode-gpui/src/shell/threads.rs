@@ -83,7 +83,9 @@ impl Shell {
                     .iter()
                     .filter(|(_, parent)| **parent == call.session)
                     .map(|(id, _)| *id)
-                    .filter(|id| self.session_summaries.contains_key(id))
+                    .filter(|id| {
+                        self.session_summaries.contains_key(id) && !self.thread_closed(*id, cx)
+                    })
                     .collect();
                 ids.sort_unstable();
                 Ok(
@@ -139,7 +141,9 @@ impl Shell {
             }
             "threads.send" => {
                 let view = self.sessions[&id].clone();
-                if !view.read(cx).ready_for_external(cx)
+                if self.thread_closed(id, cx) {
+                    Err("Child thread was closed".into())
+                } else if !view.read(cx).ready_for_external(cx)
                     || view.read(cx).thread_pending()
                     || view.read(cx).has_saved_draft()
                 {
@@ -156,9 +160,88 @@ impl Shell {
                 self.release_thread_waiters(id, Err("Child thread was stopped".into()), cx);
                 Ok(json!({"threadId":id,"stopped":true}))
             }
+            "threads.close" => {
+                if self.thread_status(id, cx)["status"] != "idle" {
+                    Err("Child is still working or needs input; stop it first".into())
+                } else {
+                    self.close_threads(call.session, &[id], cx);
+                    Ok(json!({"threadId":id,"closed":true}))
+                }
+            }
             _ => Err("Unknown thread action".into()),
         };
         self.finish_app_call(call, result, cx);
+    }
+
+    /// A closed child is archived: off its lead's list, rail and spawn tree.
+    fn thread_closed(&self, id: i64, cx: &App) -> bool {
+        (self.sessions.contains_key(&id) || self.session_summaries.contains_key(&id))
+            && self.session_metadata(id, cx).summary.archived
+    }
+
+    /// Archives the settled children of `lead` among `ids`; a child still
+    /// working or waiting for the user is left open.
+    pub(super) fn close_threads(&mut self, lead: i64, ids: &[i64], cx: &mut Context<Self>) {
+        let ids: Vec<i64> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.thread_parents.get(id) == Some(&lead)
+                    && self.session_summaries.contains_key(id)
+                    && !self.thread_closed(*id, cx)
+                    && self.thread_status(*id, cx)["status"] == "idle"
+            })
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        for &id in &ids {
+            self.set_thread_archived(id, true, cx);
+        }
+        self.thread_session_changed(lead, cx);
+        let store = self.store.clone();
+        let work = cx.background_executor().spawn(async move {
+            match locked(&store) {
+                Ok(store) => ids
+                    .into_iter()
+                    .filter_map(|id| store.set_archived(id, true).err().map(|e| (id, e)))
+                    .collect::<Vec<_>>(),
+                Err(error) => ids.into_iter().map(|id| (id, error.clone())).collect(),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let failed = work.await;
+            let Some((_, error)) = failed.first().cloned() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                for (id, _) in &failed {
+                    this.set_thread_archived(*id, false, cx);
+                }
+                this.thread_session_changed(lead, cx);
+                this.error = Some(format!("Could not close agents: {error}"));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn set_thread_archived(&mut self, id: i64, archived: bool, cx: &mut Context<Self>) {
+        if let Some(summary) = self.session_summaries.get_mut(&id) {
+            summary.archived = archived;
+        }
+        if archived {
+            self.archive_times.insert(id, monocode_core::time::now_ms());
+        }
+        if let Some(view) = self.sessions.get(&id) {
+            view.update(cx, |session, cx| {
+                session.summary.archived = archived;
+                if archived {
+                    session.cancel_usage_resume(cx);
+                }
+            });
+        }
+        self.refresh_session_mark(id, cx);
     }
 
     fn release_thread_waiters(
@@ -174,23 +257,30 @@ impl Shell {
 
     pub(super) fn thread_session_changed(&mut self, id: i64, cx: &mut Context<Self>) {
         let lead = self.thread_parents.get(&id).copied().unwrap_or(id);
-        let mut children: Vec<_> = self
+        let mut all: Vec<_> = self
             .thread_parents
             .iter()
             .filter(|(_, parent)| **parent == lead)
             .map(|(id, _)| *id)
             .filter(|id| self.session_summaries.contains_key(id))
             .collect();
-        if children.is_empty() {
+        if all.is_empty() {
             return;
         }
-        children.sort_unstable();
+        all.sort_unstable();
+        // Closed children stay in the spawn tree's states, marked so it hides
+        // them, but leave the rail.
+        let children: Vec<i64> = all
+            .iter()
+            .copied()
+            .filter(|&child| !self.thread_closed(child, cx))
+            .collect();
         let stopped = self
             .sessions
             .get(&lead)
             .is_none_or(|v| v.read(cx).thread_stopping());
         if stopped {
-            for &child in &children {
+            for &child in &all {
                 if id == lead
                     && let Some(view) = self.sessions.get(&child)
                 {
@@ -208,9 +298,15 @@ impl Shell {
             let v = v.read(cx);
             (v.summary.title.clone(), v.driver_label())
         });
-        let states: HashMap<_, _> = children
+        let states: HashMap<_, _> = all
             .iter()
-            .map(|&child| (child, self.thread_status(child, cx)))
+            .map(|&child| {
+                let mut status = self.thread_status(child, cx);
+                if self.thread_closed(child, cx) {
+                    status["closed"] = true.into();
+                }
+                (child, status)
+            })
             .collect();
         if let Some(view) = self.sessions.get(&lead) {
             let transcript = view.read(cx).transcript.clone();
@@ -258,7 +354,7 @@ impl Shell {
             || tasks
                 .iter()
                 .any(|t| matches!(t.status.as_str(), "running" | "blocked"))
-            || self.orchestrations.contains_key(&lead);
+            || self.orchestrations.active(lead);
         if let Some(previous) = self.orchestration_summaries.get(&lead) {
             tasks.extend(
                 previous

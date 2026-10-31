@@ -588,7 +588,12 @@ impl Terminal {
     }
     /// A click that pressed and released on the same link, without
     /// dragging out a selection, opens it as the web build's xterm does.
-    fn mouse_up(&mut self, event: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
+    fn mouse_up(
+        &mut self,
+        event: &gpui::MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.stop_selection();
         let Some(link) = self.pressed_link.take() else {
             return;
@@ -600,7 +605,13 @@ impl Terminal {
             .as_ref()
             .is_some_and(|selection| !selection.is_empty());
         if !selected && self.link_at(event.position).as_ref() == Some(&link) {
-            cx.open_url(&link.uri);
+            // Pull requests and issues open in the Inbox; Cmd keeps the browser.
+            let in_inbox = !event.modifiers.secondary()
+                && monocode_core::inbox::link_target(&link.uri).is_some()
+                && crate::inbox::open_in_inbox(&link.uri, window, cx);
+            if !in_inbox {
+                cx.open_url(&link.uri);
+            }
         }
     }
     fn stop_selection(&mut self) {
@@ -1114,11 +1125,11 @@ impl Element for Grid {
             }
         });
         let terminal = self.terminal.downgrade();
-        window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _, cx| {
+        window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, window, cx| {
             if phase == gpui::DispatchPhase::Capture && event.button == MouseButton::Left {
                 let _ = terminal.update(cx, |terminal, cx| {
                     terminal.finish_selection(event.position, cx);
-                    terminal.mouse_up(event, cx)
+                    terminal.mouse_up(event, window, cx)
                 });
             }
         });

@@ -66,18 +66,16 @@ fn remote_capability_and_command_guards_keep_composer_and_attachments(cx: &mut T
         view.update(cx, |view, cx| {
             view.remote_state.capabilities.clear();
             view.attachments = vec![PathBuf::from("/home/me/design.png")];
-            assert!(view.remote_send_guard(cx));
+            assert!(view.remote_send_guard(false, cx));
             assert!(view.status.contains("attachments"));
             assert_eq!(view.attachments.len(), 1);
             view.attachments.clear();
             view.settings.plan = true;
-            assert!(view.remote_send_guard(cx));
+            assert!(view.remote_send_guard(false, cx));
             assert!(view.status.contains("Plan mode"));
             view.settings.plan = false;
-            view.follow_ups.draft_selected = true;
-            assert!(view.remote_send_guard(cx));
+            assert!(view.remote_send_guard(true, cx));
             assert!(view.status.contains("save drafts"));
-            view.follow_ups.draft_selected = false;
             for command in [
                 "/operator delegate this",
                 "/orchestrate a task",
@@ -85,7 +83,7 @@ fn remote_capability_and_command_guards_keep_composer_and_attachments(cx: &mut T
             ] {
                 view.input
                     .update(cx, |input, cx| input.set_text(command.into(), cx));
-                assert!(view.remote_send_guard(cx));
+                assert!(view.remote_send_guard(false, cx));
                 assert_eq!(view.input.read(cx).content.as_ref(), command);
             }
         })

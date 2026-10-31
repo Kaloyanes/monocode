@@ -1,10 +1,13 @@
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { createContext, memo, use, useEffect, useRef, useState } from "react";
+import { useLocalSearchParams } from "expo-router";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import Svg, { Path } from "react-native-svg";
 
+import { openDraft } from "@/features/drafts/openDraft";
 import { PixelMascot } from "@/features/mascots/PixelMascot";
+import { leadingCommand } from "@/features/skills/slash";
 import { useCollapsedToolCalls } from "@/features/settings/toolCalls";
 import type {
   Turn,
@@ -115,6 +118,8 @@ export const TranscriptTurn = memo(function TranscriptTurn({
                 {item.text}
               </Text>
             );
+          case "draft":
+            return <DraftCard key={item.id} item={item} />;
         }
       })}
       {turn.footer ? <TurnFooter turn={turn} /> : null}
@@ -137,6 +142,31 @@ function ErrorNotice({ item, onPress }: { item: SessionErrorNotice; onPress: () 
       <View style={styles.errorNoticeText}>
         <Text style={styles.errorNoticeTitle}>{title}</Text>
         <Text style={styles.errorNoticeHint}>View details</Text>
+      </View>
+      <Icon name="chevronRight" size={16} color={colors.faint} />
+    </Pressable>
+  );
+}
+
+/** A page the agent built, opened live on the phone; drawn as the error card is. */
+function DraftCard({ item }: { item: Extract<TurnItem, { type: "draft" }> }) {
+  const colors = useColors();
+  const styles = useStyles();
+  const { sessionId } = useLocalSearchParams<{ sessionId?: string }>();
+  return (
+    <Pressable
+      onPress={() => sessionId && openDraft(sessionId, item.draft, item.title)}
+      disabled={!sessionId}
+      accessibilityRole="button"
+      accessibilityLabel={`${item.title}. Open draft`}
+      style={({ pressed }) => [styles.errorNotice, pressed && styles.pressed]}
+    >
+      <Icon name="edit" size={18} color={colors.muted} />
+      <View style={styles.errorNoticeText}>
+        <Text style={styles.errorNoticeTitle} numberOfLines={2}>
+          {item.title}
+        </Text>
+        <Text style={styles.errorNoticeHint}>{item.kept ? "Kept draft · Open" : "Draft · Open"}</Text>
       </View>
       <Icon name="chevronRight" size={16} color={colors.faint} />
     </Pressable>
@@ -276,6 +306,9 @@ function UserMessage({
   }
 
   const withTail = tail && !item.compact;
+  // A skill or command the message opens with stands out, as the desktop
+  // composer marks one.
+  const lead = leadingCommand(item.text);
   return (
     <View style={[styles.userRow, item.compact && styles.userRowCompact]}>
       <View
@@ -300,7 +333,14 @@ function UserMessage({
               if (!expanded) setOverflows(lines >= 4 && isClamped(event.nativeEvent.lines, item.text));
             }}
           >
-            {item.text}
+            {lead ? (
+              <>
+                <Text style={styles.command}>/{lead.name}</Text>
+                {item.text.slice(lead.name.length + 1)}
+              </>
+            ) : (
+              item.text
+            )}
           </Text>
         ) : null}
         {overflows ? (
@@ -581,6 +621,10 @@ const useStyles = themedStyles((colors) => ({
     color: colors.content,
     fontSize: 16,
     lineHeight: 23,
+  },
+  command: {
+    color: colors.accent,
+    fontWeight: "600",
   },
   attachments: {
     color: colors.muted,

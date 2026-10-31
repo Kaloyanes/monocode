@@ -2,7 +2,7 @@ use super::*;
 use crate::quick_open::{Command, Picked, QuickOpen};
 pub(super) struct Open {
     picker: Entity<QuickOpen>,
-    restore: Option<FocusHandle>,
+    pub(super) restore: Option<FocusHandle>,
     _events: Subscription,
 }
 impl Shell {
@@ -26,6 +26,7 @@ impl Shell {
             .quick_open
             .as_ref()
             .and_then(|o| o.restore.clone())
+            .or_else(|| self.project_picker.take().and_then(|o| o.restore))
             .or_else(|| window.focused(cx));
         self.close_menu(cx);
         self.close_preview(cx);
@@ -48,10 +49,12 @@ impl Shell {
                     Command::New => window.dispatch_action(Box::new(NewCodex), cx),
                     Command::Project => window.dispatch_action(Box::new(OpenProject), cx),
                     Command::Model => window.dispatch_action(Box::new(SwitchModel), cx),
+                    Command::Effort => window.dispatch_action(Box::new(ChangeEffort), cx),
                     Command::Settings => window.dispatch_action(Box::new(OpenSettings), cx),
                     Command::Sidebar => window.dispatch_action(Box::new(ToggleSidebar), cx),
                     Command::Panel => window.dispatch_action(Box::new(ToggleRightPanel), cx),
                     Command::Terminal => window.dispatch_action(Box::new(ToggleTerminal), cx),
+                    Command::Device => window.dispatch_action(Box::new(ToggleDevice), cx),
                     Command::Layout => window.dispatch_action(Box::new(ToggleLayout), cx),
                     Command::WorkspaceStyle => {
                         window.dispatch_action(Box::new(ToggleWorkspaceStyle), cx)

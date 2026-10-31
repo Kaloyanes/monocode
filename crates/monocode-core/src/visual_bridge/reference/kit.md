@@ -1,6 +1,13 @@
 Optional kit. Every HTML page includes MonoCode's component kit. Use any
 helpers that fit the subject, or write custom HTML, CSS, SVG and JavaScript.
 UI mockups can use the product's own visual identity.
+The parts worth reaching for are the ones a page cannot easily make itself:
+mc.clock (slow motion and pause for everything on the page), mc.state (values
+the agent reads and sets), mc.send (a line to the agent from the person), the
+theme variables and the classes that look like the app's own controls.
+Ready-made bars (mc.variants, mc.transport, mc.controls) are examples of one
+shape; when the subject wants different controls, build those instead, from the
+same parts.
 Classes: mc-row, mc-col, mc-grid, mc-spacer, mc-muted, mc-label, mc-mono,
 mc-title, mc-divider; mc-card (tinted panel), mc-surface (floating popover with
 shadow); mc-button (+ primary, accent, ghost, danger, icon, small), mc-input,
@@ -29,6 +36,24 @@ Script helpers on window.mc:
   runs again on every switch and replay, so entrance animations replay for free.
   ctx.now() is playback-scaled time for requestAnimationFrame loops. Arrow keys
   switch variants, r replays. A single variant has no chrome at all.
+  {layout:'side'} shows every variant at once in one row, each with its name and
+  note above its own stage, so one trigger drives them together: the right shape
+  for versions of one component, where tabs would hide the difference. render
+  gets ctx.states (the o.states you passed) and ctx.clock; return the function
+  from states.on(...) as the cleanup. Use tabs for different pages.
+- mc.clock is the page's one clock: speed, paused, setSpeed(v), pause(), resume(),
+  on(f). Slow motion also scales performance.now, Date.now, requestAnimationFrame
+  timestamps and setTimeout/setInterval delays, so script-driven motion (GSAP,
+  hand-written loops) slows with the CSS. Paused freezes animations and those clocks.
+- mc.states(['expanded','collapsed'], {initial?}) is a named state shared by the
+  page: name, go(nameOrIndex), next(), on(f) (runs now and on every change,
+  returns a stop function). Each variant listens and animates its own way.
+- mc.transport(target, {states?, labels?, replay?, slow?, speeds?, autoplay?,
+  every?, pause?}) is the playback bar, for judging motion only: a button that
+  flips states and is labelled with the next one (labels: {collapsed:'Collapse',
+  expanded:'Expand'}), Replay, a "Slow motion ×4" switch (slow: N) or speed chips
+  (speeds: [1,.5,.25]), Auto-play (loops the trigger every `every` ms, default
+  1600) and Pause. Returns an element with destroy().
 - mc.slider(label, {min,max,step,value,unit?,format?,onInput}),
   mc.toggle(label, value, onChange), mc.tabs(labels, selected, onChange) return
   ready controls; put them in the variants controls option or your own bar.
@@ -38,7 +63,13 @@ Script helpers on window.mc:
   (radius -> --s-radius, numbers unitless, so calc(var(--s-radius) * 1px)) and
   each boolean to a data attribute on <html> (glow -> data-s-glow="on"), so
   plain CSS can react with no script. The values reach you as `state` in the
-  next draft snapshot: look at it to see what the person tried.
+  next draft snapshot: look at it to see what the person tried. You change
+  them with draft_preview {draft, action:{kind:"set", values:{...}}}; keys the
+  store does not have are refused. Keep one store per page: with several,
+  set reaches only the newest.
+- mc.send(text) sends a line to the agent as from the person, for a control
+  such as "Use this one". It works only inside the handler of the person's own
+  click or key press (within two seconds) and returns whether it went.
 - mc.controls(target, spec, {state?, layout?, title?}) puts controls outside
   the content, bound to an mc.state (one is made from the specs' `value`s when
   you pass none; read it as el.state). Specs: {key, type, label?, onChange?}

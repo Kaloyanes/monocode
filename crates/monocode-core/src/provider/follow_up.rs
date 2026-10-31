@@ -69,12 +69,16 @@ impl Protocol {
                 } else {
                     request.prompt.clone()
                 };
+                // Claude takes a message between steps, or as a new turn once
+                // this one ends, and echoes its uuid then. Until that echo the
+                // message is not delivered.
+                let uuid = uuid::Uuid::new_v4().to_string();
                 write_json(
                     stdin,
-                    json!({"type":"user","session_id":"","parent_tool_use_id":null,"message":{"role":"user","content":request.claude_content(&prompt)?}}),
+                    json!({"type":"user","uuid":uuid,"session_id":"","parent_tool_use_id":null,"message":{"role":"user","content":request.claude_content(&prompt)?}}),
                 )?;
-                self.text_key = None;
-                return Ok(vec![Event::FollowUp(message)]);
+                self.steering.insert(uuid, (message, Instant::now()));
+                return Ok(Vec::new());
             }
             Kind::Pi | Kind::Omp => {
                 let mut command = json!({"id":wire,"type":"steer","message":request.prompt.trim()});
@@ -148,6 +152,36 @@ impl Protocol {
             self.text_key = None;
             Some(vec![Event::FollowUp(message)])
         }
+    }
+    /// Claude's echo of a steer it has just taken.
+    pub(super) fn claude_replay(&mut self, value: &Value) -> Option<Vec<Event>> {
+        let (message, _) = self.steering.remove(value["uuid"].as_str()?)?;
+        self.text_key = None;
+        Some(vec![Event::FollowUp(message)])
+    }
+    /// Claude still runs a message it was handed after an interrupt or a turn
+    /// that ended without taking it, so that process must not be reused.
+    pub(super) fn holds_steers(&self) -> bool {
+        self.request.kind == Kind::Claude && (self.claude_stale || !self.steering.is_empty())
+    }
+    /// A finished Claude turn with steers still out starts another turn for
+    /// them. If it never does, hand them back to be sent as the next turn.
+    pub(super) fn expire_claude_steers(&mut self) -> Vec<Event> {
+        if !self
+            .claude_steer_deadline
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            return Vec::new();
+        }
+        self.claude_steer_deadline = None;
+        self.claude_stale = true;
+        self.steering
+            .drain()
+            .map(|(_, (message, _))| Event::FollowUpFailed {
+                id: message.id,
+                error: "Claude did not take this message before its turn ended".into(),
+            })
+            .collect()
     }
     pub(super) fn expire_steering(&mut self) -> Vec<Event> {
         // These are acknowledgement deadlines, not turn deadlines. Codex's
@@ -244,7 +278,15 @@ mod tests {
             let wire: Value = serde_json::from_slice(&out).unwrap();
             if kind == Kind::Claude {
                 assert_eq!(wire["type"], "user");
-                assert_eq!(events, vec![Event::FollowUp(message)]);
+                assert!(events.is_empty(), "sent is not yet taken");
+                assert_eq!(
+                    p.frame(
+                        json!({"type":"user","isReplay":true,"uuid":wire["uuid"],"parent_tool_use_id":null,"message":{"role":"user","content":"follow up"}}),
+                        &mut out
+                    )
+                    .unwrap(),
+                    vec![Event::FollowUp(message)]
+                );
             } else {
                 assert_eq!(wire["type"], "steer");
                 assert!(events.is_empty());
@@ -258,6 +300,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_claude_steer_that_misses_the_turn_keeps_it_open_for_the_next() {
+        let mut p = protocol(Kind::Claude);
+        let mut out = Vec::new();
+        let message = Message {
+            id: "late".into(),
+            text: "also say BANANA".into(),
+            ..Default::default()
+        };
+        p.steer(message.clone(), &mut out).unwrap();
+        let wire: Value = serde_json::from_slice(&out).unwrap();
+        let ended = p
+            .frame(json!({"type":"result","result":"one two three"}), &mut out)
+            .unwrap();
+        assert!(!ended.contains(&Event::Done) && !p.done);
+        assert!(p.holds_steers());
+
+        // Claude starts a turn of its own for the message, as it does live.
+        p.frame(json!({"type":"system","subtype":"init"}), &mut out)
+            .unwrap();
+        let taken = p
+            .frame(
+                json!({"type":"user","isReplay":true,"uuid":wire["uuid"],"parent_tool_use_id":null,"message":{"role":"user","content":"also say BANANA"}}),
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(taken, vec![Event::FollowUp(message)]);
+        assert!(!p.holds_steers());
+        let ended = p
+            .frame(json!({"type":"result","result":"BANANA"}), &mut out)
+            .unwrap();
+        assert!(ended.contains(&Event::Done));
+    }
+    #[test]
+    fn an_untaken_claude_steer_is_handed_back_and_retires_the_process() {
+        let mut p = protocol(Kind::Claude);
+        let mut out = Vec::new();
+        p.steer(
+            Message {
+                id: "lost".into(),
+                text: "hello?".into(),
+                ..Default::default()
+            },
+            &mut out,
+        )
+        .unwrap();
+        p.frame(json!({"type":"result","result":"done"}), &mut out)
+            .unwrap();
+        p.claude_steer_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let events = p.lifecycle_tick(Instant::now(), &mut out).unwrap();
+        assert!(matches!(&events[0], Event::FollowUpFailed { id, .. } if id == "lost"));
+        assert!(events.contains(&Event::Done));
+        assert!(p.holds_steers(), "Claude may still run it on this process");
     }
 
     #[cfg(unix)]

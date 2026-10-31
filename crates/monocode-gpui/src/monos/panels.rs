@@ -28,6 +28,8 @@ pub(super) enum Route {
     Document(String),
     Habit(String),
     NewHabit,
+    /// A pull request or issue, shown by the Mono's own Inbox detail view.
+    WorkItem,
 }
 impl Route {
     pub(super) fn key(&self) -> String {
@@ -37,6 +39,7 @@ impl Route {
             Self::Document(id) => format!("document:{id}"),
             Self::Habit(id) => format!("habit:{id}"),
             Self::NewHabit => "new-habit".into(),
+            Self::WorkItem => "work-item".into(),
         }
     }
 }
@@ -756,27 +759,6 @@ impl Monos {
             .map(|f| f.read(cx).content.to_string())
             .unwrap_or_default()
     }
-    pub(super) fn topbar(&self, mono: &Mono, cx: &mut Context<Self>) -> AnyElement {
-        let id = mono.id.clone();
-        div()
-            .absolute()
-            .top_0()
-            .right(px(10.))
-            .h(px(40.))
-            .flex()
-            .items_center()
-            .child(
-                icon_button("mono-settings", "Mono settings", "settings")
-                    .debug_selector(|| "mono-settings".into())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.settings = Some(SettingsSection::General);
-                        window.focus(&this.settings_focus, cx);
-                        this.reload_files(&id, cx);
-                        cx.notify();
-                    })),
-            )
-            .into_any_element()
-    }
     pub(super) fn select_overview(&mut self, tab: OverviewTab, cx: &mut Context<Self>) {
         if tab != OverviewTab::Changes {
             self.pause_changes(cx);
@@ -1296,7 +1278,8 @@ impl Monos {
                         .html_documents
                         .entry(id.clone())
                         .or_insert_with(|| {
-                            cx.new(|_| super::html::Html::new(document.body.clone()))
+                            let monos = cx.weak_entity();
+                            cx.new(|_| super::html::Html::new(document.body.clone(), monos))
                         })
                         .clone();
                     html.update(cx, |html, _| html.set_interactive(interactive));
@@ -1334,6 +1317,7 @@ impl Monos {
             }
             Route::Habit(id) => self.habit_page(mono, Some(&id), window, cx),
             Route::NewHabit => self.habit_page(mono, None, window, cx),
+            Route::WorkItem => self.work_item_page(cx),
         }
     }
     fn activity_view(&mut self, mono: &Mono, cx: &mut Context<Self>) -> AnyElement {
@@ -1798,8 +1782,14 @@ impl Monos {
                 vec![
                     MenuItem::Custom(AnyView::from(editor), focus.clone()),
                     MenuItem::Separator,
+                    MenuAction::new("settings", "Settings")
+                        .icon("settings")
+                        .into(),
                     MenuAction::new("background", "Background image")
                         .icon("image-add")
+                        .into(),
+                    MenuAction::new("duplicate", "Duplicate to project…")
+                        .icon("copy")
                         .into(),
                     MenuAction::new("delete", "Delete mono…")
                         .icon("trash")
@@ -1817,7 +1807,12 @@ impl Monos {
             this.menu = None;
             if let MenuEvent::Picked(action, _) = event {
                 match action.as_ref() {
+                    "settings" => {
+                        this.open(&target, w, cx);
+                        this.open_current_settings(w, cx);
+                    }
                     "background" => this.open_background(&target, w, cx),
+                    "duplicate" => cx.emit(DuplicateRequested(target.clone())),
                     "delete" => this.delete_mono(&target, w, cx),
                     _ => {}
                 }

@@ -17,6 +17,20 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+/// The UDP port this desktop accepts phones on. Development builds take the
+/// next one, so a dev build and the installed app can both be paired, or
+/// `MONOCODE_PHONE_PORT` so several dev builds can; the phone dials whatever
+/// port its pairing code names.
+pub(super) fn listen_port() -> u16 {
+    if !cfg!(debug_assertions) {
+        return PORT;
+    }
+    std::env::var("MONOCODE_PHONE_PORT")
+        .ok()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(PORT + 1)
+}
+
 /// Methods the app answers. Pairing, leaving and the catalog are the host's.
 const APP_METHODS: &[&str] = &[
     "conversation.read",
@@ -32,12 +46,21 @@ const APP_METHODS: &[&str] = &[
     "project.fileHighlight",
     "project.git",
     "project.gitAction",
+    "project.skills",
+    "session.commands",
     "session.start",
     "conversation.send",
     "session.cancel",
     "session.rename",
     "session.delete",
     "session.archive",
+    "orchestration.read",
+    "orchestration.action",
+    "draft.read",
+    "draft.frame",
+    "draft.action",
+    "composer.read",
+    "composer.write",
 ];
 /// Under the phone's own wait, so it hears why rather than timing out.
 const REPLY_WAIT: Duration = Duration::from_secs(25);
@@ -414,13 +437,13 @@ impl MobileHost {
             monocode_mobile_link::server_endpoint(
                 &identity,
                 self.gate.clone(),
-                format!("[::]:{PORT}").parse().unwrap(),
+                format!("[::]:{}", listen_port()).parse().unwrap(),
             )
             .map_err(|error| {
                 // Another copy of the app (or the earlier desktop) holds the
                 // port; phones would reach it instead of this one.
                 if error.contains("in use") || error.contains("os error 48") {
-                    format!("Another MonoCode window or app is already accepting phone connections on port {PORT}. Quit it, then turn Accept connections off and on.")
+                    format!("Another MonoCode window or app is already accepting phone connections on port {}. Quit it, then turn Accept connections off and on.", listen_port())
                 } else {
                     error
                 }
@@ -751,7 +774,7 @@ fn addresses(inner: &Inner) -> Vec<Address> {
             } else {
                 Some(Address {
                     host: ip.to_string(),
-                    port: PORT,
+                    port: listen_port(),
                 })
             }
         })

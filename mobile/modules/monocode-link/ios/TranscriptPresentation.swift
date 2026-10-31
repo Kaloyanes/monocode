@@ -279,9 +279,22 @@ final class TranscriptRowModel {
       let y: CGFloat = compact ? 4 : 6
       let emoji = !style.agent.isEmpty && action["emojiOnly"] as? Bool == true
       let maxWidth = max(1, style.width - 76 - (emoji ? 0 : 28))
-      let body = string(
-        emoji ? plain.trimmingCharacters(in: .whitespacesAndNewlines) : plain,
-        size: emoji ? 56 : 16, line: emoji ? 64 : 23, color: contentColor)
+      let body = NSMutableAttributedString(
+        attributedString: string(
+          emoji ? plain.trimmingCharacters(in: .whitespacesAndNewlines) : plain,
+          size: emoji ? 56 : 16, line: emoji ? 64 : 23, color: contentColor))
+      // A skill or command the message opens with stands out, as the
+      // composer's own and the JS transcript's (leadingCommand in slash.ts).
+      if !emoji,
+        let match = plain.range(
+          of: #"^/[A-Za-z0-9][A-Za-z0-9_:.-]*(?=\s|$)"#, options: .regularExpression)
+      {
+        body.addAttributes(
+          [
+            .foregroundColor: UIColor.transcriptHex(style.accent),
+            .font: UIFont.systemFont(ofSize: 16 * style.scale, weight: .semibold),
+          ], range: NSRange(match, in: plain))
+      }
       let line = style.line(emoji ? 64 : 23)
       let measured = TranscriptTypography.measure(body, width: maxWidth, line: line)
       userExpandable = !emoji && measured.height > 4 * line + 0.5
@@ -498,6 +511,42 @@ final class TranscriptRowModel {
       hits.append(
         TranscriptHit(
           rect: rect, action: ["type": "error", "notice": action], label: title + ". View details"))
+      height = h + 16
+    case "draft":
+      // The agent's page; tapping it opens the live page on the phone.
+      let kept = action["kept"] as? Bool == true
+      let titleText = string(
+        plain.isEmpty ? "Draft" : plain, size: 14, line: 20,
+        color: UIColor.transcriptHex(style.muted), medium: true)
+      let hint = string(
+        kept ? "Kept draft · Open" : "Draft · Open", size: 12, line: 17,
+        color: UIColor.transcriptHex(style.faint))
+      let textWidth = max(1, style.width - 126)
+      let titleSize = TranscriptTypography.measure(
+        titleText, width: textWidth, line: style.line(20))
+      let titleHeight = min(titleSize.height, style.line(20) * 2)
+      let bodyHeight = titleHeight + style.line(17)
+      let h = max(64, bodyHeight + 28)
+      let rect = CGRect(x: 20, y: 8, width: style.width - 40, height: h)
+      surfaces.append(
+        TranscriptSurface(
+          rect: rect, color: contentColor.withAlphaComponent(0.04), radius: 16,
+          border: UIColor.transcriptHex(style.stroke)))
+      mark("icon:edit", x: 34, y: rect.midY - 9, size: 18)
+      add(
+        titleText, x: 64, y: rect.midY - bodyHeight / 2, width: textWidth, height: titleHeight,
+        lines: 2)
+      add(
+        hint, x: 64, y: rect.midY - bodyHeight / 2 + titleHeight, width: textWidth,
+        height: style.line(17))
+      marks.append(
+        TranscriptMark(
+          rect: CGRect(x: rect.maxX - 30, y: rect.midY - 8, width: 16, height: 16),
+          image: TranscriptArtwork.shared.image("icon:chevronRight"),
+          tint: UIColor.transcriptHex(style.faint)))
+      var event = action
+      event["type"] = "draft"
+      hits.append(TranscriptHit(rect: rect, action: event, label: plain + ". Open draft"))
       height = h + 16
     case "footer":
       let metrics = action["metrics"] as? [String: Any] ?? [:]

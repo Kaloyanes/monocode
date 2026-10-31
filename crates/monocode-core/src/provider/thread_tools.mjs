@@ -3,16 +3,25 @@ import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 
 const definitions = /* TOOL_DEFINITIONS */ [];
+// What Claude and Codex get in their system prompt: everything the MonoCode
+// server offers, or only the thread part when Pi gets just the thread tools.
+const guidance = /* GUIDANCE */ "";
+const threadGuidance = /* THREAD_GUIDANCE */ "";
 const execute = promisify(execFile);
 
 export default async function (pi) {
   if (process.env.MONOCODE_THREADS !== "1") return;
   const executable = process.env.MONOCODE_VISUAL_EXECUTABLE;
   if (!executable) throw new Error("MonoCode executable is unavailable");
+  const appendToSystemPrompt = (text) => {
+    if (typeof pi.on === "function") pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n${text}` }));
+  };
   if (typeof pi.registerMcpServer === "function") {
     pi.registerMcpServer("monocode", { command: executable, args: ["visual-mcp"], exposure: "direct", timeout: 90 });
+    appendToSystemPrompt(guidance);
     return;
   }
+  appendToSystemPrompt(threadGuidance);
   const { Type } = await import("typebox").catch(() => import("@sinclair/typebox"));
   const schema = (value) => {
     if (value.enum) return Type.Union(value.enum.map((item) => Type.Literal(item)));

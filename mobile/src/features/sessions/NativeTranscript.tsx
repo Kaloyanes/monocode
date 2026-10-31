@@ -24,6 +24,7 @@ import { withTiming } from "react-native-reanimated";
 
 import { useConnection } from "@/features/connection/ConnectionProvider";
 import { hasNativeTranscript } from "@/features/connection/nativeLink";
+import { openDraft } from "@/features/drafts/openDraft";
 import { pixelLayers } from "@/features/mascots/pixelMascots";
 import { useCollapsedToolCalls } from "@/features/settings/toolCalls";
 import {
@@ -44,8 +45,10 @@ import { useReportSessionError, type SessionErrorNotice } from "./sessionError";
 
 type Handle = { scrollToEnd: () => Promise<void> };
 type Action = {
-  type: "copy" | "metrics" | "error" | "link";
+  type: "copy" | "metrics" | "error" | "link" | "draft";
   url?: string;
+  draft?: string;
+  title?: string;
   copyText?: string;
   metrics?: TurnMetrics;
   durationMs?: number;
@@ -158,6 +161,8 @@ export function NativeTranscript({
   const handleAction = useCallback(
     ({ nativeEvent: action }: NativeSyntheticEvent<Action>) => {
       if (action.type === "error" && action.notice) showError(action.notice);
+      else if (action.type === "draft" && action.draft)
+        openDraft(conversationId, action.draft, action.title);
       else if (action.type === "metrics" && action.metrics) setMetrics(action);
       else if (action.type === "copy" && action.copyText) {
         void Clipboard.setStringAsync(action.copyText)
@@ -170,7 +175,7 @@ export function NativeTranscript({
           void Linking.openURL(action.url).catch(() => {});
       }
     },
-    [openFile, showError],
+    [conversationId, openFile, showError],
   );
   useEffect(() => {
     if (!jump || !focused) return;

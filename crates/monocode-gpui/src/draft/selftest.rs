@@ -5,10 +5,15 @@
 //! `MONOCODE_DRAFT_ACTIONS` is a JSON array of further `draft_preview` inputs;
 //! `"$draft"` stands for the draft's id. `{"debug":"takeover"}` plays the part
 //! of the person clicking in the page; `{"debug":"note"}` pins a note as they
-//! would, `"send"` sends it and `"send_later"` sends it a second from now. A click's `reference` written as
+//! would, `{"debug":"message"}` queues a line as a page's mc.send would, `"expand"` and
+//! `"collapse"` open and close the full view, `"send"` sends it and `"send_later"` sends it a second from now. `{"debug":"away"}` draws an empty
+//! surface in the thread's place, as Settings does, `{"debug":"cover"}` opens a
+//! modal's scrim over the thread, and `{"debug":"back"}` undoes either. A click's `reference` written as
 //! `@Name` means the control with that name in the latest snapshot. `_WIDTH`, `_HEIGHT` and `_APPEARANCE`
-//! shape the first step, `_URL` opens a dev server instead of the file, and
-//! `_HOLD` keeps the window open that many seconds for a screen capture.
+//! shape the first step, `_URL` opens a dev server instead of the file,
+//! `_START=away` starts with the card out of sight, as when the agent opens a
+//! draft in a conversation the person is not looking at, and `_HOLD` keeps
+//! the window open that many seconds for a screen capture.
 use super::Draft;
 use gpui::{
     App, Context, Entity, Window, WindowBackgroundAppearance, WindowOptions, div, prelude::*, px,
@@ -18,11 +23,28 @@ use monocode_core::visual_bridge::{DraftReply, DraftRequest};
 use serde_json::{Value, json};
 use std::{ffi::OsString, time::Duration};
 
-/// The draft on its own, or inside a thread when `_THREAD` is set.
-struct Root(gpui::AnyView, #[allow(dead_code)] Entity<Draft>);
+/// The draft on its own, or inside a thread when `_THREAD` is set, with
+/// whatever the last `away`, `cover` or `back` step left in its place.
+struct Root(
+    gpui::AnyView,
+    Entity<Draft>,
+    &'static str,
+);
 impl Render for Root {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.0.clone())
+        div()
+            .relative()
+            .size_full()
+            .when(self.2 != "away", |root| root.child(self.0.clone()))
+            .when(self.2 == "cover", |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(crate::modal::scrim("selftest-scrim")),
+                )
+            })
+            .child(crate::draft::sentinel())
     }
 }
 
@@ -81,6 +103,10 @@ pub(crate) fn run(path: OsString) {
                     cx,
                 )
             });
+            let start = match std::env::var("MONOCODE_DRAFT_SELFTEST_START").as_deref() {
+                Ok("away") => "away",
+                _ => "back",
+            };
             let window_width = env_number("MONOCODE_DRAFT_SELFTEST_PANEL").unwrap_or(460) as f32;
             let root: gpui::AnyView = if std::env::var("MONOCODE_DRAFT_SELFTEST_THREAD").is_ok() {
                 let id = draft.read(cx).id().to_owned();
@@ -106,7 +132,7 @@ pub(crate) fn run(path: OsString) {
                     },
                     {
                         let keep = draft.clone();
-                        move |_, cx| cx.new(|_| Root(root, keep))
+                        move |_, cx| cx.new(|_| Root(root, keep, start))
                     },
                 )
                 .expect("open the self-test window");
@@ -142,12 +168,31 @@ pub(crate) fn run(path: OsString) {
                 let mut all = vec![opening];
                 all.extend(steps);
                 // A new page follows its content's height, as it does when the
-                // agent opens one.
+                // agent opens one, and runs for the agent as the shell has it.
+                let lease = handle
+                    .update(cx, |root, window, cx| {
+                        root.1.update(cx, |draft, cx| draft.lease(window, cx))
+                    })
+                    .ok();
                 if let Ok(web) = Draft::ready(&weak, cx).await {
                     Draft::fit_height(&weak, &web, cx).await;
                 }
+                drop(lease);
                 for (n, mut input) in all.into_iter().enumerate() {
-                    let outcome = if let Some(what) = input.get("debug").and_then(Value::as_str) {
+                    let debug = input.get("debug").and_then(Value::as_str);
+                    let surface = ["away", "cover", "back"]
+                        .into_iter()
+                        .find(|surface| debug == Some(surface));
+                    let outcome = if let Some(what) = surface {
+                        let _ = handle.update(cx, |root, _, cx| {
+                            root.2 = what;
+                            cx.notify();
+                        });
+                        cx.background_executor()
+                            .timer(Duration::from_millis(400))
+                            .await;
+                        Ok(json!({"surface": what}))
+                    } else if let Some(what) = debug {
                         Draft::debug(&weak, what, cx).await
                     } else {
                         if let Some(draft) = input.get_mut("draft")
@@ -162,7 +207,14 @@ pub(crate) fn run(path: OsString) {
                             *reference = found.clone().into();
                         }
                         let (reply, _) = std::sync::mpsc::channel();
-                        match DraftRequest::parse(1, &input, reply) {
+                        // As the shell does: the page runs for the request
+                        // even with its card away.
+                        let lease = handle
+                            .update(cx, |root, window, cx| {
+                                root.1.update(cx, |draft, cx| draft.lease(window, cx))
+                            })
+                            .ok();
+                        let outcome = match DraftRequest::parse(1, &input, reply) {
                             Ok(request) => Draft::run(&weak, &request, cx).await.map(|reply| {
                                 if let DraftReply::Snapshot(snapshot) = &reply {
                                     id = snapshot.draft.clone();
@@ -187,7 +239,9 @@ pub(crate) fn run(path: OsString) {
                                 }
                             }),
                             Err(error) => Err(error),
-                        }
+                        };
+                        drop(lease);
+                        outcome
                     };
                     let mut json = match outcome {
                         Ok(value) => value,

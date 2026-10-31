@@ -25,7 +25,18 @@ import {
 import { selectedWorkspace } from "@/features/connection/selection";
 import type { ModelCatalog, ModelChoice } from "@/features/models/types";
 import { toWire, type Attachment } from "@/features/sessions/attachments";
-import type { Message, Mono, Project, SessionSummary, Turn, TurnItem } from "./types";
+import type {
+  ComposerMode,
+  Message,
+  Mono,
+  OrchestrationActionName,
+  OrchestrationRun,
+  OrchestrationTask,
+  Project,
+  SessionSummary,
+  Turn,
+  TurnItem,
+} from "./types";
 import { applyFrames, type WatchFrame } from "./watchUpdates";
 /**
  * The workspace: what the desktop has and what can be done with it. Changes
@@ -34,12 +45,27 @@ import { applyFrames, type WatchFrame } from "./watchUpdates";
  */
 /** A new session's model and permissions, and where it works if not the
  *  project's checkout: a new worktree off HEAD, or an existing one. */
-type StartChoice = Partial<ModelChoice> & { workspaceMode?: "worktree"; worktreePath?: string };
+type StartChoice = Partial<ModelChoice> & {
+  workspaceMode?: "worktree";
+  worktreePath?: string;
+  mode?: ComposerMode;
+};
 
 type Workspace = {
   projects: Project[];
   monos: Mono[];
   sessions: SessionSummary[];
+  /** Orchestrator workers, apart from `sessions` so no list shows them. */
+  agents: SessionSummary[];
+  /** A lead's plan under review and latest run, in full. */
+  readOrchestration: (conversationId: string) => Promise<OrchestrationRun[]>;
+  /** Presses one of a card's buttons; resolves to the cards as they are after it. */
+  orchestrationAction: (
+    conversationId: string,
+    run: OrchestrationRun,
+    action: OrchestrationActionName,
+    task?: OrchestrationTask,
+  ) => Promise<OrchestrationRun[]>;
   watch: (id: string | null) => void;
   startSession: (
     projectId: string,
@@ -47,7 +73,14 @@ type Workspace = {
     choice?: StartChoice,
     attachments?: Attachment[],
   ) => Promise<string>;
-  sendMessage: (conversationId: string, text: string, attachments?: Attachment[]) => Promise<void>;
+  sendMessage: (
+    conversationId: string,
+    text: string,
+    attachments?: Attachment[],
+    mode?: ComposerMode,
+    /** The desktop composer revision the text was based on, so the desktop clears it. */
+    draftRev?: number,
+  ) => Promise<void>;
   stop: (conversationId: string) => Promise<void>;
   /** A page of a project's sessions, newest first, beyond the recent ones the poll carries. */
   listSessions: (
@@ -383,7 +416,13 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   );
   // The message shows at once, as its own turn, until the desktop's transcript
   // has one more user message than when it was sent.
-  const sendMessage = useCallback(async (conversationId: string, text: string, attachments: Attachment[] = []) => {
+  const sendMessage = useCallback(async (
+    conversationId: string,
+    text: string,
+    attachments: Attachment[] = [],
+    mode?: ComposerMode,
+    draftRev?: number,
+  ) => {
     const at = Date.now();
     const id = `pending:${at}`;
     const userCount = hasNativeTranscript
@@ -403,6 +442,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         conversationId,
         text,
         ...(attachments.length ? { attachments: toWire(attachments) } : {}),
+        ...(mode ? { mode } : {}),
+        ...(draftRev !== undefined ? { draftRev } : {}),
       });
     } catch (reason) {
       setPending((previous) => withoutKey(previous, conversationId));
@@ -498,6 +539,30 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     (conversationId: string) => removeSession("session.archive", conversationId),
     [removeSession],
   );
+  const readOrchestration = useCallback(
+    async (conversationId: string) =>
+      (await command<{ runs: OrchestrationRun[] }>("orchestration.read", { conversationId })).runs,
+    [command],
+  );
+  const orchestrationAction = useCallback(
+    async (
+      conversationId: string,
+      run: OrchestrationRun,
+      action: OrchestrationActionName,
+      task?: OrchestrationTask,
+    ) => {
+      const result = await mutate<{ runs: OrchestrationRun[] }>("orchestration.action", {
+        conversationId,
+        call: run.call,
+        action,
+        ...(task ? { taskId: task.id, index: task.index } : {}),
+      });
+      // The lead's row and strip follow on the next catalog.
+      void refresh();
+      return result.runs;
+    },
+    [mutate, refresh],
+  );
   const listSessions = useCallback(
     (projectId: string, query: string, offset: number, filters?: SessionListFilters) =>
       command<SessionPage>("sessions.list", {
@@ -553,13 +618,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         : renamed[session.id]?.from === session.title
           ? { ...session, title: renamed[session.id].title }
           : session;
+    const all = [
+      ...selected.sessions,
+      ...Object.values(remembered).filter((session) => !known.has(session.id)),
+    ].flatMap((session) => edited(session) ?? []);
     return {
       projects: selected.projects,
       monos: selected.monos,
-      sessions: [
-        ...selected.sessions,
-        ...Object.values(remembered).filter((session) => !known.has(session.id)),
-      ].flatMap((session) => edited(session) ?? []),
+      sessions: all.filter((session) => !session.leadId),
+      agents: all.filter((session) => !!session.leadId),
+      readOrchestration,
+      orchestrationAction,
       watch,
       startSession,
       sendMessage,
@@ -584,6 +653,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     startSession,
     sendMessage,
     stop,
+    readOrchestration,
+    orchestrationAction,
     listSessions,
     rememberSession,
     loadOlder,

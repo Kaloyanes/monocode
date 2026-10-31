@@ -2,6 +2,7 @@ use super::*;
 use monocode_core::tool::threads::ThreadRun;
 
 impl gpui::EventEmitter<crate::conversation::OpenThread> for TranscriptView {}
+impl gpui::EventEmitter<crate::conversation::CloseThreads> for TranscriptView {}
 
 /// How a child thread reads in the spawn tree.
 #[derive(Clone, Copy, PartialEq)]
@@ -71,11 +72,8 @@ impl TranscriptView {
             .filter_map(|at| {
                 let (call, run) = self.thread_run_at(at)?;
                 let child = child(self, call, &run);
-                (at == ix
-                    || !child
-                        .id
-                        .is_some_and(|id| self.thread_dismissed.contains(&id)))
-                .then_some((at, child))
+                (at == ix || !child.id.is_some_and(|id| self.thread_hidden(id)))
+                    .then_some((at, child))
             })
             .collect()
     }
@@ -92,7 +90,16 @@ impl TranscriptView {
         self.remeasure_threads(&touched);
         cx.notify();
     }
+    /// Removed here, or closed by the lead or from this tree.
+    pub(crate) fn thread_hidden(&self, id: i64) -> bool {
+        self.thread_dismissed.contains(&id)
+            || self
+                .thread_states
+                .get(&id)
+                .is_some_and(|state| state["closed"] == true)
+    }
     pub(crate) fn dismiss_threads(&mut self, ids: &[i64], cx: &mut Context<Self>) {
+        cx.emit(crate::conversation::CloseThreads(ids.to_vec()));
         let ids: HashSet<i64> = ids.iter().copied().collect();
         for id in &ids {
             self.thread_dismissed.insert(*id);
@@ -240,7 +247,7 @@ pub(super) fn render(
     cx: &mut Context<TranscriptView>,
 ) -> gpui::AnyElement {
     let id = run.id.unwrap_or_default();
-    if run.id.is_some_and(|id| view.thread_dismissed.contains(&id)) {
+    if run.id.is_some_and(|id| view.thread_hidden(id)) {
         return div()
             .id(("live-thread", start))
             .h(px(0.))

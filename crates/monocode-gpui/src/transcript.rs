@@ -13,6 +13,7 @@ mod links;
 mod live_phase;
 mod mascot;
 mod measurements;
+pub(crate) mod orchestration;
 mod outline;
 pub(crate) mod phases;
 mod provider_switch;
@@ -69,6 +70,9 @@ pub(crate) struct PendingMessage {
     pub error: Option<String>,
     pub sent_at: Option<u64>,
     pub attachments: Vec<std::path::PathBuf>,
+    /// A steer the provider hasn't taken yet: the bubble is dimmed and says
+    /// when it will be read.
+    pub caption: Option<SharedString>,
 }
 struct TakenMessage {
     text: SharedString,
@@ -578,10 +582,16 @@ pub(crate) struct TranscriptView {
     document: bool,
     side_question: bool,
     pub(crate) file_link_base: Option<String>,
+    /// The conversation shown, so a draft card can open its saved page.
+    pub(crate) draft_session: Option<i64>,
     expanded: HashSet<usize>,
     agent_panels: tasks::AgentPanels,
     thread_states: HashMap<i64, serde_json::Value>,
     thread_expanded: HashSet<i64>,
+    /// Orchestration cards, by the tool call that submitted their plan.
+    orchestration: HashMap<String, orchestration::RunView>,
+    /// Assignments whose details are open, by plan call and index.
+    orchestration_open: HashSet<(String, usize)>,
     /// Finished child threads the user removed from the spawn tree.
     thread_dismissed: HashSet<i64>,
     pub(crate) thread_driver: Option<String>,
@@ -620,6 +630,8 @@ pub(crate) struct TranscriptView {
     fold_targets: HashMap<usize, Option<usize>>,
     step_queue: HashMap<usize, Instant>,
     seen_steps: HashSet<usize>,
+    /// The `/goal` still in force, for the composer's ledge.
+    goal: Option<monocode_core::transcript::ActiveGoal>,
     pub(crate) turns: HashMap<usize, monocode_core::agent::TurnInfo>,
     provider: String,
     model: String,
@@ -720,6 +732,9 @@ impl TranscriptView {
     /// Older pages above it are read-only and never part of a save.
     pub(crate) fn source_rows(&self) -> &[Row] {
         &self.source[self.base..]
+    }
+    pub(crate) fn goal(&self) -> Option<&monocode_core::transcript::ActiveGoal> {
+        self.goal.as_ref()
     }
     /// Every loaded row, older pages included, numbered as this view's turns
     /// and response actions are.
@@ -1806,7 +1821,8 @@ impl TranscriptView {
             .pending
             .get(ix + 1)
             .is_some_and(|next| !dates::opens_stretch(next.sent_at, message.sent_at));
-        let thinking = ix + 1 == self.pending.len()
+        let thinking = self.mono
+            && ix + 1 == self.pending.len()
             && !self.mono_pending_joins_live_turn()
             && self
                 .pending
@@ -1839,7 +1855,7 @@ impl TranscriptView {
             .flex_col()
             .items_center()
             .opacity(opacity)
-            .children(self.pending_separator(ix))
+            .children(self.mono.then(|| self.pending_separator(ix)).flatten())
             .child(
                 div()
                     .relative()
@@ -1890,8 +1906,23 @@ impl TranscriptView {
                                     .when(!message.text.is_empty(), |d| d.mb_2())
                                     .child(body)
                             }))
-                            .when(!message.text.is_empty(), |d| d.child(message.text.clone())),
+                            .when(!message.text.is_empty(), |d| d.child(message.text.clone()))
+                            .when(message.caption.is_some(), |d| d.opacity(0.6)),
                     )
+                    .when_some(message.caption.clone(), |d, caption| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("pending-caption-{}", message.id)))
+                                .debug_selector(|| "pending-steer-caption".into())
+                                .role(Role::Status)
+                                .px_3()
+                                .pt_1()
+                                .text_size(px(12.))
+                                .line_height(px(16.))
+                                .text_color(content(0.45))
+                                .child(caption),
+                        )
+                    })
                     .when_some(message.error.clone(), |d, error| {
                         d.child(
                             div()
@@ -2401,10 +2432,13 @@ impl TranscriptView {
             document: false,
             side_question: false,
             file_link_base: None,
+            draft_session: None,
             expanded: HashSet::new(),
             agent_panels: Default::default(),
             thread_states: HashMap::new(),
             thread_expanded: HashSet::new(),
+            orchestration: HashMap::new(),
+            orchestration_open: HashSet::new(),
             thread_dismissed: HashSet::new(),
             thread_driver: None,
             expanded_prompts: HashSet::new(),
@@ -2437,6 +2471,7 @@ impl TranscriptView {
             fold_targets: HashMap::new(),
             step_queue: HashMap::new(),
             seen_steps: HashSet::new(),
+            goal: None,
             turns: HashMap::new(),
             provider: "codex".into(),
             model: "Codex".into(),
@@ -2953,6 +2988,7 @@ impl TranscriptView {
         {
             self.rebuild_passes += 1;
         }
+        self.goal = monocode_core::transcript::active_goal(&self.source);
         self.phase_layouts.clear();
         let now = Instant::now();
         let following = self.list.is_following_tail();
@@ -3843,6 +3879,10 @@ impl TranscriptView {
             }
             self.rows.extend(ordered);
         }
+        // Steers the provider hasn't taken yet wait below the live turn.
+        if !self.mono {
+            self.push_pending(self.source.len());
+        }
         // A phase and its nested steps are one sibling in the outer work tree.
         // Its final outer branch ends at the header, above the inner tool rail.
         let mut next_work_sibling = false;
@@ -4533,6 +4573,7 @@ impl TranscriptView {
                 div()
                     .id(("code-scroll", ix))
                     .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
                     .w_full()
                     .py(px(10.))
                     .pr_2()
@@ -4726,6 +4767,11 @@ impl TranscriptView {
                     Some("concern") => rgb(0xfbbf24).into(),
                     _ => content(0.55),
                 };
+                let goal = note.goal_change();
+                let label_color = match goal {
+                    Some(monocode_core::transcript::GoalChange::Met) => rgb(0x4ade80).into(),
+                    _ => content(0.55),
+                };
                 div()
                     .w_full()
                     .min_w_0()
@@ -4744,8 +4790,14 @@ impl TranscriptView {
                                     .id(("interjection-label", message_start))
                                     .role(Role::Group)
                                     .aria_label(format!("Interjection: {}", note.label()))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
                                     .text_size(px(12.))
-                                    .text_color(content(0.55))
+                                    .text_color(label_color)
+                                    .when(goal.is_some(), |d| {
+                                        d.child(icon("goal", 12.).text_color(label_color))
+                                    })
                                     .child(note.label().to_owned()),
                             )
                             .when_some(severity, |d, severity| {
@@ -5837,7 +5889,6 @@ impl Render for TranscriptView {
                 .left_0()
                 .size_full(),
             )
-            .child(crate::draft::sentinel())
             .children(self.outline(window, cx))
             .children(self.selection_menu(cx))
             .child(self.link_overlays(cx))
@@ -6259,6 +6310,75 @@ mod scroll_tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn pull_request_prompt_bubble_fits_its_text(cx: &mut TestAppContext) {
+        // A single-row prompt with a PR chip once shrank its bubble to the
+        // chip, wrapping the text around every word.
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(900.), px(1000.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| TranscriptView::new()),
+            )
+            .unwrap()
+        });
+        let bubble = |text: String, cx: &mut TestAppContext| {
+            window
+                .update(cx, |view, _, cx| {
+                    view.patch(0, vec![row("user", &text)], cx);
+                    settle(view, cx);
+                })
+                .unwrap();
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |view, window, _| {
+                    assert!(view.messages[0].user_link.is_some());
+                    assert_eq!(view.rows.len(), 1);
+                    let quad = window
+                        .painted_quads()
+                        .into_iter()
+                        .find(|quad| quad.background == user_bubble_fill().into())
+                        .unwrap();
+                    quad.bounds.size.map(|side| side.0 / window.scale_factor())
+                })
+                .unwrap()
+        };
+        let feedback = bubble(
+            "Address the new feedback and continue the work where needed.\n\n\
+             The linked GitHub pull request has new activity:\n\n\
+             #1213 Native: Always allow for every provider's confirmations\n\
+             https://github.com/acme/monocode/pull/1213\n\n\
+             - review by @coderabbitai[bot]: COMMENTED: <!-- coderabbit-ai-generated:v1 --> \
+             **Actionable comments posted: 1**"
+                .to_owned(),
+            cx,
+        );
+        assert_eq!(
+            feedback.width, 576.,
+            "the long lines reach the cap, not the chip"
+        );
+        // 20px lines inside 8px of padding above and below.
+        let lines = (feedback.height - 16.) / 20.;
+        assert!(lines <= 10., "text wraps at the bubble, got {lines} lines");
+        let short = bubble(
+            "Review https://github.com/acme/monocode/pull/12 please".to_owned(),
+            cx,
+        );
+        assert!(
+            (150. ..400.).contains(&short.width),
+            "a short prompt sizes to its words and chip, got {}",
+            short.width
+        );
+        assert!(short.height < 40., "one line, got {}", short.height);
     }
 
     #[gpui::test]
@@ -6825,6 +6945,7 @@ mod scroll_tests {
                     error: None,
                     sent_at: None,
                     attachments: Vec::new(),
+                    caption: None,
                 }],
                 cx,
             );
@@ -6919,6 +7040,7 @@ mod scroll_tests {
                     error: None,
                     sent_at: None,
                     attachments: Vec::new(),
+                    caption: None,
                 }],
                 cx,
             );

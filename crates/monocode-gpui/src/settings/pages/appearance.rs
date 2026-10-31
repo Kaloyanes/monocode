@@ -307,6 +307,24 @@ impl SettingsView {
                 )],
             ),
             self.row(
+                Some("usage-bar-window"),
+                false,
+                "Usage bar",
+                Some("Which limit the bar next to the provider icon in the bottom bar follows.".into()),
+                vec![self.segmented(
+                    "usage-bar-window",
+                    "Usage bar",
+                    if p.usage_bar_window == "most-used" {
+                        "most-used"
+                    } else {
+                        "shortest"
+                    },
+                    &[("shortest", "Shortest window"), ("most-used", "Most used")],
+                    cx,
+                    |this, v, cx| this.update(cx, |p| p.usage_bar_window = v.into()),
+                )],
+            ),
+            self.row(
                 Some("show-excluded-files"),
                 false,
                 "Show excluded files",

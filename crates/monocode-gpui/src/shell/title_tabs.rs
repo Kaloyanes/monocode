@@ -55,13 +55,9 @@ impl Shell {
         }
     }
 
-    /// What the title strip shows. Classic keeps its tabs unless the plan
-    /// takes their place.
+    /// What the title strip shows, in either layout.
     pub(super) fn title_bar_mode(&self) -> TitleBarMode {
-        match self.workspace.preferences.title_bar_mode() {
-            TitleBarMode::SessionTitle if self.workspace.classic_layout => TitleBarMode::Tabs,
-            mode => mode,
-        }
+        self.workspace.preferences.title_bar_mode()
     }
 
     pub(super) fn tab_strip_visible(&self) -> bool {
@@ -819,6 +815,61 @@ mod interaction_tests {
     }
 
     #[gpui::test]
+    fn session_title_replaces_the_tabs_in_both_layouts(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        for classic in [true, false] {
+            window
+                .update(cx, |shell, _, cx| {
+                    shell.workspace.classic_layout = classic;
+                    shell.workspace.preferences.title_bar = Some(TitleBarMode::SessionTitle);
+                    shell.persist(cx);
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.refresh().unwrap();
+            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+            assert!(
+                visual.debug_bounds("hidden-tab-strip").is_some(),
+                "classic_layout {classic}"
+            );
+            assert!(
+                visual.debug_bounds("new-tab").is_none(),
+                "classic_layout {classic}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn classic_sidebar_rows_carry_their_shortcuts(cx: &mut TestAppContext) {
+        let (window, older, blank) = window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&older].update(cx, |view, _| {
+                    view.summary.cwd = "/work/monocode".into();
+                    view.summary.has_messages = true;
+                });
+                shell.workspace.classic_layout = true;
+                shell.workspace.preferences.title_bar = Some(TitleBarMode::SessionTitle);
+                shell.persist(cx);
+                shell.shortcut_hints = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        for id in [blank, older] {
+            assert!(
+                visual
+                    .debug_bounds(Box::leak(format!("session-shortcut-{id}").into_boxed_str()))
+                    .is_some(),
+                "session {id} shows its shortcut"
+            );
+        }
+    }
+
+    #[gpui::test]
     fn plan_in_the_title_bar_hands_switching_to_the_sidebar(cx: &mut TestAppContext) {
         let (window, older, blank) = window(cx);
         window
@@ -844,6 +895,33 @@ mod interaction_tests {
                 assert_eq!(shell.workspace.active, Some(older));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn classic_plan_readout_keeps_clear_of_the_window_edge(cx: &mut TestAppContext) {
+        let (window, older, _) = window(cx);
+        let width = window
+            .update(cx, |shell, w, cx| {
+                shell.sessions[&older].update(cx, |view, _| {
+                    view.summary.cwd = "/work/monocode".into();
+                    view.summary.has_messages = true;
+                });
+                shell.workspace.classic_layout = true;
+                shell.workspace.preferences.title_bar = Some(TitleBarMode::Plan);
+                shell.persist(cx);
+                cx.notify();
+                w.viewport_size().width
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let rail = visual.debug_bounds("plan-rail").unwrap();
+        assert!(
+            rail.right() <= width - px(12.),
+            "the rail ends at {:?} in a {width:?} window",
+            rail.right()
+        );
     }
 
     #[gpui::test]

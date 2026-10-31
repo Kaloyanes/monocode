@@ -87,11 +87,22 @@ fn mascot(index: usize, side: f32, color: gpui::Hsla) -> AnyElement {
     .flex_shrink_0()
     .into_any_element()
 }
+/// Remote projects and Home get a plain glyph until the user picks a logo or
+/// mascot of their own.
+fn builtin_icon(appearance: &ProjectAppearance, project: &str) -> Option<&'static str> {
+    if appearance.logo.is_some() {
+        None
+    } else if project.starts_with("remote://") {
+        Some("internet")
+    } else if appearance.mascot.is_none() && monocode_core::files::is_home_project(project) {
+        Some("home-01")
+    } else {
+        None
+    }
+}
 pub(crate) fn project_icon(appearance: &ProjectAppearance, project: &str, side: f32) -> AnyElement {
-    if project.starts_with("remote://") && appearance.logo.is_none() {
-        return icon("internet", side)
-            .text_color(content(0.7))
-            .into_any_element();
+    if let Some(name) = builtin_icon(appearance, project) {
+        return icon(name, side).text_color(content(0.7)).into_any_element();
     }
     match &appearance.logo {
         Some(path) => crate::image_memory::thumbnail(PathBuf::from(path))
@@ -108,13 +119,13 @@ pub(crate) fn project_icon(appearance: &ProjectAppearance, project: &str, side: 
 }
 /// Sidebar.tsx's CurrentProjectIcon: a 10px mascot inside a 20px tile.
 pub(crate) fn header_project_icon(appearance: &ProjectAppearance, project: &str) -> AnyElement {
-    if project.starts_with("remote://") && appearance.logo.is_none() {
+    if let Some(name) = builtin_icon(appearance, project) {
         return div()
             .size(px(20.))
             .flex()
             .items_center()
             .justify_center()
-            .child(icon("internet", 14.).text_color(content(0.7)))
+            .child(icon(name, 14.).text_color(content(0.7)))
             .into_any_element();
     }
     match &appearance.logo {

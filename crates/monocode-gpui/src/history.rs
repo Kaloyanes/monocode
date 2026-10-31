@@ -139,7 +139,7 @@ impl History {
         true
     }
     fn available(&self) -> bool {
-        !self.cwd.is_empty() && self.cwd != "~"
+        !self.cwd.is_empty() && self.cwd != "~" && !monocode_core::files::is_home_project(&self.cwd)
     }
     fn load(&mut self, cx: &mut Context<Self>) {
         if !self.enabled || !self.available() {
@@ -691,7 +691,14 @@ impl Focusable for History {
 impl Render for History {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let empty: Option<(&'static str, bool)> = if !self.available() {
-            Some(("No project folder", false))
+            Some((
+                if monocode_core::files::is_home_project(&self.cwd) {
+                    "Home has no Git history"
+                } else {
+                    "No project folder"
+                },
+                false,
+            ))
         } else if self.error.is_some() && self.items.is_empty() {
             None
         } else if self.items.is_empty() {

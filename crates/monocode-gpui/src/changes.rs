@@ -397,7 +397,7 @@ impl Changes {
             .index
             .as_ref()
             .and_then(|i| i.branch.clone());
-        if self.cwd.is_empty() || self.cwd == "~" || branch.is_none() {
+        if self.cwd.is_empty() || self.cwd == "~" || monocode_core::files::is_home_project(&self.cwd) || branch.is_none() {
             self.pr = None;
             return;
         }
@@ -885,7 +885,12 @@ impl Changes {
                 this.mutated(cx);
                 this.load_pr(cx);
                 match result {
-                    Ok(url) => cx.open_url(url.trim()),
+                    Ok(url) => {
+                        let url = url.trim();
+                        if !crate::inbox::open_in_inbox(url, window, cx) {
+                            cx.open_url(url);
+                        }
+                    }
                     Err(error) => Self::fail(error, window, cx),
                 }
                 cx.notify();
@@ -2001,14 +2006,19 @@ fn text_prompt(
 
 impl Render for Changes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let available = !self.cwd.is_empty() && self.cwd != "~";
+        let home = monocode_core::files::is_home_project(&self.cwd);
+        let available = !self.cwd.is_empty() && self.cwd != "~" && !home;
         if !available {
             return div()
                 .px_3()
                 .py_2()
                 .text_size(px(12.))
                 .text_color(content(0.5))
-                .child("No project folder")
+                .child(if home {
+                    "Home isn't a Git repository"
+                } else {
+                    "No project folder"
+                })
                 .into_any_element();
         }
         let index = self.git.read(cx).index.clone();

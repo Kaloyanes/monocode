@@ -60,12 +60,13 @@ export function useSessionChoice(
   project: Project | undefined,
   sessionId: string | undefined,
 ) {
-  const { sessions, configureSession } = useWorkspace();
+  const { sessions, agents, configureSession } = useWorkspace();
   const desktop = useConnection().pairing?.desktop.fingerprint;
   const defaultModel = useDefaultModel();
   const defaultAccess = useDefaultRuntimeMode();
   const session = sessionId
-    ? sessions.find((entry) => entry.id === sessionId)
+    ? (sessions.find((entry) => entry.id === sessionId) ??
+      agents.find((entry) => entry.id === sessionId))
     : undefined;
   const scope = choiceScope(desktop, project?.id, sessionId);
   const picked = useSyncExternalStore(

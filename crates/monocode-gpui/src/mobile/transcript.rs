@@ -247,6 +247,9 @@ fn compact(items: &mut [Value]) {
     }
 }
 
+/// How the phone names a kept draft: by its page's file name in the thread.
+pub(crate) const KEPT_DRAFT: &str = "kept:";
+
 fn notice(rows: &[Row], at: usize, end: usize) -> Option<Value> {
     let text = joined(&rows[at..end]);
     let id = format!("r{at}");
@@ -275,26 +278,38 @@ fn notice(rows: &[Row], at: usize, end: usize) -> Option<Value> {
             }
             Some(notice)
         }
+        // The phone opens a draft's page itself, live with the desktop's.
         monocode_core::visual_bridge::DRAFT_ROLE => {
-            let title = serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(&text)
-                .ok()
-                .map(|card| card.title)
+            let card = serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(&text).ok()?;
+            let title = Some(card.title)
                 .filter(|title| !title.is_empty())
                 .unwrap_or_else(|| "Draft".into());
-            Some(
-                json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to interact")}),
-            )
+            Some(json!({"type": "draft", "id": id, "draft": card.draft, "title": title}))
         }
         monocode_core::transcript::images::ROLE => {
-            let title =
+            let document =
                 serde_json::from_str::<monocode_core::transcript::images::ImageDocument>(&text)
                     .ok()
-                    .filter(|document| document.validate().is_ok())
-                    .map(|document| document.title)
-                    .unwrap_or_else(|| "Image".into());
-            Some(
-                json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to view")}),
-            )
+                    .filter(|document| document.validate().is_ok());
+            let kept = document.as_ref().and_then(|document| {
+                let page = document.draft()?;
+                Some(format!(
+                    "{}{}",
+                    KEPT_DRAFT,
+                    page.file_name()?.to_str()?
+                ))
+            });
+            let title = document
+                .map(|document| document.title)
+                .unwrap_or_else(|| "Image".into());
+            Some(match kept {
+                Some(draft) => {
+                    json!({"type": "draft", "id": id, "draft": draft, "title": title, "kept": true})
+                }
+                None => {
+                    json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to view")})
+                }
+            })
         }
         "system" if !text.trim().is_empty() => {
             Some(json!({"type": "notice", "id": id, "text": text}))
@@ -854,6 +869,53 @@ mod tests {
             notice["visual"]["source"],
             "return () => visual.text('Example');"
         );
+    }
+    #[test]
+    fn drafts_are_cards_the_phone_opens_and_kept_ones_go_by_their_pages_name() {
+        let dir = std::env::temp_dir().join(format!("monocode-kept-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (png, page, plain) = (dir.join("k.png"), dir.join("k.html"), dir.join("p.png"));
+        std::fs::write(&page, "<p>kept</p>").unwrap();
+        let image = |path: &std::path::Path, title: &str| {
+            serde_json::to_string(&monocode_core::transcript::images::ImageDocument {
+                title: title.into(),
+                path: path.to_owned(),
+                mime_type: "image/png".into(),
+                width: 2,
+                height: 2,
+            })
+            .unwrap()
+        };
+        let card = monocode_core::visual_bridge::DraftCard {
+            draft: "draft-1-a".into(),
+            title: "Pricing".into(),
+        };
+        let rows = vec![
+            row("user", "Mock it"),
+            row(
+                monocode_core::visual_bridge::DRAFT_ROLE,
+                &serde_json::to_string(&card).unwrap(),
+            ),
+            row(monocode_core::transcript::images::ROLE, &image(&png, "Kept pricing")),
+            row(monocode_core::transcript::images::ROLE, &image(&plain, "Screenshot")),
+            row("assistant", "Ready"),
+        ];
+        let info = HashMap::new();
+        let turns = all(&source(&rows, &info, false));
+        let items = turns[0]["items"].as_array().unwrap();
+        let drafts: Vec<_> = items.iter().filter(|i| i["type"] == "draft").collect();
+        assert_eq!(drafts.len(), 2);
+        assert_eq!(drafts[0]["draft"], "draft-1-a");
+        assert_eq!(drafts[0]["title"], "Pricing");
+        assert_eq!(drafts[1]["draft"], "kept:k.html");
+        assert_eq!(drafts[1]["kept"], true);
+        // Nothing of the desktop's paths goes to the phone.
+        assert!(!turns[0].to_string().contains(dir.to_str().unwrap()));
+        // A plain image is still a line saying where to see it.
+        assert!(items
+            .iter()
+            .any(|i| i["type"] == "notice" && i["text"] == "Screenshot · Open on desktop to view"));
+        std::fs::remove_dir_all(&dir).ok();
     }
     fn types(turn: &Value) -> Vec<&str> {
         turn["items"]

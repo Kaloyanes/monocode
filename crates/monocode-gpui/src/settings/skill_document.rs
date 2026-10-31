@@ -155,6 +155,7 @@ impl SkillDocument {
             Part::Code { fence, lines } => div()
                 .id(id.clone())
                 .overflow_x_scroll()
+                .restrict_scroll_to_axis()
                 .rounded_lg()
                 .border_1()
                 .border_color(content(0.1))

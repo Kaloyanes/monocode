@@ -5,7 +5,7 @@ mod diff;
 mod document;
 mod ui;
 pub(crate) use avatar::image as avatar_image;
-pub(crate) use ui::relative_time;
+pub(crate) use ui::{provider_mark, relative_time};
 
 use crate::{
     diff_view::{DiffEvent, DiffView},
@@ -51,26 +51,12 @@ pub(crate) fn open_in_inbox(url: &str, window: &mut Window, cx: &mut App) -> boo
     true
 }
 
-/// For code that has no window in hand: the first window with an inbox shows
-/// the link once the current update has finished, or the browser does.
-pub(crate) fn open_link_later(url: &str, cx: &mut App) {
-    let url = url.to_owned();
-    cx.defer(move |cx| {
-        let mut windows = cx.windows();
-        if let Some(active) = cx.active_window() {
-            windows.retain(|window| *window != active);
-            windows.insert(0, active);
-        }
-        let shown = windows.into_iter().any(|window| {
-            window
-                .update(cx, |_, window, cx| open_in_inbox(&url, window, cx))
-                .unwrap_or(false)
-        });
-        if !shown {
-            cx.open_url(&url);
-        }
-    });
+/// The latest Inbox rows, for the composer's `#` picker.
+pub(crate) struct Catalog {
+    pub items: std::sync::Arc<Vec<Item>>,
+    pub at: Instant,
 }
+impl gpui::Global for Catalog {}
 
 pub(crate) enum Event {
     Close,
@@ -103,6 +89,9 @@ pub(crate) struct Inbox {
         std::collections::HashMap<String, monocode_core::project_appearance::ProjectAppearance>,
     state: ViewState,
     snapshot: Snapshot,
+    /// Authors offered by the filter menu, most active first. Kept from the
+    /// last fetch that wasn't narrowed to one author.
+    authors: Vec<model::Person>,
     sessions: Vec<Session>,
     focus: FocusHandle,
     search: Entity<Input>,
@@ -167,6 +156,9 @@ pub(crate) struct Inbox {
     confirm_action: Option<String>,
     resize_start: Option<(f32, f32)>,
     active: bool,
+    /// Shows one linked item without the list, as a page inside a Mono. It
+    /// leaves the Inbox's saved view state alone.
+    detail_only: bool,
     refresh_queued: bool,
     notifications: model::NotificationTracker,
     last_refresh: Instant,
@@ -180,6 +172,23 @@ fn other_projects(projects: &[PathBuf], cwd: &PathBuf) -> Vec<String> {
         .filter(|project| *project != cwd)
         .map(|project| project.to_string_lossy().into_owned())
         .collect()
+}
+
+/// Every author in `items`, most items first, then by login.
+fn authors(items: &[Item]) -> Vec<model::Person> {
+    let mut counts = std::collections::HashMap::<String, (usize, model::Person)>::new();
+    for item in items
+        .iter()
+        .filter(|item| model::has_authors(&item.provider) && !item.author.login.is_empty())
+    {
+        counts
+            .entry(item.author.login.to_lowercase())
+            .or_insert_with(|| (0, item.author.clone()))
+            .0 += 1;
+    }
+    let mut authors = counts.into_values().collect::<Vec<_>>();
+    authors.sort_by(|(a, x), (b, y)| b.cmp(a).then_with(|| x.login.cmp(&y.login)));
+    authors.into_iter().map(|(_, person)| person).collect()
 }
 
 impl EventEmitter<Event> for Inbox {}
@@ -197,6 +206,19 @@ impl Inbox {
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_inner(store, projects, cwd, true, cx)
+    }
+
+    /// An inbox that only shows items opened with `open_url`, without the list
+    /// or background polling.
+    pub(crate) fn detail(
+        store: Database,
+        projects: Vec<PathBuf>,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut inbox = Self::new_inner(store, projects, cwd, false, cx);
+        inbox.detail_only = true;
+        inbox
     }
 
     fn new_inner(
@@ -289,12 +311,14 @@ impl Inbox {
             service: Service {
                 data_dir,
                 cwd: cwd.clone(),
+                github_viewer: Default::default(),
             },
             store,
             projects,
             appearances: Default::default(),
             state,
             snapshot: Snapshot::default(),
+            authors: vec![],
             sessions: vec![],
             focus: cx.focus_handle(),
             search,
@@ -356,6 +380,7 @@ impl Inbox {
             confirm_action: None,
             resize_start: None,
             active: false,
+            detail_only: false,
             refresh_queued: false,
             notifications: model::NotificationTracker::default(),
             last_refresh: Instant::now(),
@@ -429,6 +454,11 @@ impl Inbox {
             }
         }
         cx.notify();
+    }
+
+    /// The item on screen, whether or not the list holds it.
+    pub(crate) fn shown(&self) -> Option<Item> {
+        self.item()
     }
 
     pub(crate) fn unread_count(&self) -> usize {
@@ -514,9 +544,24 @@ impl Inbox {
                 snapshot
                     .items
                     .sort_by_key(|item| std::cmp::Reverse(item.updated_ms()));
+                for (provider, login) in &this.snapshot.viewers {
+                    snapshot
+                        .viewers
+                        .entry(provider.clone())
+                        .or_insert_with(|| login.clone());
+                }
+                if this.state.filters.fetch_author().is_none() || this.authors.is_empty() {
+                    this.authors = authors(&snapshot.items);
+                }
                 this.state.seen.seed(&snapshot.items);
                 this.snapshot = snapshot;
                 this.sessions = sessions;
+                if !this.detail_only {
+                    cx.set_global(Catalog {
+                        items: this.snapshot.items.clone().into(),
+                        at: Instant::now(),
+                    });
+                }
                 if this.active
                     && let Some(item) = this.item()
                 {
@@ -574,16 +619,30 @@ impl Inbox {
         )
     }
     fn save(&mut self) {
+        if self.detail_only {
+            return;
+        }
         if let Err(error) = locked(&self.store).and_then(|db| self.state.save(&db)) {
             self.error = Some(error);
         }
     }
+    fn viewer(&self) -> &str {
+        self.snapshot
+            .viewers
+            .get(&self.state.source)
+            .map_or("", String::as_str)
+    }
     fn visible_items(&self, cx: &App) -> Vec<Item> {
         let search = self.search.read(cx).content.as_ref();
+        let viewer = self.viewer();
         self.snapshot
             .items
             .iter()
-            .filter(|item| self.state.filters.matches(item, &self.state.source, search))
+            .filter(|item| {
+                self.state
+                    .filters
+                    .matches(item, &self.state.source, search, viewer)
+            })
             .filter(|item| {
                 item.provider != "linear" || !self.state.hidden_linear_teams.contains(&item.team_id)
             })

@@ -9,10 +9,28 @@ use std::time::{Duration, Instant};
 /// RevealHeight's `reveal-height-in` and `reveal-height-out`.
 pub(super) const OPEN: Duration = Duration::from_millis(240);
 pub(super) const CLOSE: Duration = Duration::from_millis(180);
+/// As a rail opens its rows drop into place one after another, each a
+/// little after the row above.
+const CASCADE_STAGGER: Duration = Duration::from_millis(38);
+const CASCADE_MOVE: Duration = Duration::from_millis(220);
+const CASCADE_FADE: Duration = Duration::from_millis(160);
+const CASCADE_RISE: f32 = 5.;
+/// Rows further down share the last delay, so a long rail never trails.
+const CASCADE_RANK: u32 = 8;
+/// A working agent's dot breathes at this pace.
+const BREATHE: Duration = Duration::from_millis(1200);
+/// More agents than this show only the count on their lead.
+const PROGRESS_PILLS: usize = 8;
+/// A sidebar narrower than this shows only the count.
+const PROGRESS_PILLS_WIDTH: f32 = 300.;
+
+fn cascade_length(rows: usize) -> Duration {
+    CASCADE_STAGGER * (rows.saturating_sub(1) as u32).min(CASCADE_RANK) + CASCADE_MOVE
+}
 
 #[derive(Default)]
 pub(crate) struct Rails {
-    motions: HashMap<i64, Motion>,
+    pub(super) motions: HashMap<i64, Motion>,
     /// Agent rows opened to their details, by lead and task.
     open_tasks: HashSet<(i64, usize)>,
     /// This frame's /operator groups, and the sessions they took from the list.
@@ -42,6 +60,52 @@ impl Motion {
     pub(super) fn settled(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.start) >= if self.open { OPEN } else { CLOSE }
     }
+    /// Opening from shut, the rows cascade in. Closing, or turning back
+    /// midway, they simply follow the fold.
+    fn cascades(&self) -> bool {
+        self.open && self.from <= 0.
+    }
+    /// A row's opacity and how far above its slot it still is.
+    fn row(&self, ix: usize, now: Instant) -> (f32, f32) {
+        if !self.cascades() {
+            return (1., 0.);
+        }
+        let at = now
+            .saturating_duration_since(self.start)
+            .saturating_sub(CASCADE_STAGGER * (ix as u32).min(CASCADE_RANK))
+            .as_secs_f32();
+        let fade = (at / CASCADE_FADE.as_secs_f32()).min(1.);
+        let travel = bezier(
+            (at / CASCADE_MOVE.as_secs_f32()).min(1.),
+            0.33,
+            1.,
+            0.68,
+            1.,
+        );
+        (fade, CASCADE_RISE * (1. - travel))
+    }
+}
+
+/// Where an orchestrated agent stands, as its dot on the rail shows it.
+struct Standing {
+    tone: gpui::Hsla,
+    working: bool,
+    alert: bool,
+    done: bool,
+    needs_input: bool,
+}
+
+/// A status dot: still, or breathing while its agent works.
+fn status_dot(id: SharedString, tone: gpui::Hsla, working: bool) -> AnyElement {
+    let dot = move |alpha: f32| div().size(px(6.)).rounded_full().bg(tone).opacity(alpha);
+    if working {
+        crate::pulse::looping(id, BREATHE, crate::pulse::Rate::Smooth, move |phase| {
+            dot(0.35 + 0.65 * (0.5 + 0.5 * (phase * std::f32::consts::TAU).cos()))
+        })
+        .into_any_element()
+    } else {
+        dot(1.).into_any_element()
+    }
 }
 
 /// What hangs under a sidebar row.
@@ -61,6 +125,18 @@ pub(super) fn step(last: bool, child: impl IntoElement) -> gpui::Div {
         .py(px(2.))
         .child(crate::activity::rail_branch_at(last, true, 2.))
         .child(child)
+}
+
+/// A step whose status sits where its branch meets the row.
+fn status_step(last: bool, dot: AnyElement, child: impl IntoElement) -> gpui::Div {
+    step(last, child).child(
+        div()
+            .absolute()
+            .left(px(15.))
+            .top(px(13.))
+            .size(px(6.))
+            .child(dot),
+    )
 }
 
 impl Shell {
@@ -103,9 +179,14 @@ impl Shell {
     }
     /// Orchestrated workers live on their lead's rail, never in the list.
     pub(super) fn orchestration_worker(&self, id: i64) -> bool {
+        self.orchestration_lead(id).is_some()
+    }
+    /// The lead whose run a worker session belongs to.
+    pub(super) fn orchestration_lead(&self, id: i64) -> Option<i64> {
         self.orchestration_summaries
-            .values()
-            .any(|s| s.tasks.iter().any(|t| t.session == Some(id)))
+            .iter()
+            .find(|(_, s)| s.tasks.iter().any(|t| t.session == Some(id)))
+            .map(|(lead, _)| *lead)
     }
     fn rail(&self, id: i64, started: &HashMap<i64, Vec<i64>>) -> Option<Rail> {
         if let Some(summary) = self.orchestration_summaries.get(&id)
@@ -133,6 +214,104 @@ impl Shell {
                 self.in_play(id, cx) || children.iter().any(|c| self.in_play(*c, cx))
             }
         }
+    }
+    /// The rail's motion while its rows cascade in.
+    fn cascade(&self, id: i64, cx: &App) -> Option<Motion> {
+        self.rails
+            .motions
+            .get(&id)
+            .copied()
+            .filter(|m| m.cascades() && !cx.reduce_motion())
+    }
+    fn standing(
+        &self,
+        summary: &monocode_core::orchestration::Summary,
+        task: &monocode_core::orchestration::SummaryTask,
+        cx: &App,
+    ) -> Standing {
+        let needs_input = task.session.is_some_and(|s| {
+            self.sessions
+                .get(&s)
+                .is_some_and(|v| v.read(cx).needs_approval())
+        });
+        let working = summary.live && task.status == "running" && !needs_input;
+        let alert =
+            needs_input || matches!(task.status.as_str(), "failed" | "blocked" | "interrupted");
+        let done = task.status == "completed";
+        let tone = if alert {
+            rgb(0xfbbf24).into()
+        } else if working {
+            accent_color()
+        } else if done {
+            rgb(0x34d399).into()
+        } else {
+            content(0.45)
+        };
+        Standing {
+            tone,
+            working,
+            alert,
+            done,
+            needs_input,
+        }
+    }
+    /// How long a worker spent on its turns: 45s, 14m.
+    fn run_time(&self, session: Option<i64>, cx: &App) -> Option<String> {
+        let view = self.sessions.get(&session?)?;
+        let stats =
+            monocode_core::context::SessionStats::from_turns(view.read(cx).settings.turns.values());
+        (stats.working_ms >= 1000).then(|| monocode_core::context::format_span(stats.working_ms))
+    }
+    /// The lead's share of its agents that are done: a pill each, then 3/4.
+    /// A compact row, or a narrow sidebar, shows only the count so the title
+    /// and branch keep their room.
+    pub(super) fn agent_progress(
+        &self,
+        lead: i64,
+        summary: &monocode_core::orchestration::Summary,
+        compact: bool,
+        cx: &App,
+    ) -> AnyElement {
+        let standings: Vec<Standing> = summary
+            .tasks
+            .iter()
+            .map(|task| self.standing(summary, task, cx))
+            .collect();
+        let done = standings.iter().filter(|s| s.done && !s.alert).count();
+        div()
+            .id(("rail-progress", lead as usize))
+            .debug_selector(move || format!("rail-progress-{lead}"))
+            .role(Role::Image)
+            .aria_label(format!("{done} of {} agents done", standings.len()))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .when(
+                !compact
+                    && self.workspace.sidebar_width >= PROGRESS_PILLS_WIDTH
+                    && standings.len() <= PROGRESS_PILLS,
+                |d| {
+                    d.child(div().flex().gap(px(2.)).children(standings.iter().map(|s| {
+                        div()
+                            .w(px(8.))
+                            .h(px(4.))
+                            .rounded(px(2.))
+                            .bg(if s.done || s.alert {
+                                s.tone
+                            } else {
+                                content(0.18)
+                            })
+                    })))
+                },
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(content(0.45))
+                    .child(format!("{done}/{}", standings.len())),
+            )
+            .into_any_element()
     }
     /// Moves each rail toward its open state. A rail the sidebar first shows
     /// is simply there; later changes grow and fold.
@@ -182,7 +361,14 @@ impl Shell {
                 _ => {}
             }
             // A working agent's spinner keeps itself turning on the shared clock.
-            animating |= !self.rails.motions[&id].settled(now);
+            let motion = self.rails.motions[&id];
+            let rows = match &rail {
+                Rail::Started(children) => children.len(),
+                Rail::Agents(summary) => summary.tasks.len(),
+            };
+            animating |= !motion.settled(now)
+                || (motion.cascades()
+                    && now.saturating_duration_since(motion.start) < cascade_length(rows));
         }
         self.rails.motions.retain(|id, _| seen.contains(id));
         self.rails.started = started;
@@ -228,16 +414,20 @@ impl Shell {
         if progress <= 0. {
             return row;
         }
+        let cascade = self.cascade(id, cx);
         let body = match &rail {
             Rail::Started(children) => div()
                 .pt_1()
                 .flex()
                 .flex_col()
                 .children(children.iter().enumerate().map(|(ix, child)| {
+                    let (opacity, rise) = cascade.map_or((1., 0.), |m| m.row(ix, now));
                     step(
                         ix + 1 == children.len(),
                         self.session_row_with(*child, true, None, cx),
                     )
+                    .top(px(-rise))
+                    .opacity(opacity)
                 }))
                 .into_any_element(),
             Rail::Agents(summary) => self.agents(id, summary, cx),
@@ -255,7 +445,8 @@ impl Shell {
             } else {
                 div()
                     .ml(px(10.))
-                    .opacity(progress)
+                    // Cascading rows fade in on their own.
+                    .opacity(if cascade.is_some() { 1. } else { progress })
                     .overflow_hidden()
                     .child(Disclosure::new(body.ml(px(0.)), width, progress))
                     .into_any_element()
@@ -302,15 +493,17 @@ impl Shell {
             return row;
         }
         let work_item = self.work_item_badge(id, false, cx);
+        let origin = self.archived_origin_badge(id, cx);
         let agents = match rail {
             Some((Rail::Agents(summary), true)) => Some(self.agents(id, summary, cx)),
             _ => None,
         };
         let session = self.session_metadata(id, cx);
+        let archived = session.summary.archived;
         let selected = self.selected_sessions.contains(&id);
         let active =
             self.workspace.active == Some(id) && !self.mono_active(cx) && !self.app_view_open();
-        let draft = session.has_saved_draft();
+        let draft = session.shows_draft();
         let approval = session.needs_approval();
         let orchestration = matches!(rail, Some((Rail::Agents(_), true)));
         let header = !compact || orchestration;
@@ -475,6 +668,7 @@ impl Shell {
                                         d.child(self.session_archive_button(id, &session, cx))
                                     }),
                             )
+                            .children(origin)
                             .children(work_item)
                             .when(
                                 self.automation_state.session_automations.contains_key(&id),
@@ -547,7 +741,13 @@ impl Shell {
                     }))
             })
             .when(!selected && !approval && !active, |d| {
-                d.hover(|s| s.bg(content(if orchestration { 0.1 } else { 0.05 })))
+                d.hover(|s| {
+                    let s = s.bg(content(if orchestration { 0.1 } else { 0.05 }));
+                    if archived { s.opacity(0.9) } else { s }
+                })
+            })
+            .when(archived && (selected || approval || active), |d| {
+                d.hover(|s| s.opacity(0.9))
             })
             .when(
                 self.sidebar_drop == Some(session_groups::ListDrop::Session(id)),
@@ -558,6 +758,8 @@ impl Shell {
                 },
             )
             .when(self.deleting.contains(&id), |d| d.opacity(0.5))
+            // Archived threads recede, and come back to full strength on hover.
+            .when(archived, |d| d.opacity(0.55))
             .child(body)
             .children(self.sidebar_drop_mark(id))
             .child(anchor.probe())
@@ -672,7 +874,15 @@ impl Shell {
         &self,
         id: i64,
         session: &session_loading::Metadata<'_>,
-        _cx: &Context<Self>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let status = self.classic_session_status_label(id, session);
+        self.with_shortcut_hint(id, status, cx)
+    }
+    fn classic_session_status_label(
+        &self,
+        id: i64,
+        session: &session_loading::Metadata<'_>,
     ) -> AnyElement {
         let status = div()
             .flex_shrink_0()
@@ -706,7 +916,7 @@ impl Shell {
                 .child(icon("check", 12.))
                 .child("Done")
                 .into_any_element()
-        } else if session.has_saved_draft() {
+        } else if session.shows_draft() {
             status
                 .text_color(content(0.55))
                 .child(icon("circle-dashed-hi", 12.))
@@ -729,6 +939,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let classic = self.workspace.classic_layout;
+        let cascade = self.cascade(lead, cx).filter(|_| !classic);
+        let now = Instant::now();
         div()
             .when(!classic, |d| d.pt_1().pb_1())
             .when(classic, |d| {
@@ -770,26 +982,21 @@ impl Shell {
                     .flex_col()
                     .when(classic, |d| d.mx(px(-8.)).gap_px())
                     .children(summary.tasks.iter().enumerate().map(|(ix, task)| {
-                        let needs_input = task.session.is_some_and(|s| {
-                            self.sessions
-                                .get(&s)
-                                .is_some_and(|v| v.read(cx).needs_approval())
-                        });
+                        let task_session = task.session;
+                        let Standing {
+                            tone,
+                            working,
+                            alert,
+                            done,
+                            needs_input,
+                        } = self.standing(summary, task, cx);
                         let open = self.rails.open_tasks.contains(&(lead, ix)) || needs_input;
                         let label = task.label(summary, needs_input);
-                        let working = summary.live && task.status == "running" && !needs_input;
-                        let alert =
-                            needs_input || matches!(task.status.as_str(), "failed" | "blocked");
-                        let done = task.status == "completed";
-                        let tone: gpui::Hsla = if alert {
-                            rgb(0xfbbf24).into()
-                        } else if working {
-                            accent_color()
-                        } else if done {
-                            rgb(0x34d399).into()
-                        } else {
-                            content(0.45)
-                        };
+                        // The status rail: the dot says how it stands, the row
+                        // how long it ran, or what it needs.
+                        let run_time = (!classic && done && !alert)
+                            .then(|| self.run_time(task_session, cx))
+                            .flatten();
                         let model = crate::pickers::model_name(
                             Kind::from_id(&task.provider),
                             task.model.as_deref(),
@@ -814,47 +1021,49 @@ impl Shell {
                             .cursor_pointer()
                             .when(open && !classic, |d| d.bg(content(0.1)))
                             .when(!open, |d| d.hover(|s| s.bg(content(0.1))))
-                            .child(
-                                div()
-                                    .size(px(14.))
-                                    .flex_shrink_0()
-                                    .relative()
-                                    .opacity(0.75)
-                                    .child(
-                                        div()
-                                            .when(classic && open, |d| d.invisible())
-                                            .when(classic, |d| {
-                                                d.group_hover(group.clone(), |s| s.invisible())
-                                            })
-                                            .child(provider_icon(&task.provider, 14.)),
-                                    )
-                                    .when(classic, |d| {
-                                        d.child(
+                            .when(classic, |d| {
+                                d.child(
+                                    div()
+                                        .size(px(14.))
+                                        .flex_shrink_0()
+                                        .relative()
+                                        .opacity(0.75)
+                                        .child(
                                             div()
-                                                .absolute()
-                                                .top_0()
-                                                .left_0()
-                                                .size_full()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .invisible()
-                                                .when(open, |d| d.visible())
-                                                .group_hover(group.clone(), |s| s.visible())
-                                                .child(
-                                                    icon(
-                                                        if open {
-                                                            "chevron-down"
-                                                        } else {
-                                                            "chevron-right"
-                                                        },
-                                                        12.,
-                                                    )
-                                                    .text_color(content(0.45)),
-                                                ),
+                                                .when(classic && open, |d| d.invisible())
+                                                .when(classic, |d| {
+                                                    d.group_hover(group.clone(), |s| s.invisible())
+                                                })
+                                                .child(provider_icon(&task.provider, 14.)),
                                         )
-                                    }),
-                            )
+                                        .when(classic, |d| {
+                                            d.child(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .left_0()
+                                                    .size_full()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .invisible()
+                                                    .when(open, |d| d.visible())
+                                                    .group_hover(group.clone(), |s| s.visible())
+                                                    .child(
+                                                        icon(
+                                                            if open {
+                                                                "chevron-down"
+                                                            } else {
+                                                                "chevron-right"
+                                                            },
+                                                            12.,
+                                                        )
+                                                        .text_color(content(0.45)),
+                                                    ),
+                                            )
+                                        }),
+                                )
+                            })
                             .child(
                                 div()
                                     .min_w_0()
@@ -874,34 +1083,57 @@ impl Shell {
                                     })
                                     .child(task.title.clone()),
                             )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .text_size(px(11.))
-                                    .when(classic, |d| d.line_height(px(16.5)))
-                                    .text_color(tone)
-                                    .when(alert, |d| {
-                                        d.child(icon("circle-alert", 12.).text_color(tone))
-                                    })
-                                    .when(working, |d| {
-                                        d.child(crate::pulse::looping(
-                                            SharedString::from(format!("rail-spinner-{lead}-{ix}")),
-                                            crate::session_mark::SPINNER_PERIOD,
-                                            crate::pulse::Rate::Half,
-                                            crate::session_mark::spinner_at,
-                                        ))
-                                    })
-                                    .when(done && !alert, |d| {
-                                        d.child(icon("check", 12.).text_color(tone))
-                                    })
-                                    // On the rail the spinner says it on its own.
-                                    .when(classic || !working, |d| d.child(label)),
-                            )
+                            .when(!classic, |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(11.))
+                                        .when_some(run_time, |d, time| {
+                                            d.text_color(content(0.4)).child(time)
+                                        })
+                                        .when(alert, |d| d.text_color(tone).child(label))
+                                        .when(!alert && !working && !done, |d| {
+                                            d.text_color(content(0.45)).child(label)
+                                        }),
+                                )
+                            })
+                            .when(classic, |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_size(px(11.))
+                                        .line_height(px(16.5))
+                                        .text_color(tone)
+                                        .when(alert, |d| {
+                                            d.child(icon("circle-alert", 12.).text_color(tone))
+                                        })
+                                        .when(working, |d| {
+                                            d.child(crate::pulse::looping(
+                                                SharedString::from(format!(
+                                                    "rail-spinner-{lead}-{ix}"
+                                                )),
+                                                crate::session_mark::SPINNER_PERIOD,
+                                                crate::pulse::Rate::Half,
+                                                crate::session_mark::spinner_at,
+                                            ))
+                                        })
+                                        .when(done && !alert, |d| {
+                                            d.child(icon("check", 12.).text_color(tone))
+                                        })
+                                        .child(label),
+                                )
+                            })
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                // A task with its own thread opens it; the
+                                // details only stand in until it has one.
+                                if let Some(worker) = task_session {
+                                    this.open(worker, window, cx);
+                                    return;
+                                }
                                 if !this.rails.open_tasks.remove(&(lead, ix)) {
                                     this.rails.open_tasks.insert((lead, ix));
                                 }
@@ -993,7 +1225,15 @@ impl Shell {
                         if classic {
                             row.into_any_element()
                         } else {
-                            step(ix + 1 == summary.tasks.len(), row).into_any_element()
+                            let (opacity, rise) = cascade.map_or((1., 0.), |m| m.row(ix, now));
+                            status_step(
+                                ix + 1 == summary.tasks.len(),
+                                status_dot(format!("rail-dot-{lead}-{ix}").into(), tone, working),
+                                row,
+                            )
+                            .top(px(-rise))
+                            .opacity(opacity)
+                            .into_any_element()
                         }
                     })),
             )

@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::{path::PathBuf, sync::mpsc};
 
 pub mod images;
+pub mod shared;
 
 pub const SCRIPT_HOSTS: [&str; 7] = [
     "cdn.jsdelivr.net",
@@ -74,6 +75,10 @@ pub enum DraftAction {
         replace: bool,
     },
     Resume,
+    /// Patch the page's `mc.state`, the way its own controls would.
+    Set {
+        values: serde_json::Map<String, Value>,
+    },
     /// Wait for the person to send feedback or hand the draft back.
     Wait {
         #[serde(default)]
@@ -107,7 +112,7 @@ pub struct DraftRequest {
     /// A short name shown above a new draft in the conversation.
     pub title: Option<String>,
     /// The identifier a new draft takes, chosen by the bridge so the
-    /// conversation's card exists before the page does.
+    /// conversation's card can name it.
     pub id: Option<String>,
     pub reply: mpsc::Sender<Result<DraftReply, String>>,
 }
@@ -130,6 +135,22 @@ pub fn local_url(url: &str) -> Result<(), String> {
 }
 
 impl DraftRequest {
+    /// Closes a draft without anyone waiting on the answer.
+    pub fn close(session: i64, draft: String) -> Self {
+        Self {
+            session,
+            draft: Some(draft),
+            content: None,
+            action: DraftAction::Close,
+            width: None,
+            height: None,
+            light: None,
+            title: None,
+            id: None,
+            reply: mpsc::channel().0,
+        }
+    }
+
     pub fn parse(
         session: i64,
         input: &Value,
@@ -188,6 +209,14 @@ impl DraftRequest {
             }
             DraftAction::Click { reference } if reference.is_empty() || reference.len() > 96 => {
                 return Err("Invalid element reference".into());
+            }
+            DraftAction::Set { values } if values.is_empty() => {
+                return Err("values must name at least one state key".into());
+            }
+            DraftAction::Set { values }
+                if Value::Object(values.clone()).to_string().len() > 4000 =>
+            {
+                return Err("values exceed 4000 bytes".into());
             }
             DraftAction::Keep { title } if title.chars().count() > 160 => {
                 return Err("Title exceeds 160 characters".into());
@@ -295,9 +324,13 @@ pub struct Snapshot {
     /// What the person sent from the page since the agent last looked: notes
     /// pinned to elements. Empty when nothing was sent.
     pub feedback: Vec<Feedback>,
+    /// What the page itself sent with `mc.send` when the person used one of
+    /// its controls, oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<String>,
     /// What the person did in the page by hand, oldest first.
     pub user_actions: Vec<String>,
-    /// Why a wait returned: "feedback", "handed back" or "timeout".
+    /// Why a wait returned: "feedback", "message", "handed back" or "timeout".
     pub event: Option<String>,
     /// Things worth fixing that the page itself reveals, such as low
     /// contrast, tiny tap targets and missing labels.
@@ -305,7 +338,26 @@ pub struct Snapshot {
     /// The values of the page's own controls (`mc.state`), when it uses them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<serde_json::Value>,
+    /// How this version of the page lays out at other common widths, measured
+    /// out of sight while it loaded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub layouts: Vec<Layout>,
 }
+
+/// The page laid out at one viewport width.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Layout {
+    pub width: u32,
+    /// The height the content needs at that width.
+    pub height: u32,
+    /// How far the content runs past the viewport's right edge.
+    pub horizontal_overflow: u32,
+}
+
+/// The widths a new version of a page is also laid out at: a phone, a tablet
+/// and a laptop.
+pub const LAYOUT_WIDTHS: [u32; 3] = [375, 768, 1280];
 
 /// A note the person pinned to an element of the page.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -317,13 +369,55 @@ pub struct Feedback {
     /// Where the pin sits, as a percentage of the page.
     pub x: f64,
     pub y: f64,
+    /// The element the pin was placed on, so another screen whose page is laid
+    /// out at another width can put it on the same element. It travels with
+    /// the note only as far as the pin; the agent reads the percentages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<Anchor>,
+}
+
+/// Where in the page a pin sits: the element, as the child indexes from
+/// `<body>` down to it ("0.2.1"), and the point inside its box as a fraction
+/// of its width and height. Every screen loads the same page, so the path
+/// names the same element on each.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Anchor {
+    pub path: String,
+    pub ax: f64,
+    pub ay: f64,
+}
+
+impl Anchor {
+    /// The longest path a page may report; deeper elements are pinned by
+    /// percentage alone.
+    pub const MAX_PATH: usize = 160;
+
+    /// The anchor if it is one a page could have sent: a short path of child
+    /// indexes and a point inside the box.
+    pub fn checked(self) -> Option<Self> {
+        let path_ok = !self.path.is_empty()
+            && self.path.len() <= Self::MAX_PATH
+            && self.path.split('.').all(|step| {
+                !step.is_empty() && step.len() <= 4 && step.bytes().all(|b| b.is_ascii_digit())
+            });
+        let inside = |v: f64| v.is_finite() && (0. ..=1.).contains(&v);
+        (path_ok && inside(self.ax) && inside(self.ay)).then_some(self)
+    }
 }
 
 impl Feedback {
     /// The person's notes as the message the agent reads when it was not
     /// waiting for them.
-    pub fn message(title: &str, feedback: &[Self], actions: &[String]) -> String {
+    pub fn message(
+        title: &str,
+        feedback: &[Self],
+        messages: &[String],
+        actions: &[String],
+    ) -> String {
         let mut text = format!("Feedback on the draft \u{201c}{title}\u{201d}:\n");
+        for message in messages {
+            text.push_str(&format!("From the page: {message}\n"));
+        }
         for (n, item) in feedback.iter().enumerate() {
             text.push_str(&format!(
                 "{}. On <{}> \u{201c}{}\u{201d} (about {:.0}% across, {:.0}% down): {}\n",
@@ -338,7 +432,11 @@ impl Feedback {
         if !actions.is_empty() {
             text.push_str(&format!("In the page I also: {}.\n", actions.join("; ")));
         }
-        text.push_str("The pins are numbered in the page; look at it again before changing it.");
+        if !feedback.is_empty() {
+            text.push_str(
+                "The pins are numbered in the page; look at it again before changing it.",
+            );
+        }
         text
     }
 }
@@ -499,6 +597,7 @@ mod tests {
                 name: "Choose plan".into(),
                 x: 42.4,
                 y: 80.,
+                at: None,
             },
             Feedback {
                 note: "Too tight".into(),
@@ -507,11 +606,41 @@ mod tests {
                 ..Feedback::default()
             },
         ];
-        let text = Feedback::message("Pricing", &notes, &["clicked Details".into()]);
+        let text = Feedback::message(
+            "Pricing",
+            &notes,
+            &["Chose variant B".into()],
+            &["clicked Details".into()],
+        );
+        assert!(text.contains("From the page: Chose variant B\n"));
         assert!(text.contains("\u{201c}Pricing\u{201d}"));
         assert!(text.contains("1. On <button> \u{201c}Choose plan\u{201d} (about 42% across, 80% down): Make this blue"));
         assert!(text.contains("2. On <h2>"));
         assert!(text.contains("In the page I also: clicked Details."));
+        let sent = Feedback::message("Pricing", &[], &["Use this one".into()], &[]);
+        assert!(sent.contains("From the page: Use this one"));
+        assert!(!sent.contains("pins"));
+    }
+
+    #[test]
+    fn set_patches_named_state_within_bounds() {
+        let request = parse(
+            json!({"draft":"a","action":{"kind":"set","values":{"speed":0.25,"phase":"open"}}}),
+        )
+        .unwrap();
+        let DraftAction::Set { values } = request.action else {
+            panic!("Expected a set action");
+        };
+        assert_eq!(values["speed"], 0.25);
+        for bad in [
+            json!({"draft":"a","action":{"kind":"set","values":{}}}),
+            json!({"draft":"a","action":{"kind":"set","values":[1]}}),
+            json!({"draft":"a","action":{"kind":"set"}}),
+            json!({"draft":"a","action":{"kind":"set","values":{"x":"y".repeat(4001)}}}),
+            json!({"html":"<p>x</p>","action":{"kind":"set","values":{"x":1}}}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]

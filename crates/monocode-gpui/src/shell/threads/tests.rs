@@ -447,3 +447,92 @@ fn threads_pending_send_cannot_outlive_stop_or_a_new_lead_turn(cx: &mut TestAppC
             .unwrap();
     }
 }
+
+#[gpui::test]
+fn threads_close_archives_a_finished_child_and_takes_it_off_the_rail(cx: &mut TestAppContext) {
+    let (window, child, lead) = setup(cx);
+    let close = |request: &str, cx: &mut TestAppContext| {
+        call(
+            window,
+            lead,
+            request,
+            "threads.close",
+            json!({"threadId":child}),
+            cx,
+        )
+        .try_recv()
+        .unwrap()
+    };
+    assert!(close("busy", cx).unwrap_err().contains("stop it first"));
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&child].update(cx, |v, cx| {
+                v.busy = false;
+                cx.emit(SessionChanged);
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(close("close", cx).unwrap()["closed"], true);
+    cx.run_until_parked();
+    assert_eq!(close("again", cx).unwrap()["closed"], true);
+    let listed = call(window, lead, "list", "threads.list", json!({}), cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    assert_eq!(listed["threads"], json!([]));
+    let send = call(
+        window,
+        lead,
+        "send",
+        "threads.send",
+        json!({"threadId":child,"prompt":"More"}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap_err();
+    assert!(send.contains("closed"));
+    window
+        .update(cx, |shell, _, cx| {
+            let session = locked(&shell.store)
+                .unwrap()
+                .sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == child)
+                .unwrap();
+            assert!(session.archived);
+            assert!(
+                !shell.orchestration_summaries[&lead]
+                    .tasks
+                    .iter()
+                    .any(|t| t.session == Some(child))
+            );
+            let transcript = shell.sessions[&lead].read(cx).transcript.clone();
+            assert!(transcript.read(cx).thread_hidden(child));
+            // Restoring it from the archive puts it back on the lead's rail.
+            shell.toggle_archive(child, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(
+                shell.orchestration_summaries[&lead]
+                    .tasks
+                    .iter()
+                    .any(|t| t.session == Some(child))
+            );
+            // Removing it from the lead's spawn tree closes it too.
+            let transcript = shell.sessions[&lead].read(cx).transcript.clone();
+            transcript.update(cx, |t, cx| t.dismiss_threads(&[child], cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.session_metadata(child, cx).summary.archived);
+        })
+        .unwrap();
+}

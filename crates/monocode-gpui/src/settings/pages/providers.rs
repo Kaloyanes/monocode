@@ -353,7 +353,8 @@ impl SettingsView {
         }
         let advanced=vec![
             self.row(Some("idle-agents"),true,"Keep idle agents ready",Some("Keep up to this many idle agents running for faster follow-ups. Uses additional memory.".into()),vec![self.segmented("idle-agents","Keep idle agents ready",&p.idle_agents.to_string(),&[("0","None"),("1","1"),("2","2"),("3","3"),("5","5")],cx,|this,value,cx|if let Ok(value)=value.parse(){this.update(cx,|p|p.idle_agents=value)})]),
-            self.row(Some("claude-hooks"),false,"Claude Code hooks",Some("Run your configured Claude Code hooks. Changes apply on the next turn.".into()),vec![self.toggle("claude-hooks","Claude Code hooks",p.claude_hooks,false,cx,|this,on,cx|this.update(cx,|p|p.claude_hooks=on))])];
+            self.row(Some("claude-hooks"),false,"Claude Code hooks",Some("Run your configured Claude Code hooks. Changes apply on the next turn.".into()),vec![self.toggle("claude-hooks","Claude Code hooks",p.claude_hooks,false,cx,|this,on,cx|this.update(cx,|p|p.claude_hooks=on))]),
+            self.row(Some("monocode-subagents-only"),false,"Subagents only through MonoCode",Some("Turn off Claude Code's and Codex's own subagent tools, so every subagent starts as a chat you can watch here. Claude loses its quick built-in helpers such as Explore. Changes apply on the next turn.".into()),vec![self.toggle("monocode-subagents-only","Subagents only through MonoCode",p.monocode_subagents_only,false,cx,|this,on,cx|this.update(cx,|p|p.monocode_subagents_only=on))])];
         vec![
             self.group(
                 Some("provider-accounts"),

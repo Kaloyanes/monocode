@@ -1,0 +1,23 @@
+[package]
+name = "monocode-cef-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Renders MonoCode's drafts off screen in CEF, in its own process"
+
+# Its own workspace: CEF stays out of the app's build.
+[workspace]
+
+[dependencies]
+cef = "=156.2.0"
+serde_json = "1"
+mach2 = "0.6"
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString", "CFBase"] }
+objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "IOSurfaceBase", "libc", "objc2", "objc2-core-foundation", "bitflags"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLBlitCommandEncoder", "MTLTexture", "MTLPixelFormat", "MTLResource", "MTLAllocation", "objc2-io-surface"] }

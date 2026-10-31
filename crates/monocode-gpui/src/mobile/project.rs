@@ -117,6 +117,26 @@ pub(crate) fn search(root: &Path, query: &str) -> Result<Value, String> {
     Ok(json!({ "results": results }))
 }
 
+/// The skills the composer's `/` and `$` offer for this working copy, minus
+/// disabled ones and names MonoCode's own commands own. Paths stay here: a
+/// send names a skill by `/name` and the desktop finds its file again.
+pub(crate) fn skills(root: &Path, disabled: Vec<String>) -> Result<Value, String> {
+    let skills: Vec<Value> =
+        monocode_core::skills::list_skills(root.to_string_lossy().into_owned(), Some(disabled))?
+            .into_iter()
+            .filter(|skill| !crate::composer_completion::reserved_skill_name(&skill.name))
+            .map(|skill| {
+                json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "scope": skill.scope,
+                    "source": skill.source,
+                })
+            })
+            .collect();
+    Ok(json!({ "skills": skills }))
+}
+
 /// Enough of a file to read on a phone: tens of thousands of lines, well
 /// inside a reply's 8MB. Its colours, being larger, come separately.
 const MOBILE_FILE_BYTES: usize = 1024 * 1024;
@@ -860,6 +880,44 @@ mod tests {
             .map(|(text, _)| text.as_str())
             .collect::<String>()
             == line
+    }
+
+    #[test]
+    fn skills_leave_out_disabled_and_reserved_names() {
+        let dir = Temp::new("skills");
+        for (name, description) in [
+            ("phone-review", "Review on the go"),
+            ("phone-off", "Turned off"),
+            ("plan", "Shadows a mode"),
+        ] {
+            let folder = dir.0.join(".agents/skills").join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(
+                folder.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {description}\n---\nBody."),
+            )
+            .unwrap();
+        }
+        let disabled = dir.0.join(".agents/skills/phone-off/SKILL.md");
+        let reply = skills(&dir.0, vec![disabled.to_string_lossy().into_owned()]).unwrap();
+        let names: Vec<&str> = reply["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|skill| skill["name"].as_str())
+            .collect();
+        assert!(names.contains(&"phone-review"));
+        assert!(!names.contains(&"phone-off"));
+        assert!(!names.contains(&"plan"));
+        let review = reply["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|skill| skill["name"] == "phone-review")
+            .unwrap();
+        assert_eq!(review["description"], "Review on the go");
+        assert_eq!(review["scope"], "project");
+        assert!(review.get("path").is_none());
     }
 
     #[test]

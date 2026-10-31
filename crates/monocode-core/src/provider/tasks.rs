@@ -15,7 +15,7 @@ pub(super) struct Activities {
     /// Every running Claude task in start order, as claude.ts's backgroundTasks.
     pub(super) claude_tasks: Vec<BackgroundTask>,
     /// What the UI was last told the yielded turn is waiting on.
-    pub(super) published: Vec<BackgroundTask>,
+    pub(super) published: Waiting,
 }
 fn text(value: &Value) -> Option<&str> {
     value.as_str().filter(|s| !s.trim().is_empty())
@@ -647,9 +647,12 @@ impl Protocol {
     /// on, and clear the list when Claude picks the thread back up.
     pub(super) fn sync_background(&mut self, events: &mut Vec<Event>) {
         let waiting = if self.claude_result_seen && !self.done {
-            self.activities.claude_tasks.clone()
+            Waiting {
+                tasks: self.activities.claude_tasks.clone(),
+                waking: self.claude_resume_at.is_some_and(|at| Instant::now() < at),
+            }
         } else {
-            Vec::new()
+            Waiting::default()
         };
         if waiting != self.activities.published {
             self.activities.published = waiting.clone();
@@ -976,7 +979,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .find_map(|event| match event {
-                    Event::Background(tasks) => Some(tasks),
+                    Event::Background(waiting) => Some(waiting.tasks),
                     _ => None,
                 })
         };
@@ -1011,5 +1014,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tick(&mut p), Some(Vec::new()));
+    }
+    #[test]
+    fn a_returning_background_agent_keeps_the_yielded_turn_waking() {
+        let mut p = protocol(Kind::Claude);
+        let tick = |p: &mut Protocol| {
+            p.lifecycle_tick(Instant::now(), &mut Vec::new())
+                .unwrap()
+                .into_iter()
+                .find_map(|event| match event {
+                    Event::Background(waiting) => Some(waiting),
+                    _ => None,
+                })
+        };
+        p.frame(json!({"type":"system","subtype":"task_started","task_id":"dev","description":"Start dev server","task_type":"local_bash","is_backgrounded":true}), &mut Vec::new()).unwrap();
+        p.frame(json!({"type":"system","subtype":"task_started","task_id":"review","description":"Review","task_type":"local_agent","is_backgrounded":true}), &mut Vec::new()).unwrap();
+        p.frame(
+            json!({"type":"result","result":"Started both."}),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let waiting = tick(&mut p).unwrap();
+        assert_eq!(waiting.tasks.len(), 2);
+        assert!(!waiting.waking);
+
+        p.frame(json!({"type":"system","subtype":"task_notification","task_id":"review","status":"completed","summary":"Done"}), &mut Vec::new()).unwrap();
+        let waiting = tick(&mut p).unwrap();
+        assert_eq!(waiting.tasks.len(), 1);
+        assert!(
+            waiting.waking,
+            "Claude may still pick the thread up after its agent reports back"
+        );
+
+        p.claude_resume_at = Some(Instant::now() - Duration::from_secs(1));
+        let waiting = tick(&mut p).unwrap();
+        assert!(!waiting.waking && waiting.tasks.len() == 1);
     }
 }

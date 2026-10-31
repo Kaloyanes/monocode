@@ -1076,7 +1076,9 @@ impl Shell {
     }
 
     fn poll_linked_activity(&mut self, cx: &mut Context<Self>) {
+        // On a hotspot keep-awake joined, the data is better left to agents.
         if self.notification_state.linked_seen_ready
+            && !crate::keep_awake::on_hotspot()
             && self
                 .notification_state
                 .linked_last_poll
@@ -1256,7 +1258,7 @@ impl Shell {
                     self.open_work_link_later(url, cx);
                 }
             }
-            LinkedActivityEvent::AddToChat(id, prompt, label) => {
+            LinkedActivityEvent::AddToChat(id, prompt) => {
                 cx.spawn(async move |this, cx| {
                     let _ = this.update_in(cx, |this, window, cx| {
                         this.close_settings(window, cx);
@@ -1268,15 +1270,16 @@ impl Shell {
                         }
                         if let Some(view) = this.notification_chat(id, cx) {
                             let input = view.read(cx).input.clone();
-                            view.update(cx, |view, cx| {
-                                view.attach_snippet(
-                                    monocode_core::composer::Snippet::Activity,
-                                    Some(label),
-                                    prompt,
-                                    cx,
-                                )
-                            });
-                            window.focus(&input.focus_handle(cx), cx);
+                            if !input.read(cx).is_composing() {
+                                input.update(cx, |input, cx| {
+                                    let draft = monocode_core::composer::append_block(
+                                        &input.content,
+                                        &prompt,
+                                    );
+                                    input.set_text(draft, cx);
+                                });
+                                window.focus(&input.focus_handle(cx), cx);
+                            }
                         }
                         window.activate_window();
                         cx.notify();

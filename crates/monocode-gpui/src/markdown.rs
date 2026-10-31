@@ -890,6 +890,7 @@ pub(crate) fn body_selected(
         } => body
             .id(id.clone())
             .overflow_x_scroll()
+            .restrict_scroll_to_axis()
             .rounded_t(px(if *header { 10. } else { 0. }))
             .rounded_b(px(if *last { 10. } else { 0. }))
             .border_1()

@@ -3,7 +3,9 @@ mod appearance;
 mod archive;
 mod chat;
 mod connections;
+mod devices;
 mod general;
+mod hotspot;
 mod inbox;
 mod keybindings;
 mod mcp;
@@ -11,11 +13,13 @@ mod mobile;
 mod monos;
 mod providers;
 mod skills;
+mod visualizations;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
 pub(super) use chat::TextModelMenu;
 pub(super) use connections::ConnectionsState;
+pub(super) use hotspot::HotspotState;
 pub(crate) use keybindings::command_shortcut;
 pub(super) use mobile::MobileState;
 
@@ -36,6 +40,8 @@ impl SettingsView {
             Section::Appearance => self.appearance_page(window, cx),
             Section::Keybindings => self.keybindings_page(cx),
             Section::Chat => self.chat_page(cx),
+            Section::Visualizations => self.visualizations_page(cx),
+            Section::Devices => self.devices_page(cx),
             Section::Providers => self.providers_page(cx),
             Section::Mcp => self.mcp_page(cx),
             Section::Skills => self.skills_page(cx),

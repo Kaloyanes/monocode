@@ -34,6 +34,12 @@ const target = process.env.CARGO_BUILD_TARGET
   ? join(metadata.target_directory, process.env.CARGO_BUILD_TARGET)
   : metadata.target_directory;
 if (process.platform === "darwin") {
+  // The CEF host for Chromium drafts. Its build fetches the CEF SDK it links
+  // against (cmake and ninja required); the framework itself is downloaded by
+  // the app when someone picks Chromium.
+  env.CEF_PATH = process.env.CEF_PATH || join(process.env.HOME || "", "Library/Caches/monocode-cef");
+  run("cargo", ["build", "--manifest-path", "crates/monocode-cef-host/Cargo.toml", "--locked", "--release", "--bin", "monocode-cef-host"]);
+  env.MONOCODE_CEF_HOST_BINARY = join(root, "crates/monocode-cef-host/target/release/monocode-cef-host");
   run("bash", ["scripts/bundle-native-macos.sh", "release", target, app.version, "monocode-data"]);
 } else {
   const executable = process.platform === "win32" ? "monocode-gpui.exe" : "monocode-gpui";

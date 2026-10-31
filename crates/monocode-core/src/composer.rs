@@ -9,10 +9,68 @@ use std::{
 pub const MAX_ATTACHMENTS: usize = 20;
 pub const MAX_EMBED_BYTES: u64 = 20 * 1024 * 1024;
 
+/// quoteDraft.ts: append selected rendered text without replacing a live draft.
+pub fn append_selection_quote(draft: &str, text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = normalized.trim();
+    if text.is_empty() {
+        return draft.into();
+    }
+    let quote = text
+        .split('\n')
+        .map(|line| {
+            if line.is_empty() {
+                ">".to_owned()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    append_block(draft, &quote)
+}
+
+/// Add `text` to the end of a draft as its own paragraph, whatever the draft
+/// ends with, and leave the caret on a fresh line below it.
+pub fn append_block(draft: &str, text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return draft.into();
+    }
+    let separator = if draft.is_empty() || draft.ends_with("\n\n") {
+        ""
+    } else if draft.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    format!("{draft}{separator}{text}\n\n")
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+    #[test]
+    fn quote_preserves_existing_draft_blank_lines_and_unicode() {
+        assert_eq!(
+            append_selection_quote("draft", " one\r\n\r\ncafé 🙂 "),
+            "draft\n\n> one\n>\n> café 🙂\n\n"
+        );
+        assert_eq!(append_selection_quote("draft\n", "x"), "draft\n\n> x\n\n");
+        assert_eq!(append_selection_quote("draft\n\n", "x"), "draft\n\n> x\n\n");
+        assert_eq!(append_selection_quote("unchanged", " \r\n "), "unchanged");
+        assert_eq!(append_block("", " log \n"), "log\n\n");
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trigger {
     Skill,
     Mention,
+    /// `$` only finds skills; picking one still inserts its `/name`.
+    SkillSearch,
+    /// `#` finds Inbox work items: issues and pull requests.
+    WorkItem,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Token {
@@ -36,11 +94,18 @@ pub fn token_at(text: &str, cursor: usize) -> Option<Token> {
     let trigger = match fragment.chars().next()? {
         '/' => Trigger::Skill,
         '@' => Trigger::Mention,
+        '$' => Trigger::SkillSearch,
+        '#' => Trigger::WorkItem,
         _ => return None,
     };
     let query = &fragment[1..];
+    // Prices and shell variables ($5, $HOME/x) are ordinary text.
     if query.contains(['@', '\n', '\r'])
-        || (trigger == Trigger::Skill && query.contains(['/', '.', '\\']))
+        || (trigger != Trigger::Mention && query.contains(['/', '.', '\\']))
+        || (trigger == Trigger::SkillSearch
+            && (query.contains('$') || query.starts_with(|c: char| !c.is_ascii_alphabetic())))
+        // Markdown headings (`##`) and anchors stay text.
+        || (trigger == Trigger::WorkItem && query.contains('#'))
     {
         return None;
     }
@@ -123,9 +188,8 @@ pub fn validate_attachments(paths: &[PathBuf]) -> Result<(), String> {
     }
     Ok(())
 }
-/// Text a snippet attachment may hold: what `prepare_prompt` inlines.
-pub const MAX_SNIPPET_BYTES: usize = 128 * 1024;
-/// Where a snippet attachment came from, so its chip can say so.
+/// Where a snippet attachment saved by an earlier version came from, so its
+/// chip can still say so. New quotes, pastes and selections stay in the draft.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Snippet {
     Terminal,
@@ -179,60 +243,6 @@ impl Snippet {
             Self::Activity => "New activity on the linked work",
         }
     }
-}
-/// Pastes this long become a chip rather than filling the draft.
-pub fn is_long_paste(text: &str) -> bool {
-    text.trim().lines().count() > 20 || text.len() > 4_000
-}
-/// A chip's short label as it can sit in a file name: one line, no path
-/// separators, cut at a word within 40 characters.
-fn label_slug(label: &str) -> String {
-    let words: Vec<_> = label
-        .split(|c: char| c.is_whitespace() || c.is_control() || c == '/' || c == ':')
-        .filter(|w| !w.is_empty())
-        .collect();
-    let line = words.join(" ");
-    match line.char_indices().nth(40) {
-        Some((cut, _)) => {
-            let head = &line[..cut];
-            let head = head.rsplit_once(' ').map_or(head, |(words, _)| words);
-            format!("{}…", head.trim_end())
-        }
-        None => line,
-    }
-}
-/// Write `text` as a snippet attachment in `dir`. Its kind, line count and
-/// label go in the file name, so chips are labelled without reading the
-/// file. Text past the inline limit keeps its end, where errors usually are.
-pub fn save_snippet(
-    dir: &Path,
-    kind: Snippet,
-    label: Option<&str>,
-    text: &str,
-) -> Result<PathBuf, String> {
-    let mut text = text.trim_end();
-    if text.len() > MAX_SNIPPET_BYTES {
-        let mut start = text.len() - MAX_SNIPPET_BYTES;
-        while !text.is_char_boundary(start) {
-            start += 1;
-        }
-        text = &text[start..];
-        text = text.split_once('\n').map_or(text, |(_, rest)| rest);
-    }
-    let lines = text.lines().count().max(1);
-    let label = label
-        .map(label_slug)
-        .filter(|label| !label.is_empty())
-        .map(|label| format!("-{label}"))
-        .unwrap_or_default();
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!(
-        "{}-{lines}-lines-{}{label}.txt",
-        kind.slug(),
-        crate::mono::new_id()
-    ));
-    std::fs::write(&path, text).map_err(|e| e.to_string())?;
-    Ok(path)
 }
 /// A snippet attachment's kind and chip label ("Terminal · 24 lines",
 /// "Comment · main.rs:42"), read from its file name.
@@ -407,6 +417,51 @@ fn read_text(path: &Path, max: usize) -> Result<String, String> {
     }
     String::from_utf8(data).map_err(|e| e.to_string())
 }
+/// How a pasted image is named in the draft text: "[Image 2]" is the second
+/// image attached.
+pub fn image_ref(number: usize) -> String {
+    format!("[Image {number}]")
+}
+fn image_ref_number(token: &str) -> Option<usize> {
+    token
+        .strip_prefix("[Image ")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+/// Byte ranges of every "[Image N]" reference in `text`.
+pub fn image_ref_ranges(text: &str) -> Vec<Range<usize>> {
+    text.match_indices("[Image ")
+        .filter_map(|(start, _)| {
+            let len = text[start..].find(']')? + 1;
+            image_ref_number(&text[start..start + len]).map(|_| start..start + len)
+        })
+        .collect()
+}
+/// `text` after image `number` is removed: its reference goes, with the space
+/// after it, and later images are renumbered to close the gap.
+pub fn remove_image_ref(text: &str, number: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for range in image_ref_ranges(text) {
+        let Some(n) = image_ref_number(&text[range.clone()]) else {
+            continue;
+        };
+        out.push_str(&text[last..range.start]);
+        last = range.end;
+        if n == number {
+            if text[last..].starts_with(' ') {
+                last += 1;
+            }
+        } else if n > number {
+            out.push_str(&image_ref(n - 1));
+        } else {
+            out.push_str(&text[range]);
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
 pub fn mention_text(relative: &str) -> String {
     if relative.chars().any(char::is_whitespace) {
         format!("@\"{}\"", relative.replace('"', "\\\""))
@@ -420,10 +475,12 @@ pub fn highlight_ranges(
 ) -> Vec<Range<usize>> {
     static TOKENS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let pattern = TOKENS.get_or_init(|| {
-        regex::Regex::new(r#"(?m)(?:^|\s)(/[a-z0-9][a-z0-9:-]*|@"(?:\\.|[^"\r\n])*"|@[^\s]+)"#)
-            .expect("composer token pattern")
+        regex::Regex::new(
+            r#"(?m)(?:^|\s)(/[a-z0-9][a-z0-9:-]*|@"(?:\\.|[^"\r\n])*"|@[^\s]+|#[^\s]+)"#,
+        )
+        .expect("composer token pattern")
     });
-    pattern
+    let mut ranges: Vec<_> = pattern
         .captures_iter(text)
         .filter_map(|capture| {
             let token = capture.get(1)?;
@@ -436,7 +493,10 @@ pub fn highlight_ranges(
                 .starts_with('>'))
             .then(|| token.range())
         })
-        .collect()
+        .collect();
+    ranges.extend(image_ref_ranges(text));
+    ranges.sort_by_key(|range| range.start);
+    ranges
 }
 fn mentions(text: &str) -> Vec<String> {
     text.lines()
@@ -476,34 +536,39 @@ fn mentions_in_line(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
     #[test]
-    fn snippets_carry_their_kind_and_line_count_and_reach_the_prompt() {
+    fn saved_snippets_still_carry_their_kind_and_reach_the_prompt() {
         let dir = std::env::temp_dir().join(format!("snippet-{}", crate::mono::new_id()));
-        let path = save_snippet(&dir, Snippet::Terminal, None, "$ npm test\nFAIL\n\n").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = crate::mono::new_id();
+        let path = dir.join(format!("terminal-2-lines-{id}.txt"));
+        std::fs::write(&path, "$ npm test\nFAIL").unwrap();
         assert_eq!(
             snippet(&path),
             Some((Snippet::Terminal, "Terminal · 2 lines".into()))
         );
         assert_eq!(snippet(Path::new("terminal-3-lines-notes.txt")), None);
-        let comment = save_snippet(&dir, Snippet::Comment, Some("main.rs L42"), "x").unwrap();
+        let comment = dir.join(format!("comment-1-lines-{id}-main.rs L42.txt"));
         assert_eq!(
             snippet(&comment),
             Some((Snippet::Comment, "Comment · main.rs L42".into()))
         );
-        let quote = "the build fails\nbecause the cache is stale and the lockfile drifted";
-        let quote = save_snippet(&dir, Snippet::Quote, Some(quote), quote).unwrap();
-        assert_eq!(
-            snippet(&quote).unwrap().1,
-            "Quote · the build fails because the cache is…"
-        );
-        assert!(!is_long_paste("one\ntwo"));
-        assert!(is_long_paste(&"line\n".repeat(21)));
         let prompt = prepare_prompt("why?", dir.to_str().unwrap(), &[path]).unwrap();
         assert!(prompt.starts_with("Terminal output the user selected"));
         assert!(prompt.contains("<attached_file>\n$ npm test\nFAIL\n</attached_file>"));
-        let long = format!("head\n{}\ntail", "x".repeat(MAX_SNIPPET_BYTES));
-        let path = save_snippet(&dir, Snippet::Terminal, None, &long).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "tail");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn image_refs_close_the_gap_when_one_is_removed() {
+        let text = "see [Image 1] and [Image 2] vs [Image 3], not [Image x]";
+        assert_eq!(image_ref_ranges(text).len(), 3);
+        assert_eq!(
+            remove_image_ref(text, 2),
+            "see [Image 1] and vs [Image 2], not [Image x]"
+        );
+        assert_eq!(remove_image_ref("[Image 1]", 1), "");
+        assert_eq!(remove_image_ref("plain", 1), "plain");
+        let known = Default::default();
+        assert_eq!(highlight_ranges("a [Image 1] b", &known), vec![2..11]);
     }
     #[test]
     fn thumbnails_cover_the_chip_and_swap_to_bgra() {
@@ -527,6 +592,29 @@ mod tests {
         assert!(token_at("> /review", 9).is_none());
         assert!(token_at("/tmp/file", 9).is_none());
         assert_eq!(token_at("@src/ma", 7).unwrap().trigger, Trigger::Mention);
+    }
+    #[test]
+    fn dollar_finds_skills_but_not_prices_or_variables() {
+        let token = token_at("use $rev", 8).unwrap();
+        assert_eq!(token.trigger, Trigger::SkillSearch);
+        assert_eq!((token.range, token.query.as_str()), (4..8, "rev"));
+        assert_eq!(token_at("$", 1).unwrap().query, "");
+        assert_eq!(token_at("$figma:use", 10).unwrap().query, "figma:use");
+        for text in ["costs $5", "$1.99", "a$b", "$HOME/bin", "$$", "> $rev"] {
+            assert!(token_at(text, text.len()).is_none(), "{text}");
+        }
+    }
+    #[test]
+    fn hash_finds_work_items_but_not_headings() {
+        let token = token_at("fix #ENG-12", 11).unwrap();
+        assert_eq!(token.trigger, Trigger::WorkItem);
+        assert_eq!((token.range, token.query.as_str()), (4..11, "ENG-12"));
+        assert_eq!(token_at("#", 1).unwrap().query, "");
+        for text in ["##", "a#b", "#a.b", "> #12", "C#"] {
+            assert!(token_at(text, text.len()).is_none(), "{text}");
+        }
+        let known = ["#12".to_owned()].into_iter().collect();
+        assert_eq!(highlight_ranges("see #12 and #13", &known), vec![4..7]);
     }
     #[test]
     fn replacement_and_commands_have_exact_boundaries() {

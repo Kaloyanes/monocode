@@ -351,6 +351,7 @@ fn thread_actions_validate_prompts_targets_and_bounded_waits() {
             json!({"threadId":7,"limit":3,"maxChars":1000}),
         ),
         ("threads.stop", json!({"threadId":7})),
+        ("threads.close", json!({"threadId":7})),
         ("threads.list", json!({})),
     ] {
         assert!(
@@ -377,6 +378,8 @@ fn thread_actions_validate_prompts_targets_and_bounded_waits() {
         ("threads.wait", json!({"threadId":7,"timeoutSeconds":"50"})),
         ("threads.read", json!({"threadId":7,"limit":"3"})),
         ("threads.stop", json!({"threadId":7,"force":true})),
+        ("threads.close", json!({"threadId":0})),
+        ("threads.close", json!({"threadId":7,"archive":false})),
         ("threads.list", json!({"project":"/other"})),
     ] {
         assert!(

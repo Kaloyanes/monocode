@@ -138,7 +138,9 @@ impl ApprovalNotices {
         self.track_pending(sessions);
         let previous = std::mem::take(&mut self.notices);
         for session in sessions {
-            if session.inbox_ask || session.orchestration_worker || session.conversation_focused {
+            // Orchestration workers ask here too: their lead's card only
+            // shows that they wait.
+            if session.inbox_ask || session.conversation_focused {
                 continue;
             }
             let Some(input) = session.notice() else {

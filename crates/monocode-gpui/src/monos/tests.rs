@@ -775,13 +775,17 @@ fn app_actions_are_project_scoped_and_mutation_retries_are_idempotent(cx: &mut T
         assert_eq!(m.roster.get(&s.id).unwrap().launches.len(), 1);
         let owner = m.owner.upgrade().unwrap();
         let view = owner.read(cx).mono_session_entity(child).unwrap();
-        assert!(view.read(cx).has_saved_draft());
+        // A draft launch opens with its prompt in the composer.
+        assert!(view.read(cx).has_unsent_draft());
+        assert_eq!(
+            view.read(cx).input.read(cx).content.as_ref(),
+            "Review the project"
+        );
         assert_eq!(
             locked(&s.store)
                 .unwrap()
-                .follow_ups(child)
+                .composer_draft(child)
                 .unwrap()
-                .draft
                 .unwrap()
                 .text,
             "Review the project"
@@ -1203,6 +1207,25 @@ fn opening_a_session_card_uses_the_shared_sidebar_state(cx: &mut TestAppContext)
         .unwrap();
     visual.run_until_parked();
     assert_eq!(visual.debug_bounds("right-panel-frame").unwrap(), details);
+}
+
+#[gpui::test]
+fn pull_request_cards_open_inside_the_mono(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    s.window
+        .update(cx, |_, _, cx| {
+            s.manager.update(cx, |m, cx| {
+                assert!(!m.open_work_item("https://example.com/page", cx));
+                assert_eq!(m.route, None);
+                m.card_action(
+                    &s.id,
+                    &json!({"type":"pr", "repo":"acme/app", "number":9}),
+                    cx,
+                );
+                assert_eq!(m.route, Some(Route::WorkItem));
+            })
+        })
+        .unwrap();
 }
 
 #[gpui::test]
@@ -1747,4 +1770,162 @@ fn habits_and_documents_search_like_sessions(cx: &mut TestAppContext) {
     search(visual, "mono-document-search", "release");
     assert!(visual.debug_bounds("mono-document-plan").is_none());
     assert!(visual.debug_bounds("mono-document-summary").is_some());
+}
+#[gpui::test]
+fn mono_menu_opens_settings_for_that_mono(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        input::bind(cx);
+        crate::popover::bind(cx);
+    });
+    let s = setup(cx);
+    let handle: gpui::AnyWindowHandle = s.window.into();
+    handle
+        .update(cx, |_, w, cx| {
+            s.manager.update(cx, |m, cx| {
+                m.settings = None;
+                m.open_options(&s.id, None, w, cx);
+                let menu = m.menu.as_ref().unwrap().1.clone();
+                menu.update(cx, |_, cx| {
+                    cx.emit(MenuEvent::Picked("settings".into(), None))
+                });
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    s.manager.read_with(cx, |m, _| {
+        assert!(m.menu.is_none());
+        assert_eq!(m.active.as_deref(), Some(s.id.as_str()));
+        assert!(m.settings == Some(SettingsSection::General));
+    });
+}
+#[gpui::test]
+fn duplicating_to_a_project_copies_identity_and_model_into_a_fresh_mono(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        input::bind(cx);
+        crate::popover::bind(cx);
+    });
+    let s = setup(cx);
+    let web = std::path::Path::new(&s.project).join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    let web = web.to_string_lossy().to_string();
+    {
+        let db = s.store.lock().unwrap();
+        let mut settings = db.agent_settings(s.session).unwrap().unwrap_or_default();
+        settings.model = Some("gpt-test".into());
+        settings.access = AccessMode::ReadOnly;
+        settings.revision += 1;
+        db.configure_agent(s.session, "claude", &settings).unwrap();
+    }
+    mono::files::save(&s.root, &s.id, None, "SOUL.md", "# Soul\nBe brief.", None).unwrap();
+    mono::files::save(&s.root, &s.id, None, "MEMORY.md", "- source only", None).unwrap();
+    s.window
+        .update(cx, |shell, _, _| shell.workspace.add_project(&web))
+        .unwrap();
+    let handle: gpui::AnyWindowHandle = s.window.into();
+    handle
+        .update(cx, |_, w, cx| {
+            s.manager.update(cx, |m, cx| {
+                m.roster.get_mut(&s.id).unwrap().name = "Scout".into();
+                m.open_options(&s.id, None, w, cx);
+                let menu = m.menu.as_ref().unwrap().1.clone();
+                menu.update(cx, |_, cx| {
+                    cx.emit(MenuEvent::Picked("duplicate".into(), None))
+                });
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    s.window
+        .update(cx, |shell, _, _| assert!(shell.project_picker_open()))
+        .unwrap();
+    // The source's own project is listed but cannot be picked, so Enter
+    // lands on the other one even when the search matches both.
+    cx.simulate_keystrokes(handle, "enter");
+    cx.run_until_parked();
+    let (copy, active, project) = s
+        .window
+        .update(cx, |shell, _, cx| {
+            assert!(!shell.project_picker_open());
+            let m = s.manager.read(cx);
+            assert_eq!(m.roster.monos.len(), 2);
+            assert_eq!(m.roster.monos[0].id, s.id);
+            (
+                m.roster.monos[1].clone(),
+                m.active.clone(),
+                shell.workspace.project.clone(),
+            )
+        })
+        .unwrap();
+    assert_eq!(copy.projects, vec![web.clone()]);
+    assert_eq!(copy.name, "Scout · web");
+    assert_eq!(active.as_deref(), Some(copy.id.as_str()));
+    assert_eq!(project, web);
+    let session = copy.session_id.expect("the copy has its own chat");
+    assert_ne!(session, s.session);
+    let db = s.store.lock().unwrap();
+    let settings = db.agent_settings(session).unwrap().unwrap();
+    assert_eq!(settings.model.as_deref(), Some("gpt-test"));
+    assert_eq!(settings.access, AccessMode::ReadOnly);
+    assert_eq!(
+        db.mono_session(session).unwrap().unwrap().provider,
+        "claude"
+    );
+    drop(db);
+    let copied = mono::files::load(&s.root, &copy.id, None).unwrap();
+    assert_eq!(copied.soul.as_deref(), Some("# Soul\nBe brief."));
+    assert_eq!(copied.memory, "");
+}
+#[gpui::test]
+fn a_restart_queues_the_interrupted_turns_continuation_first(cx: &mut TestAppContext) {
+    use crate::{conversation::CONTINUE_PROMPT, restart_resume::Pending};
+    use monocode_core::store::Interrupted;
+    let s = setup(cx);
+    let queued = mono::new_id();
+    let turn = |tool_activity| Pending {
+        id: s.session,
+        turn: Default::default(),
+        interrupted: Interrupted {
+            prompt: Some("Fix the build".into()),
+            attachments: Vec::new(),
+            tool_activity,
+        },
+    };
+    cx.update(|cx| {
+        s.manager.update(cx, |m, cx| {
+            // Hold dispatch so no provider starts.
+            m.chats[&s.id].update(cx, |view, _| {
+                view.settings.usage_limit = Some(Default::default());
+            });
+            m.roster.get_mut(&s.id).unwrap().outbox.push(Message {
+                sent_at: None,
+                id: queued.clone(),
+                text: "Queued later".into(),
+                internal: false,
+                error: None,
+                attachments: Vec::new(),
+            });
+            // Tools ran and no provider session exists: nothing can continue.
+            m.continue_interrupted(turn(true), false, cx);
+            assert_eq!(m.roster.get(&s.id).unwrap().outbox.len(), 1);
+            m.continue_interrupted(turn(true), true, cx);
+        })
+    });
+    cx.run_until_parked();
+    let saved = Roster::load(&locked(&s.store).unwrap()).unwrap();
+    let outbox = &saved.monos[0].outbox;
+    assert_eq!(outbox.len(), 2);
+    assert_eq!(outbox[0].text, CONTINUE_PROMPT);
+    assert!(!outbox[0].internal);
+    assert_eq!(outbox[1].id, queued);
+
+    // Nothing ran before the kill, so the request itself is sent again.
+    cx.update(|cx| {
+        s.manager.update(cx, |m, cx| {
+            m.roster.get_mut(&s.id).unwrap().outbox.clear();
+            m.continue_interrupted(turn(false), false, cx);
+        })
+    });
+    cx.run_until_parked();
+    let saved = Roster::load(&locked(&s.store).unwrap()).unwrap();
+    assert_eq!(saved.monos[0].outbox[0].text, "Fix the build");
 }

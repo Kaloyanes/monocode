@@ -415,6 +415,7 @@ impl VisualView {
                     .id(SharedString::from(format!("visual-table-{key}")))
                     .w_full()
                     .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
                     .flex()
                     .flex_col()
                     .text_size(px(12.));

@@ -21,6 +21,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 mod work;
+mod work_item;
 use crate::{
     conversation::{Conversation, MonoSubmitted, SessionChanged},
     input::{self, Input},
@@ -50,6 +51,8 @@ use std::{
     time::Duration,
 };
 pub(crate) struct Changed;
+/// Asks the shell to choose a project for a copy of this Mono.
+pub(crate) struct DuplicateRequested(pub String);
 pub(crate) struct TabOpened(pub String);
 pub(crate) struct ShowDetails(pub String);
 pub(crate) use notifications::{NotificationChanged, NotificationFinished};
@@ -121,6 +124,7 @@ pub(crate) struct Monos {
     html_documents: HashMap<String, Entity<html::Html>>,
     project_changes: changes::ProjectChanges,
     review: Option<Entity<crate::review::ReviewPane>>,
+    work_item: Option<work_item::Page>,
     activity: Option<(String, Entity<crate::transcript::TranscriptView>)>,
     activity_turn: Option<usize>,
     rail_ids: Vec<String>,
@@ -151,6 +155,39 @@ pub(crate) struct Monos {
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
 impl EventEmitter<ShowDetails> for Monos {}
+impl EventEmitter<DuplicateRequested> for Monos {}
+fn home() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into())
+}
+/// A new Mono's chat: the preferred provider with full access.
+fn default_chat(prefs: &crate::settings::Preferences) -> (Kind, Settings) {
+    let provider = prefs
+        .default_provider
+        .as_deref()
+        .and_then(Kind::parse)
+        .unwrap_or(Kind::Codex);
+    let settings = Settings {
+        access: AccessMode::Auto,
+        model: prefs.stable_model(provider.id(), &home()),
+        ..Default::default()
+    };
+    (provider, settings)
+}
+/// Mono chats run from home; their projects come from the Mono context.
+fn start_chat(
+    db: &monocode_core::store::Store,
+    mono: &Mono,
+    provider: &str,
+    settings: &Settings,
+) -> Result<Session, String> {
+    let mut summary = db.create(provider, &home())?;
+    summary.title = mono.label();
+    db.title(summary.id, &summary.title)?;
+    db.configure_agent(summary.id, provider, settings)?;
+    Ok(summary)
+}
 impl Monos {
     pub(crate) fn resource_sessions(
         &self,
@@ -168,6 +205,18 @@ impl Monos {
                         provider: s.provider.clone(),
                     },
                 )
+            })
+            .collect()
+    }
+    /// The Monos' chats and habits working now, for keep-awake.
+    pub(crate) fn busy_sessions(&self, cx: &App) -> Vec<(i64, gpui::SharedString)> {
+        self.chats
+            .values()
+            .chain(self.running.values().map(|r| &r.view))
+            .filter(|v| v.read(cx).responding())
+            .map(|v| {
+                let s = &v.read(cx).summary;
+                (s.id, s.title.clone().into())
             })
             .collect()
     }
@@ -350,6 +399,7 @@ impl Monos {
             html_documents: HashMap::new(),
             project_changes: Default::default(),
             review: None,
+            work_item: None,
             activity: None,
             activity_turn: None,
             rail_ids: Vec::new(),
@@ -397,6 +447,61 @@ impl Monos {
                 }
             }
         }));
+        if this.prefs.monos {
+            cx.spawn(async move |this, cx| {
+                // A provider left by the previous run could still drive the
+                // same session.
+                let started = std::time::Instant::now();
+                while !crate::restart_resume::reaped()
+                    && started.elapsed() < Duration::from_secs(10)
+                {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                }
+                let Ok((store, turns)) = this.update(cx, |this, _| {
+                    let sessions: Vec<_> = this
+                        .roster
+                        .monos
+                        .iter()
+                        .filter_map(|m| m.session_id)
+                        .collect();
+                    (
+                        this.store.clone(),
+                        crate::restart_resume::take_owned(&sessions),
+                    )
+                }) else {
+                    return;
+                };
+                if turns.is_empty() {
+                    return;
+                }
+                let turns = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let db = locked(&store).ok();
+                        turns
+                            .into_iter()
+                            .map(|turn| {
+                                let resumable = db.as_ref().is_some_and(|db| {
+                                    db.mono_session(turn.id)
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|s| s.provider_id.is_some())
+                                });
+                                (turn, resumable)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    for (turn, resumable) in turns {
+                        this.continue_interrupted(turn, resumable, cx);
+                    }
+                });
+            })
+            .detach();
+        }
         if this.prefs.monos
             && let Some(id) = active.filter(|id| this.roster.get(id).is_some())
         {
@@ -671,23 +776,8 @@ impl Monos {
                     .collect::<Vec<_>>();
                 return Ok::<_, String>((summary, None, delivered));
             }
-            let home = std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .unwrap_or_else(|_| ".".into());
-            let provider = prefs
-                .default_provider
-                .as_deref()
-                .and_then(Kind::parse)
-                .unwrap_or(Kind::Codex);
-            let mut summary = db.create(provider.id(), &home)?;
-            summary.title = mono.label();
-            db.title(summary.id, &summary.title)?;
-            let settings = Settings {
-                access: AccessMode::Auto,
-                model: prefs.stable_model(provider.id(), &home),
-                ..Default::default()
-            };
-            db.configure_agent(summary.id, provider.id(), &settings)?;
+            let (provider, settings) = default_chat(&prefs);
+            let summary = start_chat(&db, &mono, provider.id(), &settings)?;
             Ok((summary, Some(settings), Vec::new()))
         });
         cx.spawn(async move |this, cx| {
@@ -761,7 +851,7 @@ impl Monos {
                         if empty {
                             this.enqueue(
                                 &source,
-                                "Continue from where you left off.".into(),
+                                crate::conversation::CONTINUE_PROMPT.into(),
                                 Vec::new(),
                                 false,
                                 cx,
@@ -849,6 +939,53 @@ impl Monos {
             });
         })
         .detach();
+    }
+    /// Continue a turn a quit, crash or update restart cut short. The
+    /// interrupted message was already delivered, so nothing else resends it.
+    fn continue_interrupted(
+        &mut self,
+        turn: crate::restart_resume::Pending,
+        resumable: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let interrupted = turn.interrupted;
+        let (text, attachments) = if resumable {
+            (crate::conversation::CONTINUE_PROMPT.to_owned(), Vec::new())
+        } else if let Some(prompt) = interrupted.prompt.filter(|_| !interrupted.tool_activity) {
+            // No provider session was opened, so nothing ran yet.
+            let attachments = interrupted
+                .attachments
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            (prompt, attachments)
+        } else {
+            return;
+        };
+        let Some(mono) = self
+            .roster
+            .monos
+            .iter_mut()
+            .find(|m| m.session_id == Some(turn.id))
+        else {
+            return;
+        };
+        let id = mono.id.clone();
+        // Ahead of anything queued later, which the interrupted turn preceded.
+        mono.outbox.insert(
+            0,
+            Message {
+                id: mono::new_id(),
+                text,
+                sent_at: Some(monocode_core::time::now_ms()),
+                internal: false,
+                error: None,
+                attachments,
+            },
+        );
+        self.save(cx);
+        self.configure_chat(&id, cx);
+        self.ensure_chat(&id, cx);
     }
     /// Retry clears a queued message's error; discard drops it.
     fn queue_changed(&mut self, source: &str, id: &str, remove: bool, cx: &mut Context<Self>) {
@@ -1575,6 +1712,13 @@ impl gpui::Render for Monos {
                     cx.notify();
                 }
             }))
+            .on_action(
+                cx.listener(|this, link: &crate::inbox::OpenWorkLink, _, cx| {
+                    if !this.open_work_item(&link.0, cx) {
+                        cx.propagate();
+                    }
+                }),
+            )
             .capture_any_mouse_down(|_, window, _| {
                 #[cfg(target_os = "macos")]
                 crate::traffic_lights::focus_content(window);
@@ -1603,8 +1747,7 @@ impl gpui::Render for Monos {
                         } else {
                             d
                         }
-                    })
-                    .when(!self.original_chrome, |d| d.child(self.topbar(&mono, cx))),
+                    }),
             )
             .children(self.settings_modal(&mono, window, cx))
             .children(self.picker_surface(cx))

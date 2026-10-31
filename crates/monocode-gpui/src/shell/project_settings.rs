@@ -245,6 +245,12 @@ impl Shell {
         } else {
             None
         };
+        let chat = if chat.read(cx).holds_live_draft(cx) {
+            chat.into_any_element()
+        } else {
+            chat.cached(StyleRefinement::default().size_full())
+                .into_any_element()
+        };
         div()
             .flex_1()
             .min_h_0()
@@ -253,12 +259,7 @@ impl Shell {
             .when_some(background, |d, background| {
                 d.child(background.cached(StyleRefinement::default().absolute().size_full()))
             })
-            .child(
-                div()
-                    .relative()
-                    .size_full()
-                    .child(chat.cached(StyleRefinement::default().size_full())),
-            )
+            .child(div().relative().size_full().child(chat))
             .children(linked.map(|notice| {
                 div()
                     .absolute()

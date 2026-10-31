@@ -71,6 +71,22 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 native_identity="${MONOCODE_NATIVE_SIGNING_IDENTITY:--}"
+# The CEF host for Chromium drafts ships beside the app's executable, signed
+# on its own: it alone may load the downloaded, unsigned CEF framework.
+native_cef_host="${MONOCODE_CEF_HOST_BINARY:-crates/monocode-cef-host/target/$native_profile/monocode-cef-host}"
+rm -f "$native_bundle/Contents/MacOS/monocode-cef-host"
+if [ -f "$native_cef_host" ]; then
+  cp "$native_cef_host" "$native_bundle/Contents/MacOS/monocode-cef-host"
+  if [ "$native_identity" = - ]; then
+    codesign --force --sign - "$native_bundle/Contents/MacOS/monocode-cef-host"
+  else
+    codesign --force --sign "$native_identity" --options runtime --timestamp \
+      --entitlements crates/monocode-cef-host/Entitlements.plist \
+      "$native_bundle/Contents/MacOS/monocode-cef-host"
+  fi
+else
+  echo "No CEF host at $native_cef_host; Chromium drafts will be unavailable." >&2
+fi
 if [ "$native_identity" = - ]; then
   codesign --force --sign - "$native_bundle"
 else

@@ -434,6 +434,10 @@ impl Accounts {
     /// A finished turn is when usage changes, so fetch then, but let quick
     /// back-to-back turns share one request.
     pub(crate) fn refresh_after_turn(&mut self, key: Key, cx: &mut Context<Self>) {
+        // Saves a hotspot's data; the next turn off it catches up.
+        if crate::keep_awake::on_hotspot() {
+            return;
+        }
         let recent = self
             .usage
             .get(&key)

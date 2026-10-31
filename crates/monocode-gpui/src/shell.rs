@@ -8,6 +8,7 @@ mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
+mod devices;
 mod drafts;
 mod file_panes;
 mod idle_agents;
@@ -25,11 +26,20 @@ mod orchestration;
 mod picker_preferences;
 #[cfg(all(test, target_os = "macos"))]
 mod plan_rail_shots;
+mod project_picker;
 mod project_rail;
 mod project_removal;
 mod project_settings;
 mod quick_composer;
 mod quick_open;
+#[cfg(all(test, target_os = "macos"))]
+mod rail_shots;
+#[cfg(all(test, target_os = "macos"))]
+mod home_shots;
+#[cfg(all(test, target_os = "macos"))]
+mod keep_awake_shots;
+#[cfg(all(test, target_os = "macos"))]
+mod visualizations_shots;
 mod rails;
 mod remote_projects;
 mod remote_sessions;
@@ -44,6 +54,7 @@ mod settings;
 mod shortcuts;
 mod sidebar_list;
 mod sidebar_peek;
+mod space_reorder;
 mod space_swipe;
 mod terminal_dock;
 mod threads;
@@ -97,6 +108,7 @@ actions!(
     [
         NewCodex,
         NewClaude,
+        NewInProject,
         OpenProject,
         CloseTab,
         CloseAllTabs,
@@ -118,8 +130,12 @@ actions!(
         NextSessionInTab,
         PreviousProject,
         NextProject,
+        MoveProjectBack,
+        MoveProjectForward,
         SwitchModel,
+        ChangeEffort,
         ToggleRightPanel,
+        ToggleDevice,
         SplitRight,
         SplitDown,
         FocusPaneLeft,
@@ -170,6 +186,7 @@ impl Render for Chrome {
                     if shell.space_swipe.animating()
                         || shell.spaces_nudge.is_some()
                         || shell.classic_tabs.animating()
+                        || shell.space_reorder.animating()
                         || shell.sidebar_list.cascade.active()
                     {
                         window.request_animation_frame();
@@ -210,7 +227,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-n"), NewCodex, context),
         KeyBinding::new(&format!("{modifier}-t"), NewCodex, context),
-        KeyBinding::new(&format!("{modifier}-shift-n"), NewClaude, context),
+        KeyBinding::new(&format!("{modifier}-shift-n"), NewInProject, context),
         KeyBinding::new(&format!("{modifier}-o"), OpenProject, context),
         KeyBinding::new(&format!("{modifier}-p"), GoToFile, context),
         KeyBinding::new(&format!("{modifier}-shift-p"), OpenCommandPalette, context),
@@ -253,7 +270,10 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-down"), NextSessionInTab, context),
         KeyBinding::new(&format!("{modifier}-shift-left"), PreviousProject, context),
         KeyBinding::new(&format!("{modifier}-shift-right"), NextProject, context),
+        KeyBinding::new(&format!("{modifier}-alt-shift-left"), MoveProjectBack, context),
+        KeyBinding::new(&format!("{modifier}-alt-shift-right"), MoveProjectForward, context),
         KeyBinding::new(&format!("{modifier}-."), SwitchModel, context),
+        KeyBinding::new(&format!("{modifier}-/"), ChangeEffort, context),
         KeyBinding::new(&format!("{modifier}-shift-b"), ToggleRightPanel, context),
         KeyBinding::new(&format!("{modifier}-d"), SplitRight, context),
         KeyBinding::new(&format!("{modifier}-j"), ToggleTerminal, context),
@@ -579,6 +599,7 @@ struct SessionPreview {
 pub(crate) struct Shell {
     monos: Option<Entity<crate::monos::Monos>>,
     quick_open: Option<quick_open::Open>,
+    project_picker: Option<project_picker::Open>,
     image_lightbox: Option<(Entity<crate::image_lightbox::ImageLightbox>, Subscription)>,
     app_bridge: Option<monocode_core::mono::bridge::Server>,
     /// The live pages behind the agent's draft cards, by conversation.
@@ -586,7 +607,7 @@ pub(crate) struct Shell {
     mobile: mobile_host::Mobile,
     app_results: HashMap<(i64, String), (String, Result<serde_json::Value, String>)>,
     app_pending: HashSet<(i64, String)>,
-    orchestrations: HashMap<i64, orchestration::Run>,
+    orchestrations: orchestration::Runs,
     /// Each lead's last orchestration, whose agents hang under it in the sidebar.
     orchestration_summaries: HashMap<i64, monocode_core::orchestration::Summary>,
     /// Sessions an /operator thread started, by the session that started them.
@@ -599,10 +620,13 @@ pub(crate) struct Shell {
     usage_footer: Entity<UsageFooter>,
     /// The footer's high-usage chip and its running-work dialog.
     resources: Entity<ResourceMonitor>,
+    /// The footer's keep-awake pill: holds the Mac awake for running agents.
+    keep_awake: Entity<crate::keep_awake::KeepAwake>,
     sidebar_frame: Entity<Chrome>,
     projects_frame: Entity<Chrome>,
     project_rail_list: project_rail::ProjectRailList,
     project_rail_drag: Option<project_rail::ProjectRailDrag>,
+    space_reorder: space_reorder::SpaceReorder,
     project_rail_stats: project_rail::ProjectRailStats,
     project_resize: Option<(Pixels, f32)>,
     classic_sidebar_tab: classic_sidebar::ClassicSidebarTab,
@@ -635,6 +659,8 @@ pub(crate) struct Shell {
     /// Lightweight history index; only opened or previewed chats own GPUI entities.
     session_summaries: HashMap<i64, Session>,
     draft_sessions: HashSet<i64>,
+    /// Threads with unsent composer text saved at startup, until they load.
+    composer_draft_sessions: HashSet<i64>,
     usage_limits: HashMap<i64, monocode_core::usage::Limit>,
     history_recency: HashMap<i64, u64>,
     history_clock: u64,
@@ -658,6 +684,8 @@ pub(crate) struct Shell {
     external_editors: Option<Vec<monocode_core::external_editor::ExternalEditor>>,
     groups: HashMap<String, monocode_core::session_groups::Groups>,
     reminders: Vec<monocode_core::store::Reminder>,
+    /// When each archived thread was archived, for the archive's order.
+    archive_times: HashMap<i64, u64>,
     renaming: Option<session_groups::Renaming>,
     link_dialog: Option<session_groups::LinkDialog>,
     action_dialog: Option<actions::ActionDialog>,
@@ -862,6 +890,14 @@ impl Shell {
             })
         })
         .detach();
+        // Typing saves after a short pause; quitting must not wait for it.
+        cx.on_app_quit(|this, cx| {
+            for view in this.sessions.values() {
+                view.update(cx, |view, cx| view.flush_composer_draft(cx));
+            }
+            async {}
+        })
+        .detach();
         let remote_clock = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -876,7 +912,8 @@ impl Shell {
             }
         });
         let metadata: Vec<_> = summaries.iter().map(|s| (s.id, s.cwd.clone())).collect();
-        let workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
+        let mut workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
+        workspace.ensure_home_project();
         monocode_core::cli::initialize(&workspace.preferences.binary_paths);
         let latest_state = Arc::new(Mutex::new(serde_json::to_string(&workspace).unwrap()));
         let quit_state = latest_state.clone();
@@ -957,8 +994,26 @@ impl Shell {
                 m.update(cx, |m, cx| m.stop_session(*id, cx));
             }
         });
+        let keep_awake_prefs = workspace.preferences.keep_awake.clone();
+        let keep_awake = cx.new(|cx| {
+            crate::keep_awake::KeepAwake::new(keep_awake_prefs, crate::data_dir(), cx)
+        });
+        let keep_awake_changes = cx.subscribe(
+            &keep_awake,
+            |this, _, crate::keep_awake::PrefsChanged(prefs), cx| {
+                this.workspace.preferences.keep_awake = prefs.clone();
+                cx.set_global(this.workspace.preferences.clone());
+                this.persist(cx);
+                this.sync_settings(cx);
+            },
+        );
         let worktree_focus = workspace.worktree_focus.clone();
         let session_worktrees = sidebar_metadata.worktrees;
+        let mut orchestration_summaries = sidebar_metadata.orchestrations;
+        let orchestrations = orchestration::Runs::restore(
+            sidebar_metadata.orchestration_runs,
+            &mut orchestration_summaries,
+        );
         let notification_state = notifications::State::new(&workspace, store.clone(), cx);
         let classic_session_search = classic_sidebar::session_search(cx);
         let classic_search_subscription =
@@ -973,14 +1028,15 @@ impl Shell {
         let mut this = Self {
             monos: None,
             quick_open: None,
+            project_picker: None,
             image_lightbox: None,
             app_bridge: None,
             drafts: HashMap::new(),
             mobile: mobile_host::Mobile::default(),
             app_results: HashMap::new(),
             app_pending: HashSet::new(),
-            orchestrations: HashMap::new(),
-            orchestration_summaries: sidebar_metadata.orchestrations,
+            orchestrations,
+            orchestration_summaries,
             started_by: sidebar_metadata.started_by,
             thread_parents: sidebar_metadata.thread_parents,
             thread_waiters: HashMap::new(),
@@ -988,10 +1044,12 @@ impl Shell {
             rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
+            keep_awake,
             sidebar_frame,
             projects_frame,
             project_rail_list: project_rail::ProjectRailList::new(cx),
             project_rail_drag: None,
+            space_reorder: Default::default(),
             project_rail_stats: Default::default(),
             project_resize: None,
             classic_sidebar_tab,
@@ -1020,6 +1078,7 @@ impl Shell {
             sessions: HashMap::new(),
             session_summaries: HashMap::new(),
             draft_sessions: sidebar_metadata.drafts,
+            composer_draft_sessions: sidebar_metadata.composer_drafts,
             usage_limits: sidebar_metadata.usage_limits,
             history_recency: HashMap::new(),
             history_clock: 0,
@@ -1039,6 +1098,7 @@ impl Shell {
             external_editors: None,
             groups: sidebar_metadata.groups,
             reminders: sidebar_metadata.reminders,
+            archive_times: sidebar_metadata.archive_times,
             renaming: None,
             link_dialog: None,
             action_dialog: None,
@@ -1165,6 +1225,7 @@ impl Shell {
                 git_observation,
                 resource_observation,
                 resource_stops,
+                keep_awake_changes,
                 classic_search_subscription,
             ],
             generation: Arc::new(AtomicU64::new(0)),
@@ -1211,6 +1272,18 @@ impl Shell {
         ));
         this.observations.push(cx.subscribe(
             &monos,
+            |_, _, request: &crate::monos::DuplicateRequested, cx| {
+                let intent = project_picker::Intent::DuplicateMono(request.0.clone());
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.open_project_picker(intent, window, cx)
+                    });
+                })
+                .detach();
+            },
+        ));
+        this.observations.push(cx.subscribe(
+            &monos,
             |_, _, request: &crate::monos::ShowDetails, cx| {
                 let id = request.0.clone();
                 cx.spawn(async move |this, cx| {
@@ -1242,8 +1315,21 @@ impl Shell {
                     mono_error = error.clone();
                     cx.notify();
                 }
+                this.sync_keep_awake(cx);
             }));
         this.monos = Some(monos);
+        // A backstop for turns that start or end without a mark refresh.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                if this.update(cx, |this, cx| this.sync_keep_awake(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         this.bind_notices(cx);
         this.init_app_bridge(cx);
         this.init_draft_inbox(cx);
@@ -1347,6 +1433,14 @@ impl Shell {
             // the indexed working directory so those events cannot erase it.
             view.restore_worktree(worktree, None, cx);
             view.draft_hint = self.draft_sessions.contains(&id);
+            if self.composer_draft_sessions.contains(&id)
+                && let Some(draft) = locked(&self.store)
+                    .and_then(|s| s.composer_draft(id))
+                    .ok()
+                    .flatten()
+            {
+                view.restore_composer_draft(draft, cx);
+            }
             view.driven_by = self.thread_parents.get(&id).copied();
             view.managed |= view.driven_by.is_some() || self.orchestration_worker(id);
             if let Some(lead) = view.driven_by {
@@ -1423,6 +1517,12 @@ impl Shell {
                 .detach();
             },
         ));
+        self.observations.push(cx.subscribe(
+            &thread_transcript,
+            move |this, _, event: &crate::conversation::CloseThreads, cx| {
+                this.close_threads(id, &event.0, cx);
+            },
+        ));
         self.observations
             .push(cx.subscribe(&view, |this, _, transfer: &Transfer, cx| {
                 this.transfer_response(transfer.clone(), cx)
@@ -1452,6 +1552,9 @@ impl Shell {
         if !self.order.contains(&id) {
             self.order.push(id);
         }
+        if self.orchestrations.has_runs(id) {
+            self.push_orchestration_views(id, cx);
+        }
     }
     /// SessionPane's reviewUndoLocked: another running session shares the checkout.
     fn sync_review_locks(&mut self, cx: &mut Context<Self>) {
@@ -1477,6 +1580,7 @@ impl Shell {
         };
         let session = view.read(cx);
         let busy = session.responding();
+        let was_busy = self.busy_sessions.contains(&id);
         let focused = !self.app_view_open() && self.workspace.active == Some(id);
         if busy {
             self.busy_sessions.insert(id);
@@ -1509,6 +1613,27 @@ impl Shell {
         let provider = session.summary.provider.clone();
         self.session_marks[&id].update(cx, |mark, cx| mark.set(&provider, state, cx));
         self.tab_marks[&id].update(cx, |mark, cx| mark.set(&provider, tab_state, cx));
+        if was_busy != self.busy_sessions.contains(&id) {
+            self.sync_keep_awake(cx);
+        }
+    }
+    /// Every working agent, chats and Monos alike, keeps the Mac awake. Reads
+    /// the views themselves: `busy_sessions` misses some transitions.
+    fn sync_keep_awake(&mut self, cx: &mut Context<Self>) {
+        let mut agents: Vec<(i64, SharedString)> = self
+            .sessions
+            .iter()
+            .filter(|(_, view)| view.read(cx).responding())
+            .map(|(id, view)| (*id, view.read(cx).display_title().into()))
+            .collect();
+        if let Some(monos) = &self.monos {
+            agents.extend(monos.read(cx).busy_sessions(cx));
+        }
+        agents.sort_by_key(|(id, _)| *id);
+        agents.dedup_by_key(|(id, _)| *id);
+        let titles = agents.into_iter().map(|(_, title)| title).collect();
+        self.keep_awake
+            .update(cx, |keep, cx| keep.set_agents(titles, cx));
     }
     fn toggle_archive(&mut self, id: i64, cx: &mut Context<Self>) {
         if !self.archiving.insert(id) {
@@ -1529,6 +1654,9 @@ impl Shell {
                         if let Some(summary) = this.session_summaries.get_mut(&id) {
                             summary.archived = archived;
                         }
+                        if archived {
+                            this.archive_times.insert(id, monocode_core::time::now_ms());
+                        }
                         if let Some(view) = this.sessions.get(&id) {
                             view.update(cx, |session, cx| {
                                 session.summary.archived = archived;
@@ -1539,6 +1667,10 @@ impl Shell {
                             });
                         }
                         this.refresh_session_mark(id, cx);
+                        if this.thread_parents.contains_key(&id) {
+                            // A restored child returns to its lead's rail.
+                            this.thread_session_changed(id, cx);
+                        }
                         if archived {
                             this.start_archive_exit(id, window, cx);
                         }
@@ -1687,7 +1819,10 @@ impl Shell {
             && (!self.workspace.classic_layout
                 || self.mono_active(cx)
                 || self.right_panel.as_ref().is_some_and(|panel| {
-                    matches!(panel.read(cx).tab(), crate::right_panel::RightTab::Plan)
+                    matches!(
+                        panel.read(cx).tab(),
+                        crate::right_panel::RightTab::Plan | crate::right_panel::RightTab::Device
+                    )
                 }))
             && !self.app_view_open()
             && self.settings.is_none()
@@ -1696,8 +1831,12 @@ impl Shell {
     }
     fn sync_right_panel(&mut self, cx: &mut Context<Self>) {
         let opening = self.right_slide.as_ref().is_some_and(PaneSlide::opening);
+        // Classic shows the panel only for the plan and a device.
+        let device_tab = self.right_panel.as_ref().is_some_and(|panel| {
+            panel.read(cx).tab() == crate::right_panel::RightTab::Device
+        });
         let shown = !self.mono_active(cx)
-            && !self.workspace.classic_layout
+            && (!self.workspace.classic_layout || device_tab)
             && self.workspace.right_panel_open
             && !self.app_view_open()
             && self.settings.is_none()
@@ -1711,10 +1850,12 @@ impl Shell {
             .then(|| self.classic_sidebar_tab.tool_tab())
             .flatten();
             let terminal_tab = self.terminal_in_panel(cx);
+            let device_tab = self.devices_in_panel();
             panel.update(cx, |p, cx| {
                 p.set_shown(shown, cx);
                 p.set_sidebar_tab(sidebar_tab, cx);
                 p.set_terminal_tab(terminal_tab, cx);
+                p.set_device_tab(device_tab, cx);
             });
         }
     }
@@ -1834,11 +1975,23 @@ impl Shell {
             self.workspace.changes_view,
         );
         let terminal_tab = self.terminal_in_panel(cx);
+        let device_tab = self.devices_in_panel();
         let panel = cx.new(|cx| {
             let mut panel = RightPanel::new(git, tab, order, window, cx);
             panel.set_terminal_tab(terminal_tab, cx);
+            panel.set_device_tab(device_tab, cx);
             panel
         });
+        let device = panel.read(cx).device.clone();
+        self.observations.push(cx.subscribe_in(
+            &device,
+            window,
+            |this, _, event: &crate::device::DeviceEvent, window, cx| match event {
+                crate::device::DeviceEvent::OpenSettings => {
+                    this.open_settings(crate::settings::Section::Devices, window, cx)
+                }
+            },
+        ));
         let explorer = panel.read(cx).explorer.clone();
         self.observations.push(cx.subscribe(
             &explorer,
@@ -1896,6 +2049,10 @@ impl Shell {
                         this.workspace.right_panel_tab = *tab;
                         if *tab == crate::right_panel::RightTab::Terminal {
                             this.ensure_panel_terminal(cx);
+                        }
+                        // Classic shows the panel for a device too.
+                        if *tab == crate::right_panel::RightTab::Device {
+                            this.sync_right_panel(cx);
                         }
                     }
                     PanelEvent::Reordered(order) => this.workspace.right_panel_tabs = order.clone(),
@@ -2165,18 +2322,7 @@ impl Shell {
                     }
                     ReviewEvent::Comment(text) => {
                         let owner = this.workspace.session_for_pane(id);
-                        // Diff comments become chips; short file references
-                        // read fine as text.
-                        match monocode_core::diff::comment_label(text) {
-                            Some(label) => this.add_snippet_to_chat(
-                                owner,
-                                monocode_core::composer::Snippet::Comment,
-                                Some(label),
-                                text,
-                                cx,
-                            ),
-                            None => this.add_to_chat(owner, text, cx),
-                        }
+                        this.add_to_chat(owner, text, cx);
                     }
                     ReviewEvent::Empty => this.close_review(id, cx),
                     ReviewEvent::DragPane(position) => {
@@ -2338,35 +2484,8 @@ impl Shell {
             return;
         }
         input.update(cx, |input, cx| {
-            let draft = input.content.to_string();
-            let separator = if draft.is_empty() || draft.ends_with("\n\n") {
-                ""
-            } else if draft.ends_with('\n') {
-                "\n"
-            } else {
-                "\n\n"
-            };
-            input.set_text(format!("{draft}{separator}{}\n\n", text.trim()), cx);
-        });
-        self.chat_hidden_off(id, cx);
-        self.pending_composer_focus = Some(id);
-        cx.notify();
-    }
-    /// A terminal selection or diff comment joins the tab's attachments as a
-    /// compact chip.
-    fn add_snippet_to_chat(
-        &mut self,
-        id: i64,
-        kind: monocode_core::composer::Snippet,
-        label: Option<String>,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(view) = self.ensure_session(id, cx) else {
-            return;
-        };
-        view.update(cx, |view, cx| {
-            view.attach_snippet(kind, label, text.to_owned(), cx)
+            let draft = monocode_core::composer::append_block(&input.content, text);
+            input.set_text(draft, cx);
         });
         self.chat_hidden_off(id, cx);
         self.pending_composer_focus = Some(id);
@@ -3111,13 +3230,7 @@ impl Shell {
                 if let TerminalEvent::AddToChat(text) = event
                     && let Some(id) = this.workspace.active
                 {
-                    this.add_snippet_to_chat(
-                        id,
-                        monocode_core::composer::Snippet::Terminal,
-                        None,
-                        text,
-                        cx,
-                    );
+                    this.add_to_chat(id, text, cx);
                 }
                 cx.notify()
             }),
@@ -4375,6 +4488,7 @@ impl Shell {
     fn history_buttons_blocked(&self) -> bool {
         self.menu.is_some()
             || self.quick_open.is_some()
+            || self.project_picker.is_some()
             || self.link_dialog.is_some()
             || self.action_dialog.is_some()
             || self.remote_project_picker.is_some()
@@ -4898,6 +5012,9 @@ impl Shell {
                 && panel.read(cx).tab() == crate::right_panel::RightTab::Terminal
             {
                 self.panel_terminal(window, cx)
+            } else if panel.read(cx).tab() == crate::right_panel::RightTab::Device {
+                // The device's native view is placed on every paint.
+                div().size_full().child(panel).into_any_element()
             } else {
                 panel
                     .cached(StyleRefinement::default().size_full())
@@ -5361,7 +5478,11 @@ impl Shell {
     /// Explorer and History, and Terminal when it lives in the panel. Changes
     /// opens from the diff stat instead.
     fn right_tab_count(&self, cx: &App) -> usize {
-        2 + usize::from(self.terminal_in_panel(cx))
+        2 + usize::from(self.terminal_in_panel(cx)) + usize::from(self.devices_in_panel())
+    }
+    /// Settings › Devices adds the Device tab.
+    pub(crate) fn devices_in_panel(&self) -> bool {
+        cfg!(target_os = "macos") && self.workspace.preferences.devices
     }
     /// The toggle's room at the end of the strip: `pl-1.5`, the button, `pr-3`.
     fn toggle_room(&self, cx: &App) -> f32 {
@@ -5837,6 +5958,37 @@ impl Shell {
                         .into(),
                     ]);
                 }
+                let peers = self.workspace.project_peers(path);
+                if peers.len() > 1 {
+                    let ix = peers.iter().position(|p| p == path).unwrap_or(0);
+                    let (first, last) = (ix == 0, ix + 1 == peers.len());
+                    let (back, forward) = if self.workspace.classic_layout {
+                        ("Move up", "Move down")
+                    } else {
+                        ("Move left", "Move right")
+                    };
+                    let shortcut = |command| {
+                        crate::settings::command_shortcut(&self.workspace.preferences, command)
+                    };
+                    let step = |id, label, command, disabled| {
+                        let action = MenuAction::new(id, label).disabled(disabled);
+                        match shortcut(command) {
+                            Some(keys) => action.shortcut(keys),
+                            None => action,
+                        }
+                    };
+                    items.push(
+                        MenuAction::new("move", "Move")
+                            .icon("chevrons-up-down")
+                            .submenu(vec![
+                                step("move:back", back, "Project: Move Back", first),
+                                step("move:forward", forward, "Project: Move Forward", last),
+                                MenuAction::new("move:start", "Move to start").disabled(first),
+                                MenuAction::new("move:end", "Move to end").disabled(last),
+                            ])
+                            .into(),
+                    );
+                }
                 items.extend([
                     MenuAction::new("reveal", REVEAL_LABEL)
                         .icon("folder-open")
@@ -5948,6 +6100,16 @@ impl Shell {
                     );
                 } else if let Some(group) = action.strip_prefix("project-group:") {
                     self.assign_project_rail_group(&path, group, cx);
+                } else if let Some(direction) = action.strip_prefix("move:") {
+                    let moved = match direction {
+                        "back" => self.workspace.step_project_order(&path, -1),
+                        "forward" => self.workspace.step_project_order(&path, 1),
+                        "start" => self.workspace.move_project_to_end(&path, -1),
+                        _ => self.workspace.move_project_to_end(&path, 1),
+                    };
+                    if moved {
+                        self.project_order_changed(&path, cx);
+                    }
                 } else if action == "reveal" {
                     if path.starts_with("remote://") {
                         self.error = Some("Remote folders stay on their host machine.".into());
@@ -6127,6 +6289,27 @@ impl Shell {
                 .then(|| ("pin", "Pinned".to_owned())),
         }
     }
+    /// The pill naming an archived thread's folder or Pinned group.
+    fn archived_origin_badge(&self, id: i64, cx: &App) -> Option<AnyElement> {
+        let (glyph, label) = self.archived_origin(id, cx)?;
+        Some(
+            div()
+                .debug_selector(move || format!("session-origin-{id}"))
+                .h(px(16.))
+                .px(px(6.))
+                .flex()
+                .items_center()
+                .gap_1()
+                .rounded_full()
+                .border_1()
+                .border_color(content(0.15))
+                .text_size(px(10.))
+                .text_color(content(0.5))
+                .child(icon(glyph, 10.))
+                .child(div().max_w(px(90.)).truncate().child(label))
+                .into_any(),
+        )
+    }
     fn session_row(&self, id: i64, cx: &mut Context<Self>) -> AnyElement {
         self.session_row_with(id, false, None, cx)
     }
@@ -6192,7 +6375,7 @@ impl Shell {
             mark.update(cx, |mark, cx| mark.set_size(side, cx));
         }
         let work_item = self.work_item_badge(id, compact, cx);
-        let origin = self.archived_origin(id, cx);
+        let origin = self.archived_origin_badge(id, cx);
         let has_badges = work_item.is_some()
             || origin.is_some()
             || mode.is_some()
@@ -6208,7 +6391,7 @@ impl Shell {
             .cloned()
             .unwrap_or_default();
         self.sidebar_list.track_anchor(anchor.clone());
-        let draft = session.has_saved_draft();
+        let draft = session.shows_draft();
         let (model, branch, workspace_label) = if compact {
             (SharedString::default(), None, String::new())
         } else {
@@ -6321,29 +6504,19 @@ impl Shell {
             .items_center()
             .gap_1()
             .flex_shrink_0()
-            .when_some(origin, |d, (glyph, label)| {
-                d.child(
-                    div()
-                        .debug_selector(move || format!("session-origin-{id}"))
-                        .h(px(16.))
-                        .px(px(6.))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(content(0.15))
-                        .text_size(px(10.))
-                        .text_color(content(0.5))
-                        .child(icon(glyph, 10.))
-                        .child(div().max_w(px(90.)).truncate().child(label)),
-                )
-            })
+            .children(origin)
             .children(work_item)
             .when(
                 self.automation_state.session_automations.contains_key(&id),
                 |row| row.child(icon("zap", 12.).text_color(content(0.35))),
             )
+            // An orchestrator says how far its agents have got.
+            .children(match rail {
+                Some((rails::Rail::Agents(summary), _)) => {
+                    Some(self.agent_progress(id, summary, compact, cx))
+                }
+                _ => None,
+            })
             // Marked on the right like a linked issue or PR, in its mode's colour.
             .when_some(mode, |d, (glyph, color, label)| {
                 d.child(
@@ -6657,7 +6830,7 @@ impl Shell {
                     .child(icon("check-circle-2", 14.).text_color(rgb(0x2dd4bf)))
                     .child("Done")
                     .into_any()
-            } else if session.has_saved_draft() {
+            } else if session.shows_draft() {
                 div()
                     .id(("session-draft", id as usize))
                     .role(Role::Image)
@@ -6683,8 +6856,19 @@ impl Shell {
                     ))
                     .into_any()
             });
+        self.with_shortcut_hint(id, status.into_any(), cx)
+    }
+
+    /// Puts the row's ⌘1–9 shortcut behind `status`, swapped in while ⌘ is
+    /// held. Rows without a shortcut keep the status alone.
+    pub(super) fn with_shortcut_hint(
+        &self,
+        id: i64,
+        status: AnyElement,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let Some(slot) = self.shortcut_slots.get(&id) else {
-            return status.into_any();
+            return status;
         };
         let shortcut = div()
             .debug_selector(move || format!("session-shortcut-{id}"))
@@ -6696,9 +6880,9 @@ impl Shell {
         // Holding ⌘ swaps the status for the row's shortcut. The incoming
         // label keeps the layout; the outgoing one fades out over it.
         let (shown, hidden) = if self.shortcut_hints {
-            (shortcut.into_any_element(), status.into_any_element())
+            (shortcut.into_any_element(), status)
         } else {
-            (status.into_any_element(), shortcut.into_any_element())
+            (status, shortcut.into_any_element())
         };
         let flip = self.shortcut_hint_flips;
         let animate = flip > 0 && !cx.reduce_motion();
@@ -6750,7 +6934,9 @@ impl Shell {
                 .as_ref()
                 .is_some_and(|m| m.read(cx).hidden_session(id))
                 && s.summary.cwd == self.workspace.project
-                && (s.summary.has_messages || self.is_fresh_session(id, cx))
+                && (s.summary.has_messages
+                    || s.has_composer_draft()
+                    || self.is_fresh_session(id, cx))
                 && !self.orchestration_worker(id)
                 && self.in_sidebar_worktree_scope(id, cx)
         };
@@ -6826,12 +7012,36 @@ impl Shell {
         }
         self.open(next, window, cx);
     }
+    /// `Project: Move Back/Forward` moves the current project one place.
+    fn move_current_project(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.menu.is_some() {
+            return;
+        }
+        let path = self.workspace.project.clone();
+        if self.workspace.step_project_order(&path, step) {
+            self.project_order_changed(&path, cx);
+        }
+    }
+    /// Saves a new project order and keeps the moved project in view.
+    fn project_order_changed(&mut self, path: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self.workspace.projects.iter().position(|p| p == path) {
+            if ix < self.spaces_start {
+                self.spaces_start = ix;
+            } else if ix >= self.spaces_start + 5 {
+                self.spaces_start = ix - 4;
+            }
+        }
+        self.persist(cx);
+        self.invalidate_chrome(cx);
+        self.projects_frame.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
     /// `Project: Previous/Next` along the project rail.
     fn step_project(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
             return;
         }
-        let projects = self.workspace.projects.clone();
+        let projects = self.workspace.visible_project_order();
         let wrapped = self.wraps(step);
         if let Some(next) = adjacent(&projects, Some(&self.workspace.project), step)
             && next != self.workspace.project
@@ -7115,14 +7325,14 @@ impl Shell {
         let last = self.workspace.projects.len().saturating_sub(shown);
         self.spaces_start = self.spaces_start.min(last);
         let first = self.spaces_start;
+        let reordering = self.space_reorder.active();
         let projects: Vec<_> = self
-            .workspace
-            .projects
-            .iter()
+            .space_reorder
+            .order(&self.workspace.projects)
+            .into_iter()
             .enumerate()
             .skip(first)
             .take(shown)
-            .map(|(ix, p)| (ix, p.clone()))
             .collect();
         if self
             .hovered_space
@@ -7155,8 +7365,10 @@ impl Shell {
         // and each mark brightens as the pages bring its space into view.
         let position = self.space_pager_position(cx);
         let looping = position.as_ref().is_some_and(|p| p.leaving.is_some());
+        // Mid-drag the active space carries its own fill instead of the pill.
         let pills: Vec<_> = position
             .as_ref()
+            .filter(|_| !reordering)
             .zip(self.space_swipe.spaces_strip.get())
             .map(|(position, strip)| {
                 let count = shown as f32;
@@ -7275,6 +7487,8 @@ impl Shell {
                     .children(projects.into_iter().map(|(ix, path)| {
                         let active = path == self.workspace.project;
                         let hovered = self.hovered_space.as_ref() == Some(&path);
+                        let dragging = self.space_reorder.dragging(&path);
+                        let offset = self.space_reorder.offset(&path, ix, first);
                         div()
                             .id(("project-space", ix))
                             .debug_selector(move || format!("project-space-{ix}"))
@@ -7291,8 +7505,17 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .opacity(space_opacity(ix))
-                            .when(active && item_fill, |d| d.bg(content(0.1)))
+                            .relative()
+                            .left(px(offset))
+                            .opacity(if reordering {
+                                if active || dragging { 1. } else { 0.45 }
+                            } else {
+                                space_opacity(ix)
+                            })
+                            .when(dragging, |d| d.cursor(CursorStyle::ClosedHand))
+                            .when((active || dragging) && (item_fill || reordering), |d| {
+                                d.bg(content(0.1))
+                            })
                             .hover(|s| {
                                 let s = s.opacity(1.);
                                 if active && !item_fill {
@@ -7316,18 +7539,28 @@ impl Shell {
                                     this.invalidate_chrome(cx);
                                 })
                             })
+                            .on_mouse_down(MouseButton::Left, {
+                                let path = path.clone();
+                                cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                                    this.start_space_drag(&path, event);
+                                })
+                            })
                             .on_mouse_down(MouseButton::Right, {
                                 let path = path.clone();
                                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                     let anchor = Anchor::Point(event.position);
+                                    // Spaces have no pins or groups to offer.
                                     let target = MenuTarget::Project {
                                         path: path.clone(),
-                                        rail: true,
+                                        rail: false,
                                     };
                                     this.open_menu(target, anchor, window, cx);
                                 })
                             })
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.space_reorder.take_click() {
+                                    return;
+                                }
                                 // The tip steps aside once a space is clicked.
                                 this.hovered_space = None;
                                 this.select_project(path.clone(), window, cx)
@@ -7943,6 +8176,9 @@ impl Shell {
             .items_center()
             .gap(px(8.))
             .pl(px(STRIP_LEAD))
+            // Clear of the window edge in Classic and of an open right panel,
+            // like the hidden strip's title.
+            .pr_3()
             .child(
                 div()
                     .flex_1()
@@ -8558,7 +8794,6 @@ fn enter_from(leaf: &LayoutLeaf) -> (Edge, Rect) {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.keep_visible_idle_agents(cx);
-        self.hide_drafts_off_screen(cx);
         self.sync_ui_scale(window, cx);
         if self.mono_panes_unsettled(cx) {
             let this = cx.entity();
@@ -8797,6 +9032,17 @@ impl Render for Shell {
                 }),
             )
             .on_action(
+                cx.listener(|this, open: &crate::draft::Reopen, window, cx| {
+                    if this
+                        .reopen_draft(open.session, &open.draft, window, cx)
+                        .is_none()
+                    {
+                        this.error = Some("That draft's page is no longer available.".into());
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_action(
                 cx.listener(|this, open: &crate::image_lightbox::Open, window, cx| {
                     let view = cx.new(|cx| {
                         crate::image_lightbox::ImageLightbox::new(open.clone(), window, cx)
@@ -8912,6 +9158,9 @@ impl Render for Shell {
                 }),
             )
             .on_action(cx.listener(|this, _: &NewClaude, _, cx| this.create(Kind::Claude, cx)))
+            .on_action(cx.listener(|this, _: &NewInProject, window, cx| {
+                this.open_project_picker(project_picker::Intent::NewConversation, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenProject, _, cx| this.open_project(cx)))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 if let Some(view) = this.active_app_view.filter(|_| this.settings.is_none()) {
@@ -8985,13 +9234,24 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &NextProject, window, cx| this.step_project(1, window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &MoveProjectBack, _, cx| this.move_current_project(-1, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &MoveProjectForward, _, cx| this.move_current_project(1, cx)),
+            )
             .on_action(cx.listener(|this, _: &SwitchModel, window, cx| {
                 if let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id)) {
                     view.update(cx, |v, cx| v.toggle_recent_models(window, cx));
                 }
             }))
+            .on_action(cx.listener(|this, _: &ChangeEffort, window, cx| {
+                if let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id)) {
+                    view.update(cx, |v, cx| v.toggle_effort_menu(window, cx));
+                }
+            }))
             .on_action(cx.listener(|this, _: &DismissMenu, window, cx| {
-                if this.cancel_project_rail_drag(cx) {
+                if this.cancel_project_rail_drag(cx) || this.cancel_space_drag(cx) {
                     return;
                 }
                 if this.cancel_classic_sidebar_tab(cx) {
@@ -9003,6 +9263,10 @@ impl Render for Shell {
                 }
                 if this.quick_open.is_some() {
                     this.close_quick_open(window, cx);
+                    return;
+                }
+                if this.project_picker.is_some() {
+                    this.close_project_picker(window, cx);
                     return;
                 }
                 if this.app_search.is_some() {
@@ -9068,6 +9332,9 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.toggle_primary_sidebar(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDevice, window, cx| {
+                this.toggle_device_panel(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| {
                 if this.workspace.classic_layout {
@@ -9138,7 +9405,7 @@ impl Render for Shell {
             }))
             .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
             .on_action(|_: &FocusPrevious, window, cx| window.focus_prev(cx))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if let Some(monos) = &this.monos {
                     monos.update(cx, |m, cx| m.move_rail_drag(event, cx));
                 }
@@ -9147,6 +9414,7 @@ impl Render for Shell {
                 this.move_pane_drag(event, cx);
                 this.move_folder_drag(event, cx);
                 this.move_project_rail_drag(event, cx);
+                this.move_space_drag(event, window, cx);
                 this.move_classic_sidebar_tab(event, cx);
                 this.drag_sash(event, cx);
                 this.drag_dock(event, cx);
@@ -9179,6 +9447,7 @@ impl Render for Shell {
                     this.finish_pane_drag(window, cx);
                     this.finish_folder_drag(cx);
                     this.finish_project_rail_drag(cx);
+                    this.finish_space_drag(cx);
                     this.end_classic_sidebar_tab(cx);
                     if let Some(m) = this.monos.clone() {
                         m.update(cx, |m, cx| m.finish_reorder(cx));
@@ -9227,6 +9496,7 @@ impl Render for Shell {
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))
             .children(self.quick_open_modal(window, cx))
+            .children(self.project_picker_modal(window, cx))
             .children(self.remote_project_modal(window, cx))
             .children(self.notice_modals(window, cx))
             .children(self.folder_picker_popover(window, cx))
@@ -9242,6 +9512,8 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(view, _)| crate::image_lightbox::overlay(view)),
             )
+            // After everything that can hold a draft's card.
+            .child(crate::draft::sentinel())
             .map(|root| {
                 #[cfg(target_os = "linux")]
                 let root = root
@@ -11992,7 +12264,14 @@ mod tests {
             .unwrap();
     }
     pub(super) fn window(cx: &mut TestAppContext) -> (WindowHandle<Shell>, i64, i64) {
-        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        window_with(cx, Store::open(std::path::Path::new(":memory:")).unwrap())
+    }
+
+    /// `window` over a given store, such as one on disk.
+    pub(super) fn window_with(
+        cx: &mut TestAppContext,
+        mut store: Store,
+    ) -> (WindowHandle<Shell>, i64, i64) {
         let mut a = store.create("codex", "/work/another-project").unwrap();
         let b = store.create("claude", "/work/monocode").unwrap();
         store

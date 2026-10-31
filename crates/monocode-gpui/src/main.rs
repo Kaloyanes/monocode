@@ -10,6 +10,7 @@ mod arcade;
 mod assets;
 mod automations;
 mod changes;
+mod chromium;
 mod composer_completion;
 mod composer_motion;
 mod composer_runner;
@@ -17,6 +18,7 @@ mod context_meter;
 mod conversation;
 #[cfg(debug_assertions)]
 mod dev_reload;
+mod device;
 mod diff_view;
 mod draft;
 mod editor_analysis;
@@ -38,6 +40,7 @@ mod history;
 mod image_lightbox;
 mod image_memory;
 mod inbox;
+mod keep_awake;
 mod input;
 mod markdown;
 mod markdown_model;
@@ -59,6 +62,7 @@ mod pickers;
 mod plan_rail;
 mod popover;
 mod project_background;
+mod project_picker;
 mod project_search;
 mod project_settings;
 mod project_tabs;
@@ -118,7 +122,10 @@ fn quit(cx: &mut App) {
     hide_while_shutting_down(cx);
     let shutdown = cx
         .background_executor()
-        .spawn(async { monocode_core::process::shutdown_all() });
+        .spawn(async {
+            monocode_core::device::hub::stop();
+            monocode_core::process::shutdown_all()
+        });
     cx.spawn(async move |cx| {
         shutdown.await;
         cx.update(|cx| cx.quit());
@@ -144,7 +151,10 @@ fn restart(cx: &mut App) {
     hide_while_shutting_down(cx);
     let shutdown = cx
         .background_executor()
-        .spawn(async { monocode_core::process::shutdown_all() });
+        .spawn(async {
+            monocode_core::device::hub::stop();
+            monocode_core::process::shutdown_all()
+        });
     cx.spawn(async move |cx| {
         shutdown.await;
         cx.update(|cx| cx.restart());
@@ -239,6 +249,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        return;
+    }
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    if std::env::var_os("MONOCODE_DEVICE_SELFTEST").is_some() {
+        device::selftest::run();
         return;
     }
     #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -429,7 +444,8 @@ fn main() {
         .iter()
         .map(|s| (s.id, s.cwd.clone()))
         .collect::<Vec<_>>();
-    let workspace = workspace::Workspace::restore(saved.as_deref(), &metadata, &cwd);
+    let mut workspace = workspace::Workspace::restore(saved.as_deref(), &metadata, &cwd);
+    workspace.ensure_home_project();
     let mut projects = workspace.projects;
     if !projects.contains(&workspace.project) {
         projects.push(workspace.project);
@@ -458,6 +474,11 @@ fn main() {
             popover::bind(cx);
             cx.set_prompt_builder(modal::prompt_builder);
             draft::start();
+            // A device hub a crashed run left behind holds simulator captures.
+            #[cfg(target_os = "macos")]
+            cx.background_executor()
+                .spawn(async { monocode_core::device::hub::reap_orphan() })
+                .detach();
             explorer::bind(cx);
             history::bind(cx);
             diff_view::bind(cx);

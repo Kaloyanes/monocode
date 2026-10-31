@@ -264,7 +264,8 @@ pub(super) fn key(request: &Request) -> String {
             .mono
             .as_ref()
             .map(|mono| (&mono.root, &mono.mono.id)),
-        request.settings.disable_claude_hooks
+        request.settings.disable_claude_hooks,
+        request.settings.monocode_subagents_only
     ])
     .to_string()
 }

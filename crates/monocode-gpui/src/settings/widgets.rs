@@ -11,7 +11,7 @@ use gpui::{
     SharedString, Stateful, div, prelude::*, px, relative, rgb,
 };
 
-pub(super) const RED: u32 = 0xf87171;
+pub(in crate::settings) const RED: u32 = 0xf87171;
 /// `text-[12px] leading-relaxed` and `text-[13px]` line boxes.
 const RELAXED_12: f32 = 19.5;
 
@@ -260,6 +260,15 @@ impl SettingsView {
                     | "working-agents"
                     | "action-opens-terminal"
                     | "terminal-in-panel"
+                    | "keep-awake-auto"
+                    | "keep-awake-display"
+                    | "keep-awake-lid"
+                    | "keep-awake-lid-battery"
+                    | "keep-awake-lock"
+                    | "keep-awake-low-power"
+                    | "keep-awake-heat"
+                    | "keep-awake-hotspot"
+                    | "keep-awake-continue"
                     | "close-to-tray"
                     | "main-pane-glass"
                     | "show-excluded-files"
@@ -272,6 +281,7 @@ impl SettingsView {
                     | "show-remaining-usage"
                     | "mask-emails"
                     | "claude-hooks"
+                    | "monocode-subagents-only"
                     | "monos-enabled"
                     | "rail-monos-pinned"
                     | "mono-menu-bar-icon"

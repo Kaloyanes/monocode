@@ -351,6 +351,7 @@ impl InboxDocument {
                         .w_full()
                         .min_w_0()
                         .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
                         .rounded(px(10.))
                         .border_1()
                         .border_color(content(0.1))

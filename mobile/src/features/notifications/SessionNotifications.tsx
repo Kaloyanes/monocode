@@ -9,7 +9,10 @@ import {
   useNotificationPreferences,
   type NotificationCategory,
 } from "@/features/settings/notifications";
-import type { SessionSummary } from "@/features/workspace/types";
+import type {
+  OrchestrationPhase,
+  SessionSummary,
+} from "@/features/workspace/types";
 
 // Only for when the app is out of view; one landing as it comes back stays
 // in the list.
@@ -25,7 +28,9 @@ Notifications.setNotificationHandler({
   },
 });
 
-type Seen = Pick<SessionSummary, "busy" | "waiting">;
+type Seen = Pick<SessionSummary, "busy" | "waiting"> & {
+  orchestration?: OrchestrationPhase;
+};
 type Data = { projectId: string; sessionId: string };
 const SESSION_CHANNEL = "sessions";
 
@@ -86,7 +91,11 @@ export function SessionNotifications() {
     seen.current = new Map(
       sessions.map((session) => [
         session.id,
-        { busy: session.busy, waiting: session.waiting },
+        {
+          busy: session.busy,
+          waiting: session.waiting,
+          orchestration: session.orchestration?.phase,
+        },
       ]),
     );
     if (!before) return;
@@ -97,21 +106,33 @@ export function SessionNotifications() {
     for (const session of sessions) {
       const last = before.get(session.id);
       if (!last) continue;
+      // A lead's agents finishing is one notification, not one per agent.
+      const agentsFinished =
+        last.orchestration === "running" &&
+        session.orchestration?.phase === "finished";
       const category: NotificationCategory | null =
         session.waiting && session.waiting !== last.waiting
           ? "agentInput"
-          : last.busy && !session.busy && !session.waiting
+          : agentsFinished ||
+              (!session.leadId && last.busy && !session.busy && !session.waiting)
             ? "agentFinished"
             : null;
       if (!category || !preferences.enabled(category)) continue;
       const project = projects.find((entry) => entry.id === session.projectId);
+      const lead = session.leadId
+        ? sessions.find((entry) => entry.id === session.leadId)
+        : undefined;
       void Notifications.scheduleNotificationAsync({
         content: {
-          title: session.title || "Session",
+          title: lead
+            ? `${lead.title} · ${session.title || "Agent"}`
+            : session.title || "Session",
           subtitle: project?.name,
           body:
             category === "agentFinished"
-              ? "Finished"
+              ? agentsFinished
+                ? "All agents finished"
+                : "Finished"
               : session.waiting === "approval"
                 ? "Needs your approval"
                 : "Has a question for you",

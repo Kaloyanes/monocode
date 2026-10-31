@@ -67,6 +67,9 @@ pub(crate) enum RightTab {
     /// The project's terminal, when it opens in the panel. Always last and
     /// never part of the saved order.
     Terminal,
+    /// Simulators and emulators, when Devices are on. Last, and never part
+    /// of the saved order.
+    Device,
 }
 impl RightTab {
     fn label(self) -> &'static str {
@@ -76,6 +79,7 @@ impl RightTab {
             Self::Plan => "Plan",
             Self::Graph => "History",
             Self::Terminal => "Terminal",
+            Self::Device => "Device",
         }
     }
     /// loadRightPanelTabOrder: unique known tabs, the missing ones appended.
@@ -83,7 +87,9 @@ impl RightTab {
     pub(crate) fn normalize(order: &[RightTab]) -> Vec<RightTab> {
         let mut out = Vec::new();
         for tab in order.iter().chain(&[Self::Files, Self::Graph]) {
-            if !matches!(tab, Self::Terminal | Self::Changes | Self::Plan) && !out.contains(tab) {
+            if !matches!(tab, Self::Terminal | Self::Changes | Self::Plan | Self::Device)
+                && !out.contains(tab)
+            {
                 out.push(*tab);
             }
         }
@@ -255,6 +261,7 @@ pub(crate) struct RightPanel {
     pub explorer: Entity<Explorer>,
     pub changes: Entity<Changes>,
     pub history: Entity<History>,
+    pub device: Entity<crate::device::DevicePanel>,
     focus: FocusHandle,
     tab: RightTab,
     order: Vec<RightTab>,
@@ -262,6 +269,8 @@ pub(crate) struct RightPanel {
     sidebar_tab: Option<RightTab>,
     /// Whether the Terminal tab follows the others; the shell draws its pane.
     terminal_tab: bool,
+    /// Whether the Device tab ends the strip.
+    device_tab: bool,
     /// Classic reserves the title bar's height; rounded content starts at
     /// the card's top edge, below the window-wide title bar.
     top_inset: f32,
@@ -290,6 +299,7 @@ impl RightPanel {
         let explorer = cx.new(|cx| Explorer::new(git.clone(), window, cx));
         let changes = cx.new(|cx| Changes::new(git.clone(), window, cx));
         let history = cx.new(|cx| History::new(git.clone(), window, cx));
+        let device = cx.new(crate::device::DevicePanel::new);
         let subscriptions = vec![
             cx.observe(&git, |_, _, cx| cx.notify()),
             cx.subscribe(&git, |_, _, _: &GitChanged, cx| cx.notify()),
@@ -305,17 +315,19 @@ impl RightPanel {
             explorer,
             changes,
             history,
+            device,
             tab,
             order: RightTab::normalize(&order),
             shown: false,
             sidebar_tab: None,
             terminal_tab: false,
+            device_tab: false,
             top_inset: 0.,
             tab_width: tabs_width(3),
             drag: None,
             reveal: None,
             skip_click: false,
-            tab_bounds: (0..4).map(|_| Default::default()).collect(),
+            tab_bounds: (0..5).map(|_| Default::default()).collect(),
             _subscriptions: subscriptions,
         }
     }
@@ -329,7 +341,22 @@ impl RightPanel {
         if self.terminal_tab {
             tabs.insert(1.min(tabs.len()), RightTab::Terminal);
         }
+        if self.device_tab {
+            tabs.push(RightTab::Device);
+        }
         tabs
+    }
+    /// Adds or removes the Device tab; Explorer takes over when it goes.
+    pub(crate) fn set_device_tab(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.device_tab == enabled {
+            return;
+        }
+        self.device_tab = enabled;
+        if !enabled && self.tab == RightTab::Device {
+            self.select(RightTab::Files, cx);
+        }
+        self.sync_panes(cx);
+        cx.notify();
     }
     /// Adds or removes the Terminal tab; Explorer takes over when it goes.
     pub(crate) fn set_terminal_tab(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -398,11 +425,15 @@ impl RightPanel {
         self.history.update(cx, |h, cx| {
             h.set_enabled(shown && tab == RightTab::Graph, cx)
         });
+        let device = shown && tab == RightTab::Device && self.device_tab;
+        self.device
+            .update(cx, |d, cx| d.set_shown(device, cx));
     }
     pub(crate) fn focus_pane(&self, window: &mut Window, cx: &mut App) {
         let focus = match (self.shown, self.tab) {
             (true, RightTab::Files) => self.explorer.focus_handle(cx),
             (true, RightTab::Graph) => self.history.focus_handle(cx),
+            (true, RightTab::Device) => self.device.focus_handle(cx),
             _ => self.focus.clone(),
         };
         window.focus(&focus, cx);
@@ -443,7 +474,10 @@ impl RightPanel {
         let bounds: Vec<Option<Bounds<Pixels>>> = tabs
             .iter()
             .zip(&self.tab_bounds)
-            .map(|(tab, slot)| slot.get().filter(|_| !matches!(tab, RightTab::Terminal)))
+            .map(|(tab, slot)| {
+                slot.get()
+                    .filter(|_| !matches!(tab, RightTab::Terminal | RightTab::Device))
+            })
             .collect();
         if let Some(Some(own)) = bounds.get(from) {
             let centre = own.center().x + drag.offset;
@@ -517,6 +551,7 @@ impl RightPanel {
                     RightTab::Plan => ("right-panel-tab-Plan", "list-bullet"),
                     RightTab::Graph => ("right-panel-tab-History", "clock"),
                     RightTab::Terminal => ("right-panel-tab-Terminal", "terminal"),
+                    RightTab::Device => ("right-panel-tab-Device", "smart-phone"),
                 };
                 let unfolded = match progress {
                     Some((_, p)) if active => p,
@@ -612,6 +647,14 @@ impl Render for RightPanel {
                 .history
                 .clone()
                 .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
+                .into_any_element(),
+            // Not cached: the device's native view is placed on every paint,
+            // which a replayed cached frame would skip.
+            RightTab::Device => div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(self.device.clone())
                 .into_any_element(),
             // The shell paints the terminal over this pane.
             RightTab::Terminal | RightTab::Plan => div().into_any_element(),

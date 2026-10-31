@@ -103,11 +103,16 @@ fn prompt_bubble_width(widths: impl Iterator<Item = Pixels>) -> Pixels {
 
 impl TranscriptView {
     /// Virtualized chunks share one bubble width, even when only a narrow
-    /// continuation is on screen. Single-row prompts keep their natural layout.
+    /// continuation is on screen. Single-row prompts keep their natural layout,
+    /// except a link's: its chip line flows word by word, and a content-sized
+    /// bubble around it shrinks to the chip.
     pub(super) fn split_prompt_width(&mut self, ix: usize, window: &Window) -> Option<Pixels> {
         let row = &self.rows[ix];
         let message = &self.messages[row.message];
-        if !self.chat_layout || message.role != "user" || (row.first && row.last) {
+        if !self.chat_layout
+            || message.role != "user"
+            || (row.first && row.last && message.user_link.is_none())
+        {
             return None;
         }
         let fingerprint = message.prompt_fingerprint;
@@ -122,11 +127,17 @@ impl TranscriptView {
                     .iter()
                     .take_while(|other| other.message == row.message)
                     .filter_map(|other| match &other.body {
-                        Body::Plain(text) => Some(text.clone()),
+                        Body::Plain(text) => Some((other.key.1, text.clone())),
                         _ => None,
                     })
-                    .flat_map(|text| shape_prompt(text, None, window))
-                    .map(|line| line.width()),
+                    .flat_map(|(chunk, text)| match &message.user_link {
+                        Some((link_chunk, link)) if link_chunk + 16 == chunk => {
+                            user_links::link_line_widths(&text, link, window)
+                        }
+                        _ => shape_prompt(text, None, window)
+                            .map(|line| line.width())
+                            .collect(),
+                    }),
             )
         } else {
             // Attachment chips wrap inside the same column as every text chunk.

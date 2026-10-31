@@ -28,6 +28,8 @@ pub(crate) struct Preferences {
     pub action_opens_terminal: bool,
     /// The new layout opens the terminal as a right panel tab, not a dock.
     pub terminal_in_panel: bool,
+    /// Keeping the Mac awake while agents work.
+    pub keep_awake: KeepAwakePrefs,
     /// Legacy "Hide tab bar", read when `title_bar` is unset.
     pub hide_tab_bar: bool,
     // Appearance
@@ -66,8 +68,19 @@ pub(crate) struct Preferences {
     pub diff_view: String,
     pub composer_mascot: bool,
     pub empty_session_games: bool,
+    // Visualizations
+    /// What draws drafts: "webkit", built in, or "chromium", downloaded.
+    pub page_engine: String,
+    // Devices
+    /// iOS Simulators and Android Emulators in the right panel. Off until
+    /// chosen: it installs and runs the device hub with the user's Node.
+    pub devices: bool,
+    /// Agents may open, see and drive devices.
+    pub device_agents: bool,
     // Providers
     pub show_remaining_usage: bool,
+    /// Which limit the footer's usage bar follows: "shortest" or "most-used".
+    pub usage_bar_window: String,
     /// Writes commit messages, pull requests and session titles with this model instead of the session's.
     pub text_model: Option<ModelChoice>,
     /// Per-action overrides of `text_model`.
@@ -80,6 +93,9 @@ pub(crate) struct Preferences {
     pub mask_emails: bool,
     pub idle_agents: u32,
     pub claude_hooks: bool,
+    /// Turns off Claude Code's and Codex's own subagent tools in chats that
+    /// can start MonoCode threads.
+    pub monocode_subagents_only: bool,
     pub binary_paths: HashMap<String, String>,
     pub disabled_skill_paths: Vec<String>,
     pub skill_source_paths: Vec<String>,
@@ -134,6 +150,7 @@ impl Default for Preferences {
             close_to_tray: true,
             action_opens_terminal: true,
             terminal_in_panel: false,
+            keep_awake: KeepAwakePrefs::default(),
             hide_tab_bar: false,
             theme: "dark".into(),
             wayland_window_decorations: true,
@@ -166,7 +183,11 @@ impl Default for Preferences {
             diff_view: "editor".into(),
             composer_mascot: true,
             empty_session_games: true,
+            page_engine: "webkit".into(),
+            devices: false,
+            device_agents: false,
             show_remaining_usage: false,
+            usage_bar_window: "shortest".into(),
             text_model: None,
             commit_model: None,
             pr_model: None,
@@ -175,6 +196,7 @@ impl Default for Preferences {
             mask_emails: true,
             idle_agents: 3,
             claude_hooks: true,
+            monocode_subagents_only: true,
             binary_paths: HashMap::new(),
             disabled_skill_paths: Vec::new(),
             skill_source_paths: Vec::new(),
@@ -195,6 +217,85 @@ impl Default for Preferences {
             mono_menu_bar_icon: true,
             show_archived: false,
             keybindings: HashMap::new(),
+        }
+    }
+}
+
+/// The footer's keep-awake control. Minutes, so the rulers' steps round-trip.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct KeepAwakePrefs {
+    /// The popover's switch. On, working agents keep the Mac awake.
+    #[serde(alias = "auto")]
+    pub enabled: bool,
+    pub grace_minutes: u32,
+    pub timer_minutes: u32,
+    pub display: bool,
+    pub lid: bool,
+    /// The lid hold on battery too, not just plugged in.
+    pub lid_on_battery: bool,
+    /// "off", "dim" or "leave".
+    pub lid_screen: String,
+    /// Lock the screen when a held lid closes.
+    pub lock: bool,
+    /// "leave", "mute" or "pause".
+    pub lid_sound: String,
+    pub low_power: bool,
+    pub heat_guard: bool,
+    /// 0 never stops for the battery.
+    pub stop_below: u32,
+    /// Join `hotspot_ssid` when Wi-Fi drops while agents work. Its password,
+    /// if any, is in the Keychain.
+    pub hotspot: bool,
+    pub hotspot_ssid: String,
+    /// Send "continue" once the internet is back to a reply a dropped
+    /// connection cut off.
+    pub continue_after_drop: bool,
+}
+
+impl Default for KeepAwakePrefs {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            grace_minutes: 5,
+            timer_minutes: 120,
+            display: false,
+            lid: false,
+            lid_on_battery: false,
+            lid_screen: "off".into(),
+            lock: true,
+            lid_sound: "mute".into(),
+            low_power: false,
+            heat_guard: true,
+            stop_below: 20,
+            hotspot: false,
+            hotspot_ssid: String::new(),
+            continue_after_drop: true,
+        }
+    }
+}
+
+impl KeepAwakePrefs {
+    /// A hotspot is chosen and switched on.
+    pub(crate) fn hotspot_ready(&self) -> bool {
+        self.hotspot && !self.hotspot_ssid.trim().is_empty()
+    }
+    pub(crate) fn settings(&self) -> monocode_core::keep_awake::Settings {
+        use monocode_core::keep_awake::{LidScreen, LidSound, Settings};
+        use std::time::Duration;
+        Settings {
+            enabled: self.enabled,
+            grace: Duration::from_secs(u64::from(self.grace_minutes) * 60),
+            length: Duration::from_secs(u64::from(self.timer_minutes.max(5)) * 60),
+            display: self.display,
+            lid: self.lid,
+            lid_on_battery: self.lid_on_battery,
+            lid_screen: LidScreen::from_key(&self.lid_screen),
+            lock: self.lock,
+            lid_sound: LidSound::from_key(&self.lid_sound),
+            low_power: self.low_power,
+            heat_guard: self.heat_guard,
+            stop_below: (self.stop_below > 0).then(|| self.stop_below.min(100) as u8),
         }
     }
 }

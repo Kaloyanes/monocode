@@ -4,7 +4,7 @@ use super::*;
 use gpui::{TestAppContext, VisualTestContext, WindowHandle};
 
 #[derive(Clone, Copy, Debug)]
-enum Surface {
+pub(super) enum Surface {
     Inbox,
     Notes,
     Automations,
@@ -13,7 +13,7 @@ enum Surface {
 }
 
 impl Surface {
-    fn open(self, shell: &mut Shell, window: &mut Window, cx: &mut Context<Shell>) {
+    pub(super) fn open(self, shell: &mut Shell, window: &mut Window, cx: &mut Context<Shell>) {
         match self {
             Self::Inbox => shell.open_inbox(window, cx),
             Self::Notes => shell.open_notes(window, cx),
@@ -41,7 +41,13 @@ impl Surface {
         }
     }
 
-    fn close(self, shell: &mut Shell, session: i64, window: &mut Window, cx: &mut Context<Shell>) {
+    pub(super) fn close(
+        self,
+        shell: &mut Shell,
+        session: i64,
+        window: &mut Window,
+        cx: &mut Context<Shell>,
+    ) {
         match self {
             Self::Inbox | Self::Notes | Self::Automations => shell.close_app_view(window, cx),
             Self::Search => shell.close_app_search(window, cx),
@@ -666,6 +672,7 @@ fn original_layout_hides_saved_mono_tabs_until_returning_to_new_layout(cx: &mut 
 
 #[gpui::test]
 fn original_app_surfaces_keep_icon_rail_and_remember_closed_sessions(cx: &mut TestAppContext) {
+    crate::theme::configure(&crate::settings::Preferences::default(), false);
     let (window, session) = setup(cx, true, false);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     window
@@ -725,18 +732,19 @@ fn original_app_surfaces_keep_icon_rail_and_remember_closed_sessions(cx: &mut Te
                                 && quad.content_mask.bounds.contains(&point)
                         })
                     };
-                    assert_ne!(shell_fill(), pane_fill());
+                    assert_ne!(shell_fill(), inset_pane_fill());
+                    assert_ne!(pane_fill(), inset_pane_fill());
                     // Test the actual wash on both sides of the rail edge, which
                     // passes between the native traffic lights at x=48.
                     for x in [24., 60.] {
                         assert!(painted_at(shell_fill(), x, 20.));
                         assert!(
-                            !painted_at(pane_fill(), x, 20.),
+                            !painted_at(inset_pane_fill(), x, 20.),
                             "{surface:?} paints content tint behind the traffic lights"
                         );
                     }
                     assert!(
-                        painted_at(pane_fill(), 60., 50.),
+                        painted_at(inset_pane_fill(), 60., 50.),
                         "the destination body retains its content tint"
                     );
                 })

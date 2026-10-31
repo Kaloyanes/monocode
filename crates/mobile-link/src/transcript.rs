@@ -862,6 +862,12 @@ fn project(
                 row.action = item.clone();
                 rows.push(Arc::new(row));
             }
+            // A card the phone opens the live page from.
+            "draft" => {
+                let mut row = Row::text(id, "draft", string(item, "title"));
+                row.action = item.clone();
+                rows.push(Arc::new(row));
+            }
             "header" => {
                 let entries = item["entries"].as_array().cloned().unwrap_or_default();
                 let open = expanded.get(&id).copied().unwrap_or(false);
@@ -1122,6 +1128,20 @@ mod tests {
         assert_eq!(reply[0].presentation["top"], 4);
         assert_eq!(reply[1].presentation["gap"], 12);
         assert_eq!(reply[1].presentation["bottom"], 4);
+    }
+
+    #[test]
+    fn a_draft_is_a_card_row_that_carries_what_opens_it() {
+        let turn = json!({"id":"t","items":[
+            {"id":"r3","type":"draft","draft":"draft-1-a","title":"Pricing"},
+            {"id":"r4","type":"draft","draft":"kept:p.html","title":"Kept","kept":true}
+        ]});
+        let rows = project(&turn, &mut HashMap::new(), &HashMap::new(), false);
+        let cards: Vec<_> = rows.iter().filter(|r| r.kind == "draft").collect();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].id, "t/r3");
+        assert_eq!(cards[0].action["draft"], "draft-1-a");
+        assert_eq!(cards[1].action["kept"], true);
     }
 
     #[test]

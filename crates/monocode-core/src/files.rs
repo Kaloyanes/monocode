@@ -36,6 +36,17 @@ pub struct DirEntry {
 }
 
 /// Immediate children of `path` (project tree). Folders first, then natural name order.
+/// The user's home folder, always listed as the built-in Home project so
+/// agents can work on the computer rather than in a codebase.
+pub fn home_project() -> Option<String> {
+    crate::scm::shell::dirs_home().map(|home| path_to_js(Path::new(&home)))
+}
+
+/// Whether `path` is the home folder itself, not a folder inside it.
+pub fn is_home_project(path: &str) -> bool {
+    home_project().is_some_and(|home| path_key(&home) == path_key(path))
+}
+
 pub fn list_dir(path: &Path) -> Result<Vec<DirEntry>, String> {
     if remote::is_remote(path) {
         return remote::command("list_dir", serde_json::json!({"path":path}));

@@ -11,6 +11,8 @@ pub(crate) enum Section {
     Appearance,
     Keybindings,
     Chat,
+    Visualizations,
+    Devices,
     Providers,
     Mcp,
     Skills,
@@ -34,6 +36,8 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
         "Agents",
         &[
             Section::Chat,
+            Section::Visualizations,
+            Section::Devices,
             Section::Providers,
             Section::Mcp,
             Section::Skills,
@@ -47,12 +51,14 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
-    pub(crate) const ALL: [Section; 12] = [
+    pub(crate) const ALL: [Section; 14] = [
         Section::General,
         Section::Connections,
         Section::Appearance,
         Section::Keybindings,
         Section::Chat,
+        Section::Visualizations,
+        Section::Devices,
         Section::Providers,
         Section::Mcp,
         Section::Skills,
@@ -68,6 +74,8 @@ impl Section {
             Section::Appearance => "appearance",
             Section::Keybindings => "keybindings",
             Section::Chat => "chat",
+            Section::Visualizations => "visualizations",
+            Section::Devices => "devices",
             Section::Providers => "providers",
             Section::Mcp => "mcp",
             Section::Skills => "skills",
@@ -84,6 +92,8 @@ impl Section {
             Section::Appearance => "Appearance",
             Section::Keybindings => "Keybindings",
             Section::Chat => "Chat",
+            Section::Visualizations => "Visualizations",
+            Section::Devices => "Devices",
             Section::Providers => "Providers",
             Section::Mcp => "MCP",
             Section::Skills => "Skills",
@@ -107,6 +117,12 @@ impl Section {
             }
             Section::Chat => {
                 "How transcripts read, what the composer does with a follow-up, how files save, and how diffs open."
+            }
+            Section::Visualizations => {
+                "How drafts and the pages agents build in the thread are drawn."
+            }
+            Section::Devices => {
+                "iOS Simulators and Android Emulators in the right panel, and what agents may do with them."
             }
             Section::Providers => {
                 "Provider accounts, agent CLIs MonoCode can drive, and the model new sessions start with."
@@ -134,6 +150,12 @@ impl Section {
             Section::Chat => {
                 "transcript composer prompt message diff review layout format save editor"
             }
+            Section::Visualizations => {
+                "draft preview page engine browser webkit safari chromium chrome headless render"
+            }
+            Section::Devices => {
+                "simulator emulator ios android iphone pixel device hub stream agent-device node xcode adb"
+            }
             Section::Providers => {
                 "account sign in login model harness claude codex gemini cli default hooks hide hidden picker"
             }
@@ -157,6 +179,8 @@ impl Section {
             Section::Appearance => "palette",
             Section::Keybindings => "keyboard",
             Section::Chat => "message-square",
+            Section::Visualizations => "chart-square",
+            Section::Devices => "smart-phone",
             Section::Providers => "bot",
             Section::Mcp => "globe",
             Section::Skills => "sparkles",
@@ -273,6 +297,90 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "terminal dock right panel tab shell focused layout",
     ),
     (
+        "keep-awake-auto",
+        Section::General,
+        "Keep Mac awake while agents work",
+        "keep awake caffeinate sleep prevent mac agents working automatic",
+    ),
+    (
+        "keep-awake-grace",
+        Section::General,
+        "Wait after agents finish",
+        "keep awake caffeinate sleep grace period delay follow-up",
+    ),
+    (
+        "keep-awake-length",
+        Section::General,
+        "Default length",
+        "keep awake caffeinate sleep timer duration hours",
+    ),
+    (
+        "keep-awake-display",
+        Section::General,
+        "Keep the display on",
+        "keep awake caffeinate screen display dim sleep",
+    ),
+    (
+        "keep-awake-lid",
+        Section::General,
+        "Even with the lid closed",
+        "keep awake caffeinate clamshell lid closed laptop pmset disablesleep",
+    ),
+    (
+        "keep-awake-lid-screen",
+        Section::General,
+        "When the lid closes",
+        "keep awake lid closed screen off dim brightness backlight",
+    ),
+    (
+        "keep-awake-battery",
+        Section::General,
+        "Stop below battery",
+        "keep awake battery low charge power adapter",
+    ),
+    (
+        "keep-awake-lid-battery",
+        Section::General,
+        "Lid closed on battery too",
+        "keep awake lid closed battery bag unplugged",
+    ),
+    (
+        "keep-awake-lock",
+        Section::General,
+        "Lock when the lid closes",
+        "keep awake lock screen security password lid closed",
+    ),
+    (
+        "keep-awake-lid-sound",
+        Section::General,
+        "Sound when the lid closes",
+        "keep awake mute audio music pause media sound lid closed",
+    ),
+    (
+        "keep-awake-low-power",
+        Section::General,
+        "Low Power Mode on battery",
+        "keep awake low power mode battery energy saver",
+    ),
+    (
+        "keep-awake-heat",
+        Section::General,
+        "Let it sleep if it gets hot",
+        "keep awake heat thermal hot temperature bag",
+    ),
+    (
+        "keep-awake-hotspot",
+        Section::General,
+        "Join a hotspot if Wi-Fi drops",
+        "keep awake hotspot iphone personal wifi wi-fi network offline internet tethering",
+    ),
+    (
+        "keep-awake-continue",
+        Section::General,
+        "Continue cut-off replies",
+        "network drop offline reconnect retry continue resume reply interrupted",
+    ),
+    (
         "file-tabs",
         Section::General,
         "File tabs",
@@ -364,6 +472,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "sidebar compact icons hidden navigation layout",
     ),
     (
+        "usage-bar-window",
+        Section::Appearance,
+        "Usage bar",
+        "usage limit meter bar footer bottom shortest window weekly 5-hour most used tightest",
+    ),
+    (
         "show-excluded-files",
         Section::Appearance,
         "Show excluded files",
@@ -374,6 +488,24 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::Appearance,
         "Chat background",
         "wallpaper image picture opacity backdrop",
+    ),
+    (
+        "devices",
+        Section::Devices,
+        "Devices",
+        "simulator emulator ios android iphone pixel device hub stream",
+    ),
+    (
+        "device-agents",
+        Section::Devices,
+        "Agent access",
+        "agent-device automation tap screenshot drive tools",
+    ),
+    (
+        "page-engine",
+        Section::Visualizations,
+        "Page engine",
+        "draft preview browser webkit safari chromium chrome headless download",
     ),
     (
         "transcript-layout",
@@ -494,6 +626,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::Providers,
         "Claude Code hooks",
         "pretooluse settings.json block command notification",
+    ),
+    (
+        "monocode-subagents-only",
+        Section::Providers,
+        "Subagents only through MonoCode",
+        "agent task explore delegate spawn threads multi-agent codex claude built-in",
     ),
     (
         "idle-agents",

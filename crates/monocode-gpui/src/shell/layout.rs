@@ -193,6 +193,8 @@ impl Shell {
             .update(cx, |footer, cx| footer.set_classic(classic, cx));
         self.resources
             .update(cx, |monitor, cx| monitor.set_classic(classic, cx));
+        self.keep_awake
+            .update(cx, |keep, cx| keep.set_classic(classic, cx));
         self.invalidate_chrome(cx);
         self.drop_peek();
         if !self.workspace.classic_layout && !self.query.is_empty() {
@@ -219,6 +221,8 @@ impl Shell {
             .update(cx, |footer, cx| footer.set_classic(classic, cx));
         self.resources
             .update(cx, |monitor, cx| monitor.set_classic(classic, cx));
+        self.keep_awake
+            .update(cx, |keep, cx| keep.set_classic(classic, cx));
         if classic {
             return vec![self.classic_body(
                 sidebar_width,
@@ -358,6 +362,13 @@ impl Shell {
         let footer = (!self.classic_surface_open(cx)).then(|| self.footer_row(cx));
         let spans_window = self.classic_titlebar_spans_window(cx);
         let original = self.workspace.classic_layout;
+        // Classic's content takes the same deeper card fill as Focused, with
+        // the sidebar a step lighter. Boxy keeps the flat pane tone.
+        let content_fill = if original {
+            inset_pane_fill()
+        } else {
+            pane_fill()
+        };
         let compact_surface = cfg!(target_os = "macos")
             && original
             && !self.workspace.project_rail_open
@@ -436,7 +447,7 @@ impl Shell {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .when(!compact_surface, |d| d.bg(pane_fill()))
+                    .when(!compact_surface, |d| d.bg(content_fill))
                     .when(compact_surface, |d| {
                         // Keep one continuous shell tint behind all traffic
                         // lights; the content wash starts below the title bar.
@@ -448,7 +459,7 @@ impl Shell {
                                 .bottom_0()
                                 .left_0()
                                 .right_0()
-                                .bg(pane_fill()),
+                                .bg(content_fill),
                         )
                     })
                     .children(tab_bar)
@@ -462,7 +473,7 @@ impl Shell {
                     })),
             )
             .children(self.sidebar_resize(cx))
-            .children(panel.map(|panel| div().h_full().bg(pane_fill()).child(panel)))
+            .children(panel.map(|panel| div().h_full().bg(content_fill).child(panel)))
             .when(show_navigation, |d| {
                 d.child(
                     // The traffic lights, toggle and arrows ride above the sidebar's
@@ -795,7 +806,28 @@ impl Shell {
                     .cached(StyleRefinement::default().flex_1().min_w_0().h(px(height))),
             )
             .children(self.pressure_chip(cx))
+            .children(self.keep_awake_pill())
             .children(self.terminal_footer(cx))
+    }
+    /// The keep-awake pill, just before the terminal controls (macOS only).
+    fn keep_awake_pill(&self) -> Option<AnyElement> {
+        if !crate::keep_awake::KeepAwake::supported() {
+            return None;
+        }
+        let classic = self.workspace.boxy_layout();
+        let alone = self.app_view_open() || self.workspace.project.is_empty();
+        Some(
+            div()
+                .flex_shrink_0()
+                .map(|d| match (classic, alone) {
+                    (true, true) => d,
+                    (true, false) => d.mr(px(super::terminal_dock::FOOTER_GAP)),
+                    (false, true) => d.mr(px(6.)).pb(px(2.)),
+                    (false, false) => d.mr(px(super::terminal_dock::FOOTER_GAP)).pb(px(2.)),
+                })
+                .child(self.keep_awake.clone())
+                .into_any_element(),
+        )
     }
     /// ResourcePressureNotice's chip, just before the terminal controls.
     fn pressure_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

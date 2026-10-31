@@ -1,4 +1,5 @@
 import Add01Icon from "@hugeicons/core-free-icons/Add01Icon";
+import AiIdeaIcon from "@hugeicons/core-free-icons/AiIdeaIcon";
 import ArrowDown01Icon from "@hugeicons/core-free-icons/ArrowDown01Icon";
 import ArrowRight01Icon from "@hugeicons/core-free-icons/ArrowRight01Icon";
 import ArrowUp02Icon from "@hugeicons/core-free-icons/ArrowUp02Icon";
@@ -10,6 +11,7 @@ import ComputerIcon from "@hugeicons/core-free-icons/ComputerIcon";
 import ComputerRemoveIcon from "@hugeicons/core-free-icons/ComputerRemoveIcon";
 import ComputerTerminal01Icon from "@hugeicons/core-free-icons/ComputerTerminal01Icon";
 import Copy01Icon from "@hugeicons/core-free-icons/Copy01Icon";
+import CursorMagicSelection04Icon from "@hugeicons/core-free-icons/CursorMagicSelection04Icon";
 import DarkModeIcon from "@hugeicons/core-free-icons/DarkModeIcon";
 import Delete02Icon from "@hugeicons/core-free-icons/Delete02Icon";
 import File01Icon from "@hugeicons/core-free-icons/File01Icon";
@@ -34,6 +36,7 @@ import Robot01Icon from "@hugeicons/core-free-icons/Robot01Icon";
 import Refresh01Icon from "@hugeicons/core-free-icons/Refresh01Icon";
 import Search01Icon from "@hugeicons/core-free-icons/Search01Icon";
 import Settings01Icon from "@hugeicons/core-free-icons/Settings01Icon";
+import Share02Icon from "@hugeicons/core-free-icons/Share02Icon";
 import Shield01Icon from "@hugeicons/core-free-icons/Shield01Icon";
 import Sun03Icon from "@hugeicons/core-free-icons/Sun03Icon";
 import SourceCodeIcon from "@hugeicons/core-free-icons/SourceCodeIcon";
@@ -96,6 +99,10 @@ const icons = {
   appearance: DarkModeIcon,
   sun: Sun03Icon,
   moon: Moon02Icon,
+  // The composer modes, as the desktop's + menu draws them.
+  plan: AiIdeaIcon,
+  operator: CursorMagicSelection04Icon,
+  orchestrator: Share02Icon,
 };
 
 export type IconName = keyof typeof icons;

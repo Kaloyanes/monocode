@@ -17,7 +17,7 @@ impl Shell {
                 updated_at: s.updated_at,
             })
             .collect();
-        archived.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        archived.sort_by_cached_key(|s| std::cmp::Reverse(self.archived_at(s.id, cx)));
         let mut catalogs = HashMap::new();
         let active = self
             .monos
@@ -180,6 +180,16 @@ impl Shell {
                     this.persist(cx);
                     this.invalidate_chrome(cx);
                     cx.notify();
+                }
+                SettingsEvent::KeepAwakeLid(on) => {
+                    let on = *on;
+                    this.keep_awake
+                        .update(cx, |keep, cx| keep.request_lid(on, cx));
+                }
+                SettingsEvent::KeepAwakeLowPower(on) => {
+                    let on = *on;
+                    this.keep_awake
+                        .update(cx, |keep, cx| keep.request_low_power(on, cx));
                 }
                 SettingsEvent::NewLayout(on) => {
                     if this.workspace.classic_layout == *on {
@@ -359,6 +369,10 @@ impl Shell {
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
         cx.set_global(self.workspace.preferences.clone());
+        monocode_core::device::set_enabled(
+            self.workspace.preferences.devices && cfg!(target_os = "macos"),
+            self.workspace.preferences.device_agents,
+        );
         self.sync_right_panel(cx);
         if let Some(center) = crate::accounts::get(cx) {
             center.update(cx, |center, cx| {
@@ -377,8 +391,15 @@ impl Shell {
             });
         }
         self.usage_footer.update(cx, |footer, cx| {
-            footer.set_remaining(self.workspace.preferences.show_remaining_usage, cx)
+            footer.set_remaining(self.workspace.preferences.show_remaining_usage, cx);
+            footer.set_bar_most_used(
+                self.workspace.preferences.usage_bar_window == "most-used",
+                cx,
+            );
         });
+        let keep_awake = self.workspace.preferences.keep_awake.clone();
+        self.keep_awake
+            .update(cx, |keep, cx| keep.set_prefs(keep_awake, cx));
     }
     fn choose_chat_background(&mut self, cx: &mut Context<Self>) {
         let prompt = cx.prompt_for_paths(PathPromptOptions {
@@ -669,6 +690,8 @@ mod tests {
             "settings-nav-appearance",
             "settings-nav-keybindings",
             "settings-nav-chat",
+            "settings-nav-visualizations",
+            "settings-nav-devices",
             "settings-nav-providers",
             "settings-nav-mcp",
             "settings-nav-skills",

@@ -890,6 +890,19 @@ vertex SurfaceVertexOutput surface_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// A BGRA surface with premultiplied alpha, such as a browser's offscreen
+// frame. The pipeline blends straight alpha, so the color is divided back out.
+fragment float4 bgra_surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                      texture2d<float> texture
+                                      [[texture(SurfaceInputIndex_YTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  float4 color = texture.sample(texture_sampler, input.texture_position);
+  if (color.a <= 0.0) {
+    return float4(0.0);
+  }
+  return float4(color.rgb / color.a, color.a);
+}
+
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],

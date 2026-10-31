@@ -135,6 +135,7 @@ impl Shell {
                             if let Some(summary) = this.session_summaries.get_mut(&id) {
                                 summary.archived = true;
                             }
+                            this.archive_times.insert(id, monocode_core::time::now_ms());
                             if let Some(view) = this.sessions.get(&id) {
                                 view.update(cx, |v, _| v.summary.archived = true);
                             }
@@ -219,6 +220,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if call.action.starts_with("devices.") {
+            self.handle_device_call(call, window, cx);
+            return;
+        }
         if let Err(error) = self.authorize_app_call(&call, cx) {
             let _ = call.reply.send(Err(error));
             return;
@@ -545,7 +550,7 @@ impl Shell {
                         } else {
                             view.update(cx, |v, cx| v.load(cx));
                             if !view.read(cx).ready_for_external(cx)
-                                || view.read(cx).has_saved_draft()
+                                || view.read(cx).has_unsent_draft()
                             {
                                 Err("Session is busy, loading, or has an unsent draft. Its draft was preserved.".into())
                             } else {

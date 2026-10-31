@@ -2,7 +2,7 @@
 //! ported from src/features/sessions/ui/UserLinkPreview.tsx.
 use super::*;
 use crate::popover::Align;
-use gpui::{AnyElement, HighlightStyle, Hsla, StyledText, Task};
+use gpui::{AnyElement, ClickEvent, HighlightStyle, Hsla, StyledText, Task};
 use monocode_core::inbox::{Details, Item};
 use monocode_core::user_links::{GithubWorkItemLink, plain_text_summary};
 use std::{
@@ -82,10 +82,10 @@ impl TranscriptView {
             return pieces.block(0..text.len());
         };
         let url = link.range.clone();
-        let line_start = text[..url.start].rfind('\n').map_or(0, |i| i + 1);
-        let line_end = text[url.end..]
-            .find('\n')
-            .map_or(text.len(), |i| url.end + i);
+        let Range {
+            start: line_start,
+            end: line_end,
+        } = link_line(text, &url);
         // The space after the link is text in React; here it is the chip's gap.
         let space_after = text[url.end..line_end].starts_with([' ', '\t']);
         let line = div()
@@ -167,11 +167,7 @@ impl TranscriptView {
                         icon(if pr { "git-pull-request" } else { "circle-dot" }, 12.)
                             .text_color(alpha(ink, 0.9)),
                     )
-                    .child(format!(
-                        "{} #{}",
-                        if pr { "PR" } else { "Issue" },
-                        work.number
-                    )),
+                    .child(chip_label(work)),
             )
             .on_hover(cx.listener(move |this, hovered_now: &bool, _, cx| {
                 if *hovered_now {
@@ -181,9 +177,9 @@ impl TranscriptView {
                 }
             }))
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.hide_work_item_card(cx);
-                cx.open_url(&open_url);
+                crate::inbox::follow_link(&open_url, event, window, cx);
             }))
             .into_any_element()
     }
@@ -566,6 +562,75 @@ impl TranscriptView {
                 .into_any_element(),
         )
     }
+}
+
+/// The unwrapped widths of a link chunk's lines, with the link as its chip.
+pub(super) fn link_line_widths(
+    text: &SharedString,
+    link: &UserMessageLink,
+    window: &Window,
+) -> Vec<Pixels> {
+    let shape = |range: Range<usize>| {
+        let part: SharedString = text[range].to_owned().into();
+        measurements::shape_prompt(part, None, window).map(|line| line.width())
+    };
+    let Some(work) = &link.link.github_work_item else {
+        return shape(0..text.len()).collect();
+    };
+    let url = &link.range;
+    let line = link_line(text, url);
+    let words: SharedString = format!(
+        "{}{}",
+        &text[line.start..url.start],
+        &text[url.end..line.end]
+    )
+    .into();
+    // The words are separate flex items; a pixel of slack keeps their rounded
+    // widths from pushing the last one onto a new line.
+    let words = measurements::shape_prompt(words, None, window)
+        .map(|line| line.width())
+        .sum::<Pixels>();
+    let label: SharedString = chip_label(work).into();
+    let run = gpui::TextRun {
+        len: label.len(),
+        font: gpui::Font {
+            weight: gpui::FontWeight::MEDIUM,
+            ..gpui::font(crate::fonts::UI)
+        },
+        color: Default::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let label = window
+        .text_system()
+        .shape_line(label, px(12.), &[run], None);
+    // Margins, padding, icon and gap around the chip's label.
+    let chip = label.width + px(1. + 6. + 12. + 2. + 6. + 1.);
+    let mut widths = Vec::new();
+    if line.start > 0 {
+        widths.extend(shape(0..line.start - 1));
+    }
+    widths.push(words + chip + px(1.));
+    if line.end < text.len() {
+        widths.extend(shape(line.end + 1..text.len()));
+    }
+    widths
+}
+
+/// The line of `text` holding the link at `url`, without its newline.
+fn link_line(text: &str, url: &Range<usize>) -> Range<usize> {
+    let start = text[..url.start].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[url.end..]
+        .find('\n')
+        .map_or(text.len(), |i| url.end + i);
+    start..end
+}
+
+/// GithubWorkItemPreview's chip label: "PR #12" or "Issue #7".
+fn chip_label(work: &GithubWorkItemLink) -> String {
+    let kind = if work.kind == "pr" { "PR" } else { "Issue" };
+    format!("{kind} #{}", work.number)
 }
 
 /// A chunk's shared search highlights and selection, cut per piece.

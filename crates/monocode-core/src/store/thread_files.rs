@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 const ROOT: &str = "threads";
 const ATTACHMENTS: &str = "attachments";
 const IMAGES: &str = "images";
+const DRAFTS: &str = "drafts";
 const REMOTE_PREFIX: &str = "remote:";
 /// Encoded names start with this so they never collide with a plain id.
 const ENCODED_PREFIX: &str = "x-";
@@ -61,8 +62,34 @@ impl Store {
     pub fn thread_attachments_dir(&self, id: i64) -> Result<Option<PathBuf>, String> {
         Ok(self.thread_dir(id)?.map(|dir| dir.join(ATTACHMENTS)))
     }
+    /// Where a live draft's page is saved so it opens again after a restart,
+    /// by the draft's id. `None` for in-memory stores and unusable ids.
+    pub fn thread_draft_file(&self, id: i64, draft: &str) -> Result<Option<PathBuf>, String> {
+        let plain = !draft.is_empty()
+            && draft
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        let Some(dir) = self.thread_dir(id)?.filter(|_| plain) else {
+            return Ok(None);
+        };
+        Ok(Some(dir.join(DRAFTS).join(format!("{draft}.json"))))
+    }
     /// Writes an image the agent produced or published into the conversation's
     /// folder, named by content so a repeated image is stored once.
+    /// The page a kept draft was made from, among this thread's images, by
+    /// its file name. `None` when there is no such page.
+    pub fn thread_image_page(&self, id: i64, name: &str) -> Result<Option<PathBuf>, String> {
+        let plain = !name.is_empty()
+            && name.ends_with(".html")
+            && !name.contains(['/', '\\'])
+            && !name.starts_with('.');
+        let Some(dir) = self.thread_dir(id)?.filter(|_| plain) else {
+            return Ok(None);
+        };
+        let page = dir.join(IMAGES).join(name);
+        Ok(page.is_file().then_some(page))
+    }
+
     pub fn save_thread_image(
         &self,
         id: i64,

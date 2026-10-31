@@ -568,11 +568,127 @@ impl Workspace {
         state.add_project(&state.project.clone());
         state
     }
+    /// Lists the home folder first, as the built-in Home project, unless the
+    /// user archived it.
+    pub fn ensure_home_project(&mut self) {
+        if let Some(home) = monocode_core::files::home_project() {
+            self.ensure_home_project_at(&home);
+        }
+    }
+    fn ensure_home_project_at(&mut self, home: &str) {
+        let key = monocode_core::files::path_key(home);
+        let is_home = |p: &String| monocode_core::files::path_key(p) == key;
+        if self.archived_projects.iter().any(is_home) {
+            return;
+        }
+        let path = self
+            .projects
+            .iter()
+            .position(is_home)
+            .map_or_else(|| home.to_owned(), |ix| self.projects.remove(ix));
+        self.projects.insert(0, path);
+    }
     pub fn add_project(&mut self, path: &str) {
         self.archived_projects.retain(|p| p != path);
         if !self.projects.iter().any(|p| p == path) {
             self.projects.push(path.into());
         }
+    }
+    /// The rail group a project is listed under. Assignments to deleted
+    /// groups leave the project in the ungrouped list.
+    pub fn project_rail_group(&self, path: &str) -> Option<&str> {
+        let id = self.project_rail_assignments.get(path)?;
+        self.project_rail_groups
+            .iter()
+            .any(|group| &group.id == id)
+            .then_some(id.as_str())
+    }
+    /// Whether two projects sit in the same rail section and reorder together.
+    pub fn project_rail_peers(&self, a: &str, b: &str) -> bool {
+        let pinned = self.project_rail_pinned.contains(a);
+        pinned == self.project_rail_pinned.contains(b)
+            && (pinned || self.project_rail_group(a) == self.project_rail_group(b))
+    }
+    /// Projects in the order the current layout shows them. The rail lists
+    /// pinned projects, then each group's members, then the rest.
+    pub fn visible_project_order(&self) -> Vec<String> {
+        if !self.classic_layout {
+            return self.projects.clone();
+        }
+        let unpinned = |p: &&String| !self.project_rail_pinned.contains(*p);
+        let mut order: Vec<String> = self
+            .projects
+            .iter()
+            .filter(|p| self.project_rail_pinned.contains(*p))
+            .cloned()
+            .collect();
+        for group in &self.project_rail_groups {
+            order.extend(
+                self.projects
+                    .iter()
+                    .filter(unpinned)
+                    .filter(|p| self.project_rail_group(p) == Some(group.id.as_str()))
+                    .cloned(),
+            );
+        }
+        order.extend(
+            self.projects
+                .iter()
+                .filter(unpinned)
+                .filter(|p| self.project_rail_group(p).is_none())
+                .cloned(),
+        );
+        order
+    }
+    /// The projects that reorder alongside `path`, in the order shown: the
+    /// whole list, or just its rail section.
+    pub fn project_peers(&self, path: &str) -> Vec<String> {
+        self.visible_project_order()
+            .into_iter()
+            .filter(|p| !self.classic_layout || self.project_rail_peers(p, path))
+            .collect()
+    }
+    /// Moves a project to `to` in the saved order. Returns whether it moved.
+    pub fn move_project(&mut self, path: &str, to: usize) -> bool {
+        let Some(from) = self.projects.iter().position(|p| p == path) else {
+            return false;
+        };
+        let to = to.min(self.projects.len() - 1);
+        if from == to {
+            return false;
+        }
+        let project = self.projects.remove(from);
+        self.projects.insert(to, project);
+        true
+    }
+    /// Moves a project one place along what the layout shows, staying inside
+    /// its rail section. Returns whether it moved.
+    pub fn step_project_order(&mut self, path: &str, step: isize) -> bool {
+        let peers = self.project_peers(path);
+        let Some(ix) = peers.iter().position(|p| p == path) else {
+            return false;
+        };
+        let Some(neighbour) = ix
+            .checked_add_signed(step.signum())
+            .and_then(|ix| peers.get(ix))
+        else {
+            return false;
+        };
+        let to = self.projects.iter().position(|p| p == neighbour).unwrap();
+        self.move_project(path, to)
+    }
+    /// Moves a project to either end of its section: `step < 0` for the start.
+    pub fn move_project_to_end(&mut self, path: &str, step: isize) -> bool {
+        let peers = self.project_peers(path);
+        let target = if step < 0 {
+            peers.first()
+        } else {
+            peers.last()
+        };
+        let Some(to) = target.and_then(|t| self.projects.iter().position(|p| p == t)) else {
+            return false;
+        };
+        self.move_project(path, to)
     }
     pub fn session_for_pane(&self, id: i64) -> i64 {
         self.review_owners.get(&id).copied().unwrap_or(id)
@@ -1039,6 +1155,44 @@ pub(crate) fn project_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rail_moves_stay_inside_their_section_and_follow_the_drawn_order() {
+        let mut state = super::Workspace {
+            classic_layout: true,
+            projects: ["/a", "/b", "/c", "/d", "/e", "/f"]
+                .map(str::to_owned)
+                .to_vec(),
+            project_rail_pinned: ["/e".to_owned()].into(),
+            project_rail_groups: vec![super::ProjectRailGroup {
+                id: "g".into(),
+                name: "Group".into(),
+                ..Default::default()
+            }],
+            project_rail_assignments: [("/b", "g"), ("/d", "g"), ("/f", "deleted")]
+                .map(|(p, g)| (p.to_owned(), g.to_owned()))
+                .into(),
+            ..Default::default()
+        };
+        // Pinned, then the group, then the rest. A deleted group's member
+        // falls back to the ungrouped list.
+        assert_eq!(
+            state.visible_project_order(),
+            ["/e", "/b", "/d", "/a", "/c", "/f"]
+        );
+        assert_eq!(state.project_peers("/f"), ["/a", "/c", "/f"]);
+        assert!(state.step_project_order("/f", -1));
+        assert_eq!(state.project_peers("/a"), ["/a", "/f", "/c"]);
+        assert!(!state.step_project_order("/b", -1), "/b leads its group");
+        assert!(state.move_project_to_end("/b", 1));
+        assert_eq!(state.project_peers("/d"), ["/d", "/b"]);
+        assert!(!state.step_project_order("/e", 1), "/e is the only pin");
+        // The projects row shows the saved order as it is.
+        state.classic_layout = false;
+        assert_eq!(state.visible_project_order(), state.projects);
+        assert!(state.move_project_to_end("/e", -1));
+        assert_eq!(state.projects[0], "/e");
+    }
+
+    #[test]
     fn legacy_boxy_layout_and_hidden_rail_migrate_without_changing_appearance() {
         let state = super::Workspace::restore(
             Some(r#"{"classic_layout":true,"preferences":{"collapsed_project_rail":"hidden"}}"#),
@@ -1340,6 +1494,26 @@ mod tests {
         let rounded = Workspace::restore(Some(r#"{"new_layout_boxy":false}"#), &sessions, "/a");
         assert!(!rounded.new_layout_boxy);
     }
+    #[test]
+    fn home_is_listed_first_unless_archived() {
+        let mut state = Workspace {
+            projects: vec!["/code/app".into(), "/Users/me/".into()],
+            ..Default::default()
+        };
+        state.ensure_home_project_at("/Users/me");
+        assert_eq!(state.projects, ["/Users/me/", "/code/app"]);
+        let mut fresh = Workspace::default();
+        fresh.ensure_home_project_at("/Users/me");
+        assert_eq!(fresh.projects, ["/Users/me"]);
+        let mut archived = Workspace {
+            projects: vec!["/code/app".into()],
+            archived_projects: vec!["/Users/me".into()],
+            ..Default::default()
+        };
+        archived.ensure_home_project_at("/Users/me");
+        assert_eq!(archived.projects, ["/code/app"]);
+    }
+
     #[test]
     fn restoring_history_keeps_only_remembered_or_selected_projects() {
         let saved = serde_json::json!({

@@ -1,5 +1,7 @@
 //! Session storage. Desktop launches use Monocode's existing schema directly.
 mod app_access;
+mod composer_draft;
+pub use composer_draft::{sent_from as composer_sent_from, ComposerText, ComposerWrite};
 mod managed_sessions;
 mod monocode_import;
 mod monos;
@@ -520,6 +522,24 @@ impl Store {
         let value = serde_json::to_string(summary).map_err(|e| e.to_string())?;
         self.save_setting(&format!("orchestration:{lead}"), &value)
     }
+    /// Each lead's recent orchestration runs, oldest first, as they were saved.
+    pub fn orchestration_runs(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, Vec<crate::orchestration::Run>>, String> {
+        Ok(self
+            .settings_with_prefix("orchestration-runs:")?
+            .into_iter()
+            .filter_map(|(lead, value)| Some((lead, serde_json::from_str(&value).ok()?)))
+            .collect())
+    }
+    pub fn save_orchestration_runs(
+        &self,
+        lead: i64,
+        runs: &[crate::orchestration::Run],
+    ) -> Result<(), String> {
+        let value = serde_json::to_string(runs).map_err(|e| e.to_string())?;
+        self.save_setting(&format!("orchestration-runs:{lead}"), &value)
+    }
     /// `prefix<session id>` settings, by session id.
     fn settings_with_prefix(&self, prefix: &str) -> Result<Vec<(i64, String)>, String> {
         if self.shared.is_some() {
@@ -543,6 +563,43 @@ impl Store {
             }
         }
         Ok(out)
+    }
+    /// What was left unsent in a thread's composer, restored when it reopens.
+    pub fn composer_draft(
+        &self,
+        session: i64,
+    ) -> Result<Option<crate::follow_up::Message>, String> {
+        self.setting(&format!("composer-draft:{session}"))?
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
+            .transpose()
+    }
+    /// `None` clears it once the composer is empty again. Returns the draft's
+    /// new revision, which a paired phone writes against (0 once cleared).
+    pub fn save_composer_draft(
+        &self,
+        session: i64,
+        draft: Option<&crate::follow_up::Message>,
+    ) -> Result<u64, String> {
+        let rev = match draft {
+            Some(_) => composer_draft::next_rev(self.composer_text(session)?.rev),
+            None => 0,
+        };
+        let value = draft
+            .map(|draft| composer_draft::row(draft, rev))
+            .transpose()?
+            .unwrap_or_default();
+        self.save_setting(&format!("composer-draft:{session}"), &value)?;
+        Ok(rev)
+    }
+    /// Sessions with unsent composer text, for the sidebar's Draft mark.
+    pub fn composer_draft_sessions(&self) -> Result<std::collections::HashSet<i64>, String> {
+        Ok(self
+            .settings_with_prefix("composer-draft:")?
+            .into_iter()
+            .filter(|(_, raw)| !raw.is_empty())
+            .map(|(id, _)| id)
+            .collect())
     }
     /// Sessions whose latest message is saved as a draft and not yet sent.
     pub fn draft_sessions(&self) -> Result<std::collections::HashSet<i64>, String> {
@@ -848,19 +905,33 @@ impl Store {
     /// Archiving preserves the transcript, provider context and configuration.
     pub fn set_archived(&self, id: i64, archived: bool) -> Result<(), String> {
         if self.remote_session(id)?.is_some() {
-            return self.patch_remote_session(id, serde_json::json!({"archived": archived}));
+            self.patch_remote_session(id, serde_json::json!({"archived": archived}))?;
+        } else if self.shared.is_some() {
+            self.shared_patch(id, &[("archived", serde_json::json!(archived))])?;
+        } else {
+            self.conn
+                .execute(
+                    "UPDATE native_sessions SET archived=?2 WHERE id=?1",
+                    params![id, archived],
+                )
+                .map_err(|e| e.to_string())?;
         }
-        if self.shared.is_some() {
-            return self.shared_patch(id, &[("archived", serde_json::json!(archived))]);
+        if archived {
+            self.save_setting(
+                &format!("archived-at:{id}"),
+                &crate::time::now_ms().to_string(),
+            )?;
         }
-
-        self.conn
-            .execute(
-                "UPDATE native_sessions SET archived=?2 WHERE id=?1",
-                params![id, archived],
-            )
-            .map_err(|e| e.to_string())?;
         Ok(())
+    }
+    /// When each session was last archived, in Unix milliseconds. Sessions
+    /// archived before this was recorded have no entry.
+    pub fn archive_times(&self) -> Result<std::collections::HashMap<i64, u64>, String> {
+        Ok(self
+            .settings_with_prefix("archived-at:")?
+            .into_iter()
+            .filter_map(|(id, value)| Some((id, value.trim().parse().ok()?)))
+            .collect())
     }
     pub fn set_pinned(&self, ids: &[i64], pinned: bool) -> Result<(), String> {
         let any_remote = ids
@@ -1073,7 +1144,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1083,7 +1154,8 @@ impl Store {
                 format!("orchestration:{id}"),
                 format!("inbox-ask:{id}"),
                 format!("automation:{id}"),
-                format!("thread-parent:{id}")
+                format!("thread-parent:{id}"),
+                format!("orchestration-runs:{id}")
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1325,6 +1397,10 @@ mod tests {
             saved.updated_at, updated_at,
             "archiving does not make an old session look new"
         );
+        assert!(
+            store.archive_times().unwrap()[&session.id] >= updated_at,
+            "the archive time is kept separately"
+        );
         assert_eq!(saved.provider_id.as_deref(), Some("resume-this-thread"));
         assert_eq!(store.load(session.id).unwrap().rows, rows);
         store.set_archived(session.id, false).unwrap();
@@ -1379,15 +1455,35 @@ mod tests {
             live: true,
         };
         store.save_orchestration_summary(lead, &summary).unwrap();
+        let plan = crate::orchestration::from_input(&serde_json::json!({
+            "title": "Tests", "tasks": [{"id": "a", "title": "Tests", "prompt": "Run", "files": ["tests"]}]
+        }))
+        .unwrap();
+        let mut run = crate::orchestration::Run::new(
+            plan,
+            Some("call-1".into()),
+            "/p".into(),
+            "codex".into(),
+            Default::default(),
+        );
+        run.dispatch();
+        store.save_orchestration_runs(lead, &[run]).unwrap();
         drop(store);
         let mut store = Store::open(&path).unwrap();
         assert_eq!(store.started_links().unwrap()[&child], lead);
         assert_eq!(store.orchestration_summaries().unwrap()[&lead], summary);
+        let runs = store.orchestration_runs().unwrap();
+        assert_eq!(runs[&lead][0].call.as_deref(), Some("call-1"));
+        assert_eq!(
+            runs[&lead][0].tasks[0].state,
+            crate::orchestration::State::Starting
+        );
         assert_eq!(summary.tasks[0].label(&summary, false), "Working");
         store.delete(child).unwrap();
         store.delete(lead).unwrap();
         assert!(store.started_links().unwrap().is_empty());
         assert!(store.orchestration_summaries().unwrap().is_empty());
+        assert!(store.orchestration_runs().unwrap().is_empty());
     }
     #[test]
     fn pins_links_groups_and_reminders_survive_restart_and_delete_clears_them() {

@@ -3,7 +3,7 @@
 //! the message queue until they finish or the agent picks the thread back up.
 use super::*;
 use crate::{pane_motion::PaneSlide, reveal::Disclosure};
-use monocode_core::provider::BackgroundTask;
+use monocode_core::provider::{BackgroundTask, Waiting};
 use std::{cell::RefCell, time::Instant};
 
 const ROW_HEIGHT: f32 = 38.;
@@ -14,6 +14,8 @@ const LIVE: u32 = 0x4ade80;
 #[derive(Default)]
 pub(super) struct BackgroundTasks {
     pub tasks: Vec<BackgroundTask>,
+    /// A subagent just reported back and the agent may pick the thread up.
+    pub waking: bool,
     pub collapsed: bool,
     pub motion: composer_shelf::Motion,
     /// Springs the rows open or shut when the header is toggled.
@@ -21,6 +23,15 @@ pub(super) struct BackgroundTasks {
 }
 
 impl BackgroundTasks {
+    /// Subagents the agent will come back to, so a queued message waits.
+    pub(super) fn waiting_on_agents(&self) -> bool {
+        self.waking || self.tasks.iter().any(|task| task.agent)
+    }
+    /// The agent has answered and only commands are left, which may never end
+    /// (a dev server), so a queued message goes to the agent now.
+    pub(super) fn idle(&self) -> bool {
+        !self.tasks.is_empty() && !self.waiting_on_agents()
+    }
     fn toggle(&mut self, animate: bool) {
         self.collapsed = !self.collapsed;
         if !animate {
@@ -41,7 +52,8 @@ impl BackgroundTasks {
 }
 
 impl Conversation {
-    pub(super) fn set_background(&mut self, tasks: Vec<BackgroundTask>, cx: &mut Context<Self>) {
+    pub(super) fn set_background(&mut self, waiting: Waiting, cx: &mut Context<Self>) {
+        let Waiting { tasks, waking } = waiting;
         let animate = !cx.reduce_motion();
         for task in &tasks {
             if !self.background.tasks.iter().any(|old| old.id == task.id) {
@@ -51,11 +63,13 @@ impl Conversation {
             }
         }
         self.background.tasks = tasks;
+        self.background.waking = waking;
         cx.notify();
     }
 
     pub(super) fn clear_background(&mut self) {
         self.background.tasks.clear();
+        self.background.waking = false;
     }
 
     pub(super) fn background_shelf(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -69,7 +83,7 @@ impl Conversation {
             return div().into_any_element();
         }
         // Over a queued message the card tucks in behind it, a deck of two.
-        let inset = if self.follow_ups.state.messages.is_empty() {
+        let inset = if self.queue_card_messages().is_empty() {
             px(8.)
         } else {
             px(20.)
@@ -345,8 +359,12 @@ mod tests {
         }
     }
 
+    fn waiting(tasks: Vec<BackgroundTask>, waking: bool) -> Waiting {
+        Waiting { tasks, waking }
+    }
+
     #[gpui::test]
-    fn background_work_sits_on_the_ledge_steers_new_messages_and_clears_on_stop(
+    fn background_work_sits_on_the_ledge_holds_queued_messages_for_subagents_and_clears_on_stop(
         cx: &mut TestAppContext,
     ) {
         let store = Store::open(Path::new(":memory:")).unwrap();
@@ -364,7 +382,10 @@ mod tests {
                     view.loaded = true;
                     view.summary.has_messages = true;
                     view.busy = true;
-                    view.set_background(vec![task("dev", false), task("review", true)], cx);
+                    view.set_background(
+                        waiting(vec![task("dev", false), task("review", true)], false),
+                        cx,
+                    );
                     view
                 })
             })
@@ -381,19 +402,107 @@ mod tests {
         assert!(visual.debug_bounds("background-task-dev").is_none());
         assert!(visual.debug_bounds("background-tasks-header").is_some());
 
+        let (controls, received) = std::sync::mpsc::channel();
         window
             .update(visual, |view, _, cx| {
+                view.controls = Some(controls);
+                view.follow_ups.ready = true;
                 view.enqueue_follow_up("Is the server up?".into(), None, cx);
-                assert!(
-                    view.follow_ups.state.messages[0].steer,
-                    "a message must not wait behind a server that never ends"
-                );
+                assert!(!view.follow_ups.state.messages[0].steer);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(
+            received.try_recv().is_err(),
+            "a queued message waits for the subagent"
+        );
+        assert!(visual.debug_bounds("queue-waiting").is_some());
+
+        let release = |visual: &mut VisualTestContext, waking| {
+            window
+                .update(visual, |view, _, cx| {
+                    view.set_background(waiting(vec![task("dev", false)], waking), cx);
+                    view.pump_follow_ups(cx);
+                })
+                .unwrap();
+        };
+        release(visual, true);
+        assert!(
+            received.try_recv().is_err(),
+            "the agent may still pick the thread up after its subagent reports"
+        );
+        release(visual, false);
+        let Decision::Steer(message) = received.try_recv().unwrap().decision else {
+            panic!("expected the queued message to reach the agent");
+        };
+        assert_eq!(
+            message.text, "Is the server up?",
+            "a message must not wait behind a server that never ends"
+        );
+
+        window
+            .update(visual, |view, _, cx| {
                 view.stop(cx);
-                assert!(view.background.tasks.is_empty());
+                assert!(view.background.tasks.is_empty() && !view.background.waking);
             })
             .unwrap();
         visual.refresh().unwrap();
         assert!(visual.debug_bounds("background-tasks-header").is_none());
+    }
+
+    #[gpui::test]
+    fn a_plan_message_says_it_waits_for_the_server(cx: &mut TestAppContext) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let summary = store.create("claude", "/tmp").unwrap();
+        let window = cx.update(|cx| {
+            input::bind(cx);
+            cx.set_reduce_motion(true);
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+                    view.loaded = true;
+                    view.summary.has_messages = true;
+                    view.busy = true;
+                    view.set_background(waiting(vec![task("dev", false)], false), cx);
+                    view
+                })
+            })
+            .unwrap()
+        });
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let (controls, received) = std::sync::mpsc::channel();
+        window
+            .update(visual, |view, _, cx| {
+                view.controls = Some(controls);
+                view.follow_ups.ready = true;
+                view.enqueue_follow_up("Plan the next step".into(), Some("plan".into()), cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(
+            received.try_recv().is_err(),
+            "a plan message starts a new turn"
+        );
+        window
+            .update(visual, |view, _, _| {
+                assert_eq!(
+                    view.queue_waits_on().as_deref(),
+                    Some("Sends when the background command stops")
+                );
+            })
+            .unwrap();
+        assert!(visual.debug_bounds("queue-waiting").is_some());
+
+        window
+            .update(visual, |view, _, cx| {
+                view.follow_ups.state.messages[0].mode = None;
+                view.pump_follow_ups(cx);
+                assert!(view.queue_waits_on().is_none());
+            })
+            .unwrap();
+        assert!(received.try_recv().is_ok(), "a plain message goes out now");
     }
 
     #[gpui::test]
@@ -407,7 +516,7 @@ mod tests {
                     let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
                     view.loaded = true;
                     view.summary.has_messages = true;
-                    view.set_background(vec![task("dev", false)], cx);
+                    view.set_background(waiting(vec![task("dev", false)], false), cx);
                     view
                 })
             })

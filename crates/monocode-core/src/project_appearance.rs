@@ -27,6 +27,9 @@ pub struct ProjectAppearance {
 impl ProjectAppearance {
     pub fn label(&self, project: &str) -> String {
         if self.name.trim().is_empty() {
+            if crate::files::is_home_project(project) {
+                return "Home".into();
+            }
             Path::new(project)
                 .file_name()
                 .map_or_else(|| project.into(), |s| s.to_string_lossy().into_owned())

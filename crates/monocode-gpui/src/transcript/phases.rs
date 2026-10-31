@@ -79,7 +79,7 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
             && let Ok(mut call) = serde_json::from_str::<ToolCall>(&rows[at].text)
         {
             if call.is_draft_tool()
-                || matches!(call.thread_action(), Some("wait" | "send" | "stop"))
+                || matches!(call.thread_action(), Some("wait" | "send" | "stop" | "close"))
             {
                 result.hidden.insert(at);
                 at = end;
@@ -99,6 +99,12 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
                     if live_turn.is_some_and(|turn| at >= turn)
                         || matches!(call.state, ToolState::Failed | ToolState::Cancelled) =>
                 {
+                    result.pinned.insert(at);
+                    true
+                }
+                // A plan stays in view after its turn folds: it is where the
+                // run is started and followed.
+                Some(Panel::Orchestration(_)) => {
                     result.pinned.insert(at);
                     true
                 }

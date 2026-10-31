@@ -67,7 +67,7 @@ impl Conversation {
             && !self.preparing_worktree
             && !self.attaching
             && !self.planning_orchestration
-            && self.orchestration_progress.is_none()
+            && !self.orchestration_active
             && !self.needs_approval()
             && self.questions.is_empty()
             && self.controls.is_none()
@@ -191,10 +191,9 @@ impl Conversation {
         let text = self.input.read(cx).content.trim();
         if text.eq_ignore_ascii_case("/compact")
             || text.eq_ignore_ascii_case("/mcp")
-            || ["btw", "draft", "add-to-folder"]
+            || ["btw", "add-to-folder"]
                 .iter()
                 .any(|command| monocode_core::composer::consume_command(text, command).is_some())
-            || self.draft_active(cx)
         {
             self.status = "Cancel message editing before running a local command".into();
             cx.notify();

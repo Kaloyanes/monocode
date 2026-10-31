@@ -34,6 +34,11 @@ impl Protocol {
         }
         request["nativeContent"] = content;
         let id = wire.to_string();
+        let computer_use = request["_meta"]["connector_id"] == "computer-use"
+            && request["_meta"]["codex_approval_kind"] == "mcp_tool_call"
+            && request["_meta"]["tool_params"]["app"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty());
         self.approvals
             .insert(id.clone(), (wire, "codex-mcp".into(), request));
         events.push(Event::Approval(Approval {
@@ -41,8 +46,13 @@ impl Protocol {
             title,
             detail: String::new(),
             can_remember: false,
-            remember_scope: (!restricted && grant.is_some())
-                .then(|| "Remember this exact confirmation in this project, across chats and restarts. Remove it in Settings → MCP connections.".into()),
+            remember_scope: (!restricted && grant.is_some()).then(|| {
+                if computer_use {
+                    "Allow Computer Use actions for this app in this project, across worktrees, chats and restarts. Remove it in Settings → MCP connections.".into()
+                } else {
+                    "Remember this exact confirmation in this project, across worktrees, chats and restarts. Remove it in Settings → MCP connections.".into()
+                }
+            }),
         }));
         Ok(())
     }
@@ -83,8 +93,8 @@ impl Protocol {
                 provider: self.request.kind.id().into(),
                 account: self.request.settings.account.id.clone(),
                 account_home: crate::permissions::project(&account_home),
-                binary: crate::permissions::project(&self.request.binary),
-                project: crate::permissions::project(&self.request.cwd),
+                binary: crate::permissions::codex_binary(&self.request.binary),
+                project: crate::permissions::repository(&self.request.cwd),
                 server: server.into(),
                 confirmation,
             },
@@ -163,7 +173,9 @@ impl Protocol {
                 self.claude_prompt(stdin)?;
             }
             self.sync_background(&mut events);
+            events.extend(self.expire_claude_steers());
             if self.claude_result_seen
+                && self.steering.is_empty()
                 && self.activities.claude_background.is_empty()
                 && self.activities.claude_pending.is_empty()
                 && self.claude_resume_at.is_none_or(|at| Instant::now() >= at)
@@ -459,6 +471,77 @@ mod permission_tests {
             serde_json::from_slice::<Value>(&out).unwrap()["result"]["action"],
             "accept"
         );
+    }
+
+    #[test]
+    fn always_allow_survives_a_codex_standalone_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut first = protocol(&path);
+        first.request.binary = "/opt/codex/standalone/releases/0.164.0/bin/codex".into();
+        ask(&mut first, request(), &mut Vec::new());
+        first.remember_approval("17", &mut Vec::new()).unwrap();
+        let mut later = protocol(&path);
+        later.request.binary = "/opt/codex/standalone/releases/0.165.0/bin/codex".into();
+        let mut out = Vec::new();
+        assert!(ask(&mut later, request(), &mut out).is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap()["result"]["action"],
+            "accept"
+        );
+    }
+
+    #[test]
+    fn computer_use_grant_matches_actions_on_the_same_app_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let make = |tool: &str, app: &str| {
+            let mut r = request();
+            r["_meta"] = json!({"codex_approval_kind":"mcp_tool_call", "connector_id":"computer-use", "tool_name":tool, "tool_params":{"app":app}, "tool_params_display":[tool], "callId":tool});
+            r
+        };
+        let mut p = protocol(&path);
+        let events = ask(&mut p, make("get_app_state", "App A"), &mut Vec::new());
+        assert!(
+            matches!(&events[0], Event::Approval(a) if a.remember_scope.as_ref().unwrap().contains("actions for this app"))
+        );
+        p.remember_approval("17", &mut Vec::new()).unwrap();
+        let mut later = protocol(&path);
+        assert!(ask(&mut later, make("click", "App A"), &mut Vec::new()).is_empty());
+        assert!(matches!(
+            ask(&mut later, make("click", "App B"), &mut Vec::new()).as_slice(),
+            [Event::Approval(_)]
+        ));
+    }
+
+    #[test]
+    fn saved_approval_matches_linked_worktrees_but_not_other_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        let worktree = dir.path().join("worktree");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(main.join(".git/worktrees/test")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/test").display()),
+        )
+        .unwrap();
+        std::fs::write(main.join(".git/worktrees/test/commondir"), "../..\n").unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut p = protocol(&path);
+        p.request.cwd = worktree;
+        ask(&mut p, request(), &mut Vec::new());
+        p.remember_approval("17", &mut Vec::new()).unwrap();
+        let mut later = protocol(&path);
+        later.request.cwd = main;
+        assert!(ask(&mut later, request(), &mut Vec::new()).is_empty());
+        later.request.cwd = other;
+        assert!(matches!(
+            ask(&mut later, request(), &mut Vec::new()).as_slice(),
+            [Event::Approval(_)]
+        ));
     }
 
     #[test]

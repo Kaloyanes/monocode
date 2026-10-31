@@ -25,6 +25,9 @@ image = { version = "0.25", default-features = false }
 # The terminal dock: PTY, VT parser and grid (as Zed's terminal uses).
 alacritty_terminal = "0.26"
 libc = "0.2"
+# Chromium for drafts is downloaded on demand and checked against its hash.
+ureq = "2.12"
+sha2 = "0.10"
 rquickjs = "0.14.0"
 # The file editor's native syntax: incremental parses, highlights, folds and
 # syntax errors. Languages without a grammar here use the QuickJS fallback.
@@ -48,6 +51,8 @@ tree-sitter-java = "0.23"
 tree-sitter-yaml = "0.7"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-ruby = "0.23"
+# The device hub's input and Android video sockets, on their own threads.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Settings → Mobile draws the pairing code from the module matrix.
 qrcode = { version = "0.14", default-features = false }
 
@@ -65,9 +70,19 @@ objc2 = "0.6"
 block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSEvent", "NSGraphicsContext", "NSAppearance", "NSApplication", "NSDockTile", "NSButton", "NSControl", "NSLayoutAnchor", "NSLayoutConstraint", "NSResponder", "NSView", "NSWindow", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage", "NSImageRep", "NSBitmapImageRep"] }
 raw-window-handle = "0.6"
-objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKWebsiteDataStore", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "WKSnapshotConfiguration", "WKUserScript", "WKUserContentController", "block2"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKWebsiteDataStore", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "WKSnapshotConfiguration", "WKUserScript", "WKUserContentController", "WKScriptMessage", "WKScriptMessageHandler", "WKFrameInfo", "block2"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSData", "NSRange", "NSURL", "NSURLRequest", "NSArray", "NSSet", "NSError", "NSBundle", "NSValue", "NSDictionary"] }
 objc2-user-notifications = "0.3"
+# Chromium drafts: frames arrive from the CEF host as IOSurfaces over Mach.
+mach2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBase", "CFDictionary", "CFArray", "CFNumber"] }
+objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "IOSurfaceBase", "libc", "objc2", "objc2-core-foundation", "bitflags"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn", "objc2-io-surface"] }
+# Device screens: H.264 from the device hub, decoded and shown by Core
+# Animation beside GPUI rather than through its frames.
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVAnimation", "AVQueuedSampleBufferRendering", "AVSampleBufferDisplayLayer", "AVSampleBufferVideoRenderer", "objc2-core-media", "objc2-core-video", "objc2-quartz-core"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "CMAttachment", "objc2-core-video"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "objc2-core-foundation"] }
 # libmalloc keeps freed large spans dirty, so startup and image churn stayed
 # resident. mimalloc 3 retains churn the same way; the v2 feature pins 2.x.
 mimalloc = { version = "0.1", default-features = false, features = ["v2"] }

@@ -310,6 +310,7 @@ mod tests {
                     error: None,
                     sent_at: Some(at(6, 0, 5)),
                     attachments: Vec::new(),
+                    caption: None,
                 }],
                 cx,
             );

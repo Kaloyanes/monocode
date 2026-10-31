@@ -7,7 +7,7 @@ import {
 import { hasNativeTranscript } from "@/features/connection/nativeLink";
 import { useProjectChanges } from "@/features/connection/useProjectChanges";
 import { useProjectWorktrees } from "@/features/connection/useProjectWorktrees";
-import type { Project, SessionSummary } from "@/features/workspace/types";
+import type { ComposerMode, Project, SessionSummary } from "@/features/workspace/types";
 import { use, useCallback, useEffect, useState, type ReactNode } from "react";
 import { Platform, Pressable, StyleSheet } from "react-native";
 import Animated, {
@@ -37,6 +37,7 @@ import {
   useReportSessionError,
   useSessionErrorNotice,
 } from "@/features/sessions/sessionError";
+import { OrchestrationStrip } from "@/features/orchestration/OrchestrationStrip";
 import { LiveSessions } from "@/features/sessions/LiveSessions";
 import { NativeTranscript } from "@/features/sessions/NativeTranscript";
 import { FileOpener } from "@/features/sessions/Markdown";
@@ -90,7 +91,7 @@ export function ProjectScreen({
   project: Project;
   sessionId: string | undefined;
 }) {
-  const { startSession, sendMessage, stop } = useWorkspace();
+  const { startSession, sendMessage, stop, sessions } = useWorkspace();
   const [openAfterStarting] = useOpenSessionAfterStarting();
   const colors = useColors();
   const blurTarget = use(GlassBlurTarget);
@@ -198,7 +199,7 @@ export function ProjectScreen({
     if (focused) emptyOpacity.set(1);
   }, [focused, emptyOpacity]);
 
-  const start = async (text: string, attachments: Attachment[]) => {
+  const start = async (text: string, attachments: Attachment[], mode?: ComposerMode) => {
     // When opening the session, wait for the background and intro to fade,
     // even if the desktop replies first. Otherwise stay ready for another.
     const faded = openAfterStarting
@@ -233,6 +234,7 @@ export function ProjectScreen({
             ...(workspace.mode === "existing"
               ? { worktreePath: workspace.worktree.path }
               : {}),
+            ...(mode ? { mode } : {}),
           },
           attachments,
         ),
@@ -297,6 +299,14 @@ export function ProjectScreen({
       subtitle={[project.name, branch].filter(Boolean).join(" · ")}
     />
   ) : null;
+  // A lead's agents, or a worker's way back to its lead.
+  const lead = session?.leadId
+    ? sessions.find((entry) => entry.id === session.leadId)
+    : undefined;
+  const orchestrationStrip =
+    session && (lead || session.orchestration) ? (
+      <OrchestrationStrip session={session} lead={lead} />
+    ) : undefined;
   const sessionToolbar = sessionId ? (
     <SessionToolbar
       projectId={project.id}
@@ -314,7 +324,9 @@ export function ProjectScreen({
       // Where a new session will work, under the tabs and in view across its
       // pages; a session's composer shows where it does.
       below={
-        sessionId ? undefined : offline ? (
+        sessionId ? (
+          orchestrationStrip
+        ) : offline ? (
           // Nothing to pick from while the desktop can't be reached.
           <ReconnectingStatus />
         ) : (
@@ -346,12 +358,20 @@ export function ProjectScreen({
       composer={
         <Composer
           key={sessionId ?? project.id}
+          // A worker's thread is driven by its lead and has no draft of its own.
+          conversationId={session?.leadId ? undefined : sessionId}
           notice={sessionNotice}
           context={project.name}
           branch={sessionId ? (session?.branch ?? project.branch) : branch}
           model={model}
           effort={effort}
           harness={harness}
+          modes
+          slash={{
+            projectId: project.id,
+            ...(worktreePath ? { worktreePath } : {}),
+            ...(sessionId ? { conversationId: sessionId } : {}),
+          }}
           onModelPress={() =>
             router.push({
               pathname: "/models",
@@ -365,9 +385,14 @@ export function ProjectScreen({
             ? {
                 busy: conversation.busy,
                 onStop: () => stop(sessionId),
-                onSend: (text: string, attachments: Attachment[]) => {
+                onSend: (
+                  text: string,
+                  attachments: Attachment[],
+                  mode?: ComposerMode,
+                  draftRev?: number,
+                ) => {
                   markStartedHere(sessionId);
-                  return sendMessage(sessionId, text, attachments);
+                  return sendMessage(sessionId, text, attachments, mode, draftRev);
                 },
                 workspace: (
                   <WorkspaceLine

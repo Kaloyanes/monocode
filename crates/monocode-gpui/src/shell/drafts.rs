@@ -17,6 +17,20 @@ impl Shell {
         if cx.is_test() {
             return;
         }
+        let reopens = crate::draft::reopen_requests();
+        cx.spawn(async move |this, cx| {
+            while let Ok((session, id)) = reopens.recv().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.reopen_draft(session, &id, window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         let requests = crate::draft::inbox();
         cx.spawn(async move |this, cx| {
             while let Ok(request) = requests.recv().await {
@@ -40,25 +54,16 @@ impl Shell {
             .map(|pane| self.workspace.session_for_pane(pane))
     }
 
-    /// A native view stays where it was last placed, so the drafts of every
-    /// conversation that is not on screen step aside. Within a conversation,
-    /// the thread hides the ones scrolled out of view.
-    pub(super) fn hide_drafts_off_screen(&self, cx: &App) {
-        let showing = self.visible_session();
-        for (session, drafts) in &self.drafts {
-            if Some(*session) != showing {
-                for draft in drafts {
-                    draft.read(cx).hide();
-                }
-            }
-        }
-    }
-
     fn reply_draft(request: &DraftRequest, result: Result<DraftReply, String>) {
         let _ = request.reply.send(result);
     }
 
-    fn draft_named(&self, session: i64, id: &str, cx: &App) -> Option<Entity<Draft>> {
+    pub(super) fn draft_named(
+        &self,
+        session: i64,
+        id: &str,
+        cx: &App,
+    ) -> Option<Entity<Draft>> {
         self.drafts
             .get(&session)?
             .iter()
@@ -66,18 +71,12 @@ impl Shell {
             .cloned()
     }
 
-    fn handle_draft_request(
+    pub(super) fn handle_draft_request(
         &mut self,
         request: DraftRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.visible_session() != Some(request.session) || self.mono_active(cx) {
-            return Self::reply_draft(
-                &request,
-                Err("Drafts are drawn in the open conversation, and this one is in the background. Try again when the user is back in it.".into()),
-            );
-        }
         let session = request.session;
         let draft = match (&request.draft, &request.content) {
             (Some(id), _) => {
@@ -103,14 +102,20 @@ impl Shell {
         };
         if matches!(request.action, DraftAction::Close) {
             let id = draft.read(cx).id().to_owned();
-            self.drop_draft(session, &id, cx);
+            self.drop_draft(session, &id, true, cx);
             cx.notify();
             return Self::reply_draft(&request, Ok(DraftReply::Closed { draft: id }));
         }
         cx.notify();
+        // The page keeps running for the request even when its conversation
+        // is in the background. A wait is on the person, who can only use
+        // the page where they see it.
+        let lease = (!matches!(request.action, DraftAction::Wait { .. }))
+            .then(|| draft.update(cx, |draft, cx| draft.lease(window, cx)));
         let weak = draft.downgrade();
         cx.spawn(async move |_, cx| {
             let result = Draft::run(&weak, &request, cx).await;
+            drop(lease);
             Self::reply_draft(&request, result);
         })
         .detach();
@@ -135,8 +140,46 @@ impl Shell {
                 cx,
             )
         });
+        // The bridge names the drafts that have cards in the thread.
+        if let Some(path) = request
+            .id
+            .as_deref()
+            .and_then(|id| self.draft_file(session, id))
+        {
+            draft.update(cx, |draft, cx| draft.save_to(path, cx));
+        }
         self.add_draft(session, &draft, window, cx);
         draft
+    }
+
+    /// Where a draft is saved in its conversation's folder.
+    fn draft_file(&self, session: i64, id: &str) -> Option<std::path::PathBuf> {
+        crate::runtime::locked(&self.store)
+            .ok()?
+            .thread_draft_file(session, id)
+            .ok()
+            .flatten()
+    }
+
+    /// Opens a saved draft again under its own id, for a card whose page is
+    /// not open: after a restart, or once it was retired. An open one is
+    /// reused; `None` if it was never saved or was closed.
+    pub(super) fn reopen_draft(
+        &mut self,
+        session: i64,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Draft>> {
+        if let Some(draft) = self.draft_named(session, id, cx) {
+            return Some(draft);
+        }
+        let path = self.draft_file(session, id)?;
+        let saved = draft::Saved::read(&path)?;
+        let draft = cx.new(|cx| Draft::reopen(id.to_owned(), session, saved, path, cx));
+        self.add_draft(session, &draft, window, cx);
+        cx.notify();
+        Some(draft)
     }
 
     fn add_draft(
@@ -152,7 +195,7 @@ impl Shell {
             window,
             move |this, draft, event: &DraftEvent, _, cx| match event {
                 DraftEvent::Closed => {
-                    this.drop_draft(session, &id, cx);
+                    this.drop_draft(session, &id, true, cx);
                     cx.notify();
                 }
                 DraftEvent::Send => this.deliver_draft_notes(session, draft, cx),
@@ -163,6 +206,7 @@ impl Shell {
         let retired = (live.len() > LIVE_PER_CONVERSATION).then(|| live.remove(0));
         if let Some(old) = retired {
             old.read(cx).hide();
+            old.read(cx).save_now(cx);
             let old_id = old.read(cx).id().to_owned();
             draft::unregister(&old_id, cx);
         }
@@ -170,25 +214,28 @@ impl Shell {
         draft::register(&id, draft, cx);
     }
 
-    /// The person sent their notes. An agent that is waiting gets them as the
+    /// The person sent their notes, or used a page control that sends a
+    /// message. An agent that is waiting gets them as the
     /// result of its wait; otherwise they go to the conversation as a message,
     /// steering a running turn where the provider can take it.
     fn deliver_draft_notes(&mut self, session: i64, draft: &Entity<Draft>, cx: &mut Context<Self>) {
         if draft.read(cx).waiting() {
             return;
         }
-        let (notes, actions) = draft.update(cx, |draft, _| draft.take_outbox());
-        if notes.is_empty() {
+        let outbox = draft.update(cx, |draft, _| draft.take_outbox());
+        if outbox.notes.is_empty() && outbox.messages.is_empty() {
             return;
         }
         let title = draft.read(cx).title();
-        let text = DraftFeedback::message(&title, &notes, &actions);
+        let text = DraftFeedback::message(&title, &outbox.notes, &outbox.messages, &outbox.actions);
         if let Some(view) = self.sessions.get(&session).cloned() {
             view.update(cx, |view, cx| view.send_draft_feedback(text, cx));
         }
     }
 
-    fn drop_draft(&mut self, session: i64, id: &str, cx: &mut Context<Self>) {
+    /// Takes a draft out of its conversation. A closed one is no longer
+    /// saved, so its card stays closed after a restart.
+    fn drop_draft(&mut self, session: i64, id: &str, close: bool, cx: &mut Context<Self>) {
         let Some(live) = self.drafts.get_mut(&session) else {
             return;
         };
@@ -200,6 +247,9 @@ impl Shell {
             self.drafts.remove(&session);
         }
         draft.read(cx).hide();
+        if close {
+            draft.update(cx, |draft, cx| draft.forget(cx));
+        }
         draft::unregister(id, cx);
     }
 
@@ -213,15 +263,27 @@ impl Shell {
         let Some(session) = self.visible_session() else {
             return;
         };
-        let id = draft::kept_id(path);
-        if self.draft_named(session, &id, cx).is_some() {
-            return;
-        }
-        let Ok(html) = std::fs::read_to_string(path) else {
-            self.error = Some("That draft's page is no longer available.".into());
+        if let Err(error) = self.open_kept_draft_in(session, path, window, cx) {
+            self.error = Some(error.into());
             cx.notify();
-            return;
-        };
+        }
+    }
+
+    /// Opens a kept draft's page live in its conversation, for the desktop's
+    /// card and the phone alike. An open one is reused.
+    pub(super) fn open_kept_draft_in(
+        &mut self,
+        session: i64,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Entity<Draft>, &'static str> {
+        let id = draft::kept_id(path);
+        if let Some(draft) = self.draft_named(session, &id, cx) {
+            return Ok(draft);
+        }
+        let html = std::fs::read_to_string(path)
+            .map_err(|_| "That draft's page is no longer available.")?;
         let draft = cx.new(|cx| {
             Draft::new(
                 Some(id),
@@ -235,6 +297,7 @@ impl Shell {
         });
         self.add_draft(session, &draft, window, cx);
         cx.notify();
+        Ok(draft)
     }
 }
 
@@ -268,7 +331,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_draft_lives_in_the_open_conversation_and_background_ones_are_refused(
+    fn a_draft_lives_in_its_conversation_whether_or_not_it_is_open(
         cx: &mut gpui::TestAppContext,
     ) {
         let (window, _, _) = crate::shell::tests::window(cx);
@@ -280,12 +343,16 @@ mod tests {
                 let open = shell.visible_session().expect("a conversation is open");
                 let html = || Some(DraftContent::Html("<p>Hi</p>".into()));
 
-                // Another conversation is in the background: a clear error.
-                let (background, answer) =
-                    request(open + 1000, None, html(), DraftAction::Snapshot);
+                // A conversation in the background gets its draft too; the
+                // page runs out of sight for the agent.
+                let hidden = open + 1000;
+                let (mut background, _answer) =
+                    request(hidden, None, html(), DraftAction::Snapshot);
+                background.id = Some("draft-2-bg".into());
                 shell.handle_draft_request(background, window, cx);
-                let error = answer.try_recv().unwrap().err().unwrap();
-                assert!(error.contains("background"), "{error}");
+                assert_eq!(shell.drafts[&hidden].len(), 1);
+                assert!(draft::live("draft-2-bg", cx).is_some());
+                shell.drop_draft(hidden, "draft-2-bg", true, cx);
                 assert!(shell.drafts.is_empty());
 
                 // The open one gets a draft under the id the bridge chose, which
@@ -297,6 +364,12 @@ mod tests {
                 assert!(draft::live("draft-1-abc", cx).is_some());
                 // No side panel opens for it.
                 assert!(!shell.workspace.right_panel_open);
+
+                // Trying again on that card with new content keeps one card.
+                let (retry, _answer) =
+                    request(open, Some("draft-1-abc".into()), html(), DraftAction::Snapshot);
+                shell.handle_draft_request(retry, window, cx);
+                assert_eq!(shell.drafts[&open].len(), 1);
 
                 // A stale id is refused rather than acting on another page.
                 let (stale, answer) =
@@ -317,6 +390,70 @@ mod tests {
                 assert!(draft::live("draft-1-abc", cx).is_none());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_draft_is_saved_and_opens_again_after_a_restart_unless_it_was_closed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!("monocode-draft-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = monocode_core::store::Store::open(&dir.join("monocode.db")).unwrap();
+        let (window, _, _) = crate::shell::tests::window_with(cx, store);
+        let id = "draft-1-5aved";
+        let file = window
+            .update(cx, |shell, window, cx| {
+                cx.set_reduce_motion(true);
+                let open = shell.visible_session().unwrap();
+                let page = Some(DraftContent::Html("<p>Kept</p>".into()));
+                let (mut first, _answer) = request(open, None, page, DraftAction::Snapshot);
+                first.id = Some(id.into());
+                first.title = Some("Chart".into());
+                first.width = Some(520);
+                shell.handle_draft_request(first, window, cx);
+                shell.draft_file(open, id).unwrap()
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let open = shell.visible_session().unwrap();
+                let mut values = serde_json::Map::new();
+                values.insert("zoom".into(), 3.into());
+                shell
+                    .draft_named(open, id, cx)
+                    .unwrap()
+                    .update(cx, |draft, cx| draft.page_reported(values, cx));
+            })
+            .unwrap();
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(file.is_file(), "the draft is saved in its conversation");
+
+        // A restart: the page is gone, but its card asks for it.
+        window
+            .update(cx, |shell, window, cx| {
+                let open = shell.visible_session().unwrap();
+                shell.drafts.clear();
+                draft::unregister(id, cx);
+                let draft = shell.reopen_draft(open, id, window, cx).unwrap();
+                let draft = draft.read(cx);
+                assert_eq!(draft.id(), id);
+                assert_eq!(draft.html(), Some("<p>Kept</p>"));
+                assert_eq!(draft.title().as_ref(), "Chart");
+                assert_eq!(draft.shared().state().unwrap()["zoom"], 3);
+                assert!(draft::live(id, cx).is_some());
+
+                // Closed by the agent: no longer saved, so it stays closed.
+                let (close, _answer) =
+                    request(open, Some(id.into()), None, DraftAction::Close);
+                shell.handle_draft_request(close, window, cx);
+                assert!(!file.exists());
+                assert!(shell.reopen_draft(open, id, window, cx).is_none());
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui::test]
@@ -341,5 +478,117 @@ mod tests {
                 assert!(draft::live(&format!("draft-1-{LIVE_PER_CONVERSATION}"), cx).is_some());
             })
             .unwrap();
+    }
+
+    /// The page draws over everything GPUI paints, so any surface drawn in the
+    /// thread's place has to leave it unpainted for the sentinel to hide.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn a_draft_steps_aside_for_every_surface_drawn_in_its_threads_place(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::classic_surface_tests::Surface;
+        use monocode_core::{transcript::Row, visual_bridge::DraftCard};
+
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let open = window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.classic_layout = false;
+                shell.layout_changed(cx);
+                let open = shell.visible_session().expect("a conversation is open");
+                let html = Some(DraftContent::Html("<p>Hi</p>".into()));
+                let (mut shown, _answer) = request(open, None, html, DraftAction::Snapshot);
+                shown.id = Some("draft-1-away".into());
+                shell.handle_draft_request(shown, window, cx);
+                shell.sessions[&open].update(cx, |view, cx| {
+                    view.summary.has_messages = true;
+                    cx.notify();
+                });
+                let card = DraftCard {
+                    draft: "draft-1-away".into(),
+                    title: "Pricing".into(),
+                };
+                let transcript = shell.sessions[&open].read(cx).transcript.clone();
+                transcript.update(cx, |view, cx| {
+                    view.patch(
+                        0,
+                        vec![
+                            Row {
+                                role: "user".into(),
+                                text: "Mock a pricing page".into(),
+                                first: true,
+                                sent_at: None,
+                            },
+                            Row {
+                                role: monocode_core::visual_bridge::DRAFT_ROLE.into(),
+                                text: serde_json::to_string(&card).unwrap(),
+                                first: true,
+                                sent_at: None,
+                            },
+                        ],
+                        cx,
+                    )
+                });
+                open
+            })
+            .unwrap();
+        let id = gpui::AnyWindowHandle::from(window).window_id();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let painted = |visual: &mut gpui::VisualTestContext| {
+            visual.refresh().unwrap();
+            let card = visual.debug_bounds("draft-card").is_some();
+            let draft = visual
+                .update(|_, cx| draft::live("draft-1-away", cx).map(|d| d.read(cx).painted_in(id)));
+            (card, draft)
+        };
+        assert_eq!(
+            painted(visual),
+            (true, Some(true)),
+            "the page is in the thread"
+        );
+        // While the agent works, the window redraws around a thread that did
+        // not change, such as a spinner in the sidebar. The page stays put
+        // rather than flashing.
+        for _ in 0..3 {
+            window.update(visual, |_, _, cx| cx.notify()).unwrap();
+            assert_eq!(
+                visual.update(
+                    |_, cx| draft::live("draft-1-away", cx).map(|d| d.read(cx).painted_in(id))
+                ),
+                Some(true),
+                "a redraw of the window alone"
+            );
+        }
+
+        window
+            .update(visual, |shell, window, cx| {
+                shell.open_settings(crate::settings::Section::General, window, cx)
+            })
+            .unwrap();
+        assert_eq!(painted(visual), (false, Some(false)), "Settings");
+        window
+            .update(visual, |shell, window, cx| shell.close_settings(window, cx))
+            .unwrap();
+        assert_eq!(painted(visual), (true, Some(true)), "back from Settings");
+
+        for surface in [
+            Surface::Search,
+            Surface::Inbox,
+            Surface::Notes,
+            Surface::Automations,
+            Surface::Mono,
+        ] {
+            window
+                .update(visual, |shell, window, cx| surface.open(shell, window, cx))
+                .unwrap();
+            assert_eq!(painted(visual), (false, Some(false)), "{surface:?}");
+            window
+                .update(visual, |shell, window, cx| {
+                    surface.close(shell, open, window, cx)
+                })
+                .unwrap();
+            assert_eq!(painted(visual), (true, Some(true)), "back from {surface:?}");
+        }
     }
 }

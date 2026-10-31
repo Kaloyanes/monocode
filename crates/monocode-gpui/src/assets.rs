@@ -8,6 +8,8 @@ impl AssetSource for Assets {
    "login-01"=>include_bytes!("../assets/hugeicons/login-01.svg"),
    "logout-01"=>include_bytes!("../assets/hugeicons/logout-01.svg"),
    "smart-phone"=>include_bytes!("../assets/hugeicons/smart-phone.svg"),
+   "home-01"=>include_bytes!("../assets/hugeicons/home-01.svg"),
+   "power"=>include_bytes!("../assets/hugeicons/power.svg"),
    "delete-02"=>include_bytes!("../assets/hugeicons/delete-02.svg"),
    "account-user"=>include_bytes!("../assets/hugeicons/account-user.svg"),
    "queue-list"=>include_bytes!("../assets/hugeicons/queue-list.svg"),
@@ -115,7 +117,10 @@ impl AssetSource for Assets {
    "chevron-down-2"=>include_bytes!("../assets/hugeicons/chevron-down-2.svg"),
    "wand"=>include_bytes!("../assets/hugeicons/wand.svg"),
    "x"=>include_bytes!("../assets/hugeicons/x.svg"),
+   "maximize-screen"=>include_bytes!("../assets/hugeicons/maximize-screen.svg"),
+   "minimize-screen"=>include_bytes!("../assets/hugeicons/minimize-screen.svg"),
    "terminal"=>include_bytes!("../assets/hugeicons/terminal.svg"),
+   "coffee"=>include_bytes!("../assets/hugeicons/coffee.svg"),
    "panel-bottom"=>include_bytes!("../assets/hugeicons/panel-bottom.svg"),
    "panel-top"=>include_bytes!("../assets/hugeicons/panel-top.svg"),
    "panel-left"=>include_bytes!("../assets/hugeicons/panel-left.svg"),
@@ -179,6 +184,9 @@ impl AssetSource for Assets {
 fn icon_body(path: &str) -> Option<&'static str> {
     Some(match path {
         "circle-alert" => "<circle cx='12' cy='12' r='9'/><path d='M12 7v6m0 4h.01'/>",
+        "goal" => {
+            "<circle cx='12' cy='12' r='9'/><circle cx='12' cy='12' r='5'/><circle cx='12' cy='12' r='1.2'/>"
+        }
         "refresh" => {
             "<path d='M20 7v5h-5M4 17v-5h5'/><path d='M6 6a8 8 0 0 1 13 2l1 4M4 12l1 4a8 8 0 0 0 13 2'/>"
         }

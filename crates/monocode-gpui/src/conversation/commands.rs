@@ -101,8 +101,14 @@ impl Conversation {
 
     /// Returns false when compaction did not start.
     fn try_compact(&mut self, then: Option<String>, cx: &mut Context<Self>) -> bool {
+        // The message after compaction keeps the modes it was sent with; Send
+        // resets the composer's as soon as compaction makes the chat busy.
+        let modes = self.turn_modes();
         if !self.history_ready() {
-            self.defer_history_action(move |this, cx| this.compact_context_then(then, cx), cx);
+            self.defer_history_action(
+                move |this, cx| this.with_modes(modes, |this| this.compact_context_then(then, cx)),
+                cx,
+            );
             return true;
         }
         if self.editing_last_turn.pending()
@@ -283,7 +289,7 @@ impl Conversation {
                 };
                 if let Some(prompt) = then.filter(|_| !stopped) {
                     // A failed summary still sends the message, with full history.
-                    this.start_prompt(prompt, cx);
+                    this.with_modes(modes, |this| this.start_prompt(prompt, cx));
                     cx.emit(SessionChanged);
                     cx.notify();
                     return;

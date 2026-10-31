@@ -1,8 +1,19 @@
 use super::*;
 use crate::tooltip::Tip;
+use crate::transcript::orchestration::{OrchestrationAction, RunView};
 use std::path::PathBuf;
-pub(crate) struct StartOrchestration(pub monocode_core::orchestration::Plan);
-pub(crate) struct StopOrchestration;
+
+/// What a bare `/operator` asks.
+pub(super) const OPERATOR_INTRO: &str = "Explain what you can do in MonoCode with the app CLI.";
+
+/// The one-shot composer modes a turn was submitted with. A turn that starts
+/// later, after compaction or history loading, must still run in them.
+#[derive(Clone, Copy, Default)]
+pub(super) struct TurnModes {
+    plan: bool,
+    operator: bool,
+    orchestrator: bool,
+}
 
 impl Conversation {
     pub(crate) fn request_folder(&mut self, cx: &mut Context<Self>) {
@@ -29,7 +40,6 @@ impl Conversation {
     }
     pub(crate) fn enable_mode(&mut self, id: &str, cx: &mut Context<Self>) {
         let enabled = match id {
-            "draft" => self.follow_ups.draft_selected,
             "plan" => self.settings.plan,
             "operator" => self.settings.operator,
             "orchestrator" => self.settings.orchestrator,
@@ -41,7 +51,6 @@ impl Conversation {
     }
     pub(crate) fn clear_mode(&mut self, id: &str, cx: &mut Context<Self>) {
         let enabled = match id {
-            "draft" => &mut self.follow_ups.draft_selected,
             "plan" => &mut self.settings.plan,
             "operator" => &mut self.settings.operator,
             "orchestrator" => &mut self.settings.orchestrator,
@@ -54,6 +63,25 @@ impl Conversation {
             self.save_settings(cx);
             cx.notify();
         }
+    }
+    pub(super) fn turn_modes(&self) -> TurnModes {
+        TurnModes {
+            plan: self.settings.plan,
+            operator: self.settings.operator,
+            orchestrator: self.settings.orchestrator,
+        }
+    }
+    /// Runs `f` in `modes`, then gives the composer back the modes it has now.
+    pub(super) fn with_modes<R>(&mut self, modes: TurnModes, f: impl FnOnce(&mut Self) -> R) -> R {
+        let composer = self.turn_modes();
+        self.settings.plan = modes.plan;
+        self.settings.operator = modes.operator;
+        self.settings.orchestrator = modes.orchestrator;
+        let result = f(self);
+        self.settings.plan = composer.plan;
+        self.settings.operator = composer.operator;
+        self.settings.orchestrator = composer.orchestrator;
+        result
     }
     pub(super) fn clear_submitted_mode(&mut self, cx: &mut Context<Self>) {
         // The accepted turn or queue item already owns its mode. The empty
@@ -72,16 +100,7 @@ impl Conversation {
             cx.notify();
             return;
         }
-        if id != "draft" {
-            self.follow_ups.draft_selected = false;
-        }
         match id {
-            "draft" => {
-                self.follow_ups.draft_selected = !self.follow_ups.draft_selected;
-                self.settings.plan = false;
-                self.settings.operator = false;
-                self.settings.orchestrator = false;
-            }
             "plan" => {
                 self.settings.plan = !self.settings.plan;
                 self.settings.orchestrator = false;
@@ -99,9 +118,7 @@ impl Conversation {
             }
             _ => return,
         }
-        let selected = if self.follow_ups.draft_selected {
-            Some("draft")
-        } else if self.settings.orchestrator {
+        let selected = if self.settings.orchestrator {
             Some("orchestrator")
         } else if self.settings.plan {
             Some("plan")
@@ -151,7 +168,7 @@ impl Conversation {
                 }
                 self.save_settings(cx);
                 text = if rest.is_empty() && mode == "operator" {
-                    "Explain what you can do in MonoCode with the app CLI.".into()
+                    OPERATOR_INTRO.into()
                 } else {
                     rest
                 };
@@ -200,16 +217,6 @@ impl Conversation {
             })
             .collect();
         if images.is_empty() {
-            // A queued message's editor has no attachments; it keeps text.
-            let text = clipboard.text().filter(|text| {
-                self.follow_ups.edit.is_none()
-                    && !self.input.read(cx).is_composing()
-                    && monocode_core::composer::is_long_paste(text)
-            });
-            if let Some(text) = text {
-                self.attach_snippet(monocode_core::composer::Snippet::Pasted, None, text, cx);
-                return true;
-            }
             return false;
         }
         if self.attaching {
@@ -246,57 +253,15 @@ impl Conversation {
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                let pasted = result.clone().unwrap_or_default();
                 this.finish_attachment_read(result, cx);
+                this.refer_to_images(&pasted, window, cx);
             });
         })
         .detach();
         cx.notify();
         true
-    }
-    /// Add a terminal selection, long paste, quote or comment as a compact
-    /// chip, not as text in the draft. The agent still receives the full
-    /// text with the prompt.
-    pub(crate) fn attach_snippet(
-        &mut self,
-        kind: monocode_core::composer::Snippet,
-        label: Option<String>,
-        text: String,
-        cx: &mut Context<Self>,
-    ) {
-        let store = self.store.clone();
-        let id = self.summary.id;
-        let work = cx.background_executor().spawn(async move {
-            let root = locked(&store)?
-                .thread_attachments_dir(id)?
-                .unwrap_or_else(|| std::env::temp_dir().join("monocode-attachments"));
-            monocode_core::composer::save_snippet(&root, kind, label.as_deref(), &text)
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(path) => this.add_attachments(vec![path], cx),
-                Err(error) => {
-                    this.attachment_error = Some(error);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-    /// A quoted passage, labelled by its opening words.
-    pub(super) fn attach_quote(&mut self, text: String, cx: &mut Context<Self>) {
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let text = text.trim();
-        if !text.is_empty() {
-            let label = Some(text.to_owned());
-            self.attach_snippet(
-                monocode_core::composer::Snippet::Quote,
-                label,
-                text.into(),
-                cx,
-            );
-        }
     }
     pub(super) fn add_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         for path in paths {
@@ -325,6 +290,24 @@ impl Conversation {
         .detach();
         cx.notify();
     }
+    /// Name each pasted image in the draft at the caret, so the text can say
+    /// "[Image 2]" and the agent knows which one is meant.
+    fn refer_to_images(&mut self, pasted: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let images: Vec<_> = self
+            .attachments
+            .iter()
+            .filter(|path| monocode_core::composer::image_mime(path).is_some())
+            .collect();
+        let refs: String = pasted
+            .iter()
+            .filter_map(|path| images.iter().position(|image| *image == path))
+            .map(|ix| format!("{} ", monocode_core::composer::image_ref(ix + 1)))
+            .collect();
+        if !refs.is_empty() {
+            self.input
+                .update(cx, |input, cx| input.insert(&refs, window, cx));
+        }
+    }
     fn finish_attachment_read(
         &mut self,
         result: Result<Vec<PathBuf>, String>,
@@ -343,6 +326,7 @@ impl Conversation {
             }
             Err(error) => self.attachment_error = Some(error),
         }
+        self.queue_composer_draft(cx);
         let pending = std::mem::take(&mut self.pending_attachments);
         self.add_attachments(pending, cx);
         cx.notify();
@@ -418,7 +402,26 @@ impl Conversation {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             if ix < this.attachments.len() {
+                                let number = this.attachments[..ix]
+                                    .iter()
+                                    .filter(|path| {
+                                        monocode_core::composer::image_mime(path).is_some()
+                                    })
+                                    .count()
+                                    + 1;
                                 this.attachments.remove(ix);
+                                this.queue_composer_draft(cx);
+                                if image {
+                                    this.input.update(cx, |input, cx| {
+                                        let text = monocode_core::composer::remove_image_ref(
+                                            &input.content,
+                                            number,
+                                        );
+                                        if *input.content != *text {
+                                            input.set_text(text, cx);
+                                        }
+                                    });
+                                }
                                 cx.notify();
                             }
                         }));
@@ -484,33 +487,142 @@ impl Conversation {
                 .into_any_element(),
         )
     }
+    /// Reads the plan a planning turn submitted: from its `orchestration_plan`
+    /// call, or from the tagged fallback in its reply.
     pub(super) fn finish_orchestration_plan(&mut self, cx: &mut Context<Self>) {
-        if !self.planning_orchestration {
+        if !std::mem::take(&mut self.planning_orchestration) {
             return;
         }
-        self.planning_orchestration = false;
+        // A failed or stopped turn already says what went wrong.
+        if self.status != "Ready" || self.notification_was_cancelled() {
+            return;
+        }
         let rows = self.transcript.read(cx).source_rows();
-        let start = rows.iter().rposition(|row| row.role == "user").unwrap_or(0);
-        let text: String = rows[start..]
+        let start = rows
             .iter()
-            .filter(|row| row.role == "assistant")
-            .map(|row| row.text.as_str())
-            .collect();
-        match monocode_core::orchestration::parse(&text) {
-            Ok(plan) => self.orchestration_plan = Some(plan),
+            .rposition(|row| row.first && row.role == "user")
+            .unwrap_or(0);
+        let submitted = rows[start..]
+            .iter()
+            .rev()
+            .filter(|row| row.role == "tool")
+            .filter_map(|row| serde_json::from_str::<monocode_core::tool::ToolCall>(&row.text).ok())
+            .find_map(|call| call.orchestration_plan().map(|plan| (Some(call.id), plan)));
+        let result = submitted.map(Ok).unwrap_or_else(|| {
+            let reply = rows[start..]
+                .iter()
+                .filter(|row| row.role == "assistant")
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            monocode_core::orchestration::parse(&reply).map(|plan| (None, plan))
+        });
+        match result {
+            Ok(plan) => {
+                self.orchestration_plan = Some(plan);
+                self.orchestration_error = None;
+            }
+            Err(error) if error.contains("did not include") => {
+                self.orchestration_error =
+                    Some("No plan yet. Reply to keep planning, or retry.".into());
+            }
             Err(error) => self.orchestration_error = Some(error),
         }
+        // The next message revises the plan or answers the planner's question.
+        if self.input.read(cx).content.trim().is_empty() && !self.settings.plan {
+            self.enable_mode("orchestrator", cx);
+        }
     }
-    pub(crate) fn set_orchestration_progress(
+    /// The composer's planning mode was only there to revise this plan.
+    fn release_planning_mode(&mut self, cx: &mut Context<Self>) {
+        let content = self.input.read(cx).content.clone();
+        if self.settings.orchestrator && content.trim() == "/orchestrator" {
+            self.input
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+            self.clear_mode("orchestrator", cx);
+        }
+    }
+    /// The plan under review, taken to start it.
+    pub(crate) fn take_orchestration_plan(
         &mut self,
-        progress: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<(Option<String>, monocode_core::orchestration::Plan)> {
+        let plan = self.orchestration_plan.take()?;
+        self.orchestration_error = None;
+        self.release_planning_mode(cx);
+        cx.notify();
+        Some(plan)
+    }
+    pub(crate) fn dismiss_orchestration_plan(&mut self, cx: &mut Context<Self>) {
+        self.orchestration_plan = None;
+        self.orchestration_error = None;
+        self.release_planning_mode(cx);
+        cx.emit(SessionChanged);
+        cx.notify();
+    }
+    pub(crate) fn remove_plan_task(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some((_, plan)) = &mut self.orchestration_plan
+            && plan.tasks.len() > 1
+        {
+            plan.remove(id);
+            cx.emit(SessionChanged);
+        }
+    }
+    fn retry_orchestration_plan(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.orchestration_error = None;
+        self.release_planning_mode(cx);
+        self.with_modes(
+            TurnModes {
+                orchestrator: true,
+                ..TurnModes::default()
+            },
+            |this| {
+                this.launch_prompt(
+                    "Prepare the orchestration plan for my request and submit it.".into(),
+                    cx,
+                )
+            },
+        );
+    }
+    pub(crate) fn orchestration_views(
+        &self,
+    ) -> &[(Option<String>, crate::transcript::orchestration::RunView)] {
+        &self.orchestration_views
+    }
+    /// The shell's cards for this lead's plans, by the call that submitted
+    /// each one; `None` is a plan from the tagged fallback.
+    pub(crate) fn set_orchestration_views(
+        &mut self,
+        views: Vec<(Option<String>, RunView)>,
+        active: bool,
         cx: &mut Context<Self>,
     ) {
-        self.orchestration_progress = progress;
-        if self.needs_history_restore() {
+        self.orchestration_active = active;
+        let cards = views
+            .iter()
+            .filter_map(|(call, view)| Some((call.clone()?, view.clone())))
+            .collect();
+        self.transcript
+            .update(cx, |transcript, cx| transcript.set_orchestration(cards, cx));
+        if self.orchestration_views != views {
+            self.orchestration_views = views;
+            cx.notify();
+        }
+        if active && self.needs_history_restore() {
             self.load(cx);
         }
-        cx.notify();
+    }
+    pub(crate) fn status_text(&self) -> &str {
+        &self.status
+    }
+    pub(crate) fn turn_generation(&self) -> u64 {
+        self.submission_generation as u64
+    }
+    pub(crate) fn current_model(&self) -> Option<String> {
+        self.model.clone()
     }
     pub(crate) fn external_outcome(&self, cx: &gpui::App) -> (bool, String) {
         let rows = self.transcript.read(cx).source_rows();
@@ -560,21 +672,46 @@ impl Conversation {
             && self.follow_ups.state.draft.is_none()
             && !self.settings.worktree_removed
     }
-    pub(crate) fn send_coordinator_report(&mut self, prompt: String, cx: &mut Context<Self>) {
+    /// False when the turn could not start, so the caller can say so.
+    pub(crate) fn send_coordinator_report(
+        &mut self,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !self.history_ready() || self.stopping {
-            self.defer_history_action(move |this, cx| this.send_coordinator_report(prompt, cx), cx);
-            return;
+            self.defer_history_action(
+                move |this, cx| {
+                    this.send_coordinator_report(prompt, cx);
+                },
+                cx,
+            );
+            return true;
         }
         let internal = self.settings.internal_message;
         self.settings.internal_message = true;
-        self.launch_prompt(prompt, cx);
+        let before = self.submission_generation;
+        // A mode left selected in the composer must not make the report a
+        // read-only planning turn.
+        self.with_modes(TurnModes::default(), |this| this.launch_prompt(prompt, cx));
         self.settings.internal_message = internal;
+        self.busy || self.submission_generation != before
     }
+    /// Above the composer: planning errors, and the plans and runs that have
+    /// no card in the thread because they came from the tagged fallback.
     pub(super) fn orchestration_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.orchestration_plan.is_none()
-            && self.orchestration_error.is_none()
-            && self.orchestration_progress.is_none()
-        {
+        let fallback = self
+            .orchestration_views
+            .iter()
+            .rev()
+            .find(|(call, view)| {
+                call.is_none()
+                    && !matches!(
+                        view.phase,
+                        crate::transcript::orchestration::Phase::Inactive
+                    )
+            })
+            .map(|(_, view)| view.clone());
+        if fallback.is_none() && self.orchestration_error.is_none() {
             return None;
         }
         let mut card = div()
@@ -588,94 +725,94 @@ impl Conversation {
             .flex()
             .flex_col()
             .gap_2()
-            .text_size(px(12.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(icon("share", 16.).text_color(tint(FUCHSIA_300, 0.8)))
-                    .child(
-                        self.orchestration_plan
-                            .as_ref()
-                            .map(|p| p.title.clone())
-                            .unwrap_or_else(|| "Orchestrator".into()),
-                    ),
-            );
-        if let Some(plan) = &self.orchestration_plan {
+            .text_size(px(12.));
+        if let Some(run) = fallback {
+            let (actions, reason) = crate::transcript::orchestration::actions(&run.phase);
             card = card
                 .child(
                     div()
-                        .text_color(content(0.6))
-                        .child(monocode_core::response::limit(&plan.summary, 600)),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(icon("share", 16.).text_color(tint(FUCHSIA_300, 0.8)))
+                        .child(run.plan.title.clone())
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(content(0.45))
+                                .child(crate::transcript::orchestration::headline(&run)),
+                        ),
                 )
                 .child(
                     div()
                         .id("orchestration-tasks")
                         .max_h(px(200.))
                         .overflow_y_scroll()
-                        .children(plan.tasks.iter().map(|task| {
+                        .children(run.plan.tasks.iter().zip(&run.tasks).map(|(task, state)| {
+                            let (color, label) = crate::transcript::orchestration::tone_of(state);
                             div()
-                                .py_1()
-                                .child(format!("{} · {}", task.id, task.title))
-                                .child(div().text_size(px(10.)).text_color(content(0.4)).child(
-                                    format!(
-                                        "{}{}",
-                                        task.files.join(", "),
-                                        if task.depends_on.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" · after {}", task.depends_on.join(", "))
-                                        }
-                                    ),
-                                ))
+                                .py_0p5()
+                                .flex()
+                                .gap_2()
+                                .child(div().text_color(color).child(label))
+                                .child(div().truncate().child(format!(
+                                    "{}{}",
+                                    task.title,
+                                    state
+                                        .note
+                                        .as_ref()
+                                        .map(|note| format!(" · {note}"))
+                                        .unwrap_or_default()
+                                )))
                         })),
-                );
-            if self.orchestration_progress.is_none() {
-                card = card.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            tool_pill("start-orchestration", "Start agents")
-                                .bg(content(0.1))
-                                .child("Start agents")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(plan) = this.orchestration_plan.clone() {
-                                        cx.emit(StartOrchestration(plan));
-                                    }
-                                })),
-                        )
-                        .child(
-                            tool_pill("dismiss-orchestration", "Dismiss plan")
-                                .child("Dismiss")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.orchestration_plan = None;
-                                    cx.notify();
-                                })),
-                        ),
-                );
-            }
+                )
+                .when_some(reason, |d, reason| {
+                    d.child(div().text_color(tint(AMBER_400, 0.9)).child(reason))
+                })
+                .child(div().flex().gap_2().children(actions.into_iter().map(
+                    |(id, label, primary, disabled, action)| {
+                        tool_pill(id, label)
+                            .when(primary, |d| d.bg(content(0.1)))
+                            .when(disabled, |d| d.opacity(0.45))
+                            .child(label)
+                            .when(!disabled, |d| {
+                                d.on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(OrchestrationAction {
+                                        call: String::new(),
+                                        action: action.clone(),
+                                    })
+                                }))
+                            })
+                    },
+                )));
         }
         if let Some(error) = &self.orchestration_error {
             card = card
                 .child(div().text_color(tint(AMBER_400, 0.9)).child(error.clone()))
                 .child(
-                    tool_pill("dismiss-plan-error", "Dismiss")
-                        .child("Dismiss")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.orchestration_error = None;
-                            cx.notify();
-                        })),
-                );
-        }
-        if let Some(progress) = &self.orchestration_progress {
-            card = card
-                .child(div().text_color(content(0.6)).child(progress.clone()))
-                .child(
-                    tool_pill("stop-orchestration", "Stop agents")
-                        .child("Stop agents")
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(StopOrchestration))),
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            tool_pill("retry-plan", "Retry")
+                                .bg(content(0.1))
+                                .child("Retry")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.retry_orchestration_plan(cx)),
+                                ),
+                        )
+                        .child(
+                            tool_pill("dismiss-plan-error", "Dismiss")
+                                .child("Dismiss")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.orchestration_error = None;
+                                    this.release_planning_mode(cx);
+                                    cx.notify();
+                                })),
+                        ),
                 );
         }
         Some(card.into_any_element())

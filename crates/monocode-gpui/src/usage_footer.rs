@@ -61,6 +61,8 @@ pub(crate) struct UsageFooter {
     /// UsageFooter's `footer` variant: the classic layout's bordered strip.
     classic: bool,
     show_remaining: bool,
+    /// Bar follows the most-used window instead of the shortest one.
+    bar_most_used: bool,
     _clock: gpui::Task<()>,
 }
 impl UsageFooter {
@@ -155,6 +157,7 @@ impl UsageFooter {
             open: false,
             classic: false,
             show_remaining: false,
+            bar_most_used: false,
             _clock: clock,
         };
         this.refresh(false, cx);
@@ -163,6 +166,12 @@ impl UsageFooter {
     pub(crate) fn set_remaining(&mut self, remaining: bool, cx: &mut Context<Self>) {
         if self.show_remaining != remaining {
             self.show_remaining = remaining;
+            cx.notify();
+        }
+    }
+    pub(crate) fn set_bar_most_used(&mut self, most_used: bool, cx: &mut Context<Self>) {
+        if self.bar_most_used != most_used {
+            self.bar_most_used = most_used;
             cx.notify();
         }
     }
@@ -867,10 +876,16 @@ impl Render for UsageFooter {
             .or_else(|| state.error.as_ref().map(|e| e.message.clone()))
             .unwrap_or_else(|| "Loading usage".into());
         let fetching = state.fetching;
-        let tightest = state
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.windows.iter().map(|w| w.used_percent).reduce(f64::max));
+        let bar = state.snapshot.as_ref().and_then(|s| {
+            if self.bar_most_used {
+                s.windows.iter().map(|w| w.used_percent).reduce(f64::max)
+            } else {
+                s.windows
+                    .iter()
+                    .min_by_key(|w| w.minutes)
+                    .map(|w| w.used_percent)
+            }
+        });
         let weak = cx.weak_entity();
         let classic = self.classic;
         div()
@@ -912,7 +927,7 @@ impl Render for UsageFooter {
                     .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
                     .child(self.anchor.probe())
                     .child(provider_icon(self.kind.id(), 12.))
-                    .when_some(tightest, |d, percent| {
+                    .when_some(bar, |d, percent| {
                         d.child(
                             div()
                                 .w(px(32.))
@@ -923,7 +938,10 @@ impl Render for UsageFooter {
                                 .child(
                                     div()
                                         .h_full()
-                                        .w(gpui::relative(percent as f32 / 100.))
+                                        .w(gpui::relative(
+                                            self.display_percent(percent.clamp(0., 100.)) as f32
+                                                / 100.,
+                                        ))
                                         .rounded_full()
                                         .bg(usage_color(percent)),
                                 ),

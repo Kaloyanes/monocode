@@ -43,6 +43,10 @@ export default function SettingsLayout() {
         name="permissions"
         options={{ title: "Permissions", ...androidBackHeader("Permissions") }}
       />
+      <Stack.Screen
+        name="skills"
+        options={{ title: "Skills", ...androidBackHeader("Skills") }}
+      />
       {/* The provider's models title themselves. */}
       <Stack.Screen name="models" options={{ title: "" }} />
       <Stack.Screen

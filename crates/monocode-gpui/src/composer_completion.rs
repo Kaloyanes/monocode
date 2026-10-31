@@ -12,8 +12,10 @@ use gpui::{
 use monocode_core::{
     composer::{self, Token, Trigger},
     files::ProjectFile,
+    inbox::Item,
     skills::DiscoveredSkill,
 };
+use serde_json::{Value, json};
 use std::{
     sync::{
         Arc,
@@ -30,6 +32,22 @@ pub(crate) fn bind(cx: &mut App) {
     ]);
 }
 pub(crate) struct ModePicked(pub &'static str);
+/// Skills insert their `/name`, so names MonoCode's own commands own are left
+/// out wherever skills are listed.
+pub(crate) fn reserved_skill_name(name: &str) -> bool {
+    matches!(
+        name,
+        "plan"
+            | "compact"
+            | "mcp"
+            | "operator"
+            | "orchestrator"
+            | "add-to-folder"
+            | "btw"
+            | "mono"
+            | "monocode"
+    )
+}
 #[derive(Clone)]
 struct Choice {
     label: String,
@@ -38,6 +56,7 @@ struct Choice {
     mode: Option<&'static str>,
     file: bool,
     server: Option<monocode_core::mcp::McpConnection>,
+    item: Option<Item>,
 }
 pub(crate) struct Completion {
     input: Entity<input::Input>,
@@ -54,6 +73,9 @@ pub(crate) struct Completion {
     mcp: Vec<monocode_core::mcp::McpConnection>,
     selected_mcp: Vec<(String, monocode_core::mcp::McpConnection)>,
     mcp_open: bool,
+    items: Arc<Vec<Item>>,
+    selected_items: Vec<(String, Item)>,
+    items_loading: bool,
     disabled_paths: Vec<String>,
     known: std::collections::HashSet<String>,
     files: Vec<ProjectFile>,
@@ -70,6 +92,7 @@ pub(crate) struct Completion {
     container_anchor: AnchorSlot,
     inline_field: bool,
     _observe: Subscription,
+    _catalog: Subscription,
 }
 impl EventEmitter<ModePicked> for Completion {}
 impl Drop for Completion {
@@ -81,6 +104,17 @@ impl Completion {
     pub(crate) fn new(input: Entity<input::Input>, cwd: String, cx: &mut Context<Self>) -> Self {
         input.update(cx, |input, cx| input.enable_inline_commands(cx));
         let observe = cx.observe(&input, |this, _, cx| this.sync(cx));
+        let catalog = cx.observe_global::<crate::inbox::Catalog>(|this, cx| {
+            this.items = cx.global::<crate::inbox::Catalog>().items.clone();
+            if this
+                .token
+                .as_ref()
+                .is_some_and(|token| token.trigger == Trigger::WorkItem)
+            {
+                this.rank();
+                cx.notify();
+            }
+        });
         Self {
             input,
             store: None,
@@ -96,6 +130,9 @@ impl Completion {
             mcp: Vec::new(),
             selected_mcp: Vec::new(),
             mcp_open: false,
+            items: Default::default(),
+            selected_items: Vec::new(),
+            items_loading: false,
             disabled_paths: Vec::new(),
             known: [
                 "/plan",
@@ -124,6 +161,7 @@ impl Completion {
             container_anchor: AnchorSlot::default(),
             inline_field: false,
             _observe: observe,
+            _catalog: catalog,
         }
     }
     pub(crate) fn with_store(mut self, store: crate::runtime::Database) -> Self {
@@ -161,6 +199,7 @@ impl Completion {
         self.mcp.clear();
         self.selected_mcp.clear();
         self.mcp_open = false;
+        self.selected_items.clear();
         self.files.clear();
         self.notes.clear();
         self.known = [
@@ -226,6 +265,26 @@ impl Completion {
         self.rank();
         cx.notify();
     }
+    /// The provider's own commands this chat has heard of, as the phone's
+    /// picker lists them. Pi and OMP list theirs on request, so asking starts
+    /// that and a later ask has them.
+    pub(crate) fn mobile_commands(&mut self, cx: &mut Context<Self>) -> Value {
+        if self.native_commands.is_empty() {
+            self.load_native(cx);
+        }
+        let commands: Vec<Value> = self
+            .native_commands
+            .iter()
+            .map(|command| {
+                json!({
+                    "name": command.invocation.trim_start_matches('/'),
+                    "description": command.description,
+                    "hint": command.input_hint,
+                })
+            })
+            .collect();
+        json!({ "commands": commands, "loading": self.native_loading })
+    }
     /// A skill or provider command already named `/{name}`, which wins over
     /// MonoCode's own command of the same name.
     pub(crate) fn has_user_command(&self, name: &str) -> bool {
@@ -246,6 +305,14 @@ impl Completion {
         self.rank();
         cx.notify();
     }
+    /// The first picked `#` item `text` still mentions: the one a send links
+    /// the thread to.
+    pub(crate) fn picked_item(&self, text: &str) -> Option<&Item> {
+        self.selected_items
+            .iter()
+            .find(|(token, _)| mentions_token(text, token))
+            .map(|(_, item)| item)
+    }
     pub(crate) fn prepare_prompt(&self, text: &str) -> String {
         if self.cwd.starts_with("remote://") {
             return text.to_owned();
@@ -260,24 +327,7 @@ impl Completion {
         let servers = self
             .selected_mcp
             .iter()
-            .filter(|(token, _)| {
-                text.match_indices(token.as_str()).any(|(start, _)| {
-                    let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
-                    if text[line_start..start].trim_start().starts_with('>') {
-                        return false;
-                    }
-                    let end = start + token.len();
-                    let before = text[..start]
-                        .chars()
-                        .next_back()
-                        .is_none_or(|c| c.is_whitespace() || "([{ ".contains(c));
-                    let after = text[end..]
-                        .chars()
-                        .next()
-                        .is_none_or(|c| c.is_whitespace() || ")]}.!?;,".contains(c));
-                    before && after
-                })
-            })
+            .filter(|(token, _)| mentions_token(&text, token))
             .map(|(_, server)| {
                 format!(
                     "{} ({})",
@@ -286,6 +336,38 @@ impl Completion {
                 )
             })
             .collect::<Vec<_>>();
+        let items = self
+            .selected_items
+            .iter()
+            .filter(|(token, _)| mentions_token(&text, token))
+            .map(|(token, item)| {
+                format!(
+                    "- {token}: {} {} {}{}: {} ({})",
+                    monocode_core::inbox::provider_label(&item.provider),
+                    if item.kind == "pr" {
+                        "pull request"
+                    } else {
+                        "issue"
+                    },
+                    item.reference(),
+                    if item.repo.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" in {}", item.repo)
+                    },
+                    item.title,
+                    item.url
+                )
+            })
+            .collect::<Vec<_>>();
+        let text = if items.is_empty() {
+            text
+        } else {
+            format!(
+                "Work items referenced in this message:\n{}\n\n{text}",
+                items.join("\n")
+            )
+        };
         if servers.is_empty() {
             text
         } else {
@@ -328,7 +410,10 @@ impl Completion {
         // An empty caret token closes the picker and clears an earlier Escape
         // dismissal, so deleting and retyping the same command can reopen it.
         self.dismissed = None;
-        let close_mcp = self.mcp_open && token.as_ref().is_none_or(|token| token.query != "mcp");
+        let close_mcp = self.mcp_open
+            && token
+                .as_ref()
+                .is_none_or(|token| token.trigger != Trigger::Skill || token.query != "mcp");
         if close_mcp {
             self.mcp_open = false;
         }
@@ -340,6 +425,13 @@ impl Completion {
         }
         self.token = token;
         self.active = 0;
+        if self
+            .token
+            .as_ref()
+            .is_some_and(|token| token.trigger == Trigger::WorkItem)
+        {
+            self.load_items(cx);
+        }
         if self.token.is_some()
             && !self.loading
             && self
@@ -407,6 +499,61 @@ impl Completion {
         })
         .detach();
     }
+    /// The Inbox keeps the catalog fresh while it runs. Without one, `#` fetches
+    /// this project's rows itself, the same way the Inbox would.
+    fn load_items(&mut self, cx: &mut Context<Self>) {
+        if let Some(catalog) = cx.try_global::<crate::inbox::Catalog>() {
+            self.items = catalog.items.clone();
+            if catalog.at.elapsed() < Duration::from_secs(300) {
+                return;
+            }
+        }
+        if self.items_loading {
+            return;
+        }
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        self.items_loading = true;
+        let cwd = std::path::PathBuf::from(&self.cwd);
+        let work = cx.background_executor().spawn(async move {
+            let (state, data_dir) = crate::runtime::locked(&store)
+                .map(|db| {
+                    (
+                        monocode_core::inbox::ViewState::load(&db),
+                        db.data_dir().map(std::path::PathBuf::from),
+                    )
+                })
+                .ok()?;
+            let service = monocode_core::inbox::Service {
+                data_dir: data_dir.unwrap_or_else(|| cwd.clone()),
+                cwd: cwd.clone(),
+                github_viewer: Default::default(),
+            };
+            Some(service.list(&[cwd], &state).items)
+        });
+        cx.spawn(async move |this, cx| {
+            let items = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.items_loading = false;
+                // A running Inbox may have published a fuller list meanwhile.
+                let fresher = cx
+                    .try_global::<crate::inbox::Catalog>()
+                    .is_some_and(|catalog| catalog.at.elapsed() < Duration::from_secs(300));
+                match items {
+                    Some(items) if !fresher => cx.set_global(crate::inbox::Catalog {
+                        items: items.into(),
+                        at: Instant::now(),
+                    }),
+                    _ => {
+                        this.rank();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
     fn load(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
         self.error = None;
@@ -465,6 +612,7 @@ impl Completion {
                         .map(|c| format!("/{}", c.invocation)),
                 )
                 .chain(this.selected_mcp.iter().map(|(token, _)| token.clone()))
+                .chain(this.selected_items.iter().map(|(token, _)| token.clone()))
                 .chain(this.skills.iter().map(|s| format!("/{}", s.name)))
                 .chain(
                     this.files
@@ -519,6 +667,7 @@ impl Completion {
                     mode: None,
                     file: false,
                     server: Some(server),
+                    item: None,
                 })
                 .collect();
         } else if token.trigger == Trigger::Mention {
@@ -531,6 +680,7 @@ impl Completion {
                     mode: None,
                     file: true,
                     server: None,
+                    item: None,
                 })
                 .collect();
             let query = token
@@ -567,15 +717,75 @@ impl Completion {
                     mode: None,
                     file: false,
                     server: None,
+                    item: None,
                 }));
+        } else if token.trigger == Trigger::WorkItem {
+            let here = monocode_core::files::path_key(&self.cwd);
+            let mut choices: Vec<_> = self
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let reference = item.reference();
+                    let score = composer::score(&token.query, reference.trim_start_matches('#'))
+                        .map(|score| score + 1_000)
+                        .max(composer::score(
+                            &token.query,
+                            &format!(
+                                "{} {} {} {}",
+                                item.title, item.repo, item.team_name, item.project_name
+                            ),
+                        ))?;
+                    let boost = if item.status() == "Open" || item.status() == "Draft" {
+                        200
+                    } else {
+                        0
+                    } + if monocode_core::files::path_key(&item.project_path) == here {
+                        100
+                    } else {
+                        0
+                    };
+                    Some((score + boost, item))
+                })
+                .collect();
+            // Stable, so equal scores keep the most recently updated first.
+            choices.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            self.choices = choices
+                .into_iter()
+                .take(60)
+                .map(|(_, item)| Choice {
+                    label: item.title.clone(),
+                    detail: [
+                        format!(
+                            "{} {}",
+                            monocode_core::inbox::provider_label(&item.provider),
+                            if item.kind == "pr" { "PR" } else { "Issue" }
+                        ),
+                        item.reference(),
+                        if item.repo.is_empty() {
+                            item.team_name.clone()
+                        } else {
+                            item.repo.clone()
+                        },
+                        item.status().into(),
+                    ]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                    insertion: String::new(),
+                    mode: None,
+                    file: false,
+                    server: None,
+                    item: Some(item.clone()),
+                })
+                .collect();
+        } else if token.trigger == Trigger::SkillSearch {
+            let mut choices = self.skill_choices(&token.query);
+            choices.sort_by(|(a, x), (b, y)| b.cmp(a).then_with(|| x.label.cmp(&y.label)));
+            self.choices = choices.into_iter().take(60).map(|(_, c)| c).collect();
         } else {
             let mut choices = Vec::new();
             for (order, (id, label, detail)) in [
-                (
-                    "draft",
-                    "Draft",
-                    "Save this message without starting the agent",
-                ),
                 (
                     "orchestrator",
                     "Orchestrator",
@@ -643,6 +853,7 @@ impl Completion {
                                 .then_some(id),
                             file: false,
                             server: None,
+                            item: None,
                         },
                     ));
                 }
@@ -682,47 +893,12 @@ impl Completion {
                             mode: None,
                             file: false,
                             server: None,
+                            item: None,
                         },
                     ));
                 }
             }
-            for skill in &self.skills {
-                if matches!(
-                    skill.name.as_str(),
-                    "plan"
-                        | "compact"
-                        | "mcp"
-                        | "operator"
-                        | "orchestrator"
-                        | "add-to-folder"
-                        | "draft"
-                        | "btw"
-                        | "mono"
-                        | "monocode"
-                ) {
-                    continue;
-                }
-                if let Some(score) = composer::score(
-                    &token.query,
-                    &format!("{} {}", skill.name, skill.description),
-                ) {
-                    choices.push((
-                        score,
-                        Choice {
-                            label: skill.name.trim_start_matches('/').into(),
-                            detail: if skill.description.is_empty() {
-                                format!("{} · {}", skill.scope, skill.source)
-                            } else {
-                                skill.description.clone()
-                            },
-                            insertion: format!("/{}", skill.name),
-                            mode: None,
-                            file: false,
-                            server: None,
-                        },
-                    ));
-                }
-            }
+            choices.extend(self.skill_choices(&token.query));
             choices.sort_by(|(a, x), (b, y)| b.cmp(a).then_with(|| x.label.cmp(&y.label)));
             let limit = if self.native_commands.is_empty() {
                 60
@@ -733,6 +909,66 @@ impl Completion {
         }
         self.active = self.active.min(self.choices.len().saturating_sub(1));
         self.scroll.scroll_to_item(self.active);
+    }
+    fn skill_choices(&self, query: &str) -> Vec<(i64, Choice)> {
+        self.skills
+            .iter()
+            .filter(|skill| !reserved_skill_name(&skill.name))
+            .filter_map(|skill| {
+                let score =
+                    composer::score(query, &format!("{} {}", skill.name, skill.description))?;
+                Some((
+                    score,
+                    Choice {
+                        label: skill.name.trim_start_matches('/').into(),
+                        detail: if skill.description.is_empty() {
+                            format!("{} · {}", skill.scope, skill.source)
+                        } else {
+                            skill.description.clone()
+                        },
+                        insertion: format!("/{}", skill.name),
+                        mode: None,
+                        file: false,
+                        server: None,
+                        item: None,
+                    },
+                ))
+            })
+            .collect()
+    }
+    /// `#ENG-12` or `#34`; another repository's `#34` is spelled `#owner/repo#34`.
+    fn item_token(&mut self, item: &Item) -> String {
+        let key = item.key();
+        if let Some((token, _)) = self.selected_items.iter().find(|(_, i)| i.key() == key) {
+            return token.clone();
+        }
+        let reference = item.reference();
+        let mut token = format!("#{}", reference.trim_start_matches('#'));
+        if self.selected_items.iter().any(|(known, _)| known == &token) && !item.repo.is_empty() {
+            token = format!("#{}{reference}", item.repo);
+        }
+        let base = token.clone();
+        let mut suffix = 2;
+        while self.selected_items.iter().any(|(known, _)| known == &token) {
+            token = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        self.selected_items.push((token.clone(), item.clone()));
+        token
+    }
+    /// A `$` that finds no skill stays ordinary text, such as `$HOME`, so it
+    /// neither shows the menu nor holds back Enter and the arrow keys.
+    fn showing(&self) -> bool {
+        self.token
+            .as_ref()
+            .is_some_and(|token| match token.trigger {
+                Trigger::SkillSearch => !self.choices.is_empty(),
+                // A bare `#` shows the first fetch; otherwise unmatched `#tags` stay text.
+                Trigger::WorkItem => {
+                    !self.choices.is_empty() || (self.items_loading && token.query.is_empty())
+                }
+                _ => true,
+            })
     }
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
         if !self.choices.is_empty() {
@@ -789,6 +1025,10 @@ impl Completion {
             self.selected_mcp.push((token.clone(), server.clone()));
             self.known.insert(token.clone());
             format!("{token} ")
+        } else if let Some(item) = &choice.item {
+            let token = self.item_token(item);
+            self.known.insert(token.clone());
+            format!("{token} ")
         } else {
             match choice.mode {
                 Some(mode) => format!("/{mode} "),
@@ -811,9 +1051,28 @@ impl Completion {
         cx.notify();
     }
 }
+/// A picked token counts only where it stands as its own word outside a quote.
+fn mentions_token(text: &str, token: &str) -> bool {
+    text.match_indices(token).any(|(start, _)| {
+        let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
+        if text[line_start..start].trim_start().starts_with('>') {
+            return false;
+        }
+        let end = start + token.len();
+        let before = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace() || "([{ ".contains(c));
+        let after = text[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || ")]}.!?;,".contains(c));
+        before && after
+    })
+}
 impl Render for Completion {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let open = self.token.is_some() && self.input.focus_handle(cx).is_focused(window);
+        let open = self.showing() && self.input.focus_handle(cx).is_focused(window);
         let mut root = div()
             .debug_selector(|| "composer-text-field".into())
             .relative()
@@ -821,19 +1080,19 @@ impl Render for Completion {
             .child(self.anchor.layout_probe())
             .key_context(if open { "Completion" } else { "" })
             .capture_action(cx.listener(|this, _: &input::Up, _, cx| {
-                if this.token.is_some() && !this.input.read(cx).is_composing() {
+                if this.showing() && !this.input.read(cx).is_composing() {
                     this.step(-1, cx);
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &input::Down, _, cx| {
-                if this.token.is_some() && !this.input.read(cx).is_composing() {
+                if this.showing() && !this.input.read(cx).is_composing() {
                     this.step(1, cx);
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &input::Submit, window, cx| {
-                if this.token.is_some() && !this.input.read(cx).is_composing() {
+                if this.showing() && !this.input.read(cx).is_composing() {
                     if !this.choices.is_empty() {
                         this.pick(this.active, window, cx);
                     } else {
@@ -883,7 +1142,9 @@ impl Render for Completion {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(if choice.file {
+                                .child(if let Some(item) = &choice.item {
+                                    crate::inbox::provider_mark(&item.provider).into_any_element()
+                                } else if choice.file {
                                     crate::file_icons::file_type_icon(
                                         &choice.label,
                                         false,
@@ -933,14 +1194,13 @@ impl Render for Completion {
             let weak = cx.weak_entity();
             let title = if self.mcp_open {
                 "MCP SERVERS"
-            } else if self
-                .token
-                .as_ref()
-                .is_some_and(|t| t.trigger == Trigger::Mention)
-            {
-                "FILES & NOTES"
             } else {
-                "SKILLS & COMMANDS"
+                match self.token.as_ref().map(|t| t.trigger) {
+                    Some(Trigger::Mention) => "FILES & NOTES",
+                    Some(Trigger::SkillSearch) => "SKILLS",
+                    Some(Trigger::WorkItem) => "INBOX",
+                    _ => "SKILLS & COMMANDS",
+                }
             };
             let anchor = if self.composer_anchor.get().is_some() {
                 self.composer_anchor.clone()
@@ -1023,13 +1283,15 @@ impl Render for Completion {
                                         .py_3()
                                         .text_size(px(12.))
                                         .text_color(content(0.45))
-                                        .child(SharedString::from(if self.loading {
-                                            "Loading…".to_owned()
-                                        } else {
-                                            self.error
-                                                .clone()
-                                                .unwrap_or_else(|| "No matches".into())
-                                        })),
+                                        .child(SharedString::from(
+                                            if self.loading || self.items_loading {
+                                                "Loading…".to_owned()
+                                            } else {
+                                                self.error
+                                                    .clone()
+                                                    .unwrap_or_else(|| "No matches".into())
+                                            },
+                                        )),
                                 )
                             })
                             .child(
@@ -1103,7 +1365,6 @@ mod tests {
                 assert_eq!(
                     commands,
                     [
-                        "/draft",
                         "/orchestrator",
                         "/operator",
                         "/plan",
@@ -1140,6 +1401,145 @@ mod tests {
                 assert_eq!(view.choices[0].insertion, "/operator");
                 assert_eq!(view.choices[1].insertion, "/orchestrator");
             })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn dollar_lists_only_skills_and_stays_text_when_none_match(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let submitted = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = submitted.clone();
+        let _submission = window
+            .update(cx, |v, _, cx| {
+                cx.subscribe(&v.input, move |_, _, _: &input::Submitted, _| {
+                    count.set(count.get() + 1)
+                })
+            })
+            .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.skills = ["zebra", "alpha", "plan"]
+                    .into_iter()
+                    .map(|name| DiscoveredSkill {
+                        name: name.into(),
+                        description: String::new(),
+                        path: format!("/skills/{name}/SKILL.md"),
+                        scope: "project".into(),
+                        source: "codex".into(),
+                    })
+                    .collect();
+                view.input
+                    .update(cx, |input, cx| input.set_text("$".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                let skills: Vec<_> = view.choices.iter().map(|c| c.insertion.as_str()).collect();
+                assert_eq!(skills, ["/alpha", "/zebra"]);
+                view.input
+                    .update(cx, |input, cx| input.set_text("Try $zeb".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes(window.into(), "enter");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert_eq!(view.input.read(cx).content, "Try /zebra ");
+                view.input
+                    .update(cx, |input, cx| input.set_text("echo $HOME".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(submitted.get(), 0);
+        window
+            .update(cx, |view, _, _| assert!(!view.showing()))
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "enter");
+        cx.run_until_parked();
+        assert_eq!(submitted.get(), 1);
+    }
+    #[gpui::test]
+    fn hash_lists_inbox_items_and_adds_the_picked_one_to_the_prompt(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let item =
+            |provider: &str, kind: &str, repo: &str, identifier: &str, number, title: &str| Item {
+                provider: provider.into(),
+                kind: kind.into(),
+                repo: repo.into(),
+                identifier: identifier.into(),
+                number,
+                title: title.into(),
+                url: format!("https://example.com/{number}"),
+                state: "open".into(),
+                ..Default::default()
+            };
+        cx.update(|cx| {
+            cx.set_global(crate::inbox::Catalog {
+                items: vec![
+                    item("linear", "issue", "", "ENG-12", 12, "Crash on launch"),
+                    item("github", "pr", "acme/app", "", 34, "Fix the sidebar"),
+                    item("github", "issue", "acme/web", "", 34, "Sidebar is blank"),
+                ]
+                .into(),
+                at: Instant::now(),
+            })
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_text("#".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.showing());
+                assert_eq!(view.choices.len(), 3);
+                view.input
+                    .update(cx, |input, cx| input.set_text("see #fix".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes(window.into(), "enter");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert_eq!(view.input.read(cx).content, "see #34 ");
+                view.input.update(cx, |input, cx| {
+                    input.set_text("see #34 and #blank".into(), cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes(window.into(), "enter");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                let text = view.input.read(cx).content.to_string();
+                assert_eq!(text, "see #34 and #acme/web#34 ");
+                let prompt = view.prepare_prompt(&text);
+                assert!(prompt.starts_with("Work items referenced in this message:\n"));
+                assert!(
+                    prompt.contains("- #34: GitHub pull request #34 in acme/app: Fix the sidebar")
+                );
+                assert!(
+                    prompt
+                        .contains("- #acme/web#34: GitHub issue #34 in acme/web: Sidebar is blank")
+                );
+                assert!(!view.prepare_prompt("> #34 quoted").contains("Work items"));
+                let linked = |text: &str| view.picked_item(text).map(|item| item.title.as_str());
+                assert_eq!(linked(&text), Some("Fix the sidebar"));
+                assert_eq!(linked("only #acme/web#34"), Some("Sidebar is blank"));
+                assert_eq!(linked("> #34 quoted"), None);
+                view.input.update(cx, |input, cx| {
+                    input.set_text("#nothing-matches".into(), cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| assert!(!view.showing()))
             .unwrap();
     }
     #[gpui::test]

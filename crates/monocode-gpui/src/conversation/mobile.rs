@@ -13,21 +13,33 @@ pub(crate) enum Waiting {
 impl Conversation {
     /// A phone's message, as if typed: it starts a turn, or while one runs it
     /// steers or queues. The desktop composer's own draft and files stay put.
+    /// `mode` is the phone's Plan, Operator or Orchestrator pick; without one,
+    /// a leading `/plan`, `/operator` or `/orchestrator` in the text picks it.
     pub(crate) fn mobile_submit(
         &mut self,
         prompt: String,
+        mode: Option<&'static str>,
         attachments: Vec<std::path::PathBuf>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
         if self.driven_by.is_some() {
-            return;
+            return Ok(());
+        }
+        let (mode, prompt) = match mode {
+            Some(mode) => (Some(mode), prompt),
+            None => split_mode_command(prompt),
+        };
+        if self.is_remote() && matches!(mode, Some("operator" | "orchestrator")) {
+            return Err("This mode is not available on remote projects.".into());
         }
         if !self.history_ready() {
             self.defer_history_action(
-                move |this, cx| this.mobile_submit(prompt, attachments, cx),
+                move |this, cx| {
+                    let _ = this.mobile_submit(prompt, mode, attachments, cx);
+                },
                 cx,
             );
-            return;
+            return Ok(());
         }
         let composer_busy = self.attaching
             || !self.input.read(cx).content.is_empty()
@@ -40,20 +52,32 @@ impl Conversation {
             || self.settings.pending_provider_switch.is_some()
             || (!self.follow_ups.state.messages.is_empty() && !self.follow_ups.state.paused)
         {
+            let prompt = if prompt.is_empty() && mode == Some("operator") {
+                composer_features::OPERATOR_INTRO.into()
+            } else {
+                prompt
+            };
             let composer = std::mem::replace(&mut self.attachments, attachments);
-            self.enqueue_follow_up(prompt, None, cx);
+            self.enqueue_follow_up(prompt, mode.map(str::to_owned), cx);
             self.attachments = composer;
             if !self.busy {
                 self.pump_follow_ups(cx);
             }
             cx.emit(SessionChanged);
             cx.notify();
-            return;
+            return Ok(());
         }
         self.attachments = attachments;
-        self.input.update(cx, |i, cx| i.set_text(prompt, cx));
+        // Sent as the composer's mode command, so it starts the turn in that
+        // mode exactly as a typed one does.
+        let text = match mode {
+            Some(mode) => format!("/{mode} {prompt}"),
+            None => prompt,
+        };
+        self.input.update(cx, |i, cx| i.set_text(text, cx));
         self.send(cx);
         cx.emit(SessionChanged);
+        Ok(())
     }
 
     /// The phone's model and access sheets. A provider switch is armed as the
@@ -154,4 +178,39 @@ pub(crate) fn mobile_access_modes()
     ACCESS_MODES
         .iter()
         .map(|(id, label, hint, _)| (*id, *label, *hint))
+}
+
+/// The composer modes a phone can send a message in.
+pub(crate) const MOBILE_MODES: [&str; 3] = ["plan", "operator", "orchestrator"];
+
+/// A message's leading mode command, and the message without it.
+fn split_mode_command(prompt: String) -> (Option<&'static str>, String) {
+    MOBILE_MODES
+        .into_iter()
+        .find_map(|mode| {
+            monocode_core::composer::consume_command(&prompt, mode)
+                .map(|rest| (Some(mode), rest.to_owned()))
+        })
+        .unwrap_or((None, prompt))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_mode_command;
+
+    #[test]
+    fn a_leading_mode_command_picks_the_mode() {
+        assert_eq!(
+            split_mode_command("/Operator  open the logs".into()),
+            (Some("operator"), "open the logs".into())
+        );
+        assert_eq!(
+            split_mode_command("/orchestrator".into()),
+            (Some("orchestrator"), String::new())
+        );
+        assert_eq!(
+            split_mode_command("/planet is not a mode".into()),
+            (None, "/planet is not a mode".into())
+        );
+    }
 }

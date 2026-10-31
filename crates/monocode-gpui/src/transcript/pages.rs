@@ -20,16 +20,36 @@ impl TranscriptView {
         }));
     }
 
+    /// A live page places its native view on every paint, so a thread holding
+    /// one can't be replayed from cache: the sentinel would take the replayed
+    /// frame for one where the card was not drawn and hide the page.
+    pub(crate) fn holds_live_draft(&self, cx: &gpui::App) -> bool {
+        self.rows.iter().any(|row| {
+            matches!(&row.body, Body::Draft(card) if crate::draft::live(&card.draft, cx).is_some())
+        })
+    }
+
     pub(super) fn draft_row(&mut self, card: &DraftCard, cx: &mut Context<Self>) -> AnyElement {
         self.watch_drafts(cx);
         if let Some(draft) = crate::draft::live(&card.draft, cx) {
             return draft.into_any_element();
+        }
+        // After a restart the saved page comes back on its own.
+        if let Some(session) = self.draft_session {
+            crate::draft::ask_to_reopen(session, &card.draft, cx);
         }
         let name = if card.title.is_empty() {
             "Draft"
         } else {
             &card.title
         };
+        let reopen = self
+            .draft_session
+            .filter(|_| crate::draft::reopenable(&card.draft, cx))
+            .map(|session| crate::draft::Reopen {
+                session,
+                draft: card.draft.clone(),
+            });
         div()
             .w_full()
             .min_w_0()
@@ -41,6 +61,31 @@ impl TranscriptView {
             .text_color(content(0.45))
             .child(icon("app-window", 14.))
             .child(div().min_w_0().truncate().child(format!("{name} · closed")))
+            .when_some(reopen, |row, reopen| {
+                row.child(
+                    div()
+                        .id(SharedString::from(format!("reopen-{}", reopen.draft)))
+                        .debug_selector(|| "transcript-reopen-draft".into())
+                        .role(Role::Button)
+                        .aria_label("Open again")
+                        .flex_shrink_0()
+                        .h(px(24.))
+                        .px_2p5()
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(content(0.12))
+                        .text_color(content(0.8))
+                        .hover(|s| s.bg(content(0.06)))
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            window.dispatch_action(Box::new(reopen.clone()), cx);
+                        })
+                        .child("Open again"),
+                )
+            })
             .into_any_element()
     }
 }

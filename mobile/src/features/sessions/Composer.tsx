@@ -1,7 +1,7 @@
 import { ChoiceMenu } from "@/ui/ChoiceMenu";
-import { Button, Host, HStack, Menu, Spacer } from "@expo/ui/swift-ui";
+import { Button, Divider, Host, HStack, Menu, Spacer } from "@expo/ui/swift-ui";
 import { accessibilityLabel, contentShape, frame, shapes } from "@expo/ui/swift-ui/modifiers";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { Alert, Platform, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import Animated, {
   Easing,
@@ -14,11 +14,15 @@ import Animated, {
 } from "react-native-reanimated";
 
 import { PulsingDot, useOffline } from "@/features/connection/ConnectionNotice";
-import type { Harness } from "@/features/workspace/types";
+import { SkillsSheet } from "@/features/skills/SkillsSheet";
+import { SlashRow } from "@/features/skills/SlashRow";
+import { insert, prepend, rank, tokenAt, type SlashToken } from "@/features/skills/slash";
+import { useSlashCatalog, type SlashScope } from "@/features/skills/useSlashCatalog";
+import type { ComposerMode, Harness } from "@/features/workspace/types";
 import { FileTypeIcon } from "@/features/files/FileTypeIcon";
 import { Icon, type IconName } from "@/ui/Icon";
 import { LiquidView } from "@/ui/LiquidView";
-import { themedStyles, useColors, useScheme } from "@/ui/theme";
+import { themedStyles, useColors, useScheme, type Scheme } from "@/ui/theme";
 
 import {
   isImage,
@@ -29,9 +33,11 @@ import {
   type Attachment,
 } from "./attachments";
 import { DictationBar } from "./DictationBar";
+import { cachedText } from "./composerDraft";
 import { canDictate, insertDictation } from "./dictation";
 import { ProviderLogo } from "./ProviderLogo";
 import { COMPOSER_INPUT_ID } from "./SessionScreen";
+import { useComposerDraft } from "./useComposerDraft";
 
 export const COMPOSER_PLACEHOLDER = "Plan, ask, build…";
 /** Mid-turn the desktop steers with the message or queues it, as its setting says. */
@@ -54,7 +60,41 @@ const INPUT_MAX = 160;
 const MARGIN_COLLAPSED = 20;
 const MARGIN_EXPANDED = 12;
 const MORPH = { duration: 280, easing: Easing.out(Easing.cubic) };
+
+/** The desktop's + menu modes, in its order and with its words and hues. */
+const MODES: {
+  id: ComposerMode;
+  label: string;
+  hint: string;
+  systemImage: ComponentProps<typeof Button>["systemImage"];
+  tint: Record<Scheme, string>;
+}[] = [
+  {
+    id: "plan",
+    label: "Plan mode",
+    hint: "Review a plan before building",
+    systemImage: "lightbulb",
+    tint: { dark: "#fde047", light: "#a16207" },
+  },
+  {
+    id: "operator",
+    label: "Operator",
+    hint: "Give this thread access to MonoCode",
+    systemImage: "cursorarrow.rays",
+    tint: { dark: "#7dd3fc", light: "#0369a1" },
+  },
+  {
+    id: "orchestrator",
+    label: "Orchestrator",
+    hint: "Plan and coordinate agent work",
+    systemImage: "point.3.connected.trianglepath.dotted",
+    tint: { dark: "#f0abfc", light: "#a21caf" },
+  },
+];
 const DICTATION_FADE = { duration: 180, easing: Easing.out(Easing.cubic) };
+/** A `/` suggestion's row, and how many show before the list scrolls. */
+const SUGGESTION_ROW = 48;
+const SUGGESTIONS_SHOWN = 3.5;
 
 /**
  * The prompt field. At rest it's a single glass pill: add, the field and the
@@ -66,8 +106,17 @@ const DICTATION_FADE = { duration: 180, easing: Easing.out(Easing.cubic) };
  * While the desktop can't be reached, or the session's latest error stands,
  * the field gives way to a line saying so and nothing can be sent; a draft
  * waits under it.
+ * With `modes`, the add menu also offers the desktop's Plan, Operator and
+ * Orchestrator. The one picked shows as a chip by the model and goes with the
+ * next message only, as on the desktop.
+ * With `slash`, typing `/` or `$` suggests the chat's provider commands and
+ * the project's skills above the field, and the add menu lists them all.
+ * Either puts in `/name`, which the desktop reads as it does a typed one.
+ * With `conversationId`, the text is the thread's: it follows the desktop
+ * composer's text for the same thread, and typing here changes it there.
  */
 export function Composer({
+  conversationId,
   context,
   branch,
   model,
@@ -79,7 +128,11 @@ export function Composer({
   onModelPress,
   workspace,
   notice,
+  modes = false,
+  slash,
 }: {
+  /** The thread whose composer text this shares with the desktop. */
+  conversationId?: string;
   /** Where this runs: the project, or the mono. */
   context: string;
   branch: string;
@@ -87,7 +140,13 @@ export function Composer({
   /** The model's effort, shown dimmer after its name as on desktop. */
   effort?: string;
   harness?: Harness;
-  onSend: (text: string, attachments: Attachment[]) => void | Promise<void>;
+  onSend: (
+    text: string,
+    attachments: Attachment[],
+    mode?: ComposerMode,
+    /** The desktop composer revision the text was based on, which it clears. */
+    draftRev?: number,
+  ) => void | Promise<void>;
   busy?: boolean;
   onStop?: () => Promise<void>;
   /** Opens the model sheet. */
@@ -96,6 +155,10 @@ export function Composer({
   workspace?: ReactNode;
   /** The session's latest error, in place of the field until tapped away. */
   notice?: { text: string; dismiss: () => void } | null;
+  /** Offers the composer modes; a Mono's chat has none. */
+  modes?: boolean;
+  /** Where skills and commands come from; a Mono's chat has none. */
+  slash?: SlashScope;
 }) {
   const scheme = useScheme();
   const colors = useColors();
@@ -103,16 +166,35 @@ export function Composer({
   const offline = useOffline();
   const blocked = offline ? "offline" : notice ? "error" : null;
   const input = useRef<TextInput>(null);
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => cachedText(conversationId));
   const [sending, setSending] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [mode, setMode] = useState<ComposerMode | null>(null);
   const [inputHeight, setInputHeight] = useState(INPUT_MIN);
   const [dictating, setDictating] = useState(false);
   // Where dictated words go: the cursor, or the selection they replace.
   const selection = useRef({ start: 0, end: 0 });
+  // The field's text as of its last change, ahead of the render that shows it,
+  // since a selection event can arrive between the two.
+  const latest = useRef(text);
+  // The `/name` or `$name` at the cursor. Set only when it changes, so moving
+  // the cursor, or focusing, doesn't commit alongside the keyboard's rise.
+  const [token, setToken] = useState<SlashToken | null>(null);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  // The desktop's text for this thread, while the person isn't typing here.
+  const showDesktopText = useCallback((next: string) => {
+    latest.current = next;
+    setText(next);
+    setToken(null);
+  }, []);
+  const shared = useComposerDraft(conversationId, showDesktopText);
+  const catalog = useSlashCatalog(slash, !!token || skillsOpen);
+  const suggestions = token
+    ? rank(token.query, token.trigger, catalog.skills, catalog.commands).slice(0, 30)
+    : [];
   const canSend = (text.trim().length > 0 || attachments.length > 0) && !sending;
-  // A draft, in words or files, keeps the card open.
-  const hasText = text.length > 0 || attachments.length > 0;
+  // A draft, in words, files or a mode, keeps the card open.
+  const hasText = text.length > 0 || attachments.length > 0 || mode !== null;
 
   // Focus lives on the UI thread rather than in React state. The keyboard
   // starts moving as the field focuses, and a React commit in that same frame
@@ -134,7 +216,8 @@ export function Composer({
   }, [blocked]);
 
   const strip = attachments.length > 0 ? STRIP : 0;
-  const expandedHeight = TOP_ROW + strip + inputHeight + BOTTOM_ROW;
+  const suggest = Math.min(suggestions.length, SUGGESTIONS_SHOWN) * SUGGESTION_ROW;
+  const expandedHeight = TOP_ROW + strip + suggest + inputHeight + BOTTOM_ROW;
 
   const containerStyle = useAnimatedStyle(() => ({
     height: interpolate(progress.get(), [0, 1], [COLLAPSED, expandedHeight]),
@@ -146,7 +229,7 @@ export function Composer({
     return {
       left: interpolate(p, [0, 1], [EDGE + BUTTON + 8, 18]),
       right: interpolate(p, [0, 1], [EDGE + BUTTON + 8, 18]),
-      top: interpolate(p, [0, 1], [EDGE - 1, TOP_ROW + strip]),
+      top: interpolate(p, [0, 1], [EDGE - 1, TOP_ROW + strip + suggest]),
       bottom: interpolate(p, [0, 1], [EDGE, BOTTOM_ROW]),
     };
   });
@@ -193,6 +276,8 @@ export function Composer({
     setText((current) => {
       const next = insertDictation(current, words, selection.current);
       selection.current = { start: next.cursor, end: next.cursor };
+      latest.current = next.text;
+      shared.typed(next.text);
       return next.text;
     });
   };
@@ -215,6 +300,57 @@ export function Composer({
     }
   };
 
+  // Picking the mode that's on turns it off, as the desktop's menu does.
+  const toggleMode = (picked: ComposerMode) => {
+    const next = mode === picked ? null : picked;
+    setMode(next);
+    // Ready to say what it's for.
+    if (next) input.current?.focus();
+  };
+
+  const findToken = (value: string, cursor: number) => {
+    const next = slash ? tokenAt(value, cursor) : null;
+    setToken((current) =>
+      current?.trigger === next?.trigger &&
+      current?.start === next?.start &&
+      current?.end === next?.end &&
+      current?.query === next?.query
+        ? current
+        : next,
+    );
+  };
+  const changeText = (value: string) => {
+    // Where the cursor will be, until the selection event says.
+    const cursor = Math.max(0, selection.current.end + value.length - latest.current.length);
+    latest.current = value;
+    setText(value);
+    shared.typed(value);
+    findToken(value, Math.min(cursor, value.length));
+  };
+  // Puts `/name` in the field and the cursor after it, ready for the request.
+  const putCommand = (next: { text: string; cursor: number }) => {
+    latest.current = next.text;
+    selection.current = { start: next.cursor, end: next.cursor };
+    setText(next.text);
+    shared.typed(next.text);
+    setToken(null);
+    requestAnimationFrame(() => input.current?.setSelection(next.cursor, next.cursor));
+  };
+  const pickSuggestion = (name: string) => {
+    if (token) putCommand(insert(text, token, name));
+  };
+  // From the sheet the name leads the message, where provider commands
+  // must be; the field takes the keyboard back once the sheet is down.
+  const pickFromSheet = (name: string) => {
+    setSkillsOpen(false);
+    putCommand(prepend(text, name));
+    setTimeout(() => input.current?.focus(), 350);
+  };
+  const openSkills = () => {
+    input.current?.blur();
+    setSkillsOpen(true);
+  };
+
   // Clears, lets go of the keyboard and folds back to the pill at once; the
   // draft comes back if the desktop never takes it.
   const send = async () => {
@@ -222,17 +358,27 @@ export function Composer({
     if (!canSend || blocked) return;
     const message = text.trim();
     const files = attachments;
+    const sentMode = mode;
     setSending(true);
+    const draftRev = shared.sent();
     setText("");
+    latest.current = "";
+    setToken(null);
     setAttachments([]);
+    setMode(null);
     focused.set(false);
     morph(false);
     input.current?.blur();
     try {
-      await onSend(message, files);
+      await onSend(message, files, sentMode ?? undefined, draftRev);
     } catch (reason) {
-      setText((current) => current || message);
+      setText((current) => {
+        latest.current = current || message;
+        shared.typed(latest.current);
+        return latest.current;
+      });
       setAttachments((current) => (current.length ? current : files));
+      setMode((current) => current ?? sentMode);
       Alert.alert("Message not sent", reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSending(false);
@@ -276,15 +422,37 @@ export function Composer({
         </Animated.View>
       ) : null}
 
+      {suggestions.length > 0 ? (
+        <Animated.View
+          style={[styles.suggestions, { top: TOP_ROW + strip, height: suggest }, expandedOnly]}
+        >
+          <ScrollView
+            keyboardShouldPersistTaps="always"
+            showsVerticalScrollIndicator={false}
+            accessibilityLabel={token?.trigger === "$" ? "Skills" : "Skills and commands"}
+          >
+            {suggestions.map((entry) => (
+              <SlashRow
+                key={`${entry.kind}:${entry.name}`}
+                entry={entry}
+                onPress={() => pickSuggestion(entry.name)}
+              />
+            ))}
+          </ScrollView>
+        </Animated.View>
+      ) : null}
+
       <Animated.View style={[styles.inputSlot, inputStyle, fieldShown]}>
         <TextInput
           ref={input}
           nativeID={COMPOSER_INPUT_ID}
           value={text}
           editable={!dictating && !blocked}
-          onChangeText={setText}
+          onChangeText={changeText}
           onSelectionChange={(event) => {
-            selection.current = event.nativeEvent.selection;
+            const picked = event.nativeEvent.selection;
+            selection.current = picked;
+            findToken(latest.current, picked.start === picked.end ? picked.end : -1);
           }}
           onFocus={() => {
             focused.set(true);
@@ -292,6 +460,7 @@ export function Composer({
           }}
           onBlur={() => {
             focused.set(false);
+            shared.flush();
             if (!hasText) morph(false);
           }}
           onContentSizeChange={(event) =>
@@ -352,6 +521,9 @@ export function Composer({
         <AddMenu
           onPhotos={() => void attach(pickPhotos)}
           onFiles={() => void attach(pickFiles)}
+          mode={mode}
+          onMode={modes ? toggleMode : undefined}
+          onSkills={slash ? openSkills : undefined}
         />
       </Animated.View>
 
@@ -372,6 +544,7 @@ export function Composer({
           </Text>
           <Icon name="chevronDown" size={14} color={colors.muted} />
         </Pressable>
+        {mode ? <ModeChip mode={mode} onClear={() => setMode(null)} /> : null}
       </Animated.View>
 
       <Animated.View
@@ -399,22 +572,53 @@ export function Composer({
           <DictationBar onClose={endDictation} />
         </Animated.View>
       ) : null}
+
+      {slash ? (
+        <SkillsSheet
+          isPresented={skillsOpen}
+          onDismiss={() => setSkillsOpen(false)}
+          scope={slash}
+          onPick={pickFromSheet}
+        />
+      ) : null}
     </Animated.View>
   );
 }
 
 /**
- * The add button: a native menu to attach photos or files. The menu lies
- * over the button, its label an invisible box of the button's size, as in
- * SessionFilterMenu.
+ * The add button: a native menu to attach photos or files, with `onSkills`
+ * to list skills and commands and, with `onMode`, to pick a mode. The menu
+ * lies over the button, its label an invisible box of the button's size, as
+ * in SessionFilterMenu.
  */
-function AddMenu({ onPhotos, onFiles }: { onPhotos: () => void; onFiles: () => void }) {
+function AddMenu({
+  onPhotos,
+  onFiles,
+  mode,
+  onMode,
+  onSkills,
+}: {
+  onPhotos: () => void;
+  onFiles: () => void;
+  mode: ComposerMode | null;
+  onMode?: (mode: ComposerMode) => void;
+  onSkills?: () => void;
+}) {
   const styles = useStyles();
   const colors = useColors();
+  const label = onMode ? "Add files or pick a mode" : "Add photos or files";
   if (Platform.OS === "android") return (
-    <ChoiceMenu label="Add photos or files" actions={[
+    <ChoiceMenu label={label} actions={[
       { label: "Photo Library", onPress: onPhotos },
       { label: "Files", onPress: onFiles },
+      ...(onSkills ? [{ label: "Skills and commands", onPress: onSkills }] : []),
+      ...(onMode
+        ? MODES.map((entry) => ({
+            label: entry.label,
+            selected: entry.id === mode,
+            onPress: () => onMode(entry.id),
+          }))
+        : []),
     ]}>
       <View style={styles.round}><Icon name="add" size={18} color={colors.content} /></View>
     </ChoiceMenu>
@@ -426,7 +630,7 @@ function AddMenu({ onPhotos, onFiles }: { onPhotos: () => void; onFiles: () => v
       </View>
       <Host style={StyleSheet.absoluteFill}>
         <Menu
-          modifiers={[accessibilityLabel("Add photos or files")]}
+          modifiers={[accessibilityLabel(label)]}
           label={
             <HStack
               modifiers={[
@@ -440,9 +644,48 @@ function AddMenu({ onPhotos, onFiles }: { onPhotos: () => void; onFiles: () => v
         >
           <Button label="Photo Library" systemImage="photo.on.rectangle" onPress={onPhotos} />
           <Button label="Files" systemImage="folder" onPress={onFiles} />
+          {onSkills ? (
+            <Button label="Skills and commands" systemImage="sparkles" onPress={onSkills} />
+          ) : null}
+          {onMode ? <Divider /> : null}
+          {onMode
+            ? MODES.map((entry) => (
+                <Button
+                  key={entry.id}
+                  label={entry.label}
+                  // A tick marks the mode that's on, as a menu's checked item.
+                  systemImage={entry.id === mode ? "checkmark" : entry.systemImage}
+                  onPress={() => onMode(entry.id)}
+                />
+              ))
+            : null}
         </Menu>
       </Host>
     </View>
+  );
+}
+
+/** The mode the next message goes in, by the model; tapping it turns it off. */
+function ModeChip({ mode, onClear }: { mode: ComposerMode; onClear: () => void }) {
+  const styles = useStyles();
+  const colors = useColors();
+  const scheme = useScheme();
+  const entry = MODES.find((candidate) => candidate.id === mode)!;
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`${entry.label}, on`}
+      accessibilityHint="Turns it off for this message"
+      hitSlop={4}
+      onPress={onClear}
+      style={({ pressed }) => [styles.modePill, pressed && styles.pressed]}
+    >
+      <Icon name={mode} size={16} color={entry.tint[scheme]} />
+      <Text style={styles.modeLabel} numberOfLines={1}>
+        {entry.label.replace(" mode", "")}
+      </Text>
+      <Icon name="close" size={12} color={colors.muted} />
+    </Pressable>
   );
 }
 
@@ -552,6 +795,12 @@ const useStyles = themedStyles((colors) => ({
   inputSlot: {
     position: "absolute",
   },
+  // Over the field, between the context row and the text being typed.
+  suggestions: {
+    position: "absolute",
+    left: 8,
+    right: 8,
+  },
   strip: {
     position: "absolute",
     top: TOP_ROW,
@@ -646,6 +895,22 @@ const useStyles = themedStyles((colors) => ({
     paddingHorizontal: 12,
     borderRadius: BUTTON / 2,
     backgroundColor: colors.fill,
+  },
+  modePill: {
+    flexShrink: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    height: BUTTON,
+    marginLeft: 6,
+    paddingHorizontal: 12,
+    borderRadius: BUTTON / 2,
+    backgroundColor: colors.fill,
+  },
+  modeLabel: {
+    color: colors.content,
+    fontSize: 15,
+    fontWeight: "500",
   },
   model: {
     flexShrink: 1,

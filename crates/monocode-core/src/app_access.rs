@@ -48,6 +48,7 @@ pub fn validate_threads(action: &str, input: &Value) -> Result<(), String> {
         "threads.wait" => "threadId timeoutSeconds",
         "threads.read" => "threadId before limit maxChars",
         "threads.stop" => "threadId",
+        "threads.close" => "threadId",
         "threads.list" => "",
         _ => return Err("Unknown thread action".into()),
     };

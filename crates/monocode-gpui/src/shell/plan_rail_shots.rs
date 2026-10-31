@@ -313,9 +313,9 @@ fn plan_rail_shots() {
     shot(&mut cx, "16-building-with-list");
 }
 
-/// Appends a running turn's rows to the shell's session and reports whether
-/// the rail asked that turn for a todo list.
-fn asked_after(cx: &mut gpui::TestAppContext, rows: Vec<Row>, busy: bool) -> bool {
+/// Appends a running turn's rows to the shell's session and reports how many
+/// messages were queued for it.
+fn queued_after(cx: &mut gpui::TestAppContext, rows: Vec<Row>, busy: bool) -> usize {
     let (window, _, id) = super::tests::window(cx);
     window
         .update(cx, |shell, _, cx| {
@@ -335,7 +335,7 @@ fn asked_after(cx: &mut gpui::TestAppContext, rows: Vec<Row>, busy: bool) -> boo
     visual.run_until_parked();
     window
         .update(visual, |shell, _, cx| {
-            shell.sessions[&id].read(cx).plan_asked
+            shell.sessions[&id].read(cx).queued_follow_ups()
         })
         .unwrap()
 }
@@ -357,33 +357,11 @@ fn turn_rows(reads: usize) -> Vec<Row> {
     rows
 }
 
+/// The agent's instructions ask for a list; the rail only offers the steer.
 #[gpui::test]
-fn a_busy_turn_with_no_list_is_asked_for_one_after_a_few_calls(cx: &mut gpui::TestAppContext) {
+fn a_busy_turn_with_no_list_is_never_asked_for_one_unprompted(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| cx.set_reduce_motion(true));
-    assert!(asked_after(cx, turn_rows(3), true));
-}
-
-#[gpui::test]
-fn a_turn_is_not_asked_before_it_has_worked_or_once_it_has_stopped(cx: &mut gpui::TestAppContext) {
-    cx.update(|cx| cx.set_reduce_motion(true));
-    assert!(!asked_after(cx, turn_rows(2), true));
-    assert!(!asked_after(cx, turn_rows(5), false));
-}
-
-#[gpui::test]
-fn a_turn_that_wrote_its_own_list_is_not_asked(cx: &mut gpui::TestAppContext) {
-    cx.update(|cx| cx.set_reduce_motion(true));
-    let mut rows = turn_rows(1);
-    rows.push(tool_row(
-        "own-list",
-        "TodoWrite",
-        serde_json::json!({ "todos": [
-            { "content": "One", "status": "in_progress" },
-            { "content": "Two", "status": "pending" },
-        ]}),
-    ));
-    rows.extend(turn_rows(4).into_iter().skip(1));
-    assert!(!asked_after(cx, rows, true));
+    assert_eq!(queued_after(cx, turn_rows(5), true), 0);
 }
 
 #[gpui::test]

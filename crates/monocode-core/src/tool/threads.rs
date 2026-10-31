@@ -1,4 +1,4 @@
-use super::{tasks::Panel, ToolCall};
+use super::{tasks::Panel, ToolCall, ToolState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -20,19 +20,34 @@ impl ToolCall {
             .any(|tool| self.name.ends_with(tool))
     }
 
-    pub fn thread_action(&self) -> Option<&str> {
-        let name = self
-            .name
+    /// The tool's name without the MonoCode MCP server's prefix.
+    fn monocode_tool(&self) -> &str {
+        self.name
             .strip_prefix("mcp__monocode__")
             .or_else(|| self.name.strip_prefix("monocode_"))
             .or_else(|| self.name.strip_prefix("monocode:"))
-            .unwrap_or(&self.name);
-        match name {
+            .unwrap_or(&self.name)
+    }
+
+    /// The plan an accepted `orchestration_plan` call submitted.
+    pub fn orchestration_plan(&self) -> Option<crate::orchestration::Plan> {
+        if self.monocode_tool() != crate::orchestration::TOOL
+            || matches!(self.state, ToolState::Failed | ToolState::Cancelled)
+        {
+            return None;
+        }
+        let input: Value = serde_json::from_str(&self.input).ok()?;
+        crate::orchestration::from_input(&input).ok()
+    }
+
+    pub fn thread_action(&self) -> Option<&str> {
+        match self.monocode_tool() {
             "thread_start" => Some("start"),
             "thread_send" => Some("send"),
             "thread_wait" => Some("wait"),
             "thread_read" => Some("read"),
             "thread_stop" => Some("stop"),
+            "thread_close" => Some("close"),
             "thread_list" => Some("list"),
             _ => None,
         }

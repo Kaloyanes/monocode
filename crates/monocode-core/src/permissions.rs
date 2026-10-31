@@ -62,6 +62,10 @@ impl Store {
         let mut grants: Vec<Grant> = Vec::with_capacity(file.grants.len());
         for mut grant in file.grants {
             stable(&mut grant.key.confirmation);
+            grant.key.project = repository(&grant.key.project);
+            if grant.key.provider == "codex" {
+                grant.key.binary = codex_binary(&grant.key.binary);
+            }
             if !grants.iter().any(|g| g.key == grant.key) {
                 grants.push(grant);
             }
@@ -121,6 +125,25 @@ impl Store {
 /// in a later turn or chat produces the same key.
 pub fn stable(confirmation: &mut Value) {
     if let Some(meta) = confirmation.get_mut("_meta").and_then(Value::as_object_mut) {
+        if meta.get("codex_approval_kind").and_then(Value::as_str) == Some("mcp_tool_call")
+            && meta.get("connector_id").and_then(Value::as_str) == Some("computer-use")
+            && meta
+                .get("tool_params")
+                .and_then(|v| v.get("app"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            let app = meta["tool_params"]["app"].clone();
+            *meta = serde_json::Map::from_iter([
+                (
+                    "codex_approval_kind".into(),
+                    Value::String("mcp_tool_call".into()),
+                ),
+                ("connector_id".into(), Value::String("computer-use".into())),
+                ("tool_params".into(), serde_json::json!({"app": app})),
+            ]);
+            return;
+        }
         for field in ["callId", "x-codex-turn-metadata"] {
             meta.remove(field);
         }
@@ -129,6 +152,51 @@ pub fn stable(confirmation: &mut Value) {
 
 pub fn project(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub fn repository(path: &Path) -> PathBuf {
+    let path = project(path);
+    for root in path.ancestors() {
+        let dotgit = root.join(".git");
+        if dotgit.is_dir() {
+            return root.to_path_buf();
+        }
+        if let Ok(contents) = fs::read_to_string(&dotgit) {
+            if let Some(gitdir) = contents.trim().strip_prefix("gitdir: ") {
+                let gitdir = root.join(gitdir);
+                if let Ok(common) = fs::read_to_string(gitdir.join("commondir")) {
+                    let common = project(&gitdir.join(common.trim()));
+                    if common.file_name().is_some_and(|name| name == ".git") {
+                        if let Some(main) = common.parent() {
+                            return main.to_path_buf();
+                        }
+                    }
+                }
+            }
+            return root.to_path_buf();
+        }
+    }
+    path
+}
+
+pub fn codex_binary(path: &Path) -> PathBuf {
+    let path = project(path);
+    if let Some(releases) = path.parent().and_then(Path::parent).and_then(Path::parent) {
+        if path.file_name().is_some_and(|name| name == "codex")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "bin")
+            && releases.file_name().is_some_and(|name| name == "releases")
+            && releases
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "standalone")
+        {
+            return releases.join("current/bin/codex");
+        }
+    }
+    path
 }
 
 #[cfg(test)]
@@ -179,6 +247,33 @@ mod tests {
             grants[0].key.confirmation,
             json!({"_meta":{"tool_name":"t"}})
         );
+    }
+
+    #[test]
+    fn legacy_codex_release_grants_survive_updates_but_not_installation_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut old = grant();
+        old.key.binary = "/opt/codex/standalone/releases/0.164.0/bin/codex".into();
+        fs::write(
+            &path,
+            serde_json::to_vec(&File {
+                version: 1,
+                grants: vec![old.clone()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = Store::new(path);
+        let mut later = old.key.clone();
+        later.binary = codex_binary(Path::new(
+            "/opt/codex/standalone/releases/0.165.0/bin/codex",
+        ));
+        assert!(store.contains(&later));
+        later.binary = codex_binary(Path::new("/other/standalone/releases/0.165.0/bin/codex"));
+        assert!(!store.contains(&later));
+        store.remove(&store.list().unwrap()[0].key).unwrap();
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]

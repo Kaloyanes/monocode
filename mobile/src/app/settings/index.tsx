@@ -149,6 +149,18 @@ export default function SettingsScreen() {
             router.push({ pathname: "/settings/permissions", params })
           }
         />
+        {project ? (
+          <>
+            <View style={styles.divider} />
+            <SettingsRow
+              icon="sparkle"
+              label="Skills"
+              onPress={() =>
+                router.push({ pathname: "/settings/skills", params })
+              }
+            />
+          </>
+        ) : null}
       </View>
 
       <Text style={styles.heading}>New sessions</Text>

@@ -437,6 +437,7 @@ impl Conversation {
                         "Choose another model",
                         false,
                         switching,
+                        0.15,
                     )
                     .h(px(26.))
                     .gap(px(4.))
@@ -444,7 +445,6 @@ impl Conversation {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(content(1.))
                     .bg(content(0.1))
-                    .hover(|s| s.bg(content(0.15)))
                     .child("Choose another model")
                     .child(icon("chevron-down", 11.).text_color(content(0.5)))
                     .when(!switching, |d| {
@@ -470,6 +470,7 @@ impl Conversation {
                     "Choose another account",
                     false,
                     switching,
+                    if mono { 0.15 } else { 0.1 },
                 )
                 .relative()
                 .gap(px(4.))
@@ -478,7 +479,6 @@ impl Conversation {
                         .text_size(px(11.))
                         .text_color(content(1.))
                         .bg(content(0.1))
-                        .hover(|s| s.bg(content(0.15)))
                 })
                 .child(self.account_anchor.probe())
                 .child(if switching {
@@ -504,7 +504,7 @@ impl Conversation {
             "Resume"
         };
         controls = controls.child(
-            usage_button("resume-usage-limit", resume, armed, switching)
+            usage_button("resume-usage-limit", resume, armed, switching, 0.1)
                 .focusable()
                 .tab_stop(true)
                 .child(icon(
@@ -609,6 +609,7 @@ fn usage_button(
     label: &'static str,
     primary: bool,
     disabled: bool,
+    hover_bg: f32,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -635,7 +636,7 @@ fn usage_button(
         .when(disabled, |d| d.opacity(0.45))
         .when(!disabled, |d| {
             d.cursor_pointer()
-                .hover(move |s| s.bg(content(0.1)).text_color(content(1.)))
+                .hover(move |s| s.bg(content(hover_bg)).text_color(content(1.)))
         })
 }
 

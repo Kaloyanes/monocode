@@ -21,7 +21,7 @@ impl State {
     }
 }
 impl Conversation {
-    pub(super) fn is_remote(&self) -> bool {
+    pub(crate) fn is_remote(&self) -> bool {
         self.summary.cwd.starts_with("remote://")
     }
     pub(crate) fn remote_connection_error(&mut self, error: &str, cx: &mut Context<Self>) {
@@ -224,8 +224,10 @@ impl Conversation {
         self.follow_ups.state.draft = draft.clone();
         self.transcript
             .update(cx, |view, cx| view.set_saved_draft(draft, cx));
+        self.adopt_saved_draft(cx);
     }
-    pub(super) fn remote_send_guard(&mut self, cx: &mut Context<Self>) -> bool {
+    /// `draft` saves the message on the host instead of sending it.
+    pub(super) fn remote_send_guard(&mut self, draft: bool, cx: &mut Context<Self>) -> bool {
         let error = if !self.loaded {
             Some("Wait for this remote conversation to load.")
         } else if !self.remote_state.online {
@@ -266,7 +268,7 @@ impl Conversation {
             cx.notify();
             return true;
         }
-        if self.draft_active(cx) && !self.remote_state.capabilities.contains("sessions.draft") {
+        if draft && !self.remote_state.capabilities.contains("sessions.draft") {
             self.status = "Update MonoCode Host in Connections settings to save drafts.".into();
             cx.notify();
             return true;
@@ -278,11 +280,7 @@ impl Conversation {
             self.launch_prompt("/compact".into(), cx);
             return true;
         }
-        if text.starts_with('/')
-            && !["/plan", "/draft"]
-                .iter()
-                .any(|command| text == *command || text.starts_with(&format!("{command} ")))
-        {
+        if text.starts_with('/') && text != "/plan" && !text.starts_with("/plan ") {
             self.status =
                 "Only /plan, /compact and saved drafts are supported by this remote host.".into();
             cx.notify();
@@ -315,19 +313,15 @@ impl Conversation {
         self.launch_prompt(prompt, cx);
     }
     pub(super) fn remote_save_draft(&mut self, cx: &mut Context<Self>) {
-        if self.remote_send_guard(cx) {
+        if self.remote_send_guard(true, cx) {
             return;
         }
-        let raw = self.input.read(cx).content.to_string();
-        let prompt = monocode_core::composer::consume_command(&raw, "draft")
-            .unwrap_or(&raw)
-            .to_owned();
+        let prompt = self.input.read(cx).content.to_string();
         if prompt.trim().is_empty() && self.attachments.is_empty() {
             return;
         }
         self.input
             .update(cx, |input, cx| input.set_text(String::new(), cx));
-        self.follow_ups.draft_selected = false;
         self.settings.remote_action = Some(json!({"type":"draft"}));
         self.launch_prompt(prompt, cx);
     }
