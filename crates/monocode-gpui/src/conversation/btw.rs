@@ -129,10 +129,12 @@ pub(super) struct Btw {
     revision: u64,
     pending_submit: Option<String>,
     cancel: HashMap<String, Arc<AtomicBool>>,
-    /// The session composer's model menu, while open.
-    models: Option<Entity<Menu>>,
-    model_subscriptions: Vec<Subscription>,
+    picker: Option<Picker>,
+    picker_subscriptions: Vec<Subscription>,
+    /// The active side thread's provider catalog.
+    catalog: Vec<Model>,
     model_anchor: AnchorSlot,
+    effort_anchor: AnchorSlot,
     _submit: Subscription,
     _changed: Subscription,
     response_subscription: Option<Subscription>,
@@ -278,9 +280,11 @@ impl Btw {
             revision: monocode_core::time::now_ms(),
             pending_submit: None,
             cancel: HashMap::new(),
-            models: None,
-            model_subscriptions: Vec::new(),
+            picker: None,
+            picker_subscriptions: Vec::new(),
+            catalog: Vec::new(),
             model_anchor: AnchorSlot::default(),
+            effort_anchor: AnchorSlot::default(),
             _submit: submit,
             _changed: changed,
             response_subscription: None,
@@ -295,9 +299,8 @@ impl Btw {
         if !self.open || self.input.read(cx).is_composing() {
             return false;
         }
-        if self.models.take().is_some() {
-            window.focus(&self.input.focus_handle(cx), cx);
-            cx.notify();
+        if self.picker.is_some() {
+            self.close_picker(window, cx);
         } else {
             self.close(window, cx);
         }
@@ -558,7 +561,9 @@ impl Btw {
             .map(|thread| thread.draft.clone())
             .unwrap_or_default();
         self.input.update(cx, |input, cx| input.set_text(draft, cx));
-        self.models = None;
+        self.picker = None;
+        self.picker_subscriptions.clear();
+        self.load_catalog(cx);
         self.focus_pending = true;
         self.refresh(cx);
     }
@@ -825,47 +830,102 @@ impl Btw {
         self.save(cx);
         cx.notify();
     }
-    /// The side thread's model, from the provider catalog last loaded.
-    fn model_info<'a>(&self, models: &'a [Model]) -> Option<&'a Model> {
+    fn account(&self, cx: &App) -> Option<(Kind, monocode_core::accounts::Profile)> {
+        let thread = self.active()?;
+        let mut account = thread.account.clone();
+        if account.id != monocode_core::accounts::DEFAULT {
+            account.root = crate::accounts::get(cx).map(|center| center.read(cx).root.clone());
+        }
+        Some((Kind::from_id(&thread.provider), account))
+    }
+    /// The side thread's provider catalog: cached rows at once, then fresh ones.
+    fn load_catalog(&mut self, cx: &mut Context<Self>) {
+        let Some((provider, account)) = self.account(cx) else {
+            self.catalog.clear();
+            return;
+        };
+        self.catalog = catalog::cached_models_for(provider, &account).unwrap_or_default();
+        if cfg!(test) {
+            return;
+        }
+        let profile = account.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { catalog::models_for(provider, &profile) });
+        cx.spawn(async move |this, cx| {
+            let Ok(models) = work.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                // Another provider or account was picked meanwhile.
+                if this.account(cx) != Some((provider, account)) {
+                    return;
+                }
+                let efforts = this.model_info().map(|model| model.efforts.clone());
+                this.catalog = models;
+                // Replacing rows closes an open flyout, so only when the
+                // effort row changed.
+                if this.model_info().map(|model| model.efforts.clone()) != efforts
+                    && let Some(Picker::Menu(menu, list)) = &this.picker
+                {
+                    let (menu, items) = (menu.clone(), this.model_items(list, cx));
+                    menu.update(cx, |menu, cx| menu.set_items(items, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    fn model_info(&self) -> Option<&Model> {
         let thread = self.active()?;
         let provider = Kind::from_id(&thread.provider);
         match thread.model.as_deref() {
-            Some(id) => models.iter().find(|model| {
+            Some(id) => self.catalog.iter().find(|model| {
                 super::response_menu::model_ids_match(provider, id, &model.id)
                     || model.alias_target.as_deref().is_some_and(|alias| {
                         super::response_menu::model_ids_match(provider, id, alias)
                     })
             }),
-            None => models
+            None => self
+                .catalog
                 .iter()
                 .find(|model| model.default)
-                .or_else(|| models.first()),
+                .or_else(|| self.catalog.first()),
         }
+    }
+    fn selected_effort(&self) -> Option<&str> {
+        self.active()?
+            .effort
+            .as_deref()
+            .or_else(|| self.model_info()?.default_effort.as_deref())
+    }
+    fn effort_items(&self) -> Vec<MenuAction> {
+        let selected = self.selected_effort();
+        self.model_info().map_or_else(Vec::new, |model| {
+            model
+                .efforts
+                .iter()
+                .map(|effort| {
+                    MenuAction::new(format!("effort:{effort}"), effort_name(effort))
+                        .checked(selected == Some(effort.as_str()))
+                })
+                .collect()
+        })
     }
     /// The session composer's "Model and settings" menu: the model's
     /// efforts, then a "Model" row whose flyout is the composer's ModelList.
-    fn model_items(&self, models: &[Model], list: &Entity<ModelList>, cx: &App) -> Vec<MenuItem> {
+    fn model_items(&self, list: &Entity<ModelList>, cx: &App) -> Vec<MenuItem> {
         let Some(thread) = self.active() else {
             return Vec::new();
         };
         let provider = Kind::from_id(&thread.provider);
-        let info = self.model_info(models);
+        let info = self.model_info();
         let mut items = Vec::new();
-        if let Some(model) = info.filter(|model| !model.efforts.is_empty()) {
-            let selected = thread.effort.as_deref().or(model.default_effort.as_deref());
+        if info.is_some_and(|model| !model.efforts.is_empty()) {
             items.push(
                 MenuAction::new("reasoning", "Effort")
-                    .value(effort_name(selected.unwrap_or("default")))
-                    .submenu(
-                        model
-                            .efforts
-                            .iter()
-                            .map(|effort| {
-                                MenuAction::new(format!("effort:{effort}"), effort_name(effort))
-                                    .checked(selected == Some(effort.as_str()))
-                            })
-                            .collect(),
-                    )
+                    .value(effort_name(self.selected_effort().unwrap_or("default")))
+                    .submenu(self.effort_items())
                     .into(),
             );
         }
@@ -889,14 +949,14 @@ impl Btw {
         );
         items
     }
-    fn close_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.models = None;
-        self.model_subscriptions.clear();
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.picker_subscriptions.clear();
         window.focus(&self.input.focus_handle(cx), cx);
         cx.notify();
     }
-    /// A model picked in the ModelList flyout. Another provider brings its
-    /// own account and effort; the old provider's controls don't carry over.
+    /// A model picked in the ModelList. Another provider brings its own
+    /// account and effort; the old provider's controls don't carry over.
     fn apply_model_pick(&mut self, picked: &ModelPicked, cx: &mut Context<Self>) {
         let (kind, model) = (picked.0, picked.1.clone());
         let account = crate::accounts::get(cx);
@@ -904,7 +964,8 @@ impl Btw {
         let Some(thread) = self.active_mut() else {
             return;
         };
-        if thread.provider != kind.id() {
+        let switched = thread.provider != kind.id();
+        if switched {
             thread.provider = kind.id().into();
             thread.account = account
                 .map(|center| center.read(cx).selected(kind, &thread.cwd))
@@ -913,26 +974,22 @@ impl Btw {
             thread.model_settings.clear();
         }
         thread.model = model;
+        if switched {
+            self.load_catalog(cx);
+        }
         self.save(cx);
         self.refresh(cx);
     }
-    fn model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.models.is_some() {
-            self.close_model_picker(window, cx);
-            return;
-        }
-        let Some(thread) = self.active() else {
-            return;
-        };
-        if thread.status == "running" {
-            return;
-        }
-        let provider = Kind::from_id(&thread.provider);
-        let mut account = thread.account.clone();
-        if account.id != monocode_core::accounts::DEFAULT {
-            account.root = crate::accounts::get(cx).map(|center| center.read(cx).root.clone());
-        }
-        let (model, cwd, profile) = (thread.model.clone(), thread.cwd.clone(), account.clone());
+    /// The composer's ModelList for the side thread, which closes the
+    /// picker once a model is picked.
+    fn model_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ModelList> {
+        let thread = self.active();
+        let (model, cwd) = thread.map_or((None, self.target.cwd.clone()), |thread| {
+            (thread.model.clone(), thread.cwd.clone())
+        });
+        let (provider, profile) = self
+            .account(cx)
+            .unwrap_or_else(|| (self.target.provider, Default::default()));
         let list = cx.new(|cx| {
             let mut hidden = cx
                 .try_global::<crate::settings::Preferences>()
@@ -948,24 +1005,23 @@ impl Btw {
                 .hide_providers(hidden)
                 .allow_provider_switch(true)
         });
-        // Cached rows show at once; the fresh catalog replaces them.
-        let cached = catalog::cached_models_for(provider, &account).unwrap_or_default();
-        let items = self.model_items(&cached, &list, cx);
-        let menu = cx.new(|cx| {
-            Menu::new("Model and settings", items, window, cx)
-                .width(250.)
-                .style(MenuStyle::Settings)
-        });
-        self.model_subscriptions = vec![
-            cx.subscribe_in(
-                &list,
-                window,
-                |this, _, picked: &ModelPicked, window, cx| {
-                    this.apply_model_pick(picked, cx);
-                    this.close_model_picker(window, cx);
-                },
-            ),
-            cx.subscribe_in(&menu, window, |this, _, event: &MenuEvent, window, cx| {
+        self.picker_subscriptions.push(cx.subscribe_in(
+            &list,
+            window,
+            |this, _, picked: &ModelPicked, window, cx| {
+                this.apply_model_pick(picked, cx);
+                this.close_picker(window, cx);
+            },
+        ));
+        list
+    }
+    /// Effort rows pick the side thread's effort; any other pick or a
+    /// dismissal closes the picker.
+    fn watch_efforts(&mut self, menu: &Entity<Menu>, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker_subscriptions.push(cx.subscribe_in(
+            menu,
+            window,
+            |this, _, event: &MenuEvent, window, cx| {
                 if let MenuEvent::Picked(id, _) = event {
                     let Some(effort) = id.strip_prefix("effort:") else {
                         return;
@@ -976,40 +1032,62 @@ impl Btw {
                     this.save(cx);
                     this.refresh(cx);
                 }
-                this.close_model_picker(window, cx);
-            }),
-        ];
-        if !cfg!(test) {
-            let work = cx
-                .background_executor()
-                .spawn(async move { catalog::models_for(provider, &account) });
-            let weak_menu = menu.downgrade();
-            cx.spawn(async move |this, cx| {
-                let Ok(models) = work.await else {
-                    return;
-                };
-                let _ = this.update(cx, |this, cx| {
-                    // A closed or reopened menu keeps its own rows.
-                    if this.models.as_ref().map(|m| m.downgrade()) != Some(weak_menu.clone()) {
-                        return;
-                    }
-                    // Replacing rows closes an open flyout, so only when the
-                    // effort row changed.
-                    let efforts = |models: &[Model]| {
-                        this.model_info(models).map(|model| model.efforts.clone())
-                    };
-                    if efforts(&models) == efforts(&cached) {
-                        return;
-                    }
-                    let items = this.model_items(&models, &list, cx);
-                    if let Some(menu) = &this.models {
-                        menu.update(cx, |menu, cx| menu.set_items(items, cx));
-                    }
-                });
-            })
-            .detach();
+                this.close_picker(window, cx);
+            },
+        ));
+    }
+    fn picker_allowed(&self) -> bool {
+        self.active()
+            .is_some_and(|thread| thread.status != "running")
+    }
+    /// The model pill: the composer's model menu, or with model options
+    /// beside the picker, the model list on its own.
+    fn model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_open = matches!(self.picker, Some(Picker::Menu(..) | Picker::List(_)));
+        if self.picker.is_some() {
+            self.close_picker(window, cx);
         }
-        self.models = Some(menu);
+        if was_open || !self.picker_allowed() {
+            return;
+        }
+        self.load_catalog(cx);
+        let list = self.model_list(window, cx);
+        if options_beside(cx) {
+            window.focus(&list.read(cx).search_focus(cx), cx);
+            self.picker = Some(Picker::List(list));
+        } else {
+            let items = self.model_items(&list, cx);
+            let menu = cx.new(|cx| {
+                Menu::new("Model and settings", items, window, cx)
+                    .width(250.)
+                    .style(MenuStyle::Settings)
+            });
+            self.watch_efforts(&menu, window, cx);
+            self.picker = Some(Picker::Menu(menu, list));
+        }
+        cx.notify();
+    }
+    /// The effort pill beside the model pill.
+    fn effort_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_open = matches!(self.picker, Some(Picker::Effort(_)));
+        if self.picker.is_some() {
+            self.close_picker(window, cx);
+        }
+        if was_open || !self.picker_allowed() {
+            return;
+        }
+        let items = self
+            .effort_items()
+            .into_iter()
+            .map(MenuItem::from)
+            .collect();
+        let menu = cx.new(|cx| {
+            Menu::new("Effort", items, window, cx)
+                .width(210.)
+                .style(MenuStyle::Explorer)
+        });
+        self.watch_efforts(&menu, window, cx);
+        self.picker = Some(Picker::Effort(menu));
         cx.notify();
     }
     /// The model pill's effort, as the session composer shows it.
@@ -1018,6 +1096,27 @@ impl Btw {
             .and_then(|thread| thread.effort.as_deref())
             .map(effort_name)
     }
+    /// The effort pill's value, while model options sit beside the picker.
+    fn beside_effort(&self, cx: &App) -> Option<String> {
+        (options_beside(cx)
+            && self
+                .model_info()
+                .is_some_and(|model| !model.efforts.is_empty()))
+        .then(|| effort_name(self.selected_effort().unwrap_or("default")))
+    }
+}
+
+/// Settings › Chat "Model options": beside the picker, not in its menu.
+fn options_beside(cx: &App) -> bool {
+    cx.try_global::<crate::settings::Preferences>()
+        .is_some_and(|prefs| prefs.model_controls == "beside")
+}
+/// The open picker: the composer's model menu (with the ModelList in its
+/// flyout), or with options beside the picker, the list or efforts alone.
+enum Picker {
+    Menu(Entity<Menu>, Entity<ModelList>),
+    List(Entity<ModelList>),
+    Effort(Entity<Menu>),
 }
 
 #[derive(Clone, Copy)]
@@ -1422,6 +1521,7 @@ impl Btw {
             })
             .unwrap_or_else(|| (self.target.provider.id().into(), "Model".into()));
         let focused = self.input.focus_handle(cx).is_focused(window);
+        let beside_effort = self.beside_effort(cx);
         div().flex_shrink_0().px(px(6.)).pb(px(6.)).child(
             div()
                 .id("btw-composer-box")
@@ -1464,20 +1564,29 @@ impl Btw {
                                     Kind::from_id(&provider).label(),
                                     model
                                 ))
-                                .aria_expanded(self.models.is_some())
+                                .aria_expanded(matches!(
+                                    self.picker,
+                                    Some(Picker::Menu(..) | Picker::List(_))
+                                ))
                                 .when(running, |d| d.opacity(0.5))
                                 .child(self.model_anchor.probe())
                                 .child(provider_icon(&provider, 16.))
                                 .child(pill_label(model))
-                                .when_some(self.effort_label(), |d, effort| {
-                                    d.child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_size(px(11.))
-                                            .text_color(content(0.5))
-                                            .child(effort),
-                                    )
-                                })
+                                .when_some(
+                                    beside_effort
+                                        .is_none()
+                                        .then(|| self.effort_label())
+                                        .flatten(),
+                                    |d, effort| {
+                                        d.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_size(px(11.))
+                                                .text_color(content(0.5))
+                                                .child(effort),
+                                        )
+                                    },
+                                )
                                 .child(icon("chevron-down", 12.))
                                 .on_click(
                                     cx.listener(|this, _, window, cx| {
@@ -1485,6 +1594,23 @@ impl Btw {
                                     }),
                                 ),
                         )
+                        .when_some(beside_effort, |d, value| {
+                            let open = matches!(self.picker, Some(Picker::Effort(_)));
+                            d.child(
+                                tool_pill("btw-effort", "Effort")
+                                    .flex_shrink_0()
+                                    .aria_label(format!("Effort: {value}"))
+                                    .aria_expanded(open)
+                                    .when(running, |d| d.opacity(0.5))
+                                    .child(self.effort_anchor.probe())
+                                    .child(icon("gauge", 14.))
+                                    .child(pill_label(value))
+                                    .child(icon("chevron-down", 12.))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.effort_picker(window, cx)
+                                    })),
+                            )
+                        })
                         .child(div().flex_1())
                         .child(
                             send_button(
@@ -1571,8 +1697,30 @@ impl Render for Btw {
                 self.composer_box(running, window, cx)
                     .opacity(shape.as_ref().map_or(1., |shape| shape.composer)),
             );
-        let models = self.models.as_ref().map(|menu| {
-            menu_popover(menu, Anchor::Slot(self.model_anchor.clone()), cx).side(Side::Top)
+        let models = self.picker.as_ref().map(|picker| match picker {
+            Picker::Menu(menu, _) => {
+                menu_popover(menu, Anchor::Slot(self.model_anchor.clone()), cx)
+                    .side(Side::Top)
+                    .into_any_element()
+            }
+            Picker::Effort(menu) => {
+                menu_popover(menu, Anchor::Slot(self.effort_anchor.clone()), cx)
+                    .side(Side::Top)
+                    .into_any_element()
+            }
+            Picker::List(list) => {
+                let this = cx.entity().downgrade();
+                popover("btw-models", Anchor::Slot(self.model_anchor.clone()))
+                    .side(Side::Top)
+                    .align(Align::Start)
+                    .width(310.)
+                    .height(442.)
+                    .on_dismiss(move |window, cx| {
+                        let _ = this.update(cx, |this, cx| this.close_picker(window, cx));
+                    })
+                    .child(list.clone())
+                    .into_any_element()
+            }
         });
         let mut root = div()
             .absolute()
