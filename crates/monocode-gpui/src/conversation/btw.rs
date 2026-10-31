@@ -24,7 +24,6 @@ const CLOSE_MS: f32 = 260.;
 const OPEN_EASE: fx::Ease = (0.22, 1., 0.36, 1.);
 const CLOSE_EASE: fx::Ease = (0.4, 0., 0.2, 1.);
 const BURST_MS: f32 = 1900.;
-const MODEL_NOTE: &str = "Answer side questions with another model.";
 const BLOCK_CHARS: usize = 8_000;
 
 fn supported(kind: Kind) -> bool {
@@ -130,9 +129,9 @@ pub(super) struct Btw {
     revision: u64,
     pending_submit: Option<String>,
     cancel: HashMap<String, Arc<AtomicBool>>,
-    /// The handoff-style model menu, while open.
+    /// The session composer's model menu, while open.
     models: Option<Entity<Menu>>,
-    model_subscription: Option<Subscription>,
+    model_subscriptions: Vec<Subscription>,
     model_anchor: AnchorSlot,
     _submit: Subscription,
     _changed: Subscription,
@@ -280,7 +279,7 @@ impl Btw {
             pending_submit: None,
             cancel: HashMap::new(),
             models: None,
-            model_subscription: None,
+            model_subscriptions: Vec::new(),
             model_anchor: AnchorSlot::default(),
             _submit: submit,
             _changed: changed,
@@ -826,71 +825,100 @@ impl Btw {
         self.save(cx);
         cx.notify();
     }
-    /// The response menu's model rows for the side thread's own provider:
-    /// each model, with its reasoning efforts in a submenu.
-    fn model_items(&self, result: Result<Vec<Model>, String>) -> Vec<MenuItem> {
-        let mut items = vec![MenuItem::Note(MODEL_NOTE.into())];
-        let Some(thread) = self.active() else {
-            return items;
-        };
+    /// The side thread's model, from the provider catalog last loaded.
+    fn model_info<'a>(&self, models: &'a [Model]) -> Option<&'a Model> {
+        let thread = self.active()?;
         let provider = Kind::from_id(&thread.provider);
-        let models = match result {
-            Ok(models) => models,
-            Err(error) => {
-                items.push(MenuItem::Note(
-                    format!("Couldn't load models: {error}").into(),
-                ));
-                return items;
-            }
-        };
-        let current = thread.model.as_deref();
-        for model in models {
-            let selected = current.is_some_and(|id| {
+        match thread.model.as_deref() {
+            Some(id) => models.iter().find(|model| {
                 super::response_menu::model_ids_match(provider, id, &model.id)
                     || model.alias_target.as_deref().is_some_and(|alias| {
                         super::response_menu::model_ids_match(provider, id, alias)
                     })
-            });
-            let target = |effort: Option<String>| {
-                serde_json::to_string(&monocode_core::response::Target {
-                    provider: provider.id().into(),
-                    model: Some(model.id.clone()),
-                    effort,
-                    settings: model
-                        .controls
-                        .iter()
-                        .map(|control| (control.id.clone(), control.current.clone()))
-                        .collect(),
+            }),
+            None => models
+                .iter()
+                .find(|model| model.default)
+                .or_else(|| models.first()),
+        }
+    }
+    /// The session composer's "Model and settings" menu: the model's
+    /// efforts, then a "Model" row whose flyout is the composer's ModelList.
+    fn model_items(&self, models: &[Model], list: &Entity<ModelList>, cx: &App) -> Vec<MenuItem> {
+        let Some(thread) = self.active() else {
+            return Vec::new();
+        };
+        let provider = Kind::from_id(&thread.provider);
+        let info = self.model_info(models);
+        let mut items = Vec::new();
+        if let Some(model) = info.filter(|model| !model.efforts.is_empty()) {
+            let selected = thread.effort.as_deref().or(model.default_effort.as_deref());
+            items.push(
+                MenuAction::new("reasoning", "Effort")
+                    .value(effort_name(selected.unwrap_or("default")))
+                    .submenu(
+                        model
+                            .efforts
+                            .iter()
+                            .map(|effort| {
+                                MenuAction::new(format!("effort:{effort}"), effort_name(effort))
+                                    .checked(selected == Some(effort.as_str()))
+                            })
+                            .collect(),
+                    )
+                    .into(),
+            );
+        }
+        items.push(
+            MenuAction::new("model", "Model")
+                .value_image(provider.id())
+                .value(info.map_or_else(
+                    || crate::pickers::model_name(provider, thread.model.as_deref()),
+                    |model| crate::pickers::model_display_name(provider, &model.id, &model.name),
+                ))
+                .flyout(Flyout {
+                    view: list.clone().into(),
+                    width: 310.,
+                    padding: 0.,
+                    height: Some(442.),
+                    max_height: None,
+                    focus: Some(list.read(cx).search_focus(cx)),
+                    surface: None,
                 })
-                .unwrap_or_default()
-            };
-            let mut option = MenuAction::new(
-                target(None),
-                crate::pickers::model_display_name(provider, &model.id, &model.name),
-            )
-            .checked(selected);
-            if !model.efforts.is_empty() {
-                let mut efforts = vec![
-                    MenuAction::new(target(None), "Default")
-                        .checked(selected && thread.effort.is_none()),
-                ];
-                efforts.extend(model.efforts.iter().map(|effort| {
-                    MenuAction::new(target(Some(effort.clone())), effort_name(effort))
-                        .checked(selected && thread.effort.as_deref() == Some(effort))
-                }));
-                option = option.submenu(efforts);
-            }
-            items.push(option.into());
-        }
-        if items.len() == 1 {
-            items.push(MenuItem::Note("No models are available.".into()));
-        }
+                .into(),
+        );
         items
+    }
+    fn close_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.models = None;
+        self.model_subscriptions.clear();
+        window.focus(&self.input.focus_handle(cx), cx);
+        cx.notify();
+    }
+    /// A model picked in the ModelList flyout. Another provider brings its
+    /// own account and effort; the old provider's controls don't carry over.
+    fn apply_model_pick(&mut self, picked: &ModelPicked, cx: &mut Context<Self>) {
+        let (kind, model) = (picked.0, picked.1.clone());
+        let account = crate::accounts::get(cx);
+        let preferred = preferred_effort(kind.id(), cx);
+        let Some(thread) = self.active_mut() else {
+            return;
+        };
+        if thread.provider != kind.id() {
+            thread.provider = kind.id().into();
+            thread.account = account
+                .map(|center| center.read(cx).selected(kind, &thread.cwd))
+                .unwrap_or_default();
+            thread.effort = preferred;
+            thread.model_settings.clear();
+        }
+        thread.model = model;
+        self.save(cx);
+        self.refresh(cx);
     }
     fn model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.models.is_some() {
-            self.models = None;
-            cx.notify();
+            self.close_model_picker(window, cx);
             return;
         }
         let Some(thread) = self.active() else {
@@ -904,53 +932,76 @@ impl Btw {
         if account.id != monocode_core::accounts::DEFAULT {
             account.root = crate::accounts::get(cx).map(|center| center.read(cx).root.clone());
         }
+        let (model, cwd, profile) = (thread.model.clone(), thread.cwd.clone(), account.clone());
+        let list = cx.new(|cx| {
+            let mut hidden = cx
+                .try_global::<crate::settings::Preferences>()
+                .map(|prefs| prefs.hidden_for(&cwd))
+                .unwrap_or_default();
+            hidden.extend(
+                Kind::ALL
+                    .into_iter()
+                    .filter(|kind| !supported(*kind))
+                    .map(|kind| kind.id().to_owned()),
+            );
+            ModelList::new_for(provider, model, &cwd, profile, cx)
+                .hide_providers(hidden)
+                .allow_provider_switch(true)
+        });
         // Cached rows show at once; the fresh catalog replaces them.
-        let cached = catalog::cached_models_for(provider, &account);
-        let items = match cached {
-            Some(models) => self.model_items(Ok(models)),
-            None => vec![
-                MenuItem::Note(MODEL_NOTE.into()),
-                MenuItem::Note("Loading models…".into()),
-            ],
-        };
+        let cached = catalog::cached_models_for(provider, &account).unwrap_or_default();
+        let items = self.model_items(&cached, &list, cx);
         let menu = cx.new(|cx| {
-            Menu::new(provider.label(), items, window, cx)
-                .width(240.)
+            Menu::new("Model and settings", items, window, cx)
+                .width(250.)
                 .style(MenuStyle::Settings)
         });
-        self.model_subscription = Some(cx.subscribe_in(
-            &menu,
-            window,
-            |this, _, event: &MenuEvent, window, cx| {
-                if let MenuEvent::Picked(id, _) = event
-                    && let Ok(target) = serde_json::from_str::<monocode_core::response::Target>(id)
-                    && let Some(thread) = this.active_mut()
-                    && thread.provider == target.provider
-                {
-                    thread.model = target.model;
-                    thread.effort = target.effort;
-                    thread.model_settings.extend(target.settings);
+        self.model_subscriptions = vec![
+            cx.subscribe_in(
+                &list,
+                window,
+                |this, _, picked: &ModelPicked, window, cx| {
+                    this.apply_model_pick(picked, cx);
+                    this.close_model_picker(window, cx);
+                },
+            ),
+            cx.subscribe_in(&menu, window, |this, _, event: &MenuEvent, window, cx| {
+                if let MenuEvent::Picked(id, _) = event {
+                    let Some(effort) = id.strip_prefix("effort:") else {
+                        return;
+                    };
+                    if let Some(thread) = this.active_mut() {
+                        thread.effort = Some(effort.to_owned());
+                    }
                     this.save(cx);
                     this.refresh(cx);
                 }
-                this.models = None;
-                window.focus(&this.input.focus_handle(cx), cx);
-                cx.notify();
-            },
-        ));
+                this.close_model_picker(window, cx);
+            }),
+        ];
         if !cfg!(test) {
             let work = cx
                 .background_executor()
                 .spawn(async move { catalog::models_for(provider, &account) });
             let weak_menu = menu.downgrade();
             cx.spawn(async move |this, cx| {
-                let result = work.await;
+                let Ok(models) = work.await else {
+                    return;
+                };
                 let _ = this.update(cx, |this, cx| {
                     // A closed or reopened menu keeps its own rows.
                     if this.models.as_ref().map(|m| m.downgrade()) != Some(weak_menu.clone()) {
                         return;
                     }
-                    let items = this.model_items(result);
+                    // Replacing rows closes an open flyout, so only when the
+                    // effort row changed.
+                    let efforts = |models: &[Model]| {
+                        this.model_info(models).map(|model| model.efforts.clone())
+                    };
+                    if efforts(&models) == efforts(&cached) {
+                        return;
+                    }
+                    let items = this.model_items(&models, &list, cx);
                     if let Some(menu) = &this.models {
                         menu.update(cx, |menu, cx| menu.set_items(items, cx));
                     }
