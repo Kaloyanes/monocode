@@ -48,9 +48,14 @@ const SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
 /// After the agent's own click or typing, effects only need a moment.
 #[cfg(target_os = "macos")]
 const AFTER_ACTION: std::time::Duration = std::time::Duration::from_millis(300);
-/// Pictures are taken at most this many points wide; the display adds its scale.
+/// The agent's pictures are taken at most this many points wide; the display
+/// adds its scale.
 #[cfg(target_os = "macos")]
 const MAX_PICTURE_WIDTH: u32 = 1000;
+/// A kept picture stays in the thread and opens full size, so it keeps a wide
+/// page at its own width, up to this many points.
+#[cfg(target_os = "macos")]
+const MAX_KEPT_WIDTH: u32 = 1600;
 
 /// The shortest a draft's card gets, and the tallest it follows its page to:
 /// a page taller than that scrolls inside its card.
@@ -1902,7 +1907,11 @@ impl Draft {
         } else {
             SETTLE
         };
-        let mut snapshot = Self::capture(this, &web, settle, cx)
+        let widest = match request.action {
+            DraftAction::Keep { .. } => MAX_KEPT_WIDTH,
+            _ => MAX_PICTURE_WIDTH,
+        };
+        let mut snapshot = Self::capture(this, &web, settle, widest, cx)
             .await
             .map_err(|error| {
                 // The click or typing already reached the page.
@@ -2448,6 +2457,7 @@ impl Draft {
         this: &gpui::WeakEntity<Self>,
         web: &engine::Page,
         settle: std::time::Duration,
+        widest: u32,
         cx: &mut gpui::AsyncApp,
     ) -> Result<DraftSnapshot, String> {
         cx.background_executor().timer(settle).await;
@@ -2482,7 +2492,7 @@ impl Draft {
         cx.background_executor()
             .timer(std::time::Duration::from_millis(150))
             .await;
-        let (png, size) = engine::png(web, f64::from(width.min(MAX_PICTURE_WIDTH)), cx).await?;
+        let (png, size) = engine::png(web, f64::from(width.min(widest)), cx).await?;
         // The page is clear over the thread; give the agent's picture the
         // thread's color under it.
         let (html, palette) = this
