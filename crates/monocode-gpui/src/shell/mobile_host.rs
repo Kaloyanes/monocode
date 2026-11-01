@@ -575,6 +575,9 @@ impl Shell {
                 project["branch"] = json!(mobile_catalog::checkout_branch(&cwd, &mut branches));
                 project
             }).collect();
+            let origins = monocode_core::mobile::catalog::launch_origins(
+                monos.iter().map(|(mono, _)| (mono.id.as_str(), mono.launches.iter().map(|l| l.session_id).collect())),
+            );
             let mut sessions = Vec::new();
             for entry in entries {
                 let Some(id) = ids.get(&entry.id) else {
@@ -595,6 +598,9 @@ impl Shell {
                 let mut session = mobile_catalog::session(&entry.summary, id, &entry.project, &metadata, entry.live.as_ref(), &branch);
                 if let Some(lead) = lead {
                     session["leadId"] = json!(lead);
+                }
+                if let Some(mono) = origins.get(&entry.id) {
+                    session["monoId"] = json!(mono);
                 }
                 sessions.push(session);
             }
