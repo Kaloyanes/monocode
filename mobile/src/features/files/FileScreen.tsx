@@ -4,7 +4,7 @@ import { ActivityIndicator, ScrollView, Text, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
 import { splitPath } from "@/features/changes/diffTheme";
-import { useConnection } from "@/features/connection/ConnectionProvider";
+import { useCommand } from "@/features/connection/ConnectionProvider";
 import { Markdown } from "@/features/sessions/Markdown";
 import type { FileContents } from "@/features/workspace/types";
 import { themedStyles, useColors } from "@/ui/theme";
@@ -48,7 +48,7 @@ export function FileScreen({
 }) {
   const styles = useStyles();
   const colors = useColors();
-  const { command } = useConnection();
+  const command = useCommand();
   const [file, setFile] = useState<FileContents | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {

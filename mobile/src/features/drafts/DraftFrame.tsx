@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AppState, Image, ScrollView, Text, useWindowDimensions, View } from "react-native";
 
-import { useConnection } from "@/features/connection/ConnectionProvider";
+import { useCommand } from "@/features/connection/ConnectionProvider";
 import { themedStyles, useColors } from "@/ui/theme";
 
 /** How often the phone asks for a new picture while it shows one. */
@@ -31,7 +31,7 @@ export function DraftFrame({
   draft: string;
   url: string | undefined;
 }) {
-  const { command } = useConnection();
+  const command = useCommand();
   const colors = useColors();
   const styles = useStyles();
   const { width, scale } = useWindowDimensions();

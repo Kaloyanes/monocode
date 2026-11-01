@@ -81,7 +81,7 @@ vi.mock("@/features/connection/ConnectionProvider", () => {
       return link.answer(method, params);
     },
   };
-  return { useConnection: () => connection };
+  return { useConnection: () => connection, useCommand: () => connection.command };
 });
 vi.mock("@/features/connection/nativeLink", () => ({ makeCommandId: () => "cmd" }));
 vi.mock("@/ui/theme", () => {

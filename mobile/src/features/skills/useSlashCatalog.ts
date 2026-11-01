@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { useConnection } from "@/features/connection/ConnectionProvider";
+import { useCommand } from "@/features/connection/ConnectionProvider";
 
 import type { ProviderCommand, Skill } from "./slash";
 
@@ -26,7 +26,7 @@ const skillCache = new Map<string, Cached>();
  * chat not yet open on the desktop has no commands until it runs.
  */
 export function useSlashCatalog(scope: SlashScope | undefined, active: boolean) {
-  const { command } = useConnection();
+  const command = useCommand();
   const key = scope ? `${scope.projectId}\n${scope.worktreePath ?? ""}` : "";
   const projectId = scope?.projectId;
   const worktreePath = scope?.worktreePath;

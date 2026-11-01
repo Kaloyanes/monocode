@@ -4,7 +4,7 @@ import { ActivityIndicator, Alert, AppState, Pressable, Text, View } from "react
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import type { ShouldStartLoadRequest } from "react-native-webview/lib/WebViewTypes";
 
-import { useConnection } from "@/features/connection/ConnectionProvider";
+import { useCommand } from "@/features/connection/ConnectionProvider";
 import { makeCommandId } from "@/features/connection/nativeLink";
 import { radii, themedStyles, useColors, useScheme, withAlpha } from "@/ui/theme";
 
@@ -44,7 +44,7 @@ export function DraftScreen({
   conversationId: string;
   draft: string;
 }) {
-  const { command } = useConnection();
+  const command = useCommand();
   const light = useScheme() === "light";
   const colors = useColors();
   const styles = useStyles();

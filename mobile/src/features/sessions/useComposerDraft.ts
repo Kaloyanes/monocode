@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { AppState } from "react-native";
 
-import { useConnection } from "@/features/connection/ConnectionProvider";
+import { useCommand } from "@/features/connection/ConnectionProvider";
 import { makeCommandId } from "@/features/connection/nativeLink";
 
 import {
@@ -151,7 +151,7 @@ export function useComposerDraft(
   conversationId: string | undefined,
   show: (text: string) => void,
 ): SharedComposer {
-  const { command } = useConnection();
+  const command = useCommand();
   const [shared] = useState(() => (conversationId ? link(conversationId) : null));
   useEffect(() => shared?.start(command, show), [shared, command, show]);
   return shared ?? NONE;
