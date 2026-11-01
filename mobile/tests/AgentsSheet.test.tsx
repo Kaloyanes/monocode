@@ -253,12 +253,27 @@ describe("AgentsSheet", () => {
     expect(host.textContent).toContain("1 of 2 done · 1 needs input · running");
   });
 
-  it("reads less often when nothing changes, backs off on errors, and not off focus or in the background", async () => {
+  it("keeps reading every 2 s when nothing changes, but renders nothing for it; and not in the background", async () => {
     app.runs = [running];
     await mount(<AgentsSheet projectId="p" sessionId="lead" />);
-    // Ten quiet minutes at the old fixed 2 s would be 300 reads.
+    const commits = vi.fn();
+    const { Profiler } = await import("react");
+    await act(async () =>
+      root.render(
+        <Profiler id="sheet" onRender={commits}>
+          <AgentsSheet projectId="p" sessionId="lead" />
+        </Profiler>,
+      ),
+    );
+    // The first read of the new tree lands; count what comes after it.
+    await act(async () => void (await vi.advanceTimersByTimeAsync(2100)));
+    commits.mockClear();
+    app.read.mockClear();
     await act(async () => void (await vi.advanceTimersByTimeAsync(600_000)));
-    expect(app.read.mock.calls.length).toBeLessThan(90);
+    // Still the original cadence, 300 reads in ten minutes...
+    expect(app.read.mock.calls.length).toBeGreaterThanOrEqual(299);
+    // ...and each one finds the same runs: no state change, no render.
+    expect(commits).not.toHaveBeenCalled();
     expect(host.textContent).toContain("1 of 2 done");
 
     app.read.mockClear();

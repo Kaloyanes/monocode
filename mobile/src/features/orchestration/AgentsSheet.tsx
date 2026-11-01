@@ -21,9 +21,6 @@ import { useToneColors } from "./tones";
 
 /** How often an open sheet follows the run. The desktop card refreshes once a second. */
 const POLL_MS = 2000;
-/** After this many reads that found nothing new, the sheet reads this seldom. */
-const IDLE_AFTER = 5;
-const IDLE_POLL_MS = 8000;
 
 const failed = (reason: unknown) =>
   Alert.alert(
@@ -69,28 +66,19 @@ export function AgentsSheet({
     }
   }, [readOrchestration, sessionId]);
   // Read at once, then follow the run while the sheet is open, in view and the
-  // app in the foreground; slower while nothing happens, and after failures.
+  // app in the foreground; slower only after failures.
   const focused = useIsFocused();
   useEffect(() => {
     if (!focused) return;
     const stop = new AbortController();
     void (async () => {
-      let quiet = 0;
       let failures = 0;
       while (!stop.signal.aborted) {
         await waitForActive(stop.signal);
         if (stop.signal.aborted) return;
         const result = await load();
         failures = result === "failed" ? failures + 1 : 0;
-        quiet = result === "same" ? quiet + 1 : 0;
-        await pause(
-          failures > 0
-            ? backoff(POLL_MS, failures, 30000)
-            : quiet >= IDLE_AFTER
-              ? IDLE_POLL_MS
-              : POLL_MS,
-          stop.signal,
-        );
+        await pause(failures > 0 ? backoff(POLL_MS, failures, 30000) : POLL_MS, stop.signal);
       }
     })();
     return () => stop.abort();
