@@ -553,17 +553,21 @@ mod perf {
                 cx.activate(true);
                 let weak: Vec<_> = drafts.iter().map(Entity::downgrade).collect();
                 cx.spawn(async move |cx| {
-                    // The shell holds a conversation's drafts; here the task does.
-                    let _drafts = drafts;
                     for draft in &weak {
                         let _ = Draft::ready(draft, cx).await;
                     }
+                    // The shell holds a conversation's drafts, and runs only the
+                    // newest; here the task does.
+                    for draft in drafts.iter().rev().skip(1) {
+                        let _ = draft.update(cx, |draft, cx| draft.sleep(cx));
+                    }
+                    let _drafts = drafts;
                     // Let the fades, fits and first frames settle, and the thread
                     // come to rest with every card on screen.
                     cx.background_executor().timer(Duration::from_millis(2500)).await;
                     let settled = Instant::now();
                     while settled.elapsed() < Duration::from_secs(5) {
-                        let on_screen = weak.iter().all(|draft| {
+                        let on_screen = weak.iter().rev().take(1).all(|draft| {
                             draft
                                 .read_with(cx, |draft, _| draft.placement())
                                 .ok()
@@ -601,7 +605,8 @@ mod perf {
                     }
                     // A new version from the agent, as `draft_preview` sends one:
                     // how long the card waits before it shows it.
-                    let revise = match weak.first() {
+                    // The running draft, as the shell wakes the one it works on.
+                    let revise = match weak.last() {
                         Some(draft) => json!({
                             "first": revise(draft, &format!("{html}<!-- v1 -->"), cx).await,
                             "next": revise(draft, &format!("{html}<!-- v2 -->"), cx).await,

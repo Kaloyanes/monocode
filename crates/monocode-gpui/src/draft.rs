@@ -232,6 +232,8 @@ pub(crate) struct OpenKept {
 pub(crate) enum DraftEvent {
     /// The person closed the draft.
     Closed,
+    /// The person clicked a sleeping draft to run it again.
+    Woke,
     /// The person sent their notes. If the agent is not waiting for them, the
     /// shell delivers them as a message.
     Send,
@@ -274,6 +276,11 @@ pub(crate) struct Draft {
     outline: Vec<OutlineBox>,
     /// The version being replaced, shown until the next one is ready.
     still: Option<Arc<gpui::RenderImage>>,
+    /// Asleep: another draft of the conversation is the one running, and the
+    /// card shows a picture of this page until the person clicks it.
+    asleep: bool,
+    poster: Option<Arc<gpui::RenderImage>>,
+    _sleep: Option<gpui::Task<()>>,
     /// The agent sent the draft's first version: lay it out at other widths
     /// for them. Revisions are not, so each shows as soon as it loads; see
     /// `measure_layouts`.
@@ -488,6 +495,9 @@ impl Draft {
             revealed: None,
             outline: Vec::new(),
             still: None,
+            asleep: false,
+            poster: None,
+            _sleep: None,
             measure: false,
             measured: false,
             layouts: Vec::new(),
@@ -845,6 +855,110 @@ impl Draft {
         }
     }
 
+    /// Stops running the page and shows a picture of it instead, unless the
+    /// person or the agent is using it. The card's page leaves the frame,
+    /// which pauses it; see `engine::Presence`.
+    pub(crate) fn sleep(&mut self, cx: &mut Context<Self>) {
+        if self.asleep
+            || self._sleep.is_some()
+            || self.expanded
+            || self.commenting
+            || self.shared.waiting()
+            || self.shared.control()
+        {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let current = (self.shown == self.shared.generation() && self.host.visible())
+            .then(|| self.host.web())
+            .flatten();
+        self._sleep = Some(cx.spawn(async move |this, cx| {
+            #[cfg(target_os = "macos")]
+            let poster = match current {
+                Some(web) => engine::picture(&web, cx).await,
+                None => None,
+            };
+            #[cfg(not(target_os = "macos"))]
+            let poster = None;
+            let _ = this.update(cx, |this, cx| {
+                this._sleep = None;
+                this.asleep = true;
+                if let Some(old) = std::mem::replace(&mut this.poster, poster) {
+                    cx.drop_image(old, None);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Runs the page again. Returns whether it was asleep.
+    pub(crate) fn wake(&mut self, cx: &mut Context<Self>) -> bool {
+        self._sleep = None;
+        if !std::mem::take(&mut self.asleep) {
+            return false;
+        }
+        if let Some(poster) = self.poster.take() {
+            cx.drop_image(poster, None);
+        }
+        cx.notify();
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_asleep(&self) -> bool {
+        self.asleep || self._sleep.is_some()
+    }
+
+    /// What a sleeping card shows: its page's picture, which a click runs.
+    fn asleep_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let picture = match &self.poster {
+            Some(poster) => div()
+                .absolute()
+                .inset_0()
+                .child(gpui::img(poster.clone()).size_full())
+                .into_any_element(),
+            None => self.placeholder(false),
+        };
+        div()
+            .id("draft-asleep")
+            .debug_selector(|| "draft-asleep".into())
+            .role(gpui::Role::Button)
+            .aria_label("Run this draft again")
+            .absolute()
+            .inset_0()
+            .group("draft-asleep")
+            .cursor(gpui::CursorStyle::PointingHand)
+            .child(picture)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.)
+                    .group_hover("draft-asleep", |style| style.opacity(1.))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .bg(pane_surface())
+                            .border_1()
+                            .border_color(content(0.1))
+                            .text_size(px(12.))
+                            .text_color(content(0.8))
+                            .child("Paused · click to run"),
+                    ),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.wake(cx) {
+                    cx.emit(DraftEvent::Woke);
+                }
+            }))
+            .into_any_element()
+    }
+
     /// Applies what a request changes before it acts.
     pub(crate) fn apply(&mut self, request: &DraftRequest, cx: &mut Context<Self>) {
         if request.width.is_some() || request.height.is_some() {
@@ -1162,6 +1276,8 @@ impl Render for Draft {
                 .text_color(content(0.5))
                 .child("Open in full view")
                 .into_any_element()
+        } else if self.asleep {
+            self.asleep_view(cx)
         } else {
             self.surface(window, cx)
         };
