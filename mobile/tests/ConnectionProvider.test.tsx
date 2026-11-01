@@ -60,19 +60,22 @@ import {
 ).IS_REACT_ACT_ENVIRONMENT = true;
 
 const renders = { command: 0, monoTools: 0, everything: 0 };
+const bump = (name: keyof typeof renders) => {
+  renders[name]++;
+};
 function CommandOnly() {
   useCommand();
-  renders.command++;
+  bump("command");
   return null;
 }
 function ToolsOnly() {
   useCatalog((catalog) => catalog.monoTools === true);
-  renders.monoTools++;
+  bump("monoTools");
   return null;
 }
 function Everything() {
   useConnection();
-  renders.everything++;
+  bump("everything");
   return null;
 }
 
