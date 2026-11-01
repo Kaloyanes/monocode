@@ -78,11 +78,11 @@ it("stops when the app goes to the background and resumes after", async () => {
   expect(last()).toBe(true);
 });
 
-it("keeps running while merely inactive (control centre, a system alert)", async () => {
+it("stops while inactive, as under a system alert or the app switcher", async () => {
   await act(async () => root.render(<Probe />));
   env.state = "inactive";
   await act(async () => env.listeners.forEach((notify) => notify()));
-  expect(last()).toBe(true);
+  expect(last()).toBe(false);
 });
 
 it("drops its app state listener on unmount", async () => {
