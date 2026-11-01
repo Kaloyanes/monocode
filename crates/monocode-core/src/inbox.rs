@@ -763,6 +763,29 @@ fn repo_checkouts<'a>(
     }
     checkouts
 }
+/// Gives GitHub rows the reason the viewer should look: a requested review,
+/// then an assignment, then a mention. A reason a row already has stays.
+fn mark_github_attention(rows: &mut [Item], viewer: &str, reviews: &[i64], mentions: &[i64]) {
+    for row in rows {
+        if !row.attention_reason.is_empty() {
+            continue;
+        }
+        row.attention_reason = if reviews.contains(&row.number) {
+            "review_requested"
+        } else if row
+            .assignees
+            .iter()
+            .any(|assignee| assignee.login.eq_ignore_ascii_case(viewer))
+        {
+            "assigned"
+        } else if mentions.contains(&row.number) {
+            "mentioned"
+        } else {
+            continue;
+        }
+        .into();
+    }
+}
 fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> Result<U, String> {
     serde_json::from_value(serde_json::to_value(value).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
@@ -970,6 +993,25 @@ impl Service {
                                 Some(limit),
                             )?)?,
                         };
+                        let mut rows = rows;
+                        if provider == "github" {
+                            if let Some(viewer) = snapshot.viewers.get("github") {
+                                // Best effort: a failed search leaves the rows as listed.
+                                let involved = |involvement| {
+                                    github::git_github_involved_for(
+                                        project, &repo, kind, involvement, viewer,
+                                    )
+                                    .unwrap_or_default()
+                                };
+                                let reviews = if kind == "pr" {
+                                    involved(github::Involvement::ReviewRequested)
+                                } else {
+                                    vec![]
+                                };
+                                let mentions = involved(github::Involvement::Mentioned);
+                                mark_github_attention(&mut rows, viewer, &reviews, &mentions);
+                            }
+                        }
                         items.extend(rows.into_iter().map(|mut item| {
                             item.provider = provider.into();
                             item.project_path = project.to_string_lossy().into_owned();
@@ -1369,6 +1411,52 @@ mod notification_tests {
                 "from {cwd:?}: {checkouts:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    fn row(number: i64, assignees: &[&str]) -> Item {
+        Item {
+            provider: "github".into(),
+            kind: "pr".into(),
+            number,
+            assignees: assignees
+                .iter()
+                .map(|login| Person {
+                    login: (*login).into(),
+                    ..Person::default()
+                })
+                .collect(),
+            ..Item::default()
+        }
+    }
+
+    #[test]
+    fn rows_get_the_reason_the_viewer_is_wanted() {
+        let mut rows = vec![
+            row(1, &[]),
+            row(2, &["Octocat"]),
+            row(3, &["octocat"]),
+            row(4, &[]),
+            row(5, &["hubot"]),
+        ];
+        rows[3].attention_reason = "build_failed".into();
+        mark_github_attention(&mut rows, "octocat", &[1, 3, 4], &[1, 2, 5]);
+        let reasons: Vec<_> = rows.iter().map(|r| r.attention_reason.as_str()).collect();
+        assert_eq!(
+            reasons,
+            ["review_requested", "assigned", "review_requested", "build_failed", "mentioned"]
+        );
+    }
+
+    #[test]
+    fn rows_nobody_asked_about_have_no_reason() {
+        let mut rows = vec![row(1, &["hubot"]), row(2, &[])];
+        mark_github_attention(&mut rows, "octocat", &[], &[]);
+        assert!(rows.iter().all(|r| r.attention_reason.is_empty()));
     }
 }
 
