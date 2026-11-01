@@ -69,7 +69,7 @@ import {
   type Workspace,
 } from "@/features/workspace/WorkspaceMenu";
 import { ComposerWorkspace } from "@/features/workspace/ComposerWorkspace";
-import { UnreadDot, useAnyUnreadMono } from "@/features/workspace/UnreadDot";
+import { UnreadDot, useAnyUnread } from "@/features/workspace/UnreadDot";
 import { InboxPage } from "@/features/inbox/InboxPage";
 import { useInboxSupported } from "@/features/inbox/InboxProvider";
 import { Icon } from "@/ui/Icon";
@@ -106,11 +106,11 @@ export function ProjectScreen({
 }) {
   const { startSession, sendMessage, stop, sessions } = useWorkspace();
   const [openAfterStarting] = useOpenSessionAfterStarting();
-  const createMono = useCreateMono();
+  const createMono = useCreateMono(project.id);
   const colors = useColors();
   const drawer = useDrawerActions();
   // Read here: the native header's buttons render outside this tree.
-  const unread = useAnyUnreadMono();
+  const unread = useAnyUnread();
   // A session is pushed over its project and swipes back; only the project
   // itself swipes the drawer open.
   useDrawerSwipe(!sessionId);
@@ -291,7 +291,7 @@ export function ProjectScreen({
   );
   const menuButton = (
     <ProjectHeaderButton
-      label={unread ? "Projects and monos, new replies" : "Projects and monos"}
+      label={unread ? "Projects, new replies" : "Projects"}
       onPress={drawer.open}
     >
       {/* The drawer's button, as on every screen it opens from. */}
