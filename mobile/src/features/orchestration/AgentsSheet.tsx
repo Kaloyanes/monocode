@@ -1,8 +1,10 @@
 import * as Haptics from "expo-haptics";
-import { router } from "expo-router";
-import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Alert, AppState, Pressable, Text, View } from "react-native";
+import { router, useIsFocused } from "expo-router";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ActivityIndicator, Alert, Pressable, Text, View } from "react-native";
 
+import { backoff, pause, waitForActive } from "@/features/connection/appActivity";
+import { deepEqual } from "@/features/connection/deepEqual";
 import { SettingsPage } from "@/features/settings/SettingsUI";
 import { ProviderLogo } from "@/features/sessions/ProviderLogo";
 import type {
@@ -19,6 +21,9 @@ import { useToneColors } from "./tones";
 
 /** How often an open sheet follows the run. The desktop card refreshes once a second. */
 const POLL_MS = 2000;
+/** After this many reads that found nothing new, the sheet reads this seldom. */
+const IDLE_AFTER = 5;
+const IDLE_POLL_MS = 8000;
 
 const failed = (reason: unknown) =>
   Alert.alert(
@@ -45,28 +50,51 @@ export function AgentsSheet({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  /** What was last read, so a read of the same data renders nothing. */
+  const held = useRef<OrchestrationRun[] | null>(null);
+  // Whether the read found something new, and if it failed.
   const load = useCallback(async () => {
     try {
-      setRuns(await readOrchestration(sessionId));
+      const next = await readOrchestration(sessionId);
+      const same = !!held.current && deepEqual(held.current, next);
+      if (!same) {
+        held.current = next;
+        setRuns(next);
+      }
       setError(null);
+      return same ? "same" : "changed";
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+      return "failed";
     }
   }, [readOrchestration, sessionId]);
-  // Read at once, then follow the run while the sheet is open and in view.
+  // Read at once, then follow the run while the sheet is open, in view and the
+  // app in the foreground; slower while nothing happens, and after failures.
+  const focused = useIsFocused();
   useEffect(() => {
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      if (AppState.currentState === "active") await load();
-      if (!disposed) timer = setTimeout(poll, POLL_MS);
-    };
-    void poll();
-    return () => {
-      disposed = true;
-      clearTimeout(timer);
-    };
-  }, [load]);
+    if (!focused) return;
+    const stop = new AbortController();
+    void (async () => {
+      let quiet = 0;
+      let failures = 0;
+      while (!stop.signal.aborted) {
+        await waitForActive(stop.signal);
+        if (stop.signal.aborted) return;
+        const result = await load();
+        failures = result === "failed" ? failures + 1 : 0;
+        quiet = result === "same" ? quiet + 1 : 0;
+        await pause(
+          failures > 0
+            ? backoff(POLL_MS, failures, 30000)
+            : quiet >= IDLE_AFTER
+              ? IDLE_POLL_MS
+              : POLL_MS,
+          stop.signal,
+        );
+      }
+    })();
+    return () => stop.abort();
+  }, [load, focused]);
 
   const press = (
     run: OrchestrationRun,
@@ -77,7 +105,10 @@ export function AgentsSheet({
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       setBusy(true);
       orchestrationAction(sessionId, run, action, task)
-        .then(setRuns, failed)
+        .then((next) => {
+          held.current = next;
+          setRuns(next);
+        }, failed)
         .finally(() => setBusy(false));
     };
     const ask = (title: string, message: string, label: string) =>

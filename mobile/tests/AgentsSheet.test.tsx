@@ -20,6 +20,9 @@ const app = vi.hoisted(() => ({
   push: vi.fn(),
   back: vi.fn(),
   dismissTo: vi.fn(),
+  focused: true,
+  appState: "active",
+  listeners: new Set<(state: string) => void>(),
 }));
 
 vi.mock("react-native", () => ({
@@ -44,7 +47,15 @@ vi.mock("react-native", () => ({
   RefreshControl: () => null,
   ActivityIndicator: () => <progress />,
   Alert: { alert: app.alert },
-  AppState: { currentState: "active" },
+  AppState: {
+    get currentState() {
+      return app.appState;
+    },
+    addEventListener: (_: string, listener: (state: string) => void) => {
+      app.listeners.add(listener);
+      return { remove: () => app.listeners.delete(listener) };
+    },
+  },
   Platform: { OS: "ios" },
   StyleSheet: { create: (styles: unknown) => styles },
   useColorScheme: () => "dark",
@@ -58,6 +69,7 @@ vi.mock("expo-haptics", () => ({
 }));
 vi.mock("expo-router", () => ({
   router: { push: app.push, back: app.back, dismissTo: app.dismissTo },
+  useIsFocused: () => app.focused,
 }));
 vi.mock("expo-router/react-navigation", () => ({ useHeaderHeight: () => 0 }));
 vi.mock("react-native-safe-area-context", () => ({
@@ -162,6 +174,9 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   vi.useFakeTimers();
   vi.clearAllMocks();
+  app.focused = true;
+  app.appState = "active";
+  app.listeners.clear();
   app.read.mockImplementation(async () => app.runs);
   app.action.mockImplementation(async () => app.runs);
   host = document.createElement("div");
@@ -236,6 +251,48 @@ describe("AgentsSheet", () => {
     await act(async () => vi.advanceTimersByTime(2000));
     expect(app.read).toHaveBeenCalledTimes(2);
     expect(host.textContent).toContain("1 of 2 done · 1 needs input · running");
+  });
+
+  it("reads less often when nothing changes, backs off on errors, and not off focus or in the background", async () => {
+    app.runs = [running];
+    await mount(<AgentsSheet projectId="p" sessionId="lead" />);
+    // Ten quiet minutes at the old fixed 2 s would be 300 reads.
+    await act(async () => void (await vi.advanceTimersByTimeAsync(600_000)));
+    expect(app.read.mock.calls.length).toBeLessThan(90);
+    expect(host.textContent).toContain("1 of 2 done");
+
+    app.read.mockClear();
+    app.appState = "background";
+    await act(async () => void (await vi.advanceTimersByTimeAsync(120_000)));
+    expect(app.read.mock.calls.length).toBeLessThanOrEqual(1);
+    app.read.mockClear();
+    await act(async () => void (await vi.advanceTimersByTimeAsync(120_000)));
+    expect(app.read).not.toHaveBeenCalled();
+    app.appState = "active";
+    await act(async () => {
+      for (const listener of [...app.listeners]) listener("active");
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(app.read).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits longer between reads after failures", async () => {
+    app.read.mockImplementation(async () => {
+      throw new Error("offline");
+    });
+    await mount(<AgentsSheet projectId="p" sessionId="lead" />);
+    await act(async () => void (await vi.advanceTimersByTimeAsync(300_000)));
+    // Fixed 2 s would be 150 reads; doubling up to 30 s is about 14.
+    expect(app.read.mock.calls.length).toBeLessThan(25);
+    expect(app.read.mock.calls.length).toBeGreaterThan(5);
+  });
+
+  it("stops reading while another screen covers the sheet", async () => {
+    app.runs = [running];
+    app.focused = false;
+    await mount(<AgentsSheet projectId="p" sessionId="lead" />);
+    await act(async () => void (await vi.advanceTimersByTimeAsync(60_000)));
+    expect(app.read).not.toHaveBeenCalled();
   });
 
   it("says when there is no plan", async () => {

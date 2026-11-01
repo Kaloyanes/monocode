@@ -29,7 +29,7 @@ import {
   type Desktop,
   type Identity,
 } from "./nativeLink";
-import { backoff, onAppActive, waitForActive } from "./appActivity";
+import { backoff, onAppActive, pause, waitForActive } from "./appActivity";
 import { deepEqual } from "./deepEqual";
 import { anyBusy, mergeCatalog } from "./catalogMerge";
 import { normalizeSelection, type MobileSelection } from "./selection";
@@ -212,29 +212,19 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!pairing) return;
     const stop = new AbortController();
-    // Waits out `ms`, or less when stopped.
-    const sleep = (ms: number) =>
-      new Promise<void>((resolve) => {
-        const timer = setTimeout(done, ms);
-        function done() {
-          clearTimeout(timer);
-          stop.signal.removeEventListener("abort", done);
-          resolve();
-        }
-        stop.signal.addEventListener("abort", done);
-      });
     void (async () => {
       while (!stop.signal.aborted) {
         // In the background there is nothing to read for; wait to be shown again.
         await waitForActive(stop.signal);
         if (stop.signal.aborted) break;
         await refresh();
-        await sleep(
+        await pause(
           failures.current > 0
             ? backoff(IDLE_POLL_MS, failures.current - 1, MAX_POLL_MS)
             : busy.current
               ? BUSY_POLL_MS
               : IDLE_POLL_MS,
+          stop.signal,
         );
       }
     })();

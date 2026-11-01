@@ -36,3 +36,17 @@ export function onAppActive(listener: () => void): () => void {
 export function backoff(base: number, failures: number, max: number): number {
   return Math.min(max, base * 2 ** Math.max(0, failures));
 }
+
+/** Waits `ms`, or less when `signal` aborts. */
+export function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done);
+  });
+}

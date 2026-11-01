@@ -83,6 +83,7 @@ vi.mock("@/features/connection/ConnectionProvider", () => {
   };
   return { useConnection: () => connection, useCommand: () => connection.command };
 });
+vi.mock("expo-router", () => ({ useIsFocused: () => true }));
 vi.mock("@/features/connection/nativeLink", () => ({ makeCommandId: () => "cmd" }));
 vi.mock("@/ui/theme", () => {
   const colors = { sheet: "#141414", muted: "#8c8c8c", faint: "#5c5c5c", accent: "#4c9ef5", fill: "#222", content: "#eee" };

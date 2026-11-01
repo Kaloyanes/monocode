@@ -1,7 +1,9 @@
+import { useIsFocused } from "expo-router";
 import { useEffect, useState } from "react";
 import { AppState } from "react-native";
 
 import { useCommand } from "@/features/connection/ConnectionProvider";
+import { backoff, pause, waitForActive } from "@/features/connection/appActivity";
 import { makeCommandId } from "@/features/connection/nativeLink";
 
 import {
@@ -23,7 +25,8 @@ import {
 /** After a failed read or write, the phone tries again this much later. */
 const RETRY_MS = 2000;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** After repeated failures the phone waits longer, up to this. */
+const RETRY_MAX_MS = 30000;
 
 type Command = <T>(method: string, params?: object, id?: string) => Promise<T>;
 
@@ -86,12 +89,13 @@ function link(conversationId: string): Link {
       command = next;
       show = onShow;
       let alive = true;
+      const stop = new AbortController();
       void (async () => {
+        let failures = 0;
         while (alive) {
-          if (AppState.currentState !== "active") {
-            await sleep(1000);
-            continue;
-          }
+          // Nothing to follow while the app is in the background; wait to be shown again.
+          await waitForActive(stop.signal);
+          if (!alive) return;
           try {
             // Waits on the desktop until its copy moves past the one seen.
             const desktop = await next<DesktopText>("composer.read", {
@@ -99,12 +103,13 @@ function link(conversationId: string): Link {
               ...(sync.seen !== null ? { since: sync.seen } : {}),
             });
             if (!alive) return;
+            failures = 0;
             apply(received(sync, desktop, Date.now()));
             // A change typed before the first read goes now it has a base.
             if (unsent(sync) && !writeTimer) write();
           } catch {
             if (!alive) return;
-            await sleep(RETRY_MS);
+            await pause(backoff(RETRY_MS, failures++, RETRY_MAX_MS), stop.signal);
           }
         }
       })();
@@ -114,6 +119,7 @@ function link(conversationId: string): Link {
       });
       return () => {
         alive = false;
+        stop.abort();
         appState.remove();
         if (settleTimer) clearTimeout(settleTimer);
         show = () => {};
@@ -153,6 +159,11 @@ export function useComposerDraft(
 ): SharedComposer {
   const command = useCommand();
   const [shared] = useState(() => (conversationId ? link(conversationId) : null));
-  useEffect(() => shared?.start(command, show), [shared, command, show]);
+  // A thread behind another screen isn't followed; it picks up where it left off.
+  const focused = useIsFocused();
+  useEffect(
+    () => (focused ? shared?.start(command, show) : undefined),
+    [shared, command, show, focused],
+  );
   return shared ?? NONE;
 }
