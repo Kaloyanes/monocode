@@ -13,6 +13,7 @@ import Add01Icon from "@hugeicons/core-free-icons/Add01Icon";
 import AiIdeaIcon from "@hugeicons/core-free-icons/AiIdeaIcon";
 import ArrowDown01Icon from "@hugeicons/core-free-icons/ArrowDown01Icon";
 import ArrowRight01Icon from "@hugeicons/core-free-icons/ArrowRight01Icon";
+import Archive02Icon from "@hugeicons/core-free-icons/Archive02Icon";
 import ArrowUp02Icon from "@hugeicons/core-free-icons/ArrowUp02Icon";
 import BotIcon from "@hugeicons/core-free-icons/BotIcon";
 import BubbleChatIcon from "@hugeicons/core-free-icons/BubbleChatIcon";
@@ -124,6 +125,7 @@ const icons = {
   link: Link01Icon,
   external: ArrowUpRight01Icon,
   undo: Undo02Icon,
+  archive: Archive02Icon,
   offline: WifiOff01Icon,
   alert: Alert01Icon,
   passing: CheckmarkCircle01Icon,
