@@ -215,8 +215,8 @@ describe("DraftScreen", () => {
     expect(page.props).toBeNull();
     expect(host.textContent).toContain("Live from your desktop · localhost:5173");
     const frame = link.calls.find((call) => call.method === "draft.frame");
-    // At the phone's width in pixels, up to 750.
-    expect(frame?.params).toMatchObject({ conversationId: "c1", draft: "draft-1", width: 750 });
+    // At the phone's width in pixels.
+    expect(frame?.params).toMatchObject({ conversationId: "c1", draft: "draft-1", width: 1170 });
     const picture = host.querySelector("img");
     expect(picture?.getAttribute("src")).toBe("data:image/jpeg;base64,AAAA");
   });

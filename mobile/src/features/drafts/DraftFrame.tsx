@@ -8,12 +8,8 @@ import { themedStyles, useColors } from "@/ui/theme";
 
 /** How often the phone asks for a new picture while it shows one. */
 const FRAME_MS = 1000;
-/** While the last two pictures were the same, it asks this seldom. */
-const STILL_MS = 2000;
-/** The widest picture asked for; a phone screen shows no more than this well. */
-const MAX_PIXELS = 750;
-/** A still picture is drawn again after this many, in case the sample missed a change. */
-const REFRESH_EVERY = 5;
+/** Every this many pictures that look the same, they are compared byte for byte. */
+const FULL_COMPARE_EVERY = 5;
 /** After a failed ask, the phone tries again this much later, doubling up to this. */
 const RETRY_MS = 3000;
 const RETRY_MAX_MS = 30000;
@@ -23,8 +19,8 @@ type Frame = { frame: string; width: number; height: number };
 /**
  * A cheap stand-in for comparing two pictures: the length and a few dozen
  * small samples across the data. A change in a JPEG shifts the bytes after it,
- * so a sample nearly always shows it; the screen also draws a still picture
- * again now and then.
+ * so a sample nearly always shows it; every few matching pictures the whole
+ * thing is compared too, so a change the samples missed still gets drawn.
  */
 export function frameSignature(frame: string): string {
   const samples = 48;
@@ -66,7 +62,7 @@ export function DraftFrame({
   const [front, setFront] = useState<0 | 1 | null>(null);
   const frontRef = useRef<0 | 1 | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const pixels = Math.min(MAX_PIXELS, Math.round(width * scale));
+  const pixels = Math.round(width * scale);
   // Pictures of a page nobody sees (another screen on top) are not asked for.
   const focused = useIsFocused();
 
@@ -76,9 +72,11 @@ export function DraftFrame({
     const stop = new AbortController();
     void (async () => {
       let failures = 0;
-      let last: string | null = null;
-      // Pictures in a row that matched the one before.
-      let still = 0;
+      // The picture on screen and its signature.
+      let shownFrame: string | null = null;
+      let shownSignature = "";
+      // Pictures in a row whose signature matched the one on screen.
+      let matches = 0;
       while (alive) {
         await waitForActive(stop.signal);
         if (!alive) return;
@@ -92,18 +90,24 @@ export function DraftFrame({
           if (!("frame" in reply)) return setError("This draft was closed.");
           failures = 0;
           setError(null);
+          // Asked for every second whatever it shows, so a change appears as
+          // soon as it did before. A picture identical to the one on screen
+          // is not decoded, stored or drawn again.
           const signature = frameSignature(reply.frame);
-          still = signature === last ? still + 1 : 0;
-          last = signature;
-          // The same picture again isn't decoded or drawn, bar a refresh now and then.
-          if (still === 0 || still % REFRESH_EVERY === 0)
+          let same = signature === shownSignature;
+          if (same && ++matches % FULL_COMPARE_EVERY === 0) same = reply.frame === shownFrame;
+          if (!same) {
+            matches = 0;
+            shownFrame = reply.frame;
+            shownSignature = signature;
             setSlots((current) => {
               const back = frontRef.current === 0 ? 1 : 0;
               const next: [Frame | null, Frame | null] = [...current];
               next[back] = reply;
               return next;
             });
-          await pause(still >= 1 ? STILL_MS : FRAME_MS, stop.signal);
+          }
+          await pause(FRAME_MS, stop.signal);
         } catch (value) {
           if (!alive) return;
           setError(reason(value));

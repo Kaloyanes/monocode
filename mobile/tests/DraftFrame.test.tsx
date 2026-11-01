@@ -7,6 +7,7 @@ const world = vi.hoisted(() => ({
   appState: "active",
   listeners: new Set<(state: string) => void>(),
   command: vi.fn(),
+  imageRenders: 0,
 }));
 vi.mock("react-native", () => ({
   AppState: {
@@ -18,7 +19,10 @@ vi.mock("react-native", () => ({
       return { remove: () => world.listeners.delete(listener) };
     },
   },
-  Image: ({ source }: { source: { uri: string } }) => <img data-length={source.uri.length} />,
+  Image: ({ source }: { source: { uri: string } }) => {
+    world.imageRenders++;
+    return <img data-length={source.uri.length} />;
+  },
   ScrollView: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
   Text: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
   View: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
@@ -44,6 +48,10 @@ const picture = (seed: string) => ({
 });
 let root: ReturnType<typeof createRoot>;
 const run = (ms: number) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
+/** One second per act, so each state update is flushed on its own like a real frame. */
+const seconds = async (count: number) => {
+  for (let i = 0; i < count; i++) await run(1000);
+};
 const mount = () =>
   act(async () => root.render(<DraftFrame conversationId="c" draft="d" url="http://localhost:3000" />));
 
@@ -53,6 +61,7 @@ beforeEach(() => {
   world.appState = "active";
   world.listeners.clear();
   world.command.mockReset();
+  world.imageRenders = 0;
   root = createRoot(document.createElement("div"));
 });
 afterEach(() => {
@@ -61,26 +70,54 @@ afterEach(() => {
 });
 
 describe("DraftFrame", () => {
-  it("asks for at most 750 px, not the whole retina width", async () => {
+  it("asks for the phone's full width in pixels, as before", async () => {
     world.command.mockResolvedValue(picture("a"));
     await mount();
-    expect(world.command.mock.calls[0][1]).toMatchObject({ width: 750 });
+    // 430 points at scale 3.
+    expect(world.command.mock.calls[0][1]).toMatchObject({ width: 1290 });
   });
 
-  it("asks once a second while the page moves and every two seconds once it is still", async () => {
+  it("asks once a second while the page moves and draws every new picture", async () => {
     let n = 0;
     world.command.mockImplementation(async () => picture(String.fromCharCode(97 + (n++ % 20))));
     await mount();
-    await run(10_000);
-    const moving = world.command.mock.calls.length;
-    expect(moving).toBeGreaterThanOrEqual(10);
+    await seconds(10);
+    expect(world.command.mock.calls.length).toBeGreaterThanOrEqual(10);
+    // Each different picture is drawn: one render each.
+    expect(world.imageRenders).toBe(world.command.mock.calls.length);
+  });
 
-    world.command.mockReset();
+  it("keeps asking once a second when the page is still, but never draws the same picture again", async () => {
     world.command.mockResolvedValue(picture("z"));
-    await run(60_000);
-    // First one differs, the rest are the same: about every 2 s, not every second.
-    expect(world.command.mock.calls.length).toBeLessThanOrEqual(32);
-    expect(world.command.mock.calls.length).toBeGreaterThanOrEqual(25);
+    await mount();
+    await seconds(60);
+    // The same cadence as when it moves: no slowdown that could delay a change.
+    expect(world.command.mock.calls.length).toBeGreaterThanOrEqual(60);
+    // The one picture was drawn once. Before, it was drawn again with every ask.
+    expect(world.imageRenders).toBe(1);
+  });
+
+  it("shows a change the very next second after a long still stretch", async () => {
+    world.command.mockResolvedValue(picture("z"));
+    await mount();
+    await seconds(30);
+    expect(world.imageRenders).toBe(1);
+    world.command.mockResolvedValue(picture("y"));
+    await seconds(1);
+    expect(world.imageRenders).toBe(2);
+  });
+
+  it("draws a change the samples miss once the full comparison runs", async () => {
+    const still = picture("q");
+    // A byte between two samples, so the signatures match.
+    const changed = { ...still, frame: still.frame.slice(0, 200) + "X" + still.frame.slice(201) };
+    expect(frameSignature(changed.frame)).toBe(frameSignature(still.frame));
+    world.command.mockResolvedValue(still);
+    await mount();
+    expect(world.imageRenders).toBe(1);
+    world.command.mockResolvedValue(changed);
+    await seconds(10);
+    expect(world.imageRenders).toBe(2);
   });
 
   it("does not ask while another screen covers it or the app is in the background", async () => {
