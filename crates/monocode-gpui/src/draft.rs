@@ -274,8 +274,11 @@ pub(crate) struct Draft {
     outline: Vec<OutlineBox>,
     /// The version being replaced, shown until the next one is ready.
     still: Option<Arc<gpui::RenderImage>>,
-    /// The agent sent this version: lay it out at other widths for them.
+    /// The agent sent the draft's first version: lay it out at other widths
+    /// for them. Revisions are not, so each shows as soon as it loads; see
+    /// `measure_layouts`.
     measure: bool,
+    measured: bool,
     layouts: Vec<DraftLayout>,
     /// The agent chose the page's width; without one, the full view reflows
     /// the page to fill it.
@@ -486,6 +489,7 @@ impl Draft {
             outline: Vec::new(),
             still: None,
             measure: false,
+            measured: false,
             layouts: Vec::new(),
             explicit_width: width.is_some(),
             expanded: false,
@@ -851,7 +855,7 @@ impl Draft {
             self.shared.replace(content.clone());
             self.markup = None;
             self.elements.clear();
-            self.measure = matches!(content, DraftContent::Html(_));
+            self.measure = !self.measured && matches!(content, DraftContent::Html(_));
             self.layouts.clear();
             // A parked page has no card painting to hand it the new version.
             #[cfg(target_os = "macos")]
@@ -2050,7 +2054,10 @@ impl Draft {
             }
             let measure = this
                 .update(cx, |this, _| {
-                    std::mem::take(&mut this.measure) && this.is_html() && !this.expanded
+                    let measure =
+                        std::mem::take(&mut this.measure) && this.is_html() && !this.expanded;
+                    this.measured |= measure;
+                    measure
                 })
                 .unwrap_or(false);
             if measure {
@@ -2152,7 +2159,8 @@ impl Draft {
         }
     }
 
-    /// Lays the hidden page out at the common widths and back at its own.
+    /// Lays the hidden page out at the common widths and back at its own,
+    /// about half a second while the new version waits to be shown.
     async fn measure_layouts(
         this: &gpui::WeakEntity<Self>,
         web: &engine::Page,
