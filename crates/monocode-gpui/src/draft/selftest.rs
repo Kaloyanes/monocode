@@ -277,6 +277,7 @@ pub(crate) fn run(path: OsString) {
 /// each kind of picture has for the points it is shown at. `_TICK` adds a
 /// view beside the thread that redraws every frame, as a caret or a working
 /// spinner does, to show what the thread costs when it is not what changed.
+/// `_WIDTH` gives the pages a width of their own and `_ZOOM` zooms the window.
 mod perf {
     use super::{Draft, env_number};
     use gpui::{
@@ -475,7 +476,7 @@ mod perf {
             return Value::Null;
         };
         let (reply, _) = std::sync::mpsc::channel();
-        let input = json!({"draft": id, "html": format!("{html}<!-- v2 -->")});
+        let input = json!({"draft": id, "html": html});
         let Ok(request) = monocode_core::visual_bridge::DraftRequest::parse(1, &input, reply) else {
             return Value::Null;
         };
@@ -505,11 +506,12 @@ mod perf {
                 let html = std::fs::read_to_string(&path).unwrap_or_default();
                 let count = env_number("MONOCODE_DRAFT_SELFTEST_DRAFTS").unwrap_or(1) as usize;
                 let hold = env_number("MONOCODE_DRAFT_SELFTEST_HOLD").unwrap_or(8);
+                let width = env_number("MONOCODE_DRAFT_SELFTEST_WIDTH");
                 let mut rows = filler(16);
                 let mut drafts = Vec::new();
                 for n in 0..count {
                     let draft = cx.new(|cx| {
-                        Draft::new(None, 1, DraftContent::Html(html.clone()), (None, None), None, None, cx)
+                        Draft::new(None, 1, DraftContent::Html(html.clone()), (width, None), None, None, cx)
                     });
                     let id = draft.read(cx).id().to_owned();
                     crate::draft::register(&id, &draft, cx);
@@ -542,6 +544,12 @@ mod perf {
                         },
                     )
                     .expect("open the measuring window");
+                if let Some(zoom) = std::env::var("MONOCODE_DRAFT_SELFTEST_ZOOM")
+                    .ok()
+                    .and_then(|zoom| zoom.parse().ok())
+                {
+                    let _ = handle.update(cx, |_, window, cx| window.set_content_zoom(zoom, cx));
+                }
                 cx.activate(true);
                 let weak: Vec<_> = drafts.iter().map(Entity::downgrade).collect();
                 cx.spawn(async move |cx| {
@@ -550,8 +558,25 @@ mod perf {
                     for draft in &weak {
                         let _ = Draft::ready(draft, cx).await;
                     }
-                    // Let the fades, fits and first frames settle.
+                    // Let the fades, fits and first frames settle, and the thread
+                    // come to rest with every card on screen.
                     cx.background_executor().timer(Duration::from_millis(2500)).await;
+                    let settled = Instant::now();
+                    while settled.elapsed() < Duration::from_secs(5) {
+                        let on_screen = weak.iter().all(|draft| {
+                            draft
+                                .read_with(cx, |draft, _| draft.placement())
+                                .ok()
+                                .flatten()
+                                .is_some_and(|[_, y, _, height, hidden]| {
+                                    hidden == 0. && y >= 0. && y + height <= 1000.
+                                })
+                        });
+                        if on_screen {
+                            break;
+                        }
+                        cx.background_executor().timer(Duration::from_millis(100)).await;
+                    }
                     let cef_before = super::super::chrome::FRAMES_RECEIVED.load(Ordering::Relaxed);
                     let stops_before = super::super::chrome::STREAM_STOPS.load(Ordering::Relaxed);
                     let cpu_before = cpu_seconds();
@@ -577,7 +602,10 @@ mod perf {
                     // A new version from the agent, as `draft_preview` sends one:
                     // how long the card waits before it shows it.
                     let revise = match weak.first() {
-                        Some(draft) => revise(draft, &html, cx).await,
+                        Some(draft) => json!({
+                            "first": revise(draft, &format!("{html}<!-- v1 -->"), cx).await,
+                            "next": revise(draft, &format!("{html}<!-- v2 -->"), cx).await,
+                        }),
                         None => Value::Null,
                     };
                     let report = json!({

@@ -20,9 +20,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Chromium renders at the Retina scale; frames are scaled down to what the
-/// card shows.
-const DEVICE_SCALE: f32 = 2.;
+/// The scale Chromium renders at until the card is painted, as on a Retina
+/// display. Once it is, a frame has exactly the pixels its card covers: the
+/// window's scale, its zoom, and how far the card scales the page to fit.
+const DEFAULT_SCALE: f32 = 2.;
+/// Pictures for the agent are taken at this many pixels per point, whatever
+/// the page is shown at.
+const PICTURE_SCALE: f64 = 2.;
 /// The largest frame side, in pixels; a taller page is drawn at a lower scale
 /// rather than overrun the GPU's texture limit.
 const MAX_FRAME: f32 = 16384.;
@@ -64,6 +68,8 @@ struct TabInner {
     session: String,
     /// The top frame, the only one the agent's page is served to.
     frame: String,
+    /// The scale the tab was last asked to render at, as `f32` bits.
+    scale: std::sync::atomic::AtomicU32,
 }
 
 impl Drop for TabInner {
@@ -105,7 +111,7 @@ impl Tab {
         String,
     > {
         let browser = Browser::shared(host)?;
-        let id = browser.open_tab(width, height, DEVICE_SCALE).await?;
+        let id = browser.open_tab(width, height, DEFAULT_SCALE).await?;
         let session = id.to_string();
         let (send, events) = async_channel::unbounded();
         browser.listen(&session, send);
@@ -116,6 +122,7 @@ impl Tab {
             id,
             session,
             frame: String::new(),
+            scale: DEFAULT_SCALE.to_bits().into(),
         }));
         let mut setup = vec![
             ("Page.enable", json!({})),
@@ -179,10 +186,19 @@ pub(super) async fn evaluate(tab: &Tab, script: &str, cx: &gpui::AsyncApp) -> Op
     value["result"]["value"].as_str().map(str::to_owned)
 }
 
-/// The visible page as a PNG, `width` points wide at the Retina scale.
+/// The visible page as a PNG, `width` points wide at `PICTURE_SCALE`.
 pub(super) async fn png(
     tab: &Tab,
     width: f64,
+    cx: &gpui::AsyncApp,
+) -> Result<(Vec<u8>, (u32, u32)), String> {
+    capture(tab, Some(width * PICTURE_SCALE), cx).await
+}
+
+/// The visible page as a PNG `pixels` wide, or as Chromium renders it.
+async fn capture(
+    tab: &Tab,
+    pixels: Option<f64>,
     cx: &gpui::AsyncApp,
 ) -> Result<(Vec<u8>, (u32, u32)), String> {
     let failed = || "The page could not be captured".to_string();
@@ -199,13 +215,18 @@ pub(super) async fn png(
     if page_width <= 0. || page_height <= 0. {
         return Err(failed());
     }
+    // The screenshot comes at the tab's own scale times the clip's.
+    let rendered = f64::from(f32::from_bits(
+        tab.0.scale.load(std::sync::atomic::Ordering::Relaxed),
+    ));
+    let scale = pixels.map_or(1., |pixels| pixels / (page_width * rendered));
     let shot = cdp::within(
         tab.send(
             "Page.captureScreenshot",
             json!({"format": "png", "clip": {
                 "x": number("pageX"), "y": number("pageY"),
                 "width": page_width, "height": page_height,
-                "scale": width / page_width,
+                "scale": scale,
             }}),
         ),
         Duration::from_secs(8),
@@ -228,25 +249,14 @@ pub(super) async fn png(
 }
 
 /// A picture of the page as it is now, for the card to show while the next
-/// version loads.
+/// version loads: at the scale the card shows it, like its frames.
 pub(super) async fn picture(tab: &Tab, cx: &gpui::AsyncApp) -> Option<Arc<RenderImage>> {
-    let width = page_width(tab, cx).await?;
-    let (png, _) = png(tab, width, cx).await.ok()?;
+    let (png, _) = capture(tab, None, cx).await.ok()?;
     let image = cx
         .background_executor()
         .spawn(async move { pixels(&png) })
         .await?;
     Some(Arc::new(image))
-}
-
-async fn page_width(tab: &Tab, cx: &gpui::AsyncApp) -> Option<f64> {
-    let metrics = cdp::within(
-        tab.send("Page.getLayoutMetrics", json!({})),
-        Duration::from_secs(3),
-        cx,
-    )
-    .await?;
-    metrics["cssLayoutViewport"]["clientWidth"].as_f64()
 }
 
 /// A PNG as the BGRA sprite GPUI draws.
@@ -260,10 +270,11 @@ fn pixels(png: &[u8]) -> Option<RenderImage> {
     Some(RenderImage::new(vec![image::Frame::new(image)]))
 }
 
-/// The newest frame, and the page area it shows, in CSS pixels.
+/// The newest frame, its size in pixels, and the scale it was rendered at.
 struct Frame {
     buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
-    size: (f32, f32),
+    pixels: (f32, f32),
+    scale: f32,
 }
 
 /// The viewport and scale last asked of the tab.
@@ -293,6 +304,8 @@ struct State {
     contexts: Vec<i64>,
     frame: Option<Frame>,
     sent: Option<Metrics>,
+    /// The scale the card last asked for; see `DEFAULT_SCALE`.
+    scale: Option<f32>,
     streaming: bool,
     /// The agent is working with the page; it keeps running out of sight.
     leases: u32,
@@ -389,14 +402,16 @@ impl State {
         }
     }
 
-    /// Lays the page out at `width` × `height`, drawn at the Retina scale
+    /// Lays the page out at `width` × `height`, drawn at the card's scale
     /// unless that would make a frame too large for the GPU.
     fn apply(&mut self, width: u32, height: u32) {
         let (width, height) = (width.max(1), height.max(1));
         let metrics = Metrics {
             width,
             height,
-            scale: DEVICE_SCALE
+            scale: self
+                .scale
+                .unwrap_or(DEFAULT_SCALE)
                 .min(MAX_FRAME / width as f32)
                 .min(MAX_FRAME / height as f32),
         };
@@ -407,6 +422,10 @@ impl State {
             return;
         };
         self.sent = Some(metrics);
+        tab.0.scale.store(
+            metrics.scale.to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         tab.0
             .browser
             .resize(tab.0.id, metrics.width, metrics.height, metrics.scale);
@@ -598,8 +617,7 @@ impl Host {
         let state = self.state.borrow();
         let frame = state.frame.as_ref()?;
         let (_, scale, _) = state.drawn?;
-        let pixels = objc2_core_video::CVPixelBufferGetWidth(&frame.buffer) as f32;
-        Some((pixels, frame.size.0 * scale, state.sent?.scale))
+        Some((frame.pixels.0, frame.pixels.0 / frame.scale * scale, frame.scale))
     }
 
     pub(super) fn column(&self) -> Option<f32> {
@@ -837,10 +855,11 @@ async fn show_frames(
                 Some(_) => {}
                 None => s.unpainted = Some(Instant::now()),
             }
-            let scale = s.sent.map_or(DEVICE_SCALE, |sent| sent.scale);
+            let scale = s.sent.map_or(DEFAULT_SCALE, |sent| sent.scale);
             s.frame = Some(Frame {
                 buffer: frame.buffer,
-                size: (frame.size.0 as f32 / scale, frame.size.1 as f32 / scale),
+                pixels: (frame.size.0 as f32, frame.size.1 as f32),
+                scale,
             });
         }
         cx.update(|cx| state.borrow().notify(cx));
@@ -934,15 +953,19 @@ fn paint(
     let zoom = window.content_zoom();
     let available = (f32::from(bounds.size.width), f32::from(bounds.size.height));
     s.area = Some((available.0, available.1, zoom));
-    let (width, height, scale) = match s.measuring {
-        Some((width, height)) => (width, height, 1.),
-        None => (s.layout.0, s.layout.1, fit(s.layout.0, available).scale),
-    };
+    // A page laid out at another width to measure it keeps showing its
+    // last frame at its own.
+    let (width, height) = s.layout;
+    let scale = fit(width, available).scale;
     let shown = gpui::size(px(width as f32 * scale), px(height as f32 * scale));
+    // On whole device pixels, so each pixel of a frame lands on one of the
+    // screen's rather than being resampled.
+    let device = window.scale_factor();
+    let snap = |at: Pixels| px((f32::from(at) * device).round() / device);
     let draft = Bounds::new(
         gpui::point(
-            bounds.left() + (bounds.size.width - shown.width) / 2.,
-            bounds.top(),
+            snap(bounds.left() + (bounds.size.width - shown.width) / 2.),
+            snap(bounds.top()),
         ),
         shown,
     );
@@ -953,14 +976,18 @@ fn paint(
         return;
     }
     s.drawn = Some((draft.origin, scale, visible));
+    s.scale = Some(render_scale(device, scale));
     if s.measuring.is_none() {
         s.apply(width, height);
         s.stream();
     }
     if let Some(frame) = &s.frame {
+        // A frame rendered at this card's scale covers exactly its device
+        // pixels; one from before a resize or a zoom stretches until the next.
+        let points = scale / frame.scale;
         let image_bounds = Bounds::new(
             draft.origin,
-            gpui::size(px(frame.size.0 * scale), px(frame.size.1 * scale)),
+            gpui::size(px(frame.pixels.0 * points), px(frame.pixels.1 * points)),
         );
         let buffer = frame.buffer.clone();
         window.with_content_mask(Some(ContentMask { bounds: visible }), |window| {
@@ -1067,6 +1094,18 @@ fn paint(
             cx.stop_propagation();
         }
     });
+}
+
+/// The scale a card shown at `fit` of life size on a `device` scale display
+/// asks Chromium for. A page that fits its card renders at the display's own
+/// scale; one scaled down to fit rounds up to a sixteenth, so dragging the
+/// window's edge does not render it again at every width.
+fn render_scale(device: f32, fit: f32) -> f32 {
+    if fit >= 1. {
+        device
+    } else {
+        (device * fit * 16.).ceil() / 16.
+    }
 }
 
 /// A point in the window as a point in the page, in CSS pixels.
@@ -1242,6 +1281,16 @@ fn key_up(state: &Rc<RefCell<State>>, event: &KeyUpEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_renders_at_the_pixels_its_card_covers() {
+        assert_eq!(render_scale(2., 1.), 2.);
+        assert_eq!(render_scale(2.5, 1.), 2.5);
+        assert_eq!(render_scale(1., 1.), 1.);
+        // 1280 wide in a 788 point column on a Retina display.
+        let scale = render_scale(2., 788. / 1280.);
+        assert!(scale >= 2. * 788. / 1280. && scale < 2. * 788. / 1280. + 1. / 16.);
+    }
 
     #[test]
     fn named_keys_carry_their_codes_and_enter_types_a_return() {
