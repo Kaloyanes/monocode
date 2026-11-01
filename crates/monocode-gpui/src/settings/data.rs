@@ -43,6 +43,9 @@ pub(super) struct ResultTrees {
     pub default_root: PathBuf,
     pub main: String,
     pub error: Option<String>,
+    /// Every worktree, main first, with what cleanup needs to judge it.
+    pub sweep: Vec<monocode_core::worktree_management::TreeStatus>,
+    pub base: Option<String>,
 }
 pub(super) fn discover(cwd: &str) -> Discovery {
     let mut data = Discovery {
@@ -107,6 +110,12 @@ pub(super) fn discover(cwd: &str) -> Discovery {
                         }
                     })
                     .collect();
+                if let Ok((base, sweep)) =
+                    monocode_core::worktree_management::sweep(Path::new(cwd), None)
+                {
+                    data.worktrees.base = base;
+                    data.worktrees.sweep = sweep;
+                }
             }
             Err(e) => data.worktrees.error = Some(e),
         }

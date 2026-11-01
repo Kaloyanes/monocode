@@ -194,3 +194,78 @@ fn mono_mascot_is_beside_name_and_sidebar_switch_stays_visible(cx: &mut TestAppC
     assert_eq!(switch.size, size(px(36.), px(20.)));
     assert!(switch.right() <= px(700.));
 }
+
+#[gpui::test]
+fn cleanup_offers_removal_only_for_clean_merged_or_pushed_worktrees(cx: &mut TestAppContext) {
+    use monocode_core::{git::Worktree, worktree_management::TreeStatus};
+    let tree = |name: &str, main: bool| Worktree {
+        path: format!("/project-worktrees/{name}"),
+        branch: Some(name.into()),
+        head: "abcdef0".into(),
+        main,
+        missing: false,
+    };
+    let status = |name: &str, edit: &dyn Fn(&mut TreeStatus)| {
+        let mut s = TreeStatus {
+            tree: tree(name, false),
+            locked: false,
+            dirty: Some(false),
+            unpushed: Some(0),
+            unmerged: Some(0),
+            has_upstream: false,
+            last_commit: Some(1_700_000_000),
+        };
+        edit(&mut s);
+        s
+    };
+    let window = window(Section::Worktrees, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.selected_project = "/project".into();
+            view.discovery.worktrees.main = "/project".into();
+            view.discovery.worktrees.base = Some("feat/gpui".into());
+            view.discovery.worktrees.sweep = vec![
+                status("project", &|s| s.tree.main = true),
+                status("merged", &|_| {}),
+                status("dirty", &|s| s.dirty = Some(true)),
+                status("ahead", &|s| (s.unmerged, s.unpushed) = (Some(3), Some(3))),
+                status("pushed", &|s| {
+                    (s.unmerged, s.unpushed, s.has_upstream) = (Some(3), Some(0), true)
+                }),
+            ];
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(
+        visual.debug_bounds("sweep-remove-0").is_none(),
+        "main checkout"
+    );
+    assert!(visual.debug_bounds("sweep-remove-1").is_some(), "merged");
+    assert!(visual.debug_bounds("sweep-remove-2").is_none(), "dirty");
+    assert!(
+        visual.debug_bounds("sweep-remove-3").is_none(),
+        "unpushed commits"
+    );
+    assert!(visual.debug_bounds("sweep-remove-4").is_some(), "pushed");
+    let bulk = visual.debug_bounds("sweep-remove-merged").unwrap();
+    visual.simulate_click(bulk.center(), Default::default());
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, _| {
+            let Some(management::Editor {
+                target: management::Target::Sweep(list),
+                ..
+            }) = &view.management
+            else {
+                panic!("the bulk action asks for confirmation first");
+            };
+            let paths: Vec<_> = list.iter().map(|s| s.tree.path.as_str()).collect();
+            assert_eq!(
+                paths,
+                ["/project-worktrees/merged", "/project-worktrees/pushed"]
+            );
+        })
+        .unwrap();
+}

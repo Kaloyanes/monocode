@@ -121,6 +121,11 @@ pub(crate) enum SettingsEvent {
         path: String,
         delete_sessions: bool,
     },
+    /// Cleanup: remove these worktrees, each only if it is still safe to.
+    RemoveWorktrees {
+        cwd: String,
+        paths: Vec<String>,
+    },
     ResetMono(String),
     MonoSidebar(String, bool, bool),
     /// Read mobile access again: the router and pairing change on their own.

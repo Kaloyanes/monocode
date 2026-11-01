@@ -11,6 +11,7 @@ mod mobile;
 mod monos;
 mod providers;
 mod skills;
+mod worktree_sweep;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;

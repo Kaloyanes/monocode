@@ -43,6 +43,7 @@ mod terminal_dock;
 mod title_tabs;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
+mod worktree_sweep;
 mod worktrees;
 
 use crate::{
