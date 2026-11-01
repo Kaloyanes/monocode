@@ -17,6 +17,7 @@ pub(crate) mod mobile;
 mod mono;
 mod network_drop;
 mod notifications;
+mod open_pr;
 mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
@@ -189,6 +190,8 @@ pub(crate) struct Conversation {
     /// One of this lead's runs is not finished.
     pub(crate) orchestration_active: bool,
     status: String,
+    /// `/pr` is checking the branch or opening the pull request.
+    pr_busy: bool,
     loaded: bool,
     history_unloaded: bool,
     history_actions: std::collections::VecDeque<history::HistoryAction>,
@@ -675,6 +678,7 @@ impl Conversation {
             orchestration_views: Vec::new(),
             orchestration_active: false,
             status: "Loading conversation…".into(),
+            pr_busy: false,
             loaded: false,
             history_unloaded: false,
             history_actions: Default::default(),
@@ -3665,6 +3669,7 @@ impl Conversation {
                                     .debug_selector(|| "provider-status".into())
                                     .role(Role::Status)
                                     .aria_label(self.status.clone())
+                                    .tip(self.status.clone())
                                     .max_w(px(220.))
                                     .truncate()
                                     .text_size(px(11.))
