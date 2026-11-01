@@ -160,9 +160,11 @@ impl Protocol {
         Some(vec![Event::FollowUp(message)])
     }
     /// Claude still runs a message it was handed after an interrupt or a turn
-    /// that ended without taking it, so that process must not be reused.
+    /// that ended without taking it, so that process must not be reused. That
+    /// includes this turn's own prompt when Claude never acknowledged it.
     pub(super) fn holds_steers(&self) -> bool {
-        self.request.kind == Kind::Claude && (self.claude_stale || !self.steering.is_empty())
+        self.request.kind == Kind::Claude
+            && (self.claude_stale || !self.steering.is_empty() || self.claude_prompt_pending)
     }
     /// A finished Claude turn with steers still out starts another turn for
     /// them. If it never does, hand them back to be sent as the next turn.
@@ -305,6 +307,8 @@ mod tests {
     #[test]
     fn a_claude_steer_that_misses_the_turn_keeps_it_open_for_the_next() {
         let mut p = protocol(Kind::Claude);
+        // A steer only exists once the turn's own prompt has gone out.
+        p.claude_prompt_sent = true;
         let mut out = Vec::new();
         let message = Message {
             id: "late".into(),

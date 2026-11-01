@@ -65,8 +65,9 @@ Script helpers on window.mc:
   plain CSS can react with no script. The values reach you as `state` in the
   next draft snapshot: look at it to see what the person tried. You change
   them with draft_preview {draft, action:{kind:"set", values:{...}}}; keys the
-  store does not have are refused. Keep one store per page: with several,
-  set reaches only the newest.
+  store does not have are refused. A page has one store: mc.state() returns
+  it, and a later mc.state({...}) or mc.controls adds its new keys to the same
+  store.
 - mc.send(text) sends a line to the agent as from the person, for a control
   such as "Use this one". It works only inside the handler of the person's own
   click or key press (within two seconds) and returns whether it went.

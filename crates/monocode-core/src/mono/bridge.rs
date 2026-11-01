@@ -26,9 +26,10 @@ sessions.send {sessionId,prompt,project?,notifyOnComplete?}
 sessions.draft {sessionId,prompt,project?}
 sessions.stop / sessions.archive / sessions.delete {sessionId,project?}
 threads.start {prompt,harness?,model?,effort?,modelSettings?,title?,workspaceMode?}
+threads.new {prompt,harness?,model?,effort?,modelSettings?,title?,workspaceMode?,draft?,reveal?}
 threads.send {threadId,prompt}; threads.wait {threadId,timeoutSeconds?}; threads.read {threadId,before?,limit?,maxChars?}
 threads.stop {threadId}; threads.list {}
-Thread actions require a top-level caller. Only its own children may be addressed. Start/send return immediately; wait returns idle, working or needsInput, with a timeout of at most 50 seconds.
+Thread actions require a top-level caller. Only its own children may be addressed. threads.start makes a subagent that reports back to the caller; threads.new and sessions.start open a top-level thread the user owns, which the caller does not drive. Start/send return immediately; wait returns idle, working or needsInput, with a timeout of at most 50 seconds.
 worktrees.list {project?}
 worktrees.create {branch,base?,existing?,project?}
 folders.list {project?}

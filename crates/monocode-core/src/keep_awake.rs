@@ -740,7 +740,7 @@ pub mod mac {
     /// DisplayServices is private but the only way to set the built-in
     /// panel's brightness; every call degrades to a no-op if it goes away.
     mod brightness {
-        use std::ffi::{CStr, c_void};
+        use std::ffi::{c_void, CStr};
         use std::sync::OnceLock;
 
         type Get = unsafe extern "C" fn(u32, *mut f32) -> i32;

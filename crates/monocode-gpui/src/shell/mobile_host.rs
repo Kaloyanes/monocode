@@ -62,7 +62,8 @@ pub(super) struct Mobile {
 
 struct CatalogEntry {
     id: i64,
-    /// The lead of an Orchestrator worker, which the phone lists under it.
+    /// The lead of a subagent (a thread it drives, or an Orchestrator
+    /// worker), which the phone lists under it.
     lead: Option<i64>,
     project: String,
     summary: Session,
@@ -88,6 +89,7 @@ enum Target {
 struct Saved {
     rows: Vec<Row>,
     turns: HashMap<usize, TurnInfo>,
+    senders: HashMap<i64, crate::transcript::threads::Sender>,
     harness: String,
     model: Option<String>,
     cwd: String,
@@ -117,6 +119,7 @@ struct Snapshot<'a> {
     waiting: Option<&'static str>,
     mono: Option<String>,
     pending: Vec<turns::Pending>,
+    senders: HashMap<i64, crate::transcript::threads::Sender>,
 }
 impl Snapshot<'_> {
     fn source(&self) -> turns::Source<'_> {
@@ -132,6 +135,7 @@ impl Snapshot<'_> {
             waiting: self.waiting,
             mono: self.mono.as_deref(),
             pending: &self.pending,
+            senders: &self.senders,
         }
     }
 }
@@ -392,7 +396,7 @@ impl Shell {
                 });
                 Some(CatalogEntry {
                     id,
-                    lead: self.orchestration_lead(id),
+                    lead: self.subagent_lead(id),
                     project: project_id(project),
                     summary: summary.clone(),
                     live,
@@ -666,18 +670,20 @@ impl Shell {
     /// has none yet.
     fn mobile_commands(&mut self, request: Request, cx: &mut Context<Self>) {
         let conversation = string(&request.params, "conversationId").unwrap_or_default();
-        let result = self.mobile_target(&conversation, cx).map(|target| match target {
-            Target::Session(id) => self.sessions.get(&id).map_or_else(
-                || json!({ "commands": [] }),
-                |view| {
-                    view.read(cx)
-                        .completion
-                        .clone()
-                        .update(cx, |completion, cx| completion.mobile_commands(cx))
-                },
-            ),
-            Target::Mono(_) => json!({ "commands": [] }),
-        });
+        let result = self
+            .mobile_target(&conversation, cx)
+            .map(|target| match target {
+                Target::Session(id) => self.sessions.get(&id).map_or_else(
+                    || json!({ "commands": [] }),
+                    |view| {
+                        view.read(cx)
+                            .completion
+                            .clone()
+                            .update(cx, |completion, cx| completion.mobile_commands(cx))
+                    },
+                ),
+                Target::Mono(_) => json!({ "commands": [] }),
+            });
         request.reply(result);
     }
 
@@ -802,12 +808,16 @@ impl Shell {
         cx: &App,
         f: impl FnOnce(&Snapshot) -> T,
     ) -> Option<T> {
-        let (view, mono) = match target {
-            Target::Session(id) => (self.sessions.get(id)?.clone(), None),
+        let (view, mono, senders) = match target {
+            Target::Session(id) => (
+                self.sessions.get(id)?.clone(),
+                None,
+                self.thread_senders(*id),
+            ),
             Target::Mono(id) => {
                 let manager = self.monos.as_ref()?.read(cx);
                 let name = manager.roster.get(id).map(|m| m.label());
-                (manager.open_chat(id)?, name)
+                (manager.open_chat(id)?, name, HashMap::new())
             }
         };
         let chat = view.read(cx);
@@ -829,6 +839,7 @@ impl Shell {
             waiting,
             mono,
             pending: chat.mobile_pending(cx),
+            senders,
         };
         Some(f(&snapshot))
     }
@@ -847,6 +858,7 @@ impl Shell {
             }
         };
         let summary = id.and_then(|id| self.session_summaries.get(&id).cloned());
+        let senders = id.map(|id| self.thread_senders(id)).unwrap_or_default();
         let store = self.store.clone();
         cx.background_executor().spawn(async move {
             let Some(id) = id else {
@@ -854,6 +866,7 @@ impl Shell {
                 return Ok(Arc::new(Saved {
                     rows: Vec::new(),
                     turns: HashMap::new(),
+                    senders: HashMap::new(),
                     harness: String::new(),
                     model: None,
                     cwd: String::new(),
@@ -875,6 +888,7 @@ impl Shell {
             Ok(Arc::new(Saved {
                 rows,
                 turns: settings.turns,
+                senders,
                 harness,
                 model: settings.model,
                 cwd,
@@ -1127,7 +1141,7 @@ impl Shell {
                 }
                 .ok_or("This conversation is still opening on desktop; try again")?;
                 if view.read(cx).driven_by.is_some() {
-                    return Err("This child thread is driven by its lead".into());
+                    return Err("A subagent is driven by its lead".into());
                 }
                 let model = match (
                     string(params, "harness").as_deref().and_then(Kind::parse),
@@ -1217,7 +1231,11 @@ impl Shell {
 
     /// A lead's current Orchestrator cards in full, for the phone's Agents
     /// sheet. Opening the lead brings back a run saved before a restart.
-    fn mobile_orchestration(&mut self, params: &Value, cx: &mut Context<Self>) -> Result<Value, String> {
+    fn mobile_orchestration(
+        &mut self,
+        params: &Value,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
         let conversation = string(params, "conversationId").unwrap_or_default();
         let Target::Session(lead) = self.mobile_target(&conversation, cx)? else {
             return Ok(json!({"runs": []}));
@@ -1277,7 +1295,7 @@ impl Shell {
                             .ensure_session(*id, cx)
                             .ok_or("Session is no longer available")?;
                         if view.read(cx).driven_by.is_some() {
-                            return Err("This child thread is driven by its lead".into());
+                            return Err("A subagent is driven by its lead".into());
                         }
                         view.update(cx, |v, cx| {
                             v.clear_composer_text_sent_from_phone(&text, draft_rev, cx);
@@ -1793,6 +1811,7 @@ fn saved_snapshot<'a>(saved: &'a Saved, mono: Option<String>) -> Snapshot<'a> {
         waiting: None,
         mono,
         pending: Vec::new(),
+        senders: saved.senders.clone(),
     }
 }
 
@@ -1965,6 +1984,7 @@ mod tests {
             depends_on: Vec::new(),
             provider: None,
             model: None,
+            difficulty: None,
         };
         let plan = Plan {
             title: "Split settings".into(),
@@ -1975,7 +1995,10 @@ mod tests {
             .update(cx, |shell, _, cx| {
                 let id = shell.mobile_session_id(lead);
                 let params = json!({"conversationId": id});
-                assert_eq!(shell.mobile_orchestration(&params, cx).unwrap()["runs"], json!([]));
+                assert_eq!(
+                    shell.mobile_orchestration(&params, cx).unwrap()["runs"],
+                    json!([])
+                );
 
                 shell.sessions[&lead].update(cx, |v, cx| {
                     v.orchestration_plan = Some((Some("plan-call".into()), plan.clone()));
@@ -2015,7 +2038,13 @@ mod tests {
                 let paths = shell.mobile_projects(cx);
                 let entries = shell.mobile_catalog_sessions(&paths, cx);
                 let entry = |id: i64| entries.iter().find(|e| e.id == id).unwrap();
-                let summary = entry(lead).live.as_ref().unwrap().orchestration.clone().unwrap();
+                let summary = entry(lead)
+                    .live
+                    .as_ref()
+                    .unwrap()
+                    .orchestration
+                    .clone()
+                    .unwrap();
                 assert_eq!(summary["phase"], "review");
                 assert_eq!(summary["tones"], json!(["queued"]));
                 assert_eq!(entry(worker).lead, Some(lead));

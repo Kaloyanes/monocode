@@ -25,6 +25,7 @@ fn task(id: &str, title: &str, files: &[&str], after: &[&str]) -> Task {
         depends_on: after.iter().map(|f| (*f).into()).collect(),
         provider: None,
         model: None,
+        difficulty: None,
     }
 }
 
@@ -114,6 +115,7 @@ fn orchestration_ui_shots() {
         report: report.into(),
         outside_scope: Vec::new(),
         launched: true,
+        ..Default::default()
     };
     run.tasks[0] = state(
         workers[0].id,

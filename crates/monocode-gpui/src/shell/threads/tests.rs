@@ -248,7 +248,7 @@ fn threads_stopping_lead_stops_child_and_releases_waiters(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn threads_restore_the_permanent_lock_without_locking_operator_children(cx: &mut TestAppContext) {
+fn restored_children_name_their_lead_as_the_sender(cx: &mut TestAppContext) {
     let (window, child, lead) = setup(cx);
     window
         .update(cx, |shell, _, cx| {
@@ -258,6 +258,22 @@ fn threads_restore_the_permanent_lock_without_locking_operator_children(cx: &mut
             assert_eq!(child_view.read(cx).driven_by, Some(lead));
             assert!(child_view.read(cx).managed);
             assert_eq!(shell.sessions[&lead].read(cx).driven_by, None);
+            assert!(
+                child_view
+                    .read(cx)
+                    .transcript
+                    .read(cx)
+                    .senders
+                    .contains_key(&lead)
+            );
+            assert!(
+                shell.sessions[&lead]
+                    .read(cx)
+                    .transcript
+                    .read(cx)
+                    .senders
+                    .is_empty()
+            );
         })
         .unwrap();
 }
@@ -300,6 +316,7 @@ fn threads_start_is_idempotent_and_marks_the_child_before_dispatch(cx: &mut Test
             assert_eq!(shell.started_by.get(&child), Some(&lead));
             assert_eq!(shell.sessions[&child].read(cx).driven_by, Some(lead));
             assert!(shell.sessions[&child].read(cx).managed);
+            assert_eq!(shell.subagent_lead(child), Some(lead));
             assert_eq!(
                 locked(&shell.store)
                     .unwrap()
@@ -319,24 +336,160 @@ fn threads_start_is_idempotent_and_marks_the_child_before_dispatch(cx: &mut Test
 }
 
 #[gpui::test]
-fn child_view_renders_a_lock_after_the_lead_finishes(cx: &mut TestAppContext) {
-    let (window, child, lead) = setup(cx);
+fn threads_new_opens_a_top_level_thread_the_lead_does_not_own(cx: &mut TestAppContext) {
+    let (window, _, lead) = crate::shell::tests::window(cx);
+    let missing = std::env::temp_dir()
+        .join(monocode_core::mono::new_id())
+        .join("missing-project");
     window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&lead].update(cx, |v, cx| {
+                v.install_transfer(Settings::default(), None, cx);
+                v.summary.cwd = missing.to_string_lossy().into_owned();
+            });
+        })
+        .unwrap();
+    // No Operator grant: a lead opens a new thread through its thread tools.
+    let value = call(
+        window,
+        lead,
+        "new-once",
+        "threads.new",
+        json!({"prompt":"Plan the drafts","title":"Drafts","draft":true}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
+    assert!(value["threadId"].is_null());
+    let id = value["sessionId"].as_i64().unwrap();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.thread_parents.get(&id).is_none());
+            assert!(!shell.sessions[&id].read(cx).managed);
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .thread_parents()
+                    .unwrap()
+                    .get(&id)
+                    .is_none()
+            );
+            assert!(
+                shell
+                    .orchestration_summaries
+                    .get(&lead)
+                    .is_none_or(|s| s.tasks.iter().all(|t| t.session != Some(id)))
+            );
+        })
+        .unwrap();
+    let denied = call(
+        window,
+        lead,
+        "not-child",
+        "threads.send",
+        json!({"threadId":id,"prompt":"Go"}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap_err();
+    assert!(denied.contains("own children"));
+}
+
+#[gpui::test]
+fn a_subagent_opens_read_only_beside_its_lead(cx: &mut TestAppContext) {
+    let (window, child, lead) = setup(cx);
+    let other = window
         .update(cx, |shell, window, cx| {
             shell.sessions[&child].update(cx, |v, _| v.busy = false);
             shell.thread_session_changed(child, cx);
+            let other = locked(&shell.store)
+                .unwrap()
+                .create("codex", &shell.workspace.project)
+                .unwrap();
+            let other_id = other.id;
+            shell.thread_parents.insert(other_id, lead);
+            shell.started_by.insert(other_id, lead);
+            shell.add(other, cx);
+            shell.thread_session_changed(other_id, cx);
+            shell.open(lead, window, cx);
             shell.open(child, window, cx);
+            other_id
         })
         .unwrap();
     cx.run_until_parked();
     cx.refresh().unwrap();
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     visual.run_until_parked();
+    window
+        .update(visual, |shell, _, _| {
+            let tab = shell.workspace.tab_of(lead).unwrap();
+            assert_eq!(
+                shell.workspace.layout(tab).leaf_ids(),
+                [lead, child],
+                "beside its lead, in the lead's tab"
+            );
+            assert_eq!(shell.workspace.active, Some(child));
+        })
+        .unwrap();
+    // The lead keeps its composer; the subagent only has its lock and Stop.
     assert!(visual.debug_bounds("thread-locked-composer").is_some());
-    assert!(visual.debug_bounds("composer-box").is_none());
+    assert!(visual.debug_bounds("composer-box").is_some());
+    assert!(visual.debug_bounds("subagent-strip").is_some());
+    let chip: &'static str = Box::leak(format!("subagent-chip-{other}").into_boxed_str());
+    let chip = visual
+        .debug_bounds(chip)
+        .expect("the lead's strip lists it");
+    visual.simulate_click(chip.center(), Default::default());
+    visual.run_until_parked();
     window
         .update(visual, |shell, _, cx| {
-            assert_eq!(shell.sessions[&child].read(cx).driven_by, Some(lead))
+            let tab = shell.workspace.tab_of(lead).unwrap();
+            assert_eq!(
+                shell.workspace.layout(tab).leaf_ids(),
+                [lead, other],
+                "one subagent at a time takes the pane"
+            );
+            assert!(shell.workspace.tab_of(child).is_none());
+            let strip = shell.subagent_strip(lead, cx);
+            assert_eq!(
+                strip.iter().map(|s| s.id).collect::<Vec<_>>(),
+                [child, other]
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn archiving_a_lead_archives_its_subagents_and_restoring_brings_them_back(cx: &mut TestAppContext) {
+    let (window, child, lead) = setup(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&child].update(cx, |v, _| v.busy = false);
+            shell.thread_session_changed(child, cx);
+            shell.toggle_archive(lead, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.session_summaries[&lead].archived);
+            assert!(
+                shell.session_summaries[&child].archived,
+                "it goes with its lead"
+            );
+            shell.toggle_archive(lead, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .read_with(cx, |shell, _| {
+            assert!(!shell.session_summaries[&lead].archived);
+            assert!(
+                !shell.session_summaries[&child].archived,
+                "and comes back with it"
+            );
         })
         .unwrap();
 }

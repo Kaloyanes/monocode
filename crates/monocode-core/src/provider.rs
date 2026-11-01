@@ -283,6 +283,14 @@ struct Protocol {
     previous_turn: Option<String>,
     interrupt_id: Option<String>,
     claude_prompt_sent: bool,
+    /// A resumed Claude first runs internal turns (for background tasks the
+    /// last process left running) whose `result` frames are not this turn's.
+    /// Until Claude echoes the uuid of the prompt it was handed, a result
+    /// does not end the turn.
+    claude_prompt_uuid: Option<String>,
+    claude_prompt_pending: bool,
+    /// The newest result seen while the prompt was still unacknowledged.
+    claude_deferred_result: Option<(Value, Instant)>,
     claude_result_seen: bool,
     claude_usage_limit: Option<crate::usage::Limit>,
     claude_resume_at: Option<Instant>,
@@ -339,6 +347,9 @@ impl Protocol {
             previous_turn: None,
             interrupt_id: None,
             claude_prompt_sent: false,
+            claude_prompt_uuid: None,
+            claude_prompt_pending: false,
+            claude_deferred_result: None,
             claude_result_seen: false,
             claude_usage_limit: None,
             claude_resume_at: None,
@@ -462,6 +473,16 @@ impl Protocol {
                 self.text_key = None;
             }
             if v["type"] == "user" && v["isReplay"] == true {
+                if self.claude_prompt_pending
+                    && v["uuid"].as_str().is_some()
+                    && v["uuid"].as_str() == self.claude_prompt_uuid.as_deref()
+                {
+                    // Claude has taken this turn's prompt. Anything it finished
+                    // before now belonged to its own internal turns.
+                    self.claude_prompt_pending = false;
+                    self.claude_deferred_result = None;
+                    return Ok(Vec::new());
+                }
                 if let Some(events) = self.claude_replay(&v) {
                     return Ok(events);
                 }
@@ -962,6 +983,9 @@ impl Protocol {
                                 }
                             }
                         }
+                    }
+                    "result" if self.claude_prompt_pending && v["is_error"] != true => {
+                        self.claude_deferred_result = Some((v.clone(), Instant::now()));
                     }
                     "result" => {
                         if self.compact && !self.compact_confirmed && v["is_error"] != true {
@@ -1780,6 +1804,17 @@ fn run_operation(
                         Err(e) => return Err(format!("Invalid provider JSON: {e}")),
                     };
                     if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+                        if protocol.request.kind == Kind::Claude && value["type"] != "stream_event"
+                        {
+                            eprintln!(
+                                "claude-frame type={} subtype={} replay={} uuid={} pending_prompt={}",
+                                value["type"],
+                                value["subtype"],
+                                value["isReplay"],
+                                value["uuid"].as_str().map_or("", |u| &u[..u.len().min(8)]),
+                                protocol.claude_prompt_pending
+                            );
+                        }
                         let method = value["method"].as_str().unwrap_or("");
                         let item = &value["params"]["item"];
                         if !method.is_empty()
@@ -1966,6 +2001,99 @@ mod tests {
             model: None,
             settings: Default::default(),
         })
+    }
+    fn resumed_claude(prompt: &str) -> (Protocol, String) {
+        let mut p = protocol(Kind::Claude);
+        p.request.provider_id = Some("saved".into());
+        p.request.prompt = prompt.into();
+        let mut out = Vec::new();
+        p.frame(
+            json!({"type":"control_response","response":{"request_id":"native-init"}}),
+            &mut out,
+        )
+        .unwrap();
+        let sent: Value = serde_json::from_slice(out.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        let uuid = sent["uuid"].as_str().unwrap_or_default().to_owned();
+        (p, uuid)
+    }
+    fn result_frame() -> Value {
+        json!({"type":"result","subtype":"success","is_error":false,"result":"No response requested.","usage":{}})
+    }
+    fn echo(uuid: &str) -> Value {
+        json!({"type":"user","isReplay":true,"uuid":uuid,"parent_tool_use_id":null,"message":{"role":"user","content":"continue"}})
+    }
+    #[test]
+    fn a_resumed_claudes_internal_result_does_not_end_the_turn_before_it_takes_the_prompt() {
+        let (mut p, uuid) = resumed_claude("continue");
+        assert!(!uuid.is_empty());
+        // The resume's own turn for tasks the last process left running.
+        p.frame(
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"No response requested."}]}}),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        p.frame(result_frame(), &mut Vec::new()).unwrap();
+        assert!(!p.done);
+        assert!(!p.claude_result_seen);
+        assert!(p.holds_steers(), "an unacknowledged prompt must not be parked");
+        // Claude takes the prompt and answers it.
+        p.frame(echo(&uuid), &mut Vec::new()).unwrap();
+        assert!(!p.claude_prompt_pending);
+        assert!(!p.holds_steers());
+        p.frame(
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Working on it."}]}}),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!p.done);
+        p.frame(
+            json!({"type":"result","subtype":"success","is_error":false,"result":"Working on it.","usage":{}}),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(p.done);
+    }
+    #[test]
+    fn a_claude_that_never_echoes_the_prompt_still_finishes_after_a_grace_period() {
+        let (mut p, _) = resumed_claude("continue");
+        p.frame(result_frame(), &mut Vec::new()).unwrap();
+        assert!(!p.done);
+        p.lifecycle_tick(Instant::now(), &mut Vec::new()).unwrap();
+        assert!(!p.done, "within the grace period the result still waits");
+        if let Some((_, at)) = p.claude_deferred_result.as_mut() {
+            *at = Instant::now() - Duration::from_secs(30);
+        }
+        let events = p.lifecycle_tick(Instant::now(), &mut Vec::new()).unwrap();
+        assert!(p.done);
+        assert!(events.contains(&Event::Done));
+        assert!(!p.holds_steers());
+    }
+    #[test]
+    fn an_error_result_ends_the_turn_even_before_the_prompt_is_taken() {
+        let (mut p, _) = resumed_claude("continue");
+        let error = p
+            .frame(
+                json!({"type":"result","is_error":true,"result":"No conversation found with session ID: saved"}),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("No conversation found"));
+    }
+    #[test]
+    fn slash_commands_and_new_sessions_do_not_wait_for_an_echo() {
+        let (mut p, uuid) = resumed_claude("/context");
+        assert!(uuid.is_empty());
+        assert!(!p.claude_prompt_pending);
+        p.frame(result_frame(), &mut Vec::new()).unwrap();
+        assert!(p.done);
+        let mut fresh = protocol(Kind::Claude);
+        fresh
+            .frame(
+                json!({"type":"control_response","response":{"request_id":"native-init"}}),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert!(!fresh.claude_prompt_pending);
     }
     #[test]
     fn restart_continuation_never_falls_back_to_a_fresh_codex_thread() {

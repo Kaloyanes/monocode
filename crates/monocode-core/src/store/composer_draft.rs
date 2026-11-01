@@ -32,7 +32,9 @@ pub enum ComposerWrite {
 /// so a revision never comes back after a clear resets it to 0.
 pub(super) fn next_rev(last: u64) -> u64 {
     static ISSUED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-    let mut issued = ISSUED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut issued = ISSUED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *issued = crate::time::now_ms().max(last + 1).max(*issued + 1);
     *issued
 }
@@ -163,7 +165,11 @@ mod tests {
         assert_eq!(current.rev, newer);
 
         // The same text is no conflict, which also makes a retry harmless.
-        let same = saved(store.write_composer_text(id, "typed on the desktop", first.rev).unwrap());
+        let same = saved(
+            store
+                .write_composer_text(id, "typed on the desktop", first.rev)
+                .unwrap(),
+        );
         assert_eq!(same.rev, newer);
         let next = saved(store.write_composer_text(id, "both", newer).unwrap());
         assert!(next.rev > newer);
@@ -181,12 +187,18 @@ mod tests {
         let rev = store.save_composer_draft(id, Some(&draft)).unwrap();
         let rev = saved(store.write_composer_text(id, "look at this", rev).unwrap()).rev;
         let kept = store.composer_draft(id).unwrap().unwrap();
-        assert_eq!((kept.text.as_str(), &kept.attachments), ("look at this", &files));
+        assert_eq!(
+            (kept.text.as_str(), &kept.attachments),
+            ("look at this", &files)
+        );
 
         // Emptied, the files still make it a draft.
         let emptied = saved(store.write_composer_text(id, "", rev).unwrap());
         assert!(emptied.rev > rev);
-        assert_eq!(store.composer_draft(id).unwrap().unwrap().attachments, files);
+        assert_eq!(
+            store.composer_draft(id).unwrap().unwrap().attachments,
+            files
+        );
         assert!(store.composer_draft_sessions().unwrap().contains(&id));
 
         // Without files, blank text is no draft at all.

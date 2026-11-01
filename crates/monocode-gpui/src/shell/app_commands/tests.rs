@@ -639,7 +639,11 @@ fn device_tools_list_open_and_screenshot_a_real_simulator(cx: &mut TestAppContex
     let (window, _, caller) = setup(cx);
     monocode_core::device::set_enabled(true, false);
     let refused = call(window, caller, "d0", "devices.list", json!({}), cx);
-    assert!(refused.unwrap_err().contains("Agent access to devices is off"));
+    assert!(
+        refused
+            .unwrap_err()
+            .contains("Agent access to devices is off")
+    );
     monocode_core::device::set_enabled(true, true);
     window
         .update(cx, |shell, _, _| shell.workspace.preferences.devices = true)
@@ -652,7 +656,14 @@ fn device_tools_list_open_and_screenshot_a_real_simulator(cx: &mut TestAppContex
         .find(|d| d["booted"] == true && d["platform"] == "ios")
         .expect("a booted simulator")
         .clone();
-    let unknown = call(window, caller, "d2", "devices.open", json!({"device": "No Such Phone"}), cx);
+    let unknown = call(
+        window,
+        caller,
+        "d2",
+        "devices.open",
+        json!({"device": "No Such Phone"}),
+        cx,
+    );
     assert!(unknown.unwrap_err().contains("No device matches"));
     let opened = call(
         window,
@@ -667,7 +678,11 @@ fn device_tools_list_open_and_screenshot_a_real_simulator(cx: &mut TestAppContex
     assert_eq!(opened["device"]["id"], booted["id"]);
     window
         .update(cx, |shell, _, cx| {
-            let panel = shell.right_panel.as_ref().expect("the right panel opened").read(cx);
+            let panel = shell
+                .right_panel
+                .as_ref()
+                .expect("the right panel opened")
+                .read(cx);
             assert_eq!(panel.tab(), crate::right_panel::RightTab::Device);
             assert_eq!(
                 panel.device.read(cx).selected().map(|d| d.id.clone()),
@@ -687,7 +702,18 @@ fn device_tools_list_open_and_screenshot_a_real_simulator(cx: &mut TestAppContex
         })
         .unwrap();
     assert!(call(window, caller, "d5", "devices.screenshot", json!({}), cx).is_ok());
-    let denied = call(window, caller, "d6", "devices.close", json!({"device": booted["id"]}), cx);
-    assert!(denied.unwrap_err().contains("only device_list and device_screenshot"));
+    let denied = call(
+        window,
+        caller,
+        "d6",
+        "devices.close",
+        json!({"device": booted["id"]}),
+        cx,
+    );
+    assert!(
+        denied
+            .unwrap_err()
+            .contains("only device_list and device_screenshot")
+    );
     monocode_core::device::hub::stop();
 }

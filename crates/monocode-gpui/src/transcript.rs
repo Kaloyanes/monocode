@@ -21,7 +21,7 @@ mod remote_plans;
 pub(crate) mod selection;
 mod shell;
 pub(crate) mod tasks;
-mod threads;
+pub(crate) mod threads;
 mod tools;
 mod user_links;
 mod visuals;
@@ -594,7 +594,12 @@ pub(crate) struct TranscriptView {
     orchestration_open: HashSet<(String, usize)>,
     /// Finished child threads the user removed from the spawn tree.
     thread_dismissed: HashSet<i64>,
-    pub(crate) thread_driver: Option<String>,
+    /// Threads that sent messages into this one, by session.
+    pub(crate) senders: HashMap<i64, threads::Sender>,
+    /// This chat is a subagent its lead drives, not a thread of its own.
+    pub(crate) subagent: bool,
+    /// The thread whose message opens the turn now starting.
+    pub(crate) live_sender: Option<i64>,
     /// User messages opened past their four-line clamp, by start.
     expanded_prompts: HashSet<usize>,
     /// Collapsed user messages whose later chunks are hidden, by start.
@@ -1912,7 +1917,10 @@ impl TranscriptView {
                     .when_some(message.caption.clone(), |d, caption| {
                         d.child(
                             div()
-                                .id(SharedString::from(format!("pending-caption-{}", message.id)))
+                                .id(SharedString::from(format!(
+                                    "pending-caption-{}",
+                                    message.id
+                                )))
                                 .debug_selector(|| "pending-steer-caption".into())
                                 .role(Role::Status)
                                 .px_3()
@@ -2440,7 +2448,9 @@ impl TranscriptView {
             orchestration: HashMap::new(),
             orchestration_open: HashSet::new(),
             thread_dismissed: HashSet::new(),
-            thread_driver: None,
+            senders: HashMap::new(),
+            subagent: false,
+            live_sender: None,
             expanded_prompts: HashSet::new(),
             clamped_prompts: HashSet::new(),
             phases: HashMap::new(),
@@ -2851,13 +2861,18 @@ impl TranscriptView {
         {
             let provider = self.provider.clone();
             let model = self.model.clone();
-            self.turns
+            let info = self
+                .turns
                 .entry(turn)
                 .or_insert_with(|| monocode_core::agent::TurnInfo {
                     provider,
                     model,
                     ..Default::default()
                 });
+            // Only the prompt that opened the turn; later steers are the user's.
+            if let Some(sender) = self.live_sender.take() {
+                info.sender = Some(sender);
+            }
         }
         if self.streaming {
             for prompt in known..self.source.len() {
@@ -5230,6 +5245,7 @@ impl TranscriptView {
                         .collect::<Vec<_>>()
                 });
                 let has_prose = prose.is_some();
+                let from_thread = user && self.prompt_sender(message_start).is_some();
                 div()
                     .w_full()
                     .relative()
@@ -5239,15 +5255,6 @@ impl TranscriptView {
                         rgb(0xf87171).into()
                     } else {
                         content(1.)
-                    })
-                    .when(user && first && self.thread_driver.is_some(), |d| {
-                        d.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(content(0.45))
-                                .pb_1()
-                                .child(self.thread_driver.clone().unwrap_or_default()),
-                        )
                     })
                     .when(user, |d| {
                         // AgentTranscript.tsx: text-sm (14px / 20px), px-3 py-2.
@@ -5270,20 +5277,32 @@ impl TranscriptView {
                                             } else {
                                                 12.
                                             };
-                                        window.paint_quad(
-                                            gpui::fill(bounds, user_bubble_fill()).corner_radii(
-                                                gpui::Corners {
-                                                    top_left: px(if first { radius } else { 0. }),
-                                                    top_right: px(if first { radius } else { 0. }),
-                                                    bottom_left: px(if last { radius } else { 0. }),
-                                                    bottom_right: px(if last {
-                                                        radius
-                                                    } else {
-                                                        0.
-                                                    }),
+                                        let corners = gpui::Corners {
+                                            top_left: px(if first { radius } else { 0. }),
+                                            top_right: px(if first { radius } else { 0. }),
+                                            bottom_left: px(if last { radius } else { 0. }),
+                                            bottom_right: px(if last { radius } else { 0. }),
+                                        };
+                                        // Another thread's message is outlined, not filled,
+                                        // so it never reads as the user's own.
+                                        window.paint_quad(if from_thread {
+                                            gpui::quad(
+                                                bounds,
+                                                corners,
+                                                gpui::transparent_black(),
+                                                gpui::Edges {
+                                                    top: px(if first { 1. } else { 0. }),
+                                                    right: px(1.),
+                                                    bottom: px(if last { 1. } else { 0. }),
+                                                    left: px(1.),
                                                 },
-                                            ),
-                                        );
+                                                content(0.22),
+                                                gpui::BorderStyle::Dashed,
+                                            )
+                                        } else {
+                                            gpui::fill(bounds, user_bubble_fill())
+                                                .corner_radii(corners)
+                                        });
                                     },
                                 )
                                 .absolute()
@@ -5490,6 +5509,11 @@ impl TranscriptView {
             })
             .children(if first {
                 self.provider_separator(message_start)
+            } else {
+                None
+            })
+            .children(if first && user {
+                self.sender_label(message_start, cx)
             } else {
                 None
             })

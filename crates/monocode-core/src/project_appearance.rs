@@ -28,7 +28,7 @@ impl ProjectAppearance {
     pub fn label(&self, project: &str) -> String {
         if self.name.trim().is_empty() {
             if crate::files::is_home_project(project) {
-                return "Home".into();
+                return "No project".into();
             }
             Path::new(project)
                 .file_name()

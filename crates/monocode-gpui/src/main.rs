@@ -40,8 +40,8 @@ mod history;
 mod image_lightbox;
 mod image_memory;
 mod inbox;
-mod keep_awake;
 mod input;
+mod keep_awake;
 mod markdown;
 mod markdown_model;
 #[cfg(target_os = "macos")]
@@ -120,12 +120,10 @@ fn quit(cx: &mut App) {
         return;
     }
     hide_while_shutting_down(cx);
-    let shutdown = cx
-        .background_executor()
-        .spawn(async {
-            monocode_core::device::hub::stop();
-            monocode_core::process::shutdown_all()
-        });
+    let shutdown = cx.background_executor().spawn(async {
+        monocode_core::device::hub::stop();
+        monocode_core::process::shutdown_all()
+    });
     cx.spawn(async move |cx| {
         shutdown.await;
         cx.update(|cx| cx.quit());
@@ -149,12 +147,10 @@ fn hide_while_shutting_down(cx: &mut App) {
 /// Quit, then relaunch the same app once this process has exited.
 fn restart(cx: &mut App) {
     hide_while_shutting_down(cx);
-    let shutdown = cx
-        .background_executor()
-        .spawn(async {
-            monocode_core::device::hub::stop();
-            monocode_core::process::shutdown_all()
-        });
+    let shutdown = cx.background_executor().spawn(async {
+        monocode_core::device::hub::stop();
+        monocode_core::process::shutdown_all()
+    });
     cx.spawn(async move |cx| {
         shutdown.await;
         cx.update(|cx| cx.restart());

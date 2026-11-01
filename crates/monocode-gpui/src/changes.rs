@@ -397,7 +397,11 @@ impl Changes {
             .index
             .as_ref()
             .and_then(|i| i.branch.clone());
-        if self.cwd.is_empty() || self.cwd == "~" || monocode_core::files::is_home_project(&self.cwd) || branch.is_none() {
+        if self.cwd.is_empty()
+            || self.cwd == "~"
+            || monocode_core::files::is_home_project(&self.cwd)
+            || branch.is_none()
+        {
             self.pr = None;
             return;
         }

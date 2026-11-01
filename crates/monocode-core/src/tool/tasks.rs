@@ -603,8 +603,12 @@ impl ToolCall {
         }
     }
     pub fn agent_mut(&mut self) -> Option<&mut AgentRun> {
+        // Cache only agent panels: thread and orchestration panels are derived
+        // from the output, which a snapshot taken at tool_use would freeze.
         if self.panel.is_none() {
-            self.panel = self.panel();
+            self.panel = self
+                .panel()
+                .filter(|panel| matches!(panel, Panel::Agent(_)));
         }
         match self.panel.as_mut() {
             Some(Panel::Agent(run)) => Some(run),

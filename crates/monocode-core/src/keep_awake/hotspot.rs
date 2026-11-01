@@ -60,7 +60,11 @@ impl Hotspot {
     }
     /// Someone is back at the Mac: let it return to its usual network.
     pub fn lid_opened(&self) -> Step {
-        if self.joined { Step::Leave } else { Step::Stay }
+        if self.joined {
+            Step::Leave
+        } else {
+            Step::Stay
+        }
     }
     pub fn joined(&mut self) {
         self.joined = true;

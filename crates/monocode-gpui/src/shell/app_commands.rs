@@ -112,8 +112,12 @@ impl Shell {
                             this.started_by.insert(id, call.session);
                             this.add(summary, cx);
                             if let Some(view) = this.sessions.get(&id) {
+                                let send = !draft && !cancelled;
                                 view.update(cx, |v, cx| {
-                                    v.install_app_launch(settings, !draft && !cancelled, cx);
+                                    if send {
+                                        v.thread_sender = Some(call.session);
+                                    }
+                                    v.install_app_launch(settings, send, cx);
                                     if cancelled {
                                         v.stop_app_session(cx);
                                     }
@@ -373,7 +377,9 @@ impl Shell {
             self.finish_app_call(call, Err(error), cx);
             return;
         }
-        if call.action.starts_with("threads.") && call.action != "threads.start" {
+        if call.action.starts_with("threads.")
+            && !matches!(call.action.as_str(), "threads.start" | "threads.new")
+        {
             self.dispatch_thread_call(call, cx);
             return;
         }
@@ -414,7 +420,9 @@ impl Shell {
                 );
                 return;
             }
-            "sessions.start" | "threads.start" => {
+            // threads.new reuses sessions.start: a top-level thread the user
+            // owns, opened from a lead without the Operator grant.
+            "sessions.start" | "threads.start" | "threads.new" => {
                 let parsed = (|| {
                     let prompt = app::prompt(&input)?;
                     let kind = Kind::parse(input["harness"].as_str().unwrap_or(&provider))

@@ -369,7 +369,9 @@ pub(crate) fn provider_icon(provider: &str, side: f32) -> Div {
         "fx" => ("fx.svg", true, 1.),
         "hermes" => ("hermes.svg", true, 0.72),
         "devin" => ("devin.svg", true, 0.88),
-        _ => ("codex.svg", false, 1.),
+        "codex" => ("codex.svg", false, 1.),
+        // An unknown harness must not pass for Codex.
+        _ => ("bot", true, 0.88),
     };
     // Like React's currentColor / CSS masks, GPUI's SVG mask follows the theme.
     // Image rendering preserves brand colors but has no inherited currentColor.

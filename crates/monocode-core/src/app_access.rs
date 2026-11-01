@@ -44,6 +44,9 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
 pub fn validate_threads(action: &str, input: &Value) -> Result<(), String> {
     let fields = match action {
         "threads.start" => "prompt harness model effort modelSettings title workspaceMode",
+        "threads.new" => {
+            "prompt harness model effort modelSettings title workspaceMode draft reveal"
+        }
         "threads.send" => "threadId prompt",
         "threads.wait" => "threadId timeoutSeconds",
         "threads.read" => "threadId before limit maxChars",
@@ -57,13 +60,13 @@ pub fn validate_threads(action: &str, input: &Value) -> Result<(), String> {
             return Err(format!("{action} does not take {key}"));
         }
     }
-    if !matches!(action, "threads.start" | "threads.list")
+    if !matches!(action, "threads.start" | "threads.new" | "threads.list")
         && input["threadId"].as_i64().is_none_or(|id| id <= 0)
     {
         return Err("threadId must be a positive integer".into());
     }
     match action {
-        "threads.start" => {
+        "threads.start" | "threads.new" => {
             crate::mono::api::validate("sessions.start", input)?;
             prompt(input)?;
             for (key, max) in [

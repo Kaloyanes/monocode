@@ -62,6 +62,8 @@ struct TranscriptSurface {
   let color: UIColor
   let radius: CGFloat
   var border: UIColor? = nil
+  /// Draws `border` dashed: a message another thread sent.
+  var dashed = false
   var corners: CACornerMask = [
     .layerMinXMinYCorner, .layerMaxXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMaxYCorner,
   ]
@@ -276,9 +278,34 @@ final class TranscriptRowModel {
       }
     case "user":
       let compact = action["compact"] as? Bool == true
-      let y: CGFloat = compact ? 4 : 6
+      var y: CGFloat = compact ? 4 : 6
       let emoji = !style.agent.isEmpty && action["emojiOnly"] as? Bool == true
       let maxWidth = max(1, style.width - 76 - (emoji ? 0 : 28))
+      // Another thread sent this message: name it above the bubble, as on
+      // desktop, with its harness and whether it started this thread.
+      let sender = action["sender"] as? [String: Any]
+      if let sender, let title = sender["title"] as? String {
+        // Only the title truncates; what it did stays readable.
+        let name = string(
+          title, size: 12, line: 16, color: contentColor.withAlphaComponent(0.8), medium: true)
+        let role = string(
+          sender["started"] as? Bool == true ? " · started this thread" : " · message",
+          size: 12, line: 16, color: contentColor.withAlphaComponent(0.45))
+        let line = style.line(16)
+        let unbounded = CGFloat.greatestFiniteMagnitude
+        let roleWidth = TranscriptTypography.measure(role, width: unbounded, line: line).width
+        let nameWidth = min(
+          TranscriptTypography.measure(name, width: unbounded, line: line).width,
+          max(1, style.width - 76 - roleWidth))
+        let x = style.width - 20 - roleWidth - nameWidth
+        add(name, x: x, y: y, width: nameWidth, height: line, lines: 1)
+        add(role, x: x + nameWidth, y: y, width: roleWidth, height: line, lines: 1)
+        if let harness = sender["harness"] as? String, !harness.isEmpty {
+          let icon = 14 * style.scale
+          mark("provider:\(harness)", x: x - icon - 6, y: y + (line - icon) / 2, size: icon, alpha: 0.6)
+        }
+        y += line + 4
+      }
       let body = NSMutableAttributedString(
         attributedString: string(
           emoji ? plain.trimmingCharacters(in: .whitespacesAndNewlines) : plain,
@@ -340,9 +367,15 @@ final class TranscriptRowModel {
       bubbleRadius = measured.height <= line + 0.5 && attachments == 0 ? 21 : 14
       if !emoji {
         surfaces.append(
-          TranscriptSurface(
-            rect: cardRect, color: UIColor.transcriptHex(style.bubble), radius: bubbleRadius))
-        if !style.agent.isEmpty && !compact { tailRadius = bubbleRadius == 21 ? 18 : 14 }
+          sender == nil
+            ? TranscriptSurface(
+              rect: cardRect, color: UIColor.transcriptHex(style.bubble), radius: bubbleRadius)
+            : TranscriptSurface(
+              rect: cardRect, color: .clear, radius: bubbleRadius,
+              border: contentColor.withAlphaComponent(0.3), dashed: true))
+        if !style.agent.isEmpty && !compact && sender == nil {
+          tailRadius = bubbleRadius == 21 ? 18 : 14
+        }
       }
       if let reaction = action["reaction"] as? String {
         let value = string(reaction, size: 11, line: 14, color: contentColor)

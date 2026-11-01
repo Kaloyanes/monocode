@@ -270,7 +270,11 @@ impl SettingsView {
 }
 impl SettingsView {
     /// The footer pill's defaults (macOS only).
-    fn keep_awake_rows(&mut self, p: &crate::settings::Preferences, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn keep_awake_rows(
+        &mut self,
+        p: &crate::settings::Preferences,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         if !crate::keep_awake::KeepAwake::supported() {
             return Vec::new();
         }
@@ -287,7 +291,9 @@ impl SettingsView {
                     let label = if m == 0 {
                         "None".to_string()
                     } else {
-                        monocode_core::keep_awake::length(std::time::Duration::from_secs(u64::from(m) * 60))
+                        monocode_core::keep_awake::length(std::time::Duration::from_secs(
+                            u64::from(m) * 60,
+                        ))
                     };
                     (m.to_string(), label.into(), None)
                 })

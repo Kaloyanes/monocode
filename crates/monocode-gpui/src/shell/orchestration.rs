@@ -6,7 +6,7 @@ use super::*;
 use crate::transcript::orchestration::{Action, OrchestrationAction, Phase, RunView, TaskView};
 use monocode_core::{
     agent::Settings,
-    orchestration::{self, Outcome, Run, State, Summary},
+    orchestration::{self, Outcome, Run, State, Summary, Team},
 };
 use std::time::Duration;
 
@@ -28,6 +28,9 @@ pub(super) struct Runs {
     launches: HashMap<i64, u64>,
     /// Leads whose automatic report was tried for their current run.
     report_tried: HashSet<i64>,
+    /// The team each lead picked for its next run. Kept after starting, so the
+    /// next plan of that chat begins with the same choice.
+    teams: HashMap<i64, Team>,
 }
 impl Runs {
     /// Saved runs come back paused: nothing ran while the app was closed.
@@ -155,6 +158,14 @@ impl Shell {
             Action::Remove(id) if reviewed => {
                 view.update(cx, |v, cx| v.remove_plan_task(&id, cx));
             }
+            Action::Team(team) if reviewed => match team {
+                Some(team) => {
+                    self.orchestrations.teams.insert(lead, team);
+                }
+                None => {
+                    self.orchestrations.teams.remove(&lead);
+                }
+            },
             Action::Stop if current => self.stop_orchestration(lead, cx),
             Action::Resume if current => self.resume_orchestration(lead, cx),
             Action::Retry(ix) if current => self.retry_assignment(lead, ix, cx),
@@ -222,7 +233,8 @@ impl Shell {
             cwd,
             conversation.summary.provider.clone(),
             worker_settings(conversation),
-        );
+        )
+        .with_team(self.orchestrations.teams.get(&lead).copied());
         let runs = self.orchestrations.by_lead.entry(lead).or_default();
         runs.push(run);
         if runs.len() > KEPT_RUNS {
@@ -232,7 +244,7 @@ impl Shell {
         self.schedule_orchestration(lead, cx);
     }
 
-    fn stop_orchestration(&mut self, lead: i64, cx: &mut Context<Self>) {
+    pub(super) fn stop_orchestration(&mut self, lead: i64, cx: &mut Context<Self>) {
         let Some(run) = self.orchestrations.latest_mut(lead) else {
             return;
         };
@@ -383,6 +395,8 @@ impl Shell {
             let outside = orchestration::outside_scope(&run.plan.tasks[ix], &run.cwd, &edited);
             run.tasks[ix].outside_scope = outside;
             run.finish(ix, outcome, &report);
+            // A tiered worker that failed mid-run is replaced by a stronger one.
+            run.escalate(ix);
         }
     }
 
@@ -535,11 +549,11 @@ impl Shell {
             }
             _ => run.provider.clone(),
         };
-        if let Some(model) = &task.model {
-            settings.model = Some(model.clone());
+        if let Some(model) = run.model_for(ix) {
+            settings.model = Some(model);
             settings.model_settings.clear();
         }
-        let prompt = orchestration::worker_prompt(&task, &run.dependency_reports(ix));
+        let prompt = run.worker_prompt(ix);
         let store = self.store.clone();
         let work = cx.background_executor().spawn(async move {
             let root = std::path::Path::new(&cwd)
@@ -594,7 +608,7 @@ impl Shell {
                             let before = view.read(cx).turn_generation();
                             view.update(cx, |v, cx| {
                                 v.managed = true;
-                                v.install_transfer(settings, Some(prompt), cx)
+                                v.install_lead_transfer(settings, Some(prompt), cx)
                             });
                             this.watch_launch(lead, id, before, cx);
                         }
@@ -634,7 +648,7 @@ impl Shell {
         let prompt = if task.launched {
             orchestration::CONTINUE_PROMPT.to_owned()
         } else {
-            orchestration::worker_prompt(&run.plan.tasks[ix], &run.dependency_reports(ix))
+            run.worker_prompt(ix)
         };
         let failure = match self.ensure_session(session, cx) {
             None => Some("The worker chat no longer exists."),
@@ -738,7 +752,7 @@ impl Shell {
                                 .unwrap_or_else(|| run.provider.clone()),
                             model: worker
                                 .map(|w| w.driver_label())
-                                .or_else(|| task.model.clone())
+                                .or_else(|| run.model_for(ix))
                                 .or_else(|| run.settings.model.clone())
                                 .unwrap_or_default(),
                             steps: if running || state.state.settled() {
@@ -761,6 +775,7 @@ impl Shell {
                         plan: run.plan.clone(),
                         phase,
                         tasks,
+                        team: run.team,
                     },
                 )
             })
@@ -774,6 +789,7 @@ impl Shell {
                     Phase::Review { blocked },
                     &conversation.summary.provider,
                     &conversation.driver_label(),
+                    self.orchestrations.teams.get(&lead).copied(),
                 ),
             ));
         }
@@ -832,6 +848,7 @@ mod tests {
                     depends_on: Vec::new(),
                     provider: None,
                     model: None,
+                    difficulty: None,
                 })
                 .collect(),
         }
@@ -892,6 +909,54 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_team_chosen_on_the_review_card_sets_each_claude_workers_model(cx: &mut TestAppContext) {
+        let (window, _, lead) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&lead].update(cx, |v, cx| {
+                    v.install_transfer(Settings::default(), None, cx);
+                    v.summary.provider = "claude".into();
+                    let mut plan = plan(&["src", "tests"]);
+                    plan.tasks[0].difficulty = Some(9);
+                    plan.tasks[1].difficulty = Some(2);
+                    v.orchestration_plan = Some((Some("call-1".into()), plan));
+                });
+                let pick = |shell: &mut Shell, call: &str, team, cx: &mut Context<Shell>| {
+                    shell.orchestration_action(
+                        lead,
+                        OrchestrationAction {
+                            call: call.into(),
+                            action: Action::Team(team),
+                        },
+                        cx,
+                    )
+                };
+                // A card that is not the plan under review changes nothing.
+                pick(shell, "other-call", Some(Team::Strong), cx);
+                assert_eq!(shell.orchestrations.teams.get(&lead), None);
+                pick(shell, "call-1", Some(Team::Balanced), cx);
+                assert_eq!(shell.orchestrations.teams.get(&lead), Some(&Team::Balanced));
+                pick(shell, "call-1", None, cx);
+                assert_eq!(shell.orchestrations.teams.get(&lead), None);
+                pick(shell, "call-1", Some(Team::Cheap), cx);
+                shell.start_orchestration(lead, cx);
+                let run = shell.orchestrations.latest(lead).unwrap();
+                assert_eq!(run.team, Some(Team::Cheap));
+                assert_eq!(run.model_for(0).as_deref(), Some("sonnet"), "level 9");
+                assert_eq!(run.model_for(1).as_deref(), Some("haiku"), "level 2");
+                // The choice cannot change once the run has started.
+                pick(shell, "call-1", Some(Team::Strong), cx);
+                assert_eq!(
+                    shell.orchestrations.latest(lead).unwrap().team,
+                    Some(Team::Cheap)
+                );
+                shell.stop_orchestration(lead, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
     }
 
     #[gpui::test]

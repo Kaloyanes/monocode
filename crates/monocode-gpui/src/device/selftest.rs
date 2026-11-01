@@ -51,22 +51,18 @@ impl Render for Root {
             .when(animate, |d| {
                 // GPUI's own animation, which asks for every display frame.
                 d.child(
-                    div()
-                        .relative()
-                        .w(px(240.))
-                        .h(px(24.))
-                        .child(
-                            div()
-                                .absolute()
-                                .size(px(24.))
-                                .rounded_full()
-                                .bg(gpui::rgb(0x4da3f5))
-                                .with_animation(
-                                    "selftest-dot",
-                                    gpui::Animation::new(Duration::from_secs(1)).repeat(),
-                                    |dot, delta| dot.left(px(216. * delta)),
-                                ),
-                        ),
+                    div().relative().w(px(240.)).h(px(24.)).child(
+                        div()
+                            .absolute()
+                            .size(px(24.))
+                            .rounded_full()
+                            .bg(gpui::rgb(0x4da3f5))
+                            .with_animation(
+                                "selftest-dot",
+                                gpui::Animation::new(Duration::from_secs(1)).repeat(),
+                                |dot, delta| dot.left(px(216. * delta)),
+                            ),
+                    ),
                 )
             })
             .child(
@@ -74,7 +70,10 @@ impl Render for Root {
                     |_, _, _| (),
                     move |_, _, _, _| {
                         stats.draws.set(stats.draws.get() + 1);
-                        stats.frame_times.borrow_mut().push(render_started.elapsed());
+                        stats
+                            .frame_times
+                            .borrow_mut()
+                            .push(render_started.elapsed());
                     },
                 )
                 .flex_1()
@@ -155,10 +154,17 @@ pub(crate) fn run() {
                     }
                 }
             });
-            panel.update(cx, |panel, cx| panel.set_shown(true, cx));
             cx.spawn(async move |cx| {
                 let executor = cx.background_executor().clone();
                 let timer = |ms: u64| executor.timer(Duration::from_millis(ms));
+                // `_PREWARM` readies the hub as app launch does when a device
+                // runs, then opens the panel.
+                if std::env::var_os("MONOCODE_DEVICE_SELFTEST_PREWARM").is_some() {
+                    let started = Instant::now();
+                    executor.spawn(async { hub::prewarm() }).await;
+                    println!("{}", json!({"prewarmMs": started.elapsed().as_millis()}));
+                }
+                panel.update(cx, |panel, cx| panel.set_shown(true, cx));
                 let waited = Instant::now();
                 loop {
                     if baseline {
@@ -197,6 +203,20 @@ pub(crate) fn run() {
                 );
                 // Let the first frames and the panel's own updates settle.
                 timer(1500).await;
+                // Switching to another tab and back.
+                panel.update(cx, |panel, cx| panel.set_shown(false, cx));
+                timer(1000).await;
+                panel.update(cx, |panel, cx| panel.set_shown(true, cx));
+                let reshown = Instant::now();
+                loop {
+                    let streaming = panel.read_with(cx, |p, _| p.live.as_ref().is_some_and(|l| l.streaming));
+                    if streaming || reshown.elapsed() > Duration::from_secs(30) {
+                        break;
+                    }
+                    timer(10).await;
+                }
+                println!("{}", json!({"reshownStreamingAfterMs": reshown.elapsed().as_millis()}));
+                timer(500).await;
                 for (name, animated, swiping) in [
                     ("still", false, false),
                     ("swiping", false, true),

@@ -290,7 +290,10 @@ mod tests {
     use super::*;
 
     fn draft() -> SharedDraft {
-        SharedDraft::new(DraftContent::Html("<p>x</p>".into()), Some("Pricing".into()))
+        SharedDraft::new(
+            DraftContent::Html("<p>x</p>".into()),
+            Some("Pricing".into()),
+        )
     }
     fn values(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
@@ -389,24 +392,43 @@ mod tests {
         assert!(!draft.tell(Vec::new()));
         assert!(draft.tell(vec!["Use this one".into()]));
         assert_eq!(draft.signal(), Some("message"));
-        assert_eq!(draft.take_outbox().messages, vec!["Use this one".to_string()]);
+        assert_eq!(
+            draft.take_outbox().messages,
+            vec!["Use this one".to_string()]
+        );
     }
 
     #[test]
     fn a_pin_keeps_the_element_it_was_placed_on_and_the_agent_never_sees_it() {
         let mut draft = draft();
         let anchored = |path: &str, ax: f64| Feedback {
-            at: Some(Anchor { path: path.into(), ax, ay: 0.5 }),
+            at: Some(Anchor {
+                path: path.into(),
+                ax,
+                ay: 0.5,
+            }),
             ..note("Bigger")
         };
         draft.pin(
-            vec![anchored("0.2.1", 0.25), anchored("0.x", 0.5), anchored("1", 1.5)],
+            vec![
+                anchored("0.2.1", 0.25),
+                anchored("0.x", 0.5),
+                anchored("1", 1.5),
+            ],
             Side::Phone,
         );
         let pins: Vec<_> = draft.pins().iter().map(|pin| pin.at.clone()).collect();
         assert_eq!(
             pins,
-            [Some(Anchor { path: "0.2.1".into(), ax: 0.25, ay: 0.5 }), None, None]
+            [
+                Some(Anchor {
+                    path: "0.2.1".into(),
+                    ax: 0.25,
+                    ay: 0.5
+                }),
+                None,
+                None
+            ]
         );
         assert!(draft.pending().iter().all(|note| note.at.is_none()));
         assert_eq!(draft.summary()["pins"][0]["at"]["path"], "0.2.1");

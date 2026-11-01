@@ -87,8 +87,10 @@ impl RightTab {
     pub(crate) fn normalize(order: &[RightTab]) -> Vec<RightTab> {
         let mut out = Vec::new();
         for tab in order.iter().chain(&[Self::Files, Self::Graph]) {
-            if !matches!(tab, Self::Terminal | Self::Changes | Self::Plan | Self::Device)
-                && !out.contains(tab)
+            if !matches!(
+                tab,
+                Self::Terminal | Self::Changes | Self::Plan | Self::Device
+            ) && !out.contains(tab)
             {
                 out.push(*tab);
             }
@@ -426,8 +428,7 @@ impl RightPanel {
             h.set_enabled(shown && tab == RightTab::Graph, cx)
         });
         let device = shown && tab == RightTab::Device && self.device_tab;
-        self.device
-            .update(cx, |d, cx| d.set_shown(device, cx));
+        self.device.update(cx, |d, cx| d.set_shown(device, cx));
     }
     pub(crate) fn focus_pane(&self, window: &mut Window, cx: &mut App) {
         let focus = match (self.shown, self.tab) {

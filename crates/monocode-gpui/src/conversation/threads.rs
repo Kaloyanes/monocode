@@ -74,6 +74,24 @@ impl Conversation {
         }
         self.launch_prompt(prompt, cx);
     }
+    /// Starts a turn with a message another thread sent, recording that
+    /// thread as the turn's sender.
+    pub(crate) fn send_thread_message(
+        &mut self,
+        prompt: String,
+        sender: i64,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.history_ready() {
+            self.defer_history_action(
+                move |this, cx| this.send_thread_message(prompt, sender, cx),
+                cx,
+            );
+            return;
+        }
+        self.thread_sender = Some(sender);
+        self.launch_prompt(prompt, cx);
+    }
     pub(super) fn provider_environment(
         &self,
         settings: &Settings,
@@ -105,24 +123,45 @@ impl Conversation {
         );
         environment
     }
+    /// Where a subagent's composer would be: who drives it, and Stop.
+    /// Its approvals still show above this, so the user can answer them.
     pub(super) fn thread_composer(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let lead = self.driven_by.expect("thread composer requires a lead");
-        let driver = if self.thread_driver.is_empty() {
-            "The lead".to_owned()
+        let lead = if self.thread_lead_title.is_empty() {
+            "its lead".to_owned()
         } else {
-            self.thread_driver.clone()
+            self.thread_lead_title.clone()
         };
-        div().id("thread-locked-composer").debug_selector(||"thread-locked-composer".into()).role(gpui::Role::Group)
-                .aria_label("Read-only child thread").flex().items_center().gap_2().p_3()
-                .border_t_1().border_color(content(0.1))
-                .child(icon("lock", 14.).text_color(content(0.5)))
-                .child(div().flex_1().min_w_0().text_size(px(12.)).text_color(content(0.6))
-                    .child(format!("{driver} is driving this thread from {}. You can read it but not send messages.", self.thread_lead_title)))
-                .child(crate::settings::widgets::secondary_button("thread-open-lead", "Open lead", false, false)
-                    .child("Open lead").on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenThread(lead)))))
-                .when(self.busy, |d| d.child(crate::settings::widgets::secondary_button("thread-stop", "Stop", true, false)
-                    .child("Stop").on_click(cx.listener(|this, _, _, cx| this.stop_app_session(cx)))))
-                .into_any_element()
+        div()
+            .id("thread-locked-composer")
+            .debug_selector(|| "thread-locked-composer".into())
+            .role(gpui::Role::Group)
+            .aria_label("Subagent")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2p5()
+            .border_t_1()
+            .border_color(content(0.08))
+            .child(icon("lock", 14.).text_color(content(0.5)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(content(0.6))
+                    .child(format!(
+                        "Subagent of {lead}. Its replies go back to the lead."
+                    )),
+            )
+            .when(self.busy, |d| {
+                d.child(
+                    crate::settings::widgets::secondary_button("thread-stop", "Stop", true, false)
+                        .child("Stop")
+                        .on_click(cx.listener(|this, _, _, cx| this.stop_app_session(cx))),
+                )
+            })
+            .into_any_element()
     }
 }
 

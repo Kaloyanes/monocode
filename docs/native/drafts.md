@@ -1,8 +1,8 @@
 # Drafts
 
-An agent can build a live page inside the conversation, look at it, and let
-you use it. The page is a card in the thread at the point where the agent made
-it: a WebKit view hosted in MonoCode's own window (macOS only), clipped to the
+An agent can build a live page, look at it out of sight, and then publish it
+for you to use. The page is a card in the thread at the point where the agent
+published it: a WebKit view hosted in MonoCode's own window (macOS only), clipped to the
 transcript as it scrolls. It is not a side panel and not a separate window.
 Native visuals (`visual_show`) are unchanged; see [session visuals](visuals.md).
 
@@ -27,8 +27,8 @@ a draft, or `draft` to continue one, with an optional `action`:
 | Action | Effect |
 | --- | --- |
 | `{kind:"snapshot"}` (default) | Look again, optionally at a new `width`, `height` or `appearance` |
-| `{kind:"click", reference}` | Click a control by the ref from the last snapshot |
-| `{kind:"type", text, replace}` | Type into the focused input |
+| `{kind:"click", reference}` | Click a control by its ref; a ref lasts as long as its element is on the page |
+| `{kind:"type", text, reference?, replace}` | Type into the field with that ref, or the focused one |
 | `{kind:"resume"}` | Take control back after the person had it |
 | `{kind:"close"}` | Close the draft |
 
@@ -62,8 +62,14 @@ from the page itself:
 
 ## Behavior
 
-- A new draft first publishes its card into the running turn (the bridge picks
-  the draft's id). Each agent request holds a lease on the page, so it opens
+- A new draft runs out of sight (the bridge picks its id) until the agent
+  shows it: `draft_preview` with `publish: true`, `draft_wait` or
+  `draft_keep`. The bridge then puts its card into the running turn once that
+  call's page has answered, so a failed call adds no card, and a failed first
+  call closes the new draft and deletes its file. Later versions of a shown
+  draft appear in its card as they come. Drafts never shown get their cards
+  when the turn ends (`Server::unpublished`, added by the runtime after the
+  provider exits). Each agent request holds a lease on the page, so it opens
   and runs whether or not the card is on screen: WebKit parks the view clear
   and out of the pointer's way in the window, Chromium runs its tab off
   screen. If Chromium gives up while the agent waits (it is tried three
@@ -76,8 +82,8 @@ from the page itself:
 - The app saves every draft as it changes (page, title, size, appearance and
   `mc.state`) in `threads/<session>/drafts/<id>.json` beside the
   conversation's other files. After a restart a card whose page is not open
-  opens it again from there the first time the card is drawn, under the same
-  id, so the agent can keep working with it. Closing a draft deletes its file;
+  opens it again from there the first time the card is drawn or the agent
+  sends to it, under the same id. A retired draft comes back the same way. Closing a draft deletes its file;
   deleting the conversation deletes the folder.
 - Agent clicks and typing are sent as script events. They never take focus from
   the user's composer. When the person clicks or types in the page they have

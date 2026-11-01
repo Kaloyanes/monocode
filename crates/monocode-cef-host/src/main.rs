@@ -200,14 +200,27 @@ fn id_of(value: &Value) -> Option<u64> {
     value.as_u64().or_else(|| value["id"].as_u64())
 }
 
-fn with_host(id: u64, act: impl FnOnce(&BrowserHost, &Open)) {
-    BROWSERS.with_borrow(|browsers| {
-        if let Some(open) = browsers.get(&id)
-            && let Some(host) = open.browser.host()
-        {
-            act(&host, open);
-        }
+/// The size and scale a browser renders at, shared with its render handler.
+struct Geometry {
+    size: StdRc<Cell<(i32, i32)>>,
+    scale: StdRc<Cell<f32>>,
+}
+
+/// Runs `act` on a browser's host outside the `BROWSERS` borrow: CEF calls
+/// back into handlers synchronously (a forced close runs `on_before_close`,
+/// which removes the browser), and a borrow held across that panics.
+fn with_host(id: u64, act: impl FnOnce(&BrowserHost, &Geometry)) {
+    let found = BROWSERS.with_borrow(|browsers| {
+        let open = browsers.get(&id)?;
+        let geometry = Geometry {
+            size: open.size.clone(),
+            scale: open.scale.clone(),
+        };
+        Some((open.browser.host()?, geometry))
     });
+    if let Some((host, geometry)) = found {
+        act(&host, &geometry);
+    }
 }
 
 /// Runs one command from the app on the UI thread.

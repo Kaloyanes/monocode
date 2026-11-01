@@ -88,6 +88,24 @@ impl Conversation {
         )
     }
 
+    /// Puts a message that was never sent back ahead of anything typed since.
+    fn return_to_composer(
+        &mut self,
+        prompt: String,
+        files: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let typed = self.input.read(cx).content.to_string();
+        let text = if typed.trim().is_empty() {
+            prompt
+        } else {
+            format!("{prompt}\n\n{typed}")
+        };
+        self.attachments.splice(0..0, files);
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+        self.save_composer_draft(cx);
+    }
+
     /// `then` is the prompt to send once compaction settles. Whatever happens
     /// to compaction, the message is never dropped.
     fn compact_context_then(&mut self, then: Option<String>, cx: &mut Context<Self>) {
@@ -191,6 +209,19 @@ impl Conversation {
         self.transcript.update(cx, |view, cx| {
             view.patch(compact_start, vec![compact_row.clone()], cx);
         });
+        // The sent message has left the composer; until the summary is written
+        // it waits in the thread, and files attached meanwhile stay behind.
+        if let Some(prompt) = &then {
+            self.compacting_prompt = Some(crate::transcript::PendingMessage {
+                id: format!("compacting-{generation}"),
+                text: prompt.clone().into(),
+                error: None,
+                sent_at: Some(monocode_core::time::now_ms()),
+                attachments: std::mem::take(&mut self.attachments),
+                caption: Some("Sends once context is compacted".into()),
+            });
+            self.sync_steers(cx);
+        }
         let compact_draft = self.input.read(cx).content.clone();
         let clear_command = compact_draft.trim().eq_ignore_ascii_case("/compact");
         let store = self.store.clone();
@@ -257,6 +288,14 @@ impl Conversation {
             let (result, context, commands, compact_row) = work.await;
             let _ = this.update(cx, |this, cx| {
                 if this.submission_generation != generation {
+                    // A newer turn took over; its held message goes back unsent.
+                    if let Some(held) = this
+                        .compacting_prompt
+                        .take_if(|held| held.id == format!("compacting-{generation}"))
+                    {
+                        this.sync_steers(cx);
+                        this.return_to_composer(held.text.into(), held.attachments, cx);
+                    }
                     return;
                 }
                 this.busy = false;
@@ -287,9 +326,24 @@ impl Conversation {
                     Err(error) if error == "Stopped" => "Ready".into(),
                     Err(error) => error,
                 };
-                if let Some(prompt) = then.filter(|_| !stopped) {
+                let held = this.compacting_prompt.take();
+                if held.is_some() {
+                    this.sync_steers(cx);
+                }
+                let held_files = held.map(|held| held.attachments).unwrap_or_default();
+                if let Some(prompt) = then {
+                    if stopped {
+                        // Stop keeps the message unsent, back in the composer.
+                        this.return_to_composer(prompt, held_files, cx);
+                        cx.emit(SessionChanged);
+                        cx.notify();
+                        return;
+                    }
                     // A failed summary still sends the message, with full history.
+                    let composer_files = std::mem::replace(&mut this.attachments, held_files);
                     this.with_modes(modes, |this| this.start_prompt(prompt, cx));
+                    let unsent = std::mem::replace(&mut this.attachments, composer_files);
+                    this.attachments.splice(0..0, unsent);
                     cx.emit(SessionChanged);
                     cx.notify();
                     return;

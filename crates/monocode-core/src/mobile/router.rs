@@ -1,7 +1,7 @@
 //! Automatic NAT-PMP/UPnP UDP mapping so a phone can reach the desktop away
 //! from its network.
-use super::host::MobileHost;
 use super::host::listen_port;
+use super::host::MobileHost;
 use monocode_mobile_link::Address;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
@@ -129,7 +129,10 @@ fn map() -> Result<Mapping, String> {
     }
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     socket.connect(gateway.addr).map_err(|e| e.to_string())?;
-    let local = SocketAddr::new(socket.local_addr().map_err(|e| e.to_string())?.ip(), listen_port());
+    let local = SocketAddr::new(
+        socket.local_addr().map_err(|e| e.to_string())?.ip(),
+        listen_port(),
+    );
     let port = gateway
         .add_any_port(
             igd_next::PortMappingProtocol::UDP,

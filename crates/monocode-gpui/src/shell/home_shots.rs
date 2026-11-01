@@ -85,7 +85,7 @@ fn home_shots() {
     window
         .update(&mut cx, |shell, _, _| {
             assert_eq!(shell.workspace.projects[0], home);
-            assert_eq!(shell.project_label(&home), "Home");
+            assert_eq!(shell.project_label(&home), "No project");
         })
         .unwrap();
     shot(&mut cx, "0-home");

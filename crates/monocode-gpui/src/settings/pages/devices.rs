@@ -104,17 +104,6 @@ impl SettingsView {
                         Vec::new(),
                     ),
                     self.row(None, false, "Android SDK", Some(android), Vec::new()),
-                    self.row(
-                        None,
-                        false,
-                        "scrcpy",
-                        Some(if doctor.scrcpy {
-                            "Installed. Android Emulators stream with it.".into()
-                        } else {
-                            "Optional. With it, Android Emulators stream more smoothly. Install it with `brew install scrcpy`.".into()
-                        }),
-                        Vec::new(),
-                    ),
                 ]
             }
         };
@@ -135,7 +124,13 @@ impl SettingsView {
                 } else {
                     "Not installed.".into()
                 };
-                self.row(None, index == 0, tool.label(), Some(description), Vec::new())
+                self.row(
+                    None,
+                    index == 0,
+                    tool.label(),
+                    Some(description),
+                    Vec::new(),
+                )
             })
             .collect();
         if let Some(error) = error {

@@ -73,6 +73,9 @@ pub enum DraftAction {
         text: String,
         #[serde(default)]
         replace: bool,
+        /// The field to type into; without it, the focused one.
+        #[serde(default)]
+        reference: Option<String>,
     },
     Resume,
     /// Patch the page's `mc.state`, the way its own controls would.
@@ -207,7 +210,11 @@ impl DraftRequest {
             DraftAction::Type { text, .. } if text.len() > 4096 => {
                 return Err("Text exceeds 4096 bytes".into());
             }
-            DraftAction::Click { reference } if reference.is_empty() || reference.len() > 96 => {
+            DraftAction::Click { reference }
+            | DraftAction::Type {
+                reference: Some(reference),
+                ..
+            } if reference.is_empty() || reference.len() > 96 => {
                 return Err("Invalid element reference".into());
             }
             DraftAction::Set { values } if values.is_empty() => {
@@ -656,6 +663,12 @@ mod tests {
             DraftAction::Type { replace: true, .. }
         ));
         assert!(matches!(
+            parse(json!({"draft":"a","action":{"kind":"type","text":"Ada","reference":"k3-2"}}))
+                .unwrap()
+                .action,
+            DraftAction::Type { reference: Some(r), replace: false, .. } if r == "k3-2"
+        ));
+        assert!(matches!(
             parse(json!({"draft":"a","action":{"kind":"keep","title":"Pricing"}}))
                 .unwrap()
                 .action,
@@ -672,6 +685,7 @@ mod tests {
             json!({"draft":"a","width":0}),
             json!({"draft":"a","appearance":"sepia"}),
             json!({"draft":"a","action":{"kind":"type","text":"x".repeat(4097)}}),
+            json!({"draft":"a","action":{"kind":"type","text":"x","reference":""}}),
         ] {
             assert!(
                 parse(input.clone()).is_err(),

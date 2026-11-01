@@ -125,7 +125,14 @@ pub fn quick_start(device: &Device, launcher: &std::path::Path, session: &str) -
     };
     let executable = quote(&launcher.to_string_lossy());
     let target_args = match device.platform {
-        Platform::Ios => vec!["--platform", "ios", "--udid", &device.id, "--session", session],
+        Platform::Ios => vec![
+            "--platform",
+            "ios",
+            "--udid",
+            &device.id,
+            "--session",
+            session,
+        ],
         Platform::Android => vec![
             "--platform",
             "android",
@@ -141,7 +148,9 @@ pub fn quick_start(device: &Device, launcher: &std::path::Path, session: &str) -
         .collect::<Vec<_>>()
         .join(" ");
     let first_use = match device.platform {
-        Platform::Ios => "First use builds an XCTest runner and can take a couple of minutes; later commands are fast.",
+        Platform::Ios => {
+            "First use builds an XCTest runner and can take a couple of minutes; later commands are fast."
+        }
         Platform::Android => "The Android snapshot helper installs itself on first use.",
     };
     let guide = [
@@ -153,8 +162,12 @@ pub fn quick_start(device: &Device, launcher: &std::path::Path, session: &str) -
             "Drive it with {executable}. Use this exact path; a login shell may reset PATH. Always pass {target}."
         ),
         "Typical loop:".into(),
-        format!("  {executable} open <bundle-or-package-id> {target}     # or: open <app> <deep-link-url>"),
-        format!("  {executable} snapshot -i {target}                     # accessibility tree with @eN refs"),
+        format!(
+            "  {executable} open <bundle-or-package-id> {target}     # or: open <app> <deep-link-url>"
+        ),
+        format!(
+            "  {executable} snapshot -i {target}                     # accessibility tree with @eN refs"
+        ),
         format!("  {executable} click @e3 {target}"),
         format!("  {executable} fill @e5 \"text\" {target}"),
         format!("  {executable} install <app> <path-to-.app-or-.apk> {target}"),
@@ -173,11 +186,27 @@ pub fn quick_start(device: &Device, launcher: &std::path::Path, session: &str) -
 
 /// agent-device scopes its session to this name: one per thread and device.
 /// The app actions agents reach through the MonoCode MCP server.
-pub const ACTIONS: [&str; 4] = [
+pub const ACTIONS: [&str; 5] = [
     "devices.list",
     "devices.open",
     "devices.screenshot",
     "devices.close",
+    "devices.set",
+];
+
+/// What `devices.set` changes on an iOS Simulator: serve-sim's names for
+/// its settings, and the simulated location.
+pub const SETTINGS: [&str; 10] = [
+    "appearance",
+    "text-size",
+    "color-filter",
+    "liquid-glass",
+    "reduce-motion",
+    "increase-contrast",
+    "reduce-transparency",
+    "voiceover",
+    "show-borders",
+    "location",
 ];
 
 /// Refuses input the app would not act on, before it crosses the bridge.
@@ -186,6 +215,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "devices.list" => &[],
         "devices.open" => &["device", "platform"],
         "devices.screenshot" | "devices.close" => &["device"],
+        "devices.set" => &["device", "setting", "value"],
         _ => return Err("Unknown device action".into()),
     };
     let object = input.as_object().ok_or("Input must be an object")?;
@@ -199,7 +229,10 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         if device.trim().is_empty() || device.len() > 256 {
             return Err("device must be 1 to 256 characters".into());
         }
-    } else if action != "devices.list" && action != "devices.screenshot" {
+    } else if !matches!(
+        action,
+        "devices.list" | "devices.screenshot" | "devices.set"
+    ) {
         return Err(format!("{action} needs device"));
     }
     if let Some(platform) = object.get("platform") {
@@ -207,12 +240,32 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             return Err("platform must be ios or android".into());
         }
     }
+    if action == "devices.set" {
+        let setting = object
+            .get("setting")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !SETTINGS.contains(&setting) {
+            return Err(format!("setting must be one of {}", SETTINGS.join(", ")));
+        }
+        let value = object
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if value.trim().is_empty() || value.len() > 64 {
+            return Err("value must be 1 to 64 characters".into());
+        }
+    }
     Ok(())
 }
 
 /// The device `query` names: an id, else a name ("iPhone 17 Pro"), on
 /// `platform` when given. A booted match wins over one that is off.
-pub fn resolve<'a>(list: &'a DeviceList, query: &str, platform: Option<Platform>) -> Option<&'a Device> {
+pub fn resolve<'a>(
+    list: &'a DeviceList,
+    query: &str,
+    platform: Option<Platform>,
+) -> Option<&'a Device> {
     let query = query.trim();
     let candidates = || {
         list.devices
@@ -277,12 +330,45 @@ mod tests {
         };
         assert_eq!(resolve(&list, "A", None).unwrap().id, "A");
         assert_eq!(resolve(&list, "iphone 17", None).unwrap().id, "B");
-        assert_eq!(resolve(&list, "Pixel 9", Some(Platform::Android)).unwrap().id, "emulator-5554");
+        assert_eq!(
+            resolve(&list, "Pixel 9", Some(Platform::Android))
+                .unwrap()
+                .id,
+            "emulator-5554"
+        );
         assert!(resolve(&list, "Pixel 9", Some(Platform::Ios)).is_none());
         assert!(validate("devices.open", &json!({})).is_err());
         assert!(validate("devices.open", &json!({"device":"A","x":1})).is_err());
         assert!(validate("devices.screenshot", &json!({})).is_ok());
         assert!(validate("devices.open", &json!({"device":"A","platform":"web"})).is_err());
+    }
+
+    #[test]
+    fn device_settings_name_a_known_setting_and_a_value() {
+        assert!(
+            validate(
+                "devices.set",
+                &json!({"setting":"appearance","value":"dark"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                "devices.set",
+                &json!({"device":"B","setting":"location","value":"35.6,139.6"})
+            )
+            .is_ok()
+        );
+        assert!(validate("devices.set", &json!({"setting":"volume","value":"1"})).is_err());
+        assert!(validate("devices.set", &json!({"setting":"appearance"})).is_err());
+        assert!(validate("devices.set", &json!({"setting":"appearance","value":" "})).is_err());
+        assert!(
+            validate(
+                "devices.set",
+                &json!({"setting":"appearance","value":"dark","x":1})
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -298,7 +384,9 @@ mod tests {
         };
         let value = quick_start(
             &device,
-            std::path::Path::new("/Users/me/Library/Application Support/MonoCode/devices/bin/agent-device"),
+            std::path::Path::new(
+                "/Users/me/Library/Application Support/MonoCode/devices/bin/agent-device",
+            ),
             "mc-1",
         );
         let text = value["quickStart"].as_str().unwrap();

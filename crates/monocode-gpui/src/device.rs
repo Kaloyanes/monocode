@@ -8,10 +8,12 @@
 mod http;
 #[cfg(target_os = "macos")]
 mod screen;
-mod shelf;
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub(crate) mod selftest;
+mod shelf;
+pub(crate) mod sim;
 mod stream;
+mod tools;
 
 /// Debug builds count what GPUI does for the device, so the self-test can
 /// show it does nothing per video frame.
@@ -35,8 +37,7 @@ use gpui::{
     prelude::*, px,
 };
 use monocode_core::device::{
-    self, Device, DeviceList, Platform,
-    hub,
+    self, Device, DeviceList, Platform, hub,
     protocol::Button,
     toolchain::{self, Tool},
 };
@@ -44,6 +45,8 @@ use stream::{Event, Input};
 
 pub(crate) enum DeviceEvent {
     OpenSettings,
+    /// Screenshots or a recording to add to the message being written.
+    Attach(Vec<std::path::PathBuf>),
 }
 
 /// What the hub is doing, as far as this panel knows.
@@ -96,7 +99,17 @@ pub(crate) struct DevicePanel {
     menu_anchor: crate::popover::AnchorSlot,
     /// A failed create, delete or shutdown, shown above the shelf.
     notice: Option<String>,
+    /// Closes the stream a while after the panel hides; dropped when it
+    /// shows again first.
+    hide: Option<Task<()>>,
+    /// The tool rail beside an iOS Simulator.
+    tools: tools::Tools,
 }
+
+/// How long a hidden panel keeps its stream, so switching tabs and back
+/// shows the device at once instead of reconnecting (about a second and a
+/// half). Hidden, its view is off screen and GPUI does no work for it.
+const KEEP_HIDDEN: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl EventEmitter<DeviceEvent> for DevicePanel {}
 impl Focusable for DevicePanel {
@@ -132,6 +145,8 @@ impl DevicePanel {
             menu: None,
             menu_anchor: Default::default(),
             notice: None,
+            hide: None,
+            tools: tools::Tools::default(),
         }
     }
 
@@ -143,9 +158,17 @@ impl DevicePanel {
         }
         self.shown = shown;
         if shown {
+            self.hide = None;
             self.activate(cx);
-        } else {
-            self.disconnect();
+        } else if self.live.is_some() {
+            self.hide = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(KEEP_HIDDEN).await;
+                let _ = this.update(cx, |this, _| {
+                    if !this.shown {
+                        this.disconnect();
+                    }
+                });
+            }));
         }
         cx.notify();
     }
@@ -155,6 +178,12 @@ impl DevicePanel {
             return;
         }
         if self.list.is_none() && !self.listing {
+            // The last list shows the shelf, and connects a booted device,
+            // while a fresh one loads.
+            if let Some(list) = hub::cached_list() {
+                self.hub = HubState::Ready;
+                self.apply_list(list, cx);
+            }
             self.refresh(cx);
         } else if self.selected.as_ref().is_some_and(|d| d.booted) && self.live.is_none() {
             self.connect(cx);
@@ -227,6 +256,11 @@ impl DevicePanel {
                     != Some((&device.id, device.booted));
                 self.selected = Some(device);
                 if changed || self.live.is_none() {
+                    // A connect from a stale list may have failed for a
+                    // device that has since stopped.
+                    if changed {
+                        self.error = None;
+                    }
                     self.disconnect();
                     if self.selected.as_ref().is_some_and(|d| d.booted) {
                         self.connect(cx);
@@ -274,7 +308,9 @@ impl DevicePanel {
     /// Shows a device an agent opened; it is booted already.
     pub(crate) fn show(&mut self, device: Device, cx: &mut Context<Self>) {
         if let Some(list) = self.list.as_mut() {
-            match list.devices.iter_mut().find(|d| d.id == device.id || (d.platform == device.platform && d.name == device.name)) {
+            match list.devices.iter_mut().find(|d| {
+                d.id == device.id || (d.platform == device.platform && d.name == device.name)
+            }) {
                 Some(entry) => *entry = device.clone(),
                 None => list.devices.insert(0, device.clone()),
             }
@@ -369,13 +405,14 @@ impl DevicePanel {
             self.error = Some("The device screen could not be created.".into());
             return;
         };
-        let stream = match stream::start(endpoint, device.platform, device.id.clone(), screen.sink()) {
-            Ok(stream) => stream,
-            Err(error) => {
-                self.error = Some(error);
-                return;
-            }
-        };
+        let stream =
+            match stream::start(endpoint, device.platform, device.id.clone(), screen.sink()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
         screen.set_input(Some(stream.sender()));
         let events = stream.events.clone();
         let epoch = self.epoch;
@@ -405,12 +442,7 @@ impl DevicePanel {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn start_stream(
-        &mut self,
-        _: std::sync::Arc<hub::Endpoint>,
-        _: Device,
-        _: &mut Context<Self>,
-    ) {
+    fn start_stream(&mut self, _: std::sync::Arc<hub::Endpoint>, _: Device, _: &mut Context<Self>) {
         self.error = Some("Device screens need the macOS app.".into());
     }
 
@@ -418,19 +450,27 @@ impl DevicePanel {
         let Some(live) = self.live.as_mut() else {
             return;
         };
+        let mut attach = false;
         match event {
             Event::Connecting(reason) => {
                 live.streaming = false;
                 live.connecting = reason;
             }
             Event::Streaming => {
+                let first = !live.streaming;
                 live.streaming = true;
                 live.connecting = None;
+                attach = first;
             }
             Event::Size(width, height) => live.size = Some((width, height)),
             Event::Input(ready, reason) => {
-                live.input = (!ready).then(|| reason.unwrap_or_default()).filter(|r| !r.is_empty())
+                live.input = (!ready)
+                    .then(|| reason.unwrap_or_default())
+                    .filter(|r| !r.is_empty())
             }
+        }
+        if attach {
+            self.tools_attach(cx);
         }
         cx.notify();
     }
@@ -517,17 +557,60 @@ impl DevicePanel {
                 })),
         );
         header = header.child(div().flex_1());
+        if let Some(elapsed) = self.recording_label().filter(|_| !self.picking) {
+            let red: gpui::Hsla = gpui::rgb(0xf87171).into();
+            header = header.child(
+                div()
+                    .id("device-recording")
+                    .debug_selector(|| "device-recording".into())
+                    .role(gpui::Role::Button)
+                    .aria_label("Stop recording")
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .h(px(22.))
+                    .px(px(6.))
+                    .rounded(px(5.))
+                    .text_size(px(11.5))
+                    .text_color(red)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(content(0.08)))
+                    .child(div().size(px(7.)).rounded_full().bg(red))
+                    .child(elapsed)
+                    .child(div().text_color(content(0.7)).child("Stop"))
+                    .on_click(cx.listener(|this, _, _, cx| this.stop_recording(cx))),
+            );
+        } else if self.recording_busy() {
+            header = header.child(spinner("device-recording-saving", "loader", 12.));
+        }
         if live && !self.picking {
             header = header
+                .when(self.tools_available(), |h| {
+                    h.child(
+                        icon_action(
+                            "device-screenshot",
+                            "Add a screenshot to the message",
+                            "camera",
+                            !self.screenshot_busy(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.screenshot_busy() {
+                                this.attach_screenshot(cx)
+                            }
+                        })),
+                    )
+                })
                 .child(
                     icon_action("device-home", "Home", "home-01", true).on_click(
                         cx.listener(|this, _, _, _| this.send(Input::Button(Button::Home))),
                     ),
                 )
                 .when(platform == Some(Platform::Android), |h| {
-                    h.child(icon_action("device-back", "Back", "arrow-left", true).on_click(
-                        cx.listener(|this, _, _, _| this.send(Input::Button(Button::Back))),
-                    ))
+                    h.child(
+                        icon_action("device-back", "Back", "arrow-left", true).on_click(
+                            cx.listener(|this, _, _, _| this.send(Input::Button(Button::Back))),
+                        ),
+                    )
                 })
                 .when(platform == Some(Platform::Ios), |h| {
                     h.child(
@@ -594,7 +677,7 @@ impl DevicePanel {
     }
 
     #[cfg(target_os = "macos")]
-    fn screen_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn screen_area(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.screen.is_none() {
             self.screen = screen::Screen::new();
         }
@@ -621,7 +704,7 @@ impl DevicePanel {
         let streaming = live.is_some_and(|live| live.streaming);
         let note = live.and_then(|live| live.input.clone());
         let screen = self.screen.clone();
-        div()
+        let picture = div()
             .relative()
             .flex_1()
             .min_h_0()
@@ -665,26 +748,53 @@ impl DevicePanel {
                         .child(note),
                 )
             })
-            .when(self.selected.as_ref().is_some_and(|d| !d.booted) && self.busy.is_none(), |d| {
-                d.child(
-                    div().pt_2().flex().justify_center().child(
-                        crate::settings::widgets::secondary_button("device-boot", "Start", false, false)
+            .when(
+                self.selected.as_ref().is_some_and(|d| !d.booted) && self.busy.is_none(),
+                |d| {
+                    d.child(
+                        div().pt_2().flex().justify_center().child(
+                            crate::settings::widgets::secondary_button(
+                                "device-boot",
+                                "Start",
+                                false,
+                                false,
+                            )
                             .child("Start")
                             .on_click(cx.listener(|this, _, _, cx| this.boot(cx))),
-                    ),
-                )
-            })
+                        ),
+                    )
+                },
+            );
+        if !self.tools_available() {
+            return picture.into_any_element();
+        }
+        let dock = self.tool_dock(window, cx);
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .child(self.tool_rail(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(picture)
+                    .children(dock)
+                    .child(self.overrides_strip(cx)),
+            )
             .into_any_element()
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn screen_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn screen_area(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.message("Device screens need the macOS app.", None, None, cx)
     }
 }
 
 impl gpui::Render for DevicePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(debug_assertions)]
         counters::count(&counters::PANEL_RENDERS);
         let body = if !device::enabled() {
@@ -702,7 +812,12 @@ impl gpui::Render for DevicePanel {
                 cx,
             )
         } else if let Some(error) = self.error.clone().filter(|_| self.busy.is_none()) {
-            self.message("Something went wrong", Some(error), Some(("device-retry", "Try again")), cx)
+            self.message(
+                "Something went wrong",
+                Some(error),
+                Some(("device-retry", "Try again")),
+                cx,
+            )
         } else if let HubState::Starting(label) = &self.hub
             && self.list.is_none()
         {
@@ -722,17 +837,22 @@ impl gpui::Render for DevicePanel {
         } else if self.picking || self.selected.is_none() {
             self.shelf(cx)
         } else {
-            self.screen_area(cx)
+            self.screen_area(window, cx)
         };
+        let flyout = self.tool_flyout(window, cx);
         div()
             .id("device-panel")
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event, window, cx| this.tool_key(event, window, cx)))
+            .relative()
             .size_full()
             .min_h_0()
             .flex()
             .flex_col()
+            .child(self.tools.region.probe())
             .child(self.header(cx))
             .child(body)
+            .children(flyout)
             .child(div().h(px(1.)).bg(stroke()).flex_shrink_0().opacity(0.))
     }
 }
@@ -765,7 +885,9 @@ pub(crate) fn check(cx: &mut gpui::App) {
         return;
     }
     cx.default_global::<Setup>().checking = true;
-    let work = cx.background_executor().spawn(async { toolchain::Doctor::check() });
+    let work = cx
+        .background_executor()
+        .spawn(async { toolchain::Doctor::check() });
     cx.spawn(async move |cx| {
         let doctor = work.await;
         cx.update(|cx| {

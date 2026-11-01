@@ -97,8 +97,17 @@ fn phone(platform: Platform, on: bool) -> gpui::Div {
         )
 }
 
-fn menu_row(id: &'static str, path: &'static str, label: &'static str, danger: bool) -> Stateful<gpui::Div> {
-    let color = if danger { modal::danger(1.) } else { content(0.85) };
+fn menu_row(
+    id: &'static str,
+    path: &'static str,
+    label: &'static str,
+    danger: bool,
+) -> Stateful<gpui::Div> {
+    let color = if danger {
+        modal::danger(1.)
+    } else {
+        content(0.85)
+    };
     div()
         .id(id)
         .role(Role::MenuItem)
@@ -112,7 +121,13 @@ fn menu_row(id: &'static str, path: &'static str, label: &'static str, danger: b
         .text_size(px(12.5))
         .text_color(color)
         .cursor_pointer()
-        .hover(move |s| s.bg(if danger { modal::danger(0.1) } else { content(0.06) }))
+        .hover(move |s| {
+            s.bg(if danger {
+                modal::danger(0.1)
+            } else {
+                content(0.06)
+            })
+        })
         .child(icon(path, 14.).text_color(color))
         .child(label)
 }
@@ -131,7 +146,9 @@ impl DevicePanel {
             return;
         }
         self.loading_options = true;
-        let work = cx.background_executor().spawn(async { hub::new_device_options() });
+        let work = cx
+            .background_executor()
+            .spawn(async { hub::new_device_options() });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -200,18 +217,22 @@ impl DevicePanel {
             return;
         }
         let mut taken = self.list.clone().unwrap_or_default();
-        taken.devices.extend(self.creating.iter().map(|(platform, name)| Device {
-            id: name.clone(),
-            name: name.clone(),
-            version: String::new(),
-            platform: *platform,
-            booted: false,
-            physical: false,
-            supported: true,
-        }));
+        taken
+            .devices
+            .extend(self.creating.iter().map(|(platform, name)| Device {
+                id: name.clone(),
+                name: name.clone(),
+                version: String::new(),
+                platform: *platform,
+                booted: false,
+                physical: false,
+                supported: true,
+            }));
         let suggested = hub::unique_name(sheet.platform, &model.name, &taken);
         sheet.suggested = suggested.clone();
-        sheet.name.update(cx, |input, cx| input.set_text(suggested, cx));
+        sheet
+            .name
+            .update(cx, |input, cx| input.set_text(suggested, cx));
     }
 
     fn choose(&mut self, choice: Choice, ix: usize, cx: &mut Context<Self>) {
@@ -231,9 +252,16 @@ impl DevicePanel {
     }
 
     /// What the sheet would create: the runtime, model id and final name.
-    fn new_device_choice(&self, cx: &gpui::App) -> Option<(Platform, hub::RuntimeOption, String, String)> {
+    fn new_device_choice(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<(Platform, hub::RuntimeOption, String, String)> {
         let sheet = self.sheet.as_ref()?;
-        let runtime = self.options.as_ref()?.runtimes(sheet.platform).get(sheet.runtime)?;
+        let runtime = self
+            .options
+            .as_ref()?
+            .runtimes(sheet.platform)
+            .get(sheet.runtime)?;
         let model = runtime.models.get(sheet.model)?;
         let name = hub::device_name(sheet.platform, &sheet.name.read(cx).content);
         (!name.is_empty()).then(|| (sheet.platform, runtime.clone(), model.id.clone(), name))
@@ -255,7 +283,8 @@ impl DevicePanel {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
-                this.creating.retain(|(p, n)| !(*p == platform && *n == name));
+                this.creating
+                    .retain(|(p, n)| !(*p == platform && *n == name));
                 match result {
                     Ok(device) => {
                         this.show(device, cx);
@@ -297,10 +326,9 @@ impl DevicePanel {
     }
 
     fn delete(&mut self, device: Device, cx: &mut Context<Self>) {
-        let shown = self
-            .selected
-            .as_ref()
-            .is_some_and(|d| d.id == device.id || (d.platform == device.platform && d.name == device.name));
+        let shown = self.selected.as_ref().is_some_and(|d| {
+            d.id == device.id || (d.platform == device.platform && d.name == device.name)
+        });
         if shown {
             self.disconnect();
             #[cfg(target_os = "macos")]
@@ -344,12 +372,10 @@ impl DevicePanel {
             self.shutdown(cx);
             return;
         }
-        let work = cx
-            .background_executor()
-            .spawn({
-                let device = device.clone();
-                async move { hub::shutdown(&device) }
-            });
+        let work = cx.background_executor().spawn({
+            let device = device.clone();
+            async move { hub::shutdown(&device) }
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -380,14 +406,15 @@ impl DevicePanel {
             .pb_3()
             .flex()
             .flex_col()
-            .children(self.notice.clone().map(|notice| self.notice_row(notice, cx)))
+            .children(
+                self.notice
+                    .clone()
+                    .map(|notice| self.notice_row(notice, cx)),
+            )
             .when(empty, |d| {
-                d.child(
-                    div()
-                        .px_4()
-                        .pt_3()
-                        .child(caption("No simulators or emulators yet. Make one to see and use it here.")),
-                )
+                d.child(div().px_4().pt_3().child(caption(
+                    "No simulators or emulators yet. Make one to see and use it here.",
+                )))
             })
             .child(self.section(Platform::Ios, &list, cx))
             .child(self.section(Platform::Android, &list, cx))
@@ -418,7 +445,11 @@ impl DevicePanel {
             .flex()
             .items_start()
             .gap_2()
-            .child(icon("alert-circle", 14.).text_color(modal::danger(1.)).mt(px(1.)))
+            .child(
+                icon("alert-circle", 14.)
+                    .text_color(modal::danger(1.))
+                    .mt(px(1.)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -467,7 +498,11 @@ impl DevicePanel {
                     .grid()
                     .grid_cols(3)
                     .gap(px(2.))
-                    .children(devices.into_iter().map(|(ix, device)| self.tile(ix, device, cx)))
+                    .children(
+                        devices
+                            .into_iter()
+                            .map(|(ix, device)| self.tile(ix, device, cx)),
+                    )
                     .children(
                         creating
                             .into_iter()
@@ -592,11 +627,21 @@ impl DevicePanel {
                     )
                 }),
             )
-            .children(Self::tile_text(device.name.clone().into(), detail, deleting))
+            .children(Self::tile_text(
+                device.name.clone().into(),
+                detail,
+                deleting,
+            ))
             .into_any_element()
     }
 
-    fn creating_tile(&self, platform: Platform, ix: usize, name: String, cx: &mut Context<Self>) -> AnyElement {
+    fn creating_tile(
+        &self,
+        platform: Platform,
+        ix: usize,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let outline = phone(platform, false);
         let outline = if cx.reduce_motion() {
             outline.opacity(0.6).into_any_element()
@@ -609,11 +654,13 @@ impl DevicePanel {
                 )
                 .into_any_element()
         };
-        Self::tile_frame(SharedString::from(format!("device-creating-tile-{platform:?}-{ix}")))
-            .aria_label(SharedString::from(format!("Creating {name}")))
-            .child(outline)
-            .children(Self::tile_text(name.into(), "Creating…".into(), true))
-            .into_any_element()
+        Self::tile_frame(SharedString::from(format!(
+            "device-creating-tile-{platform:?}-{ix}"
+        )))
+        .aria_label(SharedString::from(format!("Creating {name}")))
+        .child(outline)
+        .children(Self::tile_text(name.into(), "Creating…".into(), true))
+        .into_any_element()
     }
 
     fn new_tile(&self, platform: Platform, cx: &mut Context<Self>) -> AnyElement {
@@ -663,7 +710,11 @@ impl DevicePanel {
         };
         let this = cx.entity().downgrade();
         let showing = !self.picking && self.selected.as_ref().is_some_and(|d| d.id == device.id);
-        let (open_path, open_label) = if device.booted { ("smart-phone", "Show") } else { ("play", "Start") };
+        let (open_path, open_label) = if device.booted {
+            ("smart-phone", "Show")
+        } else {
+            ("play", "Start")
+        };
         let (start, shut, delete) = (device.clone(), device.clone(), device.clone());
         Some(
             popover::popover("device-tile-menu", anchor)
@@ -681,26 +732,32 @@ impl DevicePanel {
                         .flex()
                         .flex_col()
                         .when(!showing, |d| {
-                            d.child(menu_row("device-menu-open", open_path, open_label, false).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.menu = None;
-                                    this.select(start.clone(), cx);
-                                }),
-                            ))
+                            d.child(
+                                menu_row("device-menu-open", open_path, open_label, false)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.menu = None;
+                                        this.select(start.clone(), cx);
+                                    })),
+                            )
                         })
                         .when(device.booted, |d| {
-                            d.child(menu_row("device-menu-shutdown", "power", "Shut down", false).on_click(
-                                cx.listener(move |this, _, _, cx| this.shut_down_device(shut.clone(), cx)),
-                            ))
+                            d.child(
+                                menu_row("device-menu-shutdown", "power", "Shut down", false)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.shut_down_device(shut.clone(), cx)
+                                    })),
+                            )
                         })
                         .when(!showing || device.booted, |d| {
                             d.child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(content(0.08)))
                         })
-                        .child(menu_row("device-menu-delete", "trash", "Delete…", true).on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.confirm_delete(delete.clone(), window, cx)
-                            }),
-                        )),
+                        .child(
+                            menu_row("device-menu-delete", "trash", "Delete…", true).on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    this.confirm_delete(delete.clone(), window, cx)
+                                }),
+                            ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -731,10 +788,18 @@ impl DevicePanel {
                 .into_any_element(),
             Some([]) => {
                 let how = match platform {
-                    Platform::Ios => "No iOS versions are installed. Add one in Xcode › Settings › Components, then try again.",
-                    Platform::Android => "No Android system images are installed. Add one in Android Studio's SDK Manager, then try again.",
+                    Platform::Ios => {
+                        "No iOS versions are installed. Add one in Xcode › Settings › Components, then try again."
+                    }
+                    Platform::Android => {
+                        "No Android system images are installed. Add one in Android Studio's SDK Manager, then try again."
+                    }
                 };
-                let errors = self.options.as_ref().map(|o| o.errors.join("\n")).unwrap_or_default();
+                let errors = self
+                    .options
+                    .as_ref()
+                    .map(|o| o.errors.join("\n"))
+                    .unwrap_or_default();
                 div()
                     .py_2()
                     .flex()
@@ -773,23 +838,27 @@ impl DevicePanel {
                     ),
                     None,
                 ))
-                .child(self.field(
-                    "Name",
-                    div()
-                        .id("device-new-name")
-                        .h(px(32.))
-                        .px(px(10.))
-                        .flex()
-                        .items_center()
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(content(0.12))
-                        .bg(content(0.04))
-                        .child(sheet.name.clone())
-                        .into_any_element(),
-                    (platform == Platform::Android && !saved_as.is_empty() && saved_as != typed.trim())
+                .child(
+                    self.field(
+                        "Name",
+                        div()
+                            .id("device-new-name")
+                            .h(px(32.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(content(0.12))
+                            .bg(content(0.04))
+                            .child(sheet.name.clone())
+                            .into_any_element(),
+                        (platform == Platform::Android
+                            && !saved_as.is_empty()
+                            && saved_as != typed.trim())
                         .then(|| format!("Saved as {saved_as}")),
-                ))
+                    ),
+                )
                 .into_any_element(),
         };
         let backdrop = div()
@@ -798,7 +867,10 @@ impl DevicePanel {
             .inset_0()
             .occlude()
             .bg(modal::scrim_color())
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_new(cx)));
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_new(cx)),
+            );
         let card = modal::card()
             .w_full()
             .occlude()
@@ -834,7 +906,9 @@ impl DevicePanel {
                                     modal::primary_button("device-new-create", "Create and Start"),
                                     !ready,
                                 )
-                                .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.create(cx)))),
+                                .when(ready, |b| {
+                                    b.on_click(cx.listener(|this, _, _, cx| this.create(cx)))
+                                }),
                             ),
                     ),
             );
@@ -939,7 +1013,11 @@ impl DevicePanel {
             .child(icon("chevrons-up-down", 13.))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(sheet) = this.sheet.as_mut() {
-                    sheet.open = if sheet.open == Some(choice) { None } else { Some(choice) };
+                    sheet.open = if sheet.open == Some(choice) {
+                        None
+                    } else {
+                        Some(choice)
+                    };
                 }
                 cx.notify();
             }))
@@ -954,7 +1032,12 @@ impl DevicePanel {
             Choice::Model => (
                 sheet.model_anchor.clone(),
                 sheet.model,
-                runtimes.get(sheet.runtime)?.models.iter().map(|m| m.name.clone()).collect(),
+                runtimes
+                    .get(sheet.runtime)?
+                    .models
+                    .iter()
+                    .map(|m| m.name.clone())
+                    .collect(),
             ),
             Choice::Runtime => (
                 sheet.runtime_anchor.clone(),
@@ -962,7 +1045,10 @@ impl DevicePanel {
                 runtimes.iter().map(|r| r.name.clone()).collect(),
             ),
         };
-        let width = anchor.get().map(|b| f32::from(b.size.width)).unwrap_or(280.);
+        let width = anchor
+            .get()
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(280.);
         let this = cx.entity().downgrade();
         let rows = items.into_iter().enumerate().map(|(ix, label)| {
             div()
@@ -980,7 +1066,9 @@ impl DevicePanel {
                 .text_color(content(0.85))
                 .cursor_pointer()
                 .hover(|s| s.bg(content(0.06)))
-                .child(div().size(px(14.)).when(ix == current, |d| d.child(icon("check", 14.).text_color(content(0.85)))))
+                .child(div().size(px(14.)).when(ix == current, |d| {
+                    d.child(icon("check", 14.).text_color(content(0.85)))
+                }))
                 .child(div().flex_1().min_w_0().truncate().child(label))
                 .on_click(cx.listener(move |this, _, _, cx| this.choose(choice, ix, cx)))
         });
@@ -1025,7 +1113,11 @@ mod shots {
     struct Root(Entity<DevicePanel>);
     impl Render for Root {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().bg(pane_fill()).text_color(content(1.)).child(self.0.clone())
+            div()
+                .size_full()
+                .bg(pane_fill())
+                .text_color(content(1.))
+                .child(self.0.clone())
         }
     }
 
@@ -1045,7 +1137,10 @@ mod shots {
         let models = |names: &[&str]| {
             names
                 .iter()
-                .map(|n| ModelOption { id: n.to_lowercase().replace(' ', "_"), name: (*n).into() })
+                .map(|n| ModelOption {
+                    id: n.to_lowercase().replace(' ', "_"),
+                    name: (*n).into(),
+                })
                 .collect()
         };
         NewDeviceOptions {
@@ -1053,15 +1148,29 @@ mod shots {
                 id: "rt.iOS-27-0".into(),
                 name: "iOS 27.0".into(),
                 models: models(&[
-                    "iPhone 18 Pro", "iPhone 18 Pro Max", "iPhone 17 Pro", "iPhone 17 Pro Max",
-                    "iPhone 17e", "iPhone Air", "iPhone 17", "iPhone 16 Pro", "iPhone 16e",
-                    "iPhone 16", "iPhone SE (3rd generation)",
+                    "iPhone 18 Pro",
+                    "iPhone 18 Pro Max",
+                    "iPhone 17 Pro",
+                    "iPhone 17 Pro Max",
+                    "iPhone 17e",
+                    "iPhone Air",
+                    "iPhone 17",
+                    "iPhone 16 Pro",
+                    "iPhone 16e",
+                    "iPhone 16",
+                    "iPhone SE (3rd generation)",
                 ]),
             }],
             android: vec![RuntimeOption {
                 id: "system-images;android-36;google_apis;arm64-v8a".into(),
                 name: "Android 16 · Google APIs".into(),
-                models: models(&["Pixel 10 Pro XL", "Pixel 10 Pro", "Pixel 10", "Pixel 9 Pro", "Pixel 9"]),
+                models: models(&[
+                    "Pixel 10 Pro XL",
+                    "Pixel 10 Pro",
+                    "Pixel 10",
+                    "Pixel 9 Pro",
+                    "Pixel 9",
+                ]),
             }],
             errors: vec![],
         }
@@ -1076,7 +1185,11 @@ mod shots {
         let mut cx = HeadlessAppContext::with_platform(
             Arc::new(gpui_apple::AppleTextSystem::new()),
             Arc::new(crate::assets::Assets),
-            || Ok(Some(Box::new(gpui_apple::metal_renderer::MetalHeadlessRenderer::new()))),
+            || {
+                Ok(Some(Box::new(
+                    gpui_apple::metal_renderer::MetalHeadlessRenderer::new(),
+                )))
+            },
         );
         cx.update(crate::popover::bind);
         cx.update(crate::input::bind);
@@ -1094,7 +1207,8 @@ mod shots {
             for _ in 0..4 {
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 cx.run_until_parked();
-                cx.update_window(window.into(), |_, w, _| w.refresh()).unwrap();
+                cx.update_window(window.into(), |_, w, _| w.refresh())
+                    .unwrap();
                 cx.run_until_parked();
             }
             cx.capture_screenshot(window.into())
@@ -1102,16 +1216,18 @@ mod shots {
                 .save(format!("{dir}/{name}.png"))
                 .unwrap();
         };
-        let stage = |cx: &mut HeadlessAppContext, f: &dyn Fn(&mut DevicePanel, &mut Window, &mut Context<DevicePanel>)| {
-            window
-                .update(cx, |_, window, cx| {
-                    panel.update(cx, |p, cx| {
-                        f(p, window, cx);
-                        cx.notify();
+        let stage =
+            |cx: &mut HeadlessAppContext,
+             f: &dyn Fn(&mut DevicePanel, &mut Window, &mut Context<DevicePanel>)| {
+                window
+                    .update(cx, |_, window, cx| {
+                        panel.update(cx, |p, cx| {
+                            f(p, window, cx);
+                            cx.notify();
+                        })
                     })
-                })
-                .unwrap();
-        };
+                    .unwrap();
+            };
         let list = DeviceList {
             devices: vec![
                 device(Platform::Ios, "iPhone (clean)", "iOS 27.0", true),
@@ -1119,13 +1235,20 @@ mod shots {
                 device(Platform::Ios, "MOB-13", "iOS 27.0", false),
                 device(Platform::Ios, "MOB-15", "iOS 27.0", false),
                 device(Platform::Ios, "Termisio Snapshots", "iOS 27.0", false),
-                device(Platform::Android, "termisio_driver_api36", "Android 16.0", false),
+                device(
+                    Platform::Android,
+                    "termisio_driver_api36",
+                    "Android 16.0",
+                    false,
+                ),
             ],
             errors: vec![],
         };
         for (theme, light) in [("dark", false), ("light", true)] {
-            let mut prefs = crate::settings::Preferences::default();
-            prefs.theme = theme.into();
+            let prefs = crate::settings::Preferences {
+                theme: theme.into(),
+                ..Default::default()
+            };
             crate::theme::configure(&prefs, light);
             let list = list.clone();
             stage(&mut cx, &move |p, _, _| {
@@ -1142,7 +1265,10 @@ mod shots {
             shot(&mut cx, &format!("{theme}-1-shelf"));
             stage(&mut cx, &|p, _, _| {
                 let target = p.list.as_ref().unwrap().devices[0].clone();
-                p.menu = Some(TileMenu { device: target, at: None });
+                p.menu = Some(TileMenu {
+                    device: target,
+                    at: None,
+                });
             });
             shot(&mut cx, &format!("{theme}-2-menu"));
             stage(&mut cx, &|p, _, _| {
@@ -1163,7 +1289,11 @@ mod shots {
             shot(&mut cx, &format!("{theme}-5-models"));
             stage(&mut cx, &|p, window, cx| {
                 p.open_new(Platform::Android, window, cx);
-                p.sheet.as_ref().unwrap().name.update(cx, |i, cx| i.set_text("Pixel 10 Pro (work)".into(), cx));
+                p.sheet
+                    .as_ref()
+                    .unwrap()
+                    .name
+                    .update(cx, |i, cx| i.set_text("Pixel 10 Pro (work)".into(), cx));
             });
             shot(&mut cx, &format!("{theme}-6-new-android"));
             stage(&mut cx, &|p, _, _| {

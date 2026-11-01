@@ -3,7 +3,7 @@
 //! have no explicit dependency. The model only proposes the plan: dispatch,
 //! dependencies, reports and the hand-back are all decided here.
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     path::{Component, Path},
@@ -81,6 +81,10 @@ pub struct Task {
     /// Another model for this assignment; the lead's when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The lead's rating from 1 (trivial edit) to 10 (hard design or
+    /// concurrency work). With a [`Team`] it picks the worker's model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<u8>,
 }
 fn whole_project() -> Vec<String> {
     vec![".".into()]
@@ -103,10 +107,87 @@ impl Plan {
     }
 }
 
+/// How much model the user wants behind a run's workers. Only Claude workers
+/// are tiered: other harnesses keep the lead's model, and an assignment that
+/// names its own model keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Team {
+    Cheap,
+    Balanced,
+    Strong,
+}
+/// Weakest to strongest, as Claude's model aliases.
+const RUNGS: [&str; 3] = ["haiku", "sonnet", "opus"];
+/// Difficulty assumed when the lead gave none.
+const DEFAULT_DIFFICULTY: u8 = 5;
+impl Team {
+    pub const ALL: [Self; 3] = [Self::Cheap, Self::Balanced, Self::Strong];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cheap => "Cheap",
+            Self::Balanced => "Balanced",
+            Self::Strong => "Strong",
+        }
+    }
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Cheap => "Haiku first, stronger only after a failure",
+            Self::Balanced => "Haiku for easy work, Sonnet for the rest",
+            Self::Strong => "Sonnet, with Opus for hard work",
+        }
+    }
+    /// The lowest rung this team starts a task of that difficulty on. A router
+    /// run over this repo's history found cheap models clearing the bar for
+    /// about half of level 5 and almost no level 7+ tasks.
+    fn start(self, difficulty: u8) -> usize {
+        match self {
+            Self::Cheap => usize::from(difficulty >= 8),
+            Self::Balanced => usize::from(difficulty >= 5),
+            Self::Strong => 1 + usize::from(difficulty >= 7),
+        }
+    }
+    /// How many times a failed worker may be replaced by a stronger one.
+    fn retries(self) -> u8 {
+        match self {
+            Self::Cheap | Self::Balanced => 2,
+            Self::Strong => 1,
+        }
+    }
+    /// The model alias for attempt `attempt` (0 is the first).
+    pub fn model(self, difficulty: Option<u8>, attempt: u8) -> &'static str {
+        let rung = self.start(difficulty.unwrap_or(DEFAULT_DIFFICULTY));
+        RUNGS[(rung + usize::from(attempt)).min(RUNGS.len() - 1)]
+    }
+    /// Whether a worker that failed on `attempt` has a stronger model to move to.
+    fn can_escalate(self, difficulty: Option<u8>, attempt: u8) -> bool {
+        attempt < self.retries()
+            && self.model(difficulty, attempt) != self.model(difficulty, attempt + 1)
+    }
+}
+
+/// The model `task` runs on under `team` for a lead on `lead_provider`: its
+/// own when it names one, else the team's pick when it runs on Claude.
+pub fn tier_model(
+    team: Option<Team>,
+    lead_provider: &str,
+    task: &Task,
+    attempt: u8,
+) -> Option<String> {
+    if task.model.is_some() {
+        return task.model.clone();
+    }
+    let provider = task.provider.as_deref().unwrap_or(lead_provider);
+    if provider != crate::provider::Kind::Claude.id() {
+        return None;
+    }
+    team.map(|team| team.model(task.difficulty, attempt).to_owned())
+}
+
 pub const INSTRUCTIONS: &str = r#"Prepare an orchestration plan for the user's request. Inspect the project with read-only tools. Do not edit files or launch workers. The user reviews the plan and starts it in MonoCode.
 Submit the plan by calling the orchestration_plan tool from the monocode MCP server. If it returns an error, fix the plan and call it again. After it succeeds, reply with a short explanation of the approach.
 Only if that tool is unavailable, end your reply with exactly one JSON object between <monocode_orchestration> and </monocode_orchestration>, using the tool's schema: {"title":"short title","summary":"approach","tasks":[{"id":"task-1","title":"assignment title","prompt":"complete self-contained instructions, validation and expected report","files":["src/path"],"depends_on":[]}]}
-Use 1 to 12 assignments with unique ASCII IDs, exact project-relative file or directory scopes ('.' for the whole project) and dependency IDs. Independent assignments run concurrently (up to four); overlapping scopes run one after another. Workers use this session's provider, model and access policy unless an assignment sets provider or model, which you should do only when the user asks for it. Each worker sees only its own prompt and the reports of the assignments it depends on, so make every prompt self-contained and include how to verify the work.
+Use 1 to 12 assignments with unique ASCII IDs, exact project-relative file or directory scopes ('.' for the whole project) and dependency IDs. Independent assignments run concurrently (up to four); overlapping scopes run one after another. Workers use this session's provider, model and access policy unless an assignment sets provider or model, which you should do only when the user asks for it. Rate every assignment's difficulty from 1 (trivial edit) to 10 (hard design, concurrency or cross-cutting work) in 'difficulty': when the user picked a team, MonoCode chooses each worker's model from it. Each worker sees only its own prompt and the reports of the assignments it depends on, so make every prompt self-contained and include how to verify the work.
 If the request is too unclear to plan, ask one short question instead of submitting a plan; the user's answer continues the planning. Never claim that workers have started."#;
 
 /// The MCP definition of [`TOOL`].
@@ -130,7 +211,8 @@ pub fn tool_definition() -> Value {
                             "files": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string"}, "description": "Project-relative write scopes; '.' is the whole project"},
                             "depends_on": {"type": "array", "maxItems": 12, "items": {"type": "string"}},
                             "provider": {"type": "string", "description": "Only when the user asked for another harness"},
-                            "model": {"type": "string", "description": "Only when the user asked for another model"}
+                            "model": {"type": "string", "description": "Only when the user asked for another model"},
+                            "difficulty": {"type": "integer", "minimum": 1, "maximum": 10, "description": "1 trivial edit to 10 hard design or concurrency work"}
                         },
                         "required": ["id", "title", "prompt", "files"],
                         "additionalProperties": false
@@ -208,6 +290,12 @@ pub fn validate(plan: &Plan) -> Result<(), String> {
         {
             return Err(format!(
                 "Assignment {} needs a title, instructions and file scopes.",
+                task.id
+            ));
+        }
+        if task.difficulty.is_some_and(|d| !(1..=10).contains(&d)) {
+            return Err(format!(
+                "Assignment {} needs a difficulty from 1 to 10.",
                 task.id
             ));
         }
@@ -418,6 +506,10 @@ pub struct Assignment {
     /// Its worker received the assignment, so a retry continues instead of
     /// starting over.
     pub launched: bool,
+    /// Workers already replaced by a stronger model after failing.
+    pub attempt: u8,
+    /// The last report of the worker this one replaced.
+    pub previous_failure: String,
 }
 
 /// One started plan. Saved on every change, so a restart can resume it.
@@ -439,6 +531,9 @@ pub struct Run {
     /// The final report reached the lead.
     #[serde(default)]
     pub reported: bool,
+    /// The user's team choice; none keeps every worker on the lead's model.
+    #[serde(default)]
+    pub team: Option<Team>,
 }
 impl Run {
     pub fn new(
@@ -459,7 +554,61 @@ impl Run {
             stopped: false,
             paused: false,
             reported: false,
+            team: None,
         }
+    }
+    pub fn with_team(mut self, team: Option<Team>) -> Self {
+        self.team = team;
+        self
+    }
+    /// The model assignment `ix` runs on: its own when it names one, else its
+    /// team's pick for a Claude worker, else none (the lead's).
+    pub fn model_for(&self, ix: usize) -> Option<String> {
+        tier_model(
+            self.team,
+            &self.provider,
+            &self.plan.tasks[ix],
+            self.tasks[ix].attempt,
+        )
+    }
+    /// Replaces a worker that failed mid-run with a new one a rung up. False
+    /// when it did not fail, never started, names its own model, or is already
+    /// as strong as its team goes. The replacement is queued like a new
+    /// assignment and told what its predecessor reported.
+    pub fn escalate(&mut self, ix: usize) -> bool {
+        let task = &self.plan.tasks[ix];
+        let state = &self.tasks[ix];
+        let Some(team) = self.team else {
+            return false;
+        };
+        // Only tiered workers move: not an explicit model, nor another harness.
+        let tiered = task.model.is_none() && self.model_for(ix).is_some();
+        if state.state != State::Failed
+            || !state.launched
+            || !tiered
+            || !team.can_escalate(task.difficulty, state.attempt)
+        {
+            return false;
+        }
+        let state = &mut self.tasks[ix];
+        state.attempt += 1;
+        state.previous_failure = std::mem::take(&mut state.report);
+        state.session = None;
+        state.launched = false;
+        state.outside_scope.clear();
+        state.state = State::Pending;
+        self.reported = false;
+        true
+    }
+    /// What assignment `ix`'s worker is told, including the report of the
+    /// weaker worker it replaced.
+    pub fn worker_prompt(&self, ix: usize) -> String {
+        let mut prompt = worker_prompt(&self.plan.tasks[ix], &self.dependency_reports(ix));
+        let failure = self.tasks[ix].previous_failure.trim();
+        if !failure.is_empty() {
+            prompt.push_str(&format!("\n\nA previous worker on a weaker model failed this assignment and was replaced by you. Its edits may still be in the checkout: inspect them and fix or redo them rather than assuming they are right. Its last report:\n{failure}"));
+        }
+        prompt
     }
     pub fn finished(&self) -> bool {
         self.tasks.iter().all(|task| task.state.settled())
@@ -701,7 +850,9 @@ impl Run {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        format!("The orchestration workers have finished. Check the combined result: read the changed files, run the relevant checks, fix small integration problems and identify incomplete work. Preserve the workers' changes. Then report the outcome to the user.\n\n{body}")
+        format!(
+            "The orchestration workers have finished. Check the combined result: read the changed files, run the relevant checks, fix small integration problems and identify incomplete work. Preserve the workers' changes. Then report the outcome to the user.\n\n{body}"
+        )
     }
     /// The sidebar's view of this run.
     pub fn summary(&self) -> Summary {
@@ -712,14 +863,15 @@ impl Run {
                 .tasks
                 .iter()
                 .zip(&self.tasks)
-                .map(|(task, state)| SummaryTask {
+                .enumerate()
+                .map(|(ix, (task, state))| SummaryTask {
                     session: state.session,
                     title: task.title.clone(),
                     provider: task
                         .provider
                         .clone()
                         .unwrap_or_else(|| self.provider.clone()),
-                    model: task.model.clone().or_else(|| self.settings.model.clone()),
+                    model: self.model_for(ix).or_else(|| self.settings.model.clone()),
                     status: state.state.summary_status().into(),
                 })
                 .collect(),
@@ -739,6 +891,7 @@ mod tests {
             depends_on: deps.iter().map(|s| (*s).into()).collect(),
             provider: None,
             model: None,
+            difficulty: None,
         }
     }
     fn run(tasks: Vec<Task>) -> Run {
@@ -904,5 +1057,151 @@ mod tests {
             outside_scope(&whole, "/project", &edited),
             vec!["/elsewhere/file"]
         );
+    }
+
+    fn started(run: &mut Run, ix: usize) {
+        run.tasks[ix].state = State::Running;
+        run.tasks[ix].session = Some(ix as i64 + 1);
+        run.tasks[ix].launched = true;
+    }
+    fn claude_run(team: Option<Team>, difficulty: Option<u8>) -> Run {
+        let mut run = run(vec![task("a", &[], "src")]).with_team(team);
+        run.provider = "claude".into();
+        run.plan.tasks[0].difficulty = difficulty;
+        run
+    }
+    #[test]
+    fn each_team_starts_on_its_own_rung_by_difficulty() {
+        let pick = |team: Team, d: u8| team.model(Some(d), 0);
+        assert_eq!(
+            [1, 4, 5, 6, 7, 8, 10].map(|d| pick(Team::Cheap, d)),
+            [
+                "haiku", "haiku", "haiku", "haiku", "haiku", "sonnet", "sonnet"
+            ]
+        );
+        assert_eq!(
+            [1, 4, 5, 10].map(|d| pick(Team::Balanced, d)),
+            ["haiku", "haiku", "sonnet", "sonnet"]
+        );
+        assert_eq!(
+            [1, 6, 7, 10].map(|d| pick(Team::Strong, d)),
+            ["sonnet", "sonnet", "opus", "opus"]
+        );
+        // Unrated work is treated as middling.
+        assert_eq!(Team::Balanced.model(None, 0), "sonnet");
+        assert_eq!(Team::Cheap.model(None, 0), "haiku");
+    }
+    #[test]
+    fn model_for_respects_explicit_choices_and_other_harnesses() {
+        let mut run = claude_run(Some(Team::Strong), Some(9));
+        assert_eq!(run.model_for(0).as_deref(), Some("opus"));
+        run.plan.tasks[0].model = Some("claude-sonnet-5".into());
+        assert_eq!(run.model_for(0).as_deref(), Some("claude-sonnet-5"));
+        run.plan.tasks[0].model = None;
+        run.plan.tasks[0].provider = Some("codex".into());
+        assert_eq!(run.model_for(0), None);
+        run.plan.tasks[0].provider = None;
+        run.team = None;
+        assert_eq!(run.model_for(0), None);
+        run.provider = "codex".into();
+        run.team = Some(Team::Cheap);
+        assert_eq!(run.model_for(0), None);
+    }
+    #[test]
+    fn a_failed_worker_is_replaced_one_rung_up_until_the_ladder_ends() {
+        let mut run = claude_run(Some(Team::Cheap), Some(3));
+        started(&mut run, 0);
+        run.finish(0, Outcome::Failed, "tests still fail");
+        assert!(run.escalate(0));
+        assert_eq!(run.tasks[0].state, State::Pending);
+        assert_eq!(run.tasks[0].session, None);
+        assert!(!run.tasks[0].launched);
+        assert_eq!(run.model_for(0).as_deref(), Some("sonnet"));
+        assert!(run.worker_prompt(0).contains("tests still fail"));
+        started(&mut run, 0);
+        run.finish(0, Outcome::Failed, "still broken");
+        assert!(run.escalate(0));
+        assert_eq!(run.model_for(0).as_deref(), Some("opus"));
+        assert!(run.worker_prompt(0).contains("still broken"));
+        assert!(!run.worker_prompt(0).contains("tests still fail"));
+        started(&mut run, 0);
+        run.finish(0, Outcome::Failed, "nope");
+        assert!(!run.escalate(0), "opus is the top of the ladder");
+        assert_eq!(run.tasks[0].state, State::Failed);
+    }
+    #[test]
+    fn escalation_leaves_alone_what_a_stronger_model_would_not_fix() {
+        let fail = |run: &mut Run, outcome| {
+            started(run, 0);
+            run.finish(0, outcome, "report");
+        };
+        // No team: nothing is tiered.
+        let mut run = claude_run(None, Some(3));
+        fail(&mut run, Outcome::Failed);
+        assert!(!run.escalate(0));
+        // The worker never got its prompt, so its model was not the problem.
+        let mut run = claude_run(Some(Team::Cheap), Some(3));
+        run.tasks[0].state = State::Running;
+        run.finish(0, Outcome::NotStarted, "no launch");
+        assert!(!run.escalate(0));
+        // A stop is the user's call, not a failure.
+        let mut run = claude_run(Some(Team::Cheap), Some(3));
+        fail(&mut run, Outcome::Stopped);
+        assert!(!run.escalate(0));
+        // An assignment that named its model keeps it.
+        let mut run = claude_run(Some(Team::Cheap), Some(3));
+        run.plan.tasks[0].model = Some("haiku".into());
+        fail(&mut run, Outcome::Failed);
+        assert!(!run.escalate(0));
+        // Strong gets one retry, and none when it already starts on Opus.
+        let mut run = claude_run(Some(Team::Strong), Some(2));
+        fail(&mut run, Outcome::Failed);
+        assert!(run.escalate(0));
+        assert_eq!(run.model_for(0).as_deref(), Some("opus"));
+        let mut run = claude_run(Some(Team::Strong), Some(9));
+        fail(&mut run, Outcome::Failed);
+        assert!(!run.escalate(0));
+    }
+    #[test]
+    fn a_replaced_worker_does_not_block_its_dependants() {
+        let mut run = run(vec![task("a", &[], "src"), task("b", &["a"], "tests")])
+            .with_team(Some(Team::Cheap));
+        run.provider = "claude".into();
+        run.dispatch();
+        started(&mut run, 0);
+        run.finish(0, Outcome::Failed, "broke");
+        assert!(run.escalate(0));
+        assert_eq!(run.dispatch(), vec![0]);
+        assert_eq!(run.tasks[1].state, State::Pending);
+    }
+    #[test]
+    fn difficulty_must_be_one_to_ten() {
+        let mut plan = Plan {
+            title: "Work".into(),
+            summary: String::new(),
+            tasks: vec![task("a", &[], "src")],
+        };
+        for ok in [None, Some(1), Some(10)] {
+            plan.tasks[0].difficulty = ok;
+            assert!(validate(&plan).is_ok());
+        }
+        for bad in [0, 11] {
+            plan.tasks[0].difficulty = Some(bad);
+            assert!(validate(&plan).is_err());
+        }
+    }
+    #[test]
+    fn runs_saved_before_teams_still_load() {
+        let mut value = serde_json::to_value(run(vec![task("a", &[], "src")])).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("team");
+        for task in object["tasks"].as_array_mut().unwrap() {
+            let task = task.as_object_mut().unwrap();
+            task.remove("attempt");
+            task.remove("previous_failure");
+        }
+        let loaded: Run = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.team, None);
+        assert_eq!(loaded.tasks[0].attempt, 0);
     }
 }

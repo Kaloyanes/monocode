@@ -19,11 +19,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The H.264 rate the hub encodes at. The app draws at the display's rate
-/// regardless; see the Device panel's notes on performance.
-pub const VIDEO_FPS: u32 = 60;
-/// Wide enough for a phone in the largest panel on a Retina display.
-const MAX_DIMENSION: u32 = 2048;
+/// The most frames a second the hub encodes. Simulators draw at 60, but an
+/// encoder paced at exactly 60 beats against them and drops a frame in four;
+/// at 120 it takes each one as it comes (measured: median gap 21 → 16.5 ms).
+/// It encodes only changed frames, so a still screen costs nothing more.
+pub const VIDEO_FPS: u32 = 120;
+/// Taller than a phone in the panel is drawn on a Retina display. Larger
+/// costs Android's software encoder its frame rate (32 fps at 2048, 40 at
+/// 1600) for detail the panel cannot show.
+const MAX_DIMENSION: u32 = 1600;
 /// An unwatched, unused hub stops after this long.
 const IDLE: Duration = Duration::from_secs(10 * 60);
 const READY_TIMEOUT: Duration = Duration::from_secs(45);
@@ -58,7 +62,12 @@ impl Endpoint {
                 .call(),
         )
     }
-    pub fn post(&self, path: &str, body: Value, timeout: Duration) -> Result<ureq::Response, String> {
+    pub fn post(
+        &self,
+        path: &str,
+        body: Value,
+        timeout: Duration,
+    ) -> Result<ureq::Response, String> {
         touch();
         response(
             ureq::post(&self.url(path))
@@ -177,7 +186,11 @@ fn idle_watch() {
             .saturating_sub(LAST_USE.load(Ordering::Relaxed));
         if VIEWERS.load(Ordering::Relaxed) == 0 && idle >= IDLE.as_secs() {
             let (lock, _) = supervisor();
-            let running = lock.lock().unwrap_or_else(|e| e.into_inner()).running.is_some();
+            let running = lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .running
+                .is_some();
             if running {
                 stop();
             }
@@ -191,7 +204,11 @@ pub fn state() -> State {
     // A hub that exited by itself is reported, not silently restarted.
     let exited = hub.running.as_mut().and_then(|running| {
         let status = running.child.try_wait().ok().flatten()?;
-        let log = running.log.lock().map(|log| log.join("\n")).unwrap_or_default();
+        let log = running
+            .log
+            .lock()
+            .map(|log| log.join("\n"))
+            .unwrap_or_default();
         Some(exit_message(status, &log))
     });
     if let Some(message) = exited {
@@ -340,7 +357,7 @@ pub fn reap_orphan() {
 /// The hub's flags. Android capture prefers scrcpy, then the emulator's
 /// shared-memory frames encoded in hardware: the default software x264 of
 /// raw frames costs a CPU core.
-fn arguments(entry: &std::path::Path, port: u16, doctor: &toolchain::Doctor) -> Vec<String> {
+fn arguments(entry: &std::path::Path, port: u16) -> Vec<String> {
     let mut args = vec![
         entry.to_string_lossy().into_owned(),
         "--port".into(),
@@ -359,15 +376,28 @@ fn arguments(entry: &std::path::Path, port: u16, doctor: &toolchain::Doctor) -> 
         "--encoder".into(),
         "hardware".into(),
     ];
-    if doctor.scrcpy {
-        args.extend(["--stream-source".into(), "scrcpy".into()]);
-    } else {
-        args.extend(["--grpc-image-mode".into(), "mmap".into()]);
-    }
+    // The hub ships scrcpy's server and pushes it over adb, so this needs
+    // nothing installed. It shows an emulator's first frame in about 0.5 s
+    // where the emulator's gRPC screenshots take 1.3 to 1.7.
+    args.extend(["--stream-source".into(), "scrcpy".into()]);
     if !cfg!(target_os = "macos") {
         args.extend(["--platform".into(), "android".into()]);
     }
+    if let Ok(extra) = std::env::var("MONOCODE_DEVICE_HUB_ARGS") {
+        // For measuring other settings; see the live stream test.
+        args.extend(extra.split_whitespace().map(String::from));
+    }
     args
+}
+
+/// Flags for emulators the hub starts. It starts them without a window, and
+/// headless `-gpu auto` picks SwiftShader, which draws Android on the CPU:
+/// the launcher managed 25 fps with three frames in four janky. On the Mac's
+/// GPU it draws at the display's 60 with 6 to 18% janky.
+fn emulator_args() -> String {
+    let own = std::env::var("EXPO_DEVICE_HUB_EMULATOR_EXTRA_ARGS").unwrap_or_default();
+    // The emulator takes the last `-gpu`, so the person's own still wins.
+    format!("-gpu host {own}").trim().to_owned()
 }
 
 /// Reads `Local: http://localhost:PORT/?token=TOKEN` from the startup banner.
@@ -390,26 +420,25 @@ fn free_port() -> Result<u16, String> {
 fn start() -> Result<Running, String> {
     reap_orphan();
     let entry = toolchain::install(toolchain::Tool::Hub)?;
-    let doctor = toolchain::Doctor::check();
-    let (node, _) = doctor
-        .node
-        .clone()
-        .ok_or("MonoCode needs Node.js to run the Device Hub.")?;
+    // Only the paths: the full doctor check spawns two processes.
+    let node = toolchain::node().ok_or("MonoCode needs Node.js to run the Device Hub.")?;
+    let android_sdk = toolchain::android_sdk();
     let port = free_port()?;
     let state_dir = toolchain::root().join("hub-state");
     std::fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
     let mut command = Command::new(&node);
     command
-        .args(arguments(&entry, port, &doctor))
+        .args(arguments(&entry, port))
         .current_dir(toolchain::root())
         .env("PATH", toolchain::search_path())
         .env("EXPO_DEVICE_HUB_STATE_DIR", &state_dir)
         .env("FORCE_COLOR", "0")
         .env("NO_COLOR", "1")
+        .env("EXPO_DEVICE_HUB_EMULATOR_EXTRA_ARGS", emulator_args())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(sdk) = &doctor.android_sdk {
+    if let Some(sdk) = &android_sdk {
         command.env("ANDROID_HOME", sdk);
     }
     crate::process::configure_child(&mut command);
@@ -423,7 +452,8 @@ fn start() -> Result<Running, String> {
         .map_err(|e| format!("Could not start the Device Hub: {e}"))?;
     let log = Arc::new(Mutex::new(Vec::new()));
     let (banner_tx, banner_rx) = std::sync::mpsc::channel();
-    let forward = |stream: Box<dyn Read + Send>, banner: Option<std::sync::mpsc::Sender<(u16, String)>>| {
+    let forward = |stream: Box<dyn Read + Send>,
+                   banner: Option<std::sync::mpsc::Sender<(u16, String)>>| {
         let log = log.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
@@ -432,6 +462,9 @@ fn start() -> Result<Running, String> {
                     let _ = banner.send(found);
                     // The banner carries the token; keep it out of the log.
                     continue;
+                }
+                if std::env::var_os("MONOCODE_DEVICE_HUB_LOG").is_some() {
+                    eprintln!("hub| {line}");
                 }
                 if let Ok(mut log) = log.lock() {
                     if log.len() >= 64 {
@@ -452,9 +485,21 @@ fn start() -> Result<Running, String> {
         terminate(child);
         let tail = log
             .lock()
-            .map(|log| log.iter().rev().take(8).rev().cloned().collect::<Vec<_>>().join("\n"))
+            .map(|log| {
+                log.iter()
+                    .rev()
+                    .take(8)
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
             .unwrap_or_default();
-        if tail.is_empty() { message } else { format!("{message}\n{tail}") }
+        if tail.is_empty() {
+            message
+        } else {
+            format!("{message}\n{tail}")
+        }
     };
     let (port, token) = match banner_rx.recv_timeout(READY_TIMEOUT) {
         Ok(found) => found,
@@ -477,7 +522,10 @@ fn start() -> Result<Running, String> {
             break;
         }
         if Instant::now() > deadline || child.try_wait().ok().flatten().is_some() {
-            return Err(fail(&mut child, "The Device Hub never became ready.".into()));
+            return Err(fail(
+                &mut child,
+                "The Device Hub never became ready.".into(),
+            ));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -498,7 +546,69 @@ pub fn list() -> Result<DeviceList, String> {
     let response = endpoint.get("/api/devices", Duration::from_secs(20))?;
     let value: Value = serde_json::from_str(&response.into_string().map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-    DeviceList::from_hub(&value)
+    let list = DeviceList::from_hub(&value)?;
+    *LAST_LIST.lock().unwrap_or_else(|e| e.into_inner()) = Some(list.clone());
+    Ok(list)
+}
+
+/// The list the hub last gave, to show while a fresh one loads: asking the
+/// hub runs simctl and adb, which takes half a second or more.
+static LAST_LIST: Mutex<Option<DeviceList>> = Mutex::new(None);
+
+pub fn cached_list() -> Option<DeviceList> {
+    LAST_LIST.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Blocking, once per run: when a simulator or emulator is already running,
+/// starts the hub and readies booted simulators' streams, so the Device tab
+/// and agents' device tools find them ready instead of spending seconds on
+/// it. With nothing running it starts nothing; the hub still stops after its
+/// idle time.
+pub fn prewarm() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !super::enabled() || STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if !toolchain::Tool::Hub.installed() || !anything_booted() {
+        return;
+    }
+    let Ok(endpoint) = ensure() else {
+        return;
+    };
+    let Ok(list) = list() else {
+        return;
+    };
+    for device in &list.devices {
+        if device.platform == Platform::Ios && device.booted && device.supported {
+            let _ = attach(&endpoint, &device.id);
+        }
+    }
+}
+
+/// Whether a simulator or emulator runs, without starting the hub or adb.
+fn anything_booted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let simulator = Command::new("/usr/bin/xcrun")
+            .args(["simctl", "list", "devices", "booted", "--json"])
+            .output()
+            .ok()
+            .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok())
+            .is_some_and(|value| {
+                value["devices"].as_object().is_some_and(|runtimes| {
+                    runtimes
+                        .values()
+                        .any(|d| d.as_array().is_some_and(|d| !d.is_empty()))
+                })
+            });
+        if simulator {
+            return true;
+        }
+    }
+    Command::new("/usr/bin/pgrep")
+        .args(["-f", "qemu-system"])
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn vendor(platform: Platform) -> &'static str {
@@ -559,8 +669,17 @@ pub fn boot(device: &Device) -> Result<String, String> {
 }
 
 /// Booting alone does not start serve-sim's helper for a simulator; the grid
-/// start does both and is idempotent for a booted one.
+/// start does both and is idempotent for a booted one. It takes 1.5 s or
+/// more even then, so each simulator is attached once per hub run, until
+/// `forget_attached` says its helper is gone.
 pub fn attach(endpoint: &Endpoint, udid: &str) -> Result<(), String> {
+    let generation = generation();
+    let known = |attached: &(u64, Vec<String>)| {
+        attached.0 == generation && attached.1.iter().any(|id| id == udid)
+    };
+    if known(&ATTACHED.lock().unwrap_or_else(|e| e.into_inner())) {
+        return Ok(());
+    }
     checked(
         endpoint.post(
             &vendor_path(Platform::Ios, "/grid/api/start"),
@@ -568,14 +687,35 @@ pub fn attach(endpoint: &Endpoint, udid: &str) -> Result<(), String> {
             Duration::from_secs(180),
         )?,
         "attach",
-    )
-    .map(|_| ())
+    )?;
+    let mut attached = ATTACHED.lock().unwrap_or_else(|e| e.into_inner());
+    if attached.0 != generation {
+        *attached = (generation, Vec::new());
+    }
+    if !known(&attached) {
+        attached.1.push(udid.to_owned());
+    }
+    Ok(())
+}
+
+/// The simulators attached in the hub run of the given generation.
+static ATTACHED: Mutex<(u64, Vec<String>)> = Mutex::new((0, Vec::new()));
+
+/// The simulator's stream helper is gone (it shut down, or its stream could
+/// not be opened); the next `attach` starts it again.
+pub fn forget_attached(udid: &str) {
+    ATTACHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .1
+        .retain(|id| id != udid);
 }
 
 /// Blocking: shuts a device down. serve-sim's own shutdown also closes its
 /// capture session, which the hub's generic one can leave cached.
 pub fn shutdown(device: &Device) -> Result<(), String> {
     let endpoint = ensure()?;
+    forget_attached(&device.id);
     let result = match device.platform {
         Platform::Ios => endpoint.post(
             &vendor_path(Platform::Ios, "/grid/api/shutdown"),
@@ -735,7 +875,11 @@ pub fn device_name(platform: Platform, wanted: &str) -> String {
         Platform::Android => {
             let mut name = String::new();
             for c in wanted.chars() {
-                let c = if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' };
+                let c = if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                };
                 if !(c == '_' && name.ends_with('_')) {
                     name.push(c);
                 }
@@ -757,7 +901,11 @@ pub fn unique_name(platform: Platform, base: &str, list: &DeviceList) -> String 
     if !taken(&base) {
         return base;
     }
-    let separator = if platform == Platform::Android { "_" } else { " " };
+    let separator = if platform == Platform::Android {
+        "_"
+    } else {
+        " "
+    };
     (2..)
         .map(|n| format!("{base}{separator}{n}"))
         .find(|name| !taken(name))
@@ -775,13 +923,19 @@ pub fn new_device_options() -> Result<NewDeviceOptions, String> {
 
 /// Blocking: makes a device and starts it, as the hub always does. Returns
 /// it booted, with the id it streams under (an emulator's serial).
-pub fn create(platform: Platform, name: &str, runtime: &RuntimeOption, model: &str) -> Result<Device, String> {
+pub fn create(
+    platform: Platform,
+    name: &str,
+    runtime: &RuntimeOption,
+    model: &str,
+) -> Result<Device, String> {
     let name = device_name(platform, name);
     if name.is_empty() {
         return Err("Give the device a name.".into());
     }
     let endpoint = ensure()?;
-    let body = json!({"platform": platform, "name": name, "runtime": runtime.id, "deviceType": model});
+    let body =
+        json!({"platform": platform, "name": name, "runtime": runtime.id, "deviceType": model});
     // Creating an emulator includes its first boot, which can take minutes.
     let value = checked(
         endpoint.post("/api/devices/create", body, Duration::from_secs(300))?,
@@ -801,7 +955,12 @@ pub fn create(platform: Platform, name: &str, runtime: &RuntimeOption, model: &s
         name,
         version: match platform {
             Platform::Ios => runtime.name.clone(),
-            Platform::Android => runtime.name.split(" · ").next().unwrap_or_default().to_owned(),
+            Platform::Android => runtime
+                .name
+                .split(" · ")
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
         },
         platform,
         booted: true,
@@ -817,7 +976,11 @@ const EMULATOR_SPACE: u64 = 12 * 1024 * 1024 * 1024;
 /// An emulator that was made but could not start usually lacked disk space,
 /// which the hub does not pass on; say so when the disk is short.
 fn explain_create_failure(platform: Platform, error: &str) -> String {
-    let error = error.split("\n\nFor details").next().unwrap_or(error).trim();
+    let error = error
+        .split("\n\nFor details")
+        .next()
+        .unwrap_or(error)
+        .trim();
     let short = (platform == Platform::Android && error.contains("before coming online"))
         .then(|| free_space(&avd_home()))
         .flatten()
@@ -874,10 +1037,7 @@ pub fn remove(device: &Device) -> Result<(), String> {
 /// Blocking: a PNG of the device's screen.
 pub fn screenshot(platform: Platform, id: &str) -> Result<Vec<u8>, String> {
     let endpoint = ensure()?;
-    let path = vendor_path(
-        platform,
-        &format!("/api/screenshot?device={}", encode(id)),
-    );
+    let path = vendor_path(platform, &format!("/api/screenshot?device={}", encode(id)));
     let response = endpoint.post_empty(&path, Duration::from_secs(20))?;
     let mut bytes = Vec::new();
     response
@@ -889,6 +1049,52 @@ pub fn screenshot(platform: Platform, id: &str) -> Result<Vec<u8>, String> {
         return Err("The device returned an empty screenshot.".into());
     }
     Ok(bytes)
+}
+
+/// Blocking: runs serve-sim's own command line with the hub's Node, and
+/// returns what it printed.
+///
+/// The hub's exec socket runs most simulator settings (`ui`, `permissions`)
+/// through serve-sim's command line, but inside the hub it resolves that to
+/// the hub's own `cli.mjs`, which rejects them. Running serve-sim's script
+/// directly does the same work. It needs no running hub.
+pub fn serve_sim_cli(args: &[&str]) -> Result<String, String> {
+    let node = toolchain::node().ok_or("MonoCode needs Node.js to change simulator settings.")?;
+    let script = toolchain::Tool::Hub
+        .install_dir()
+        .join("node_modules/expo-device-hub/vendor/serve-sim/dist/serve-sim.js");
+    if !script.is_file() {
+        return Err("The Device Hub is not installed.".into());
+    }
+    touch();
+    let mut command = Command::new(&node);
+    command
+        .arg(&script)
+        .args(args)
+        .current_dir(toolchain::root())
+        .env("PATH", toolchain::search_path())
+        .env("FORCE_COLOR", "0")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null());
+    crate::process::configure_child(&mut command);
+    let output = command
+        .output()
+        .map_err(|e| format!("Could not run serve-sim: {e}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let message = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(if message.is_empty() {
+        format!("serve-sim {} failed.", args.first().unwrap_or(&""))
+    } else {
+        message.lines().take(6).collect::<Vec<_>>().join("\n")
+    })
 }
 
 /// Percent-encodes a device id for a query string.
@@ -918,7 +1124,11 @@ mod tests {
             ]}]},
             "errors": [{"message": "[android-utils] no sdk"}, {"message": "Xcode is busy"}],
         }));
-        assert_eq!(options.ios.len(), 1, "a runtime with nothing to stream is left out");
+        assert_eq!(
+            options.ios.len(),
+            1,
+            "a runtime with nothing to stream is left out"
+        );
         assert_eq!(options.ios[0].models.len(), 1);
         let android = &options.android[0];
         assert_eq!(android.name, "Android 16 · Google APIs");
@@ -930,17 +1140,32 @@ mod tests {
     #[test]
     fn create_failures_drop_the_command_line() {
         let error = "Failed to create iOS simulator X\n\nFor details, try running it manually:\n/opt/emulator -avd X";
-        assert_eq!(explain_create_failure(Platform::Ios, error), "Failed to create iOS simulator X");
+        assert_eq!(
+            explain_create_failure(Platform::Ios, error),
+            "Failed to create iOS simulator X"
+        );
         #[cfg(unix)]
         assert!(free_space(std::path::Path::new("/")).is_some_and(|free| free > 0));
     }
 
     #[test]
     fn android_names_are_sanitized_and_names_kept_unique() {
-        assert_eq!(device_name(Platform::Android, " Pixel 9 Pro (work) "), "Pixel_9_Pro_work");
-        assert_eq!(device_name(Platform::Ios, " iPhone 17 Pro "), "iPhone 17 Pro");
-        assert_eq!(android_image_name("system-images;android-35;google_apis_playstore;arm64-v8a"), "Android 15 · Google Play");
-        assert_eq!(android_image_name("system-images;android-40;default;x86_64"), "Android API 40 · AOSP");
+        assert_eq!(
+            device_name(Platform::Android, " Pixel 9 Pro (work) "),
+            "Pixel_9_Pro_work"
+        );
+        assert_eq!(
+            device_name(Platform::Ios, " iPhone 17 Pro "),
+            "iPhone 17 Pro"
+        );
+        assert_eq!(
+            android_image_name("system-images;android-35;google_apis_playstore;arm64-v8a"),
+            "Android 15 · Google Play"
+        );
+        assert_eq!(
+            android_image_name("system-images;android-40;default;x86_64"),
+            "Android API 40 · AOSP"
+        );
         let device = |platform, name: &str| Device {
             id: name.into(),
             name: name.into(),
@@ -958,8 +1183,14 @@ mod tests {
             ],
             errors: vec![],
         };
-        assert_eq!(unique_name(Platform::Ios, "iPhone 17 Pro", &list), "iPhone 17 Pro 3");
-        assert_eq!(unique_name(Platform::Android, "Pixel 9", &list), "Pixel_9_2");
+        assert_eq!(
+            unique_name(Platform::Ios, "iPhone 17 Pro", &list),
+            "iPhone 17 Pro 3"
+        );
+        assert_eq!(
+            unique_name(Platform::Android, "Pixel 9", &list),
+            "Pixel_9_2"
+        );
         assert_eq!(unique_name(Platform::Ios, "Pixel 9", &list), "Pixel 9");
     }
 
@@ -975,7 +1206,11 @@ mod tests {
             _ => Platform::Ios,
         };
         let options = new_device_options().expect("options");
-        let runtime = options.runtimes(platform).first().expect("a runtime").clone();
+        let runtime = options
+            .runtimes(platform)
+            .first()
+            .expect("a runtime")
+            .clone();
         let model = runtime
             .models
             .iter()
@@ -985,7 +1220,13 @@ mod tests {
         let name = unique_name(platform, "MonoCode Check", &list().unwrap());
         let started = Instant::now();
         let device = create(platform, &name, &runtime, &model.id).expect("created");
-        eprintln!("created {} ({}) as {} in {:?}", device.name, model.name, device.id, started.elapsed());
+        eprintln!(
+            "created {} ({}) as {} in {:?}",
+            device.name,
+            model.name,
+            device.id,
+            started.elapsed()
+        );
         let listed = list().unwrap();
         let entry = listed
             .devices
@@ -1000,7 +1241,11 @@ mod tests {
         remove(&entry).expect("deleted");
         eprintln!("deleted in {:?}", started.elapsed());
         assert!(
-            !list().unwrap().devices.iter().any(|d| d.platform == platform && d.name == device.name),
+            !list()
+                .unwrap()
+                .devices
+                .iter()
+                .any(|d| d.platform == platform && d.name == device.name),
             "gone from the list"
         );
         stop();
@@ -1019,12 +1264,55 @@ mod tests {
             .into_string()
             .unwrap();
         std::fs::write("/tmp/hub-new-device-options.json", &raw).unwrap();
-        let devices = endpoint.get("/api/devices", Duration::from_secs(60)).unwrap().into_string().unwrap();
+        let devices = endpoint
+            .get("/api/devices", Duration::from_secs(60))
+            .unwrap()
+            .into_string()
+            .unwrap();
         std::fs::write("/tmp/hub-devices.json", &devices).unwrap();
         stop();
     }
 
     /// Installs and runs the real hub against a booted iOS Simulator:
+    /// How long each hub call takes on repeat, with a booted simulator:
+    /// `cargo test --lib live_timings -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "runs the real Device Hub"]
+    fn live_timings() {
+        super::super::set_enabled(true, false);
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            let started = Instant::now();
+            f();
+            eprintln!("timing: {label} {:?}", started.elapsed());
+        };
+        let mut endpoint = None;
+        time("hub start", &mut || endpoint = Some(ensure().unwrap()));
+        let endpoint = endpoint.unwrap();
+        let mut udid = String::new();
+        for round in 0..3 {
+            time(&format!("list #{round}"), &mut || {
+                let list = list().unwrap();
+                udid = list
+                    .devices
+                    .iter()
+                    .find(|d| d.platform == Platform::Ios && d.booted)
+                    .map(|d| d.id.clone())
+                    .unwrap_or_default();
+            });
+        }
+        for round in 0..3 {
+            time(&format!("attach #{round}"), &mut || {
+                attach(&endpoint, &udid).unwrap()
+            });
+        }
+        for path in ["/api/devices", "/readyz"] {
+            time(&format!("GET {path}"), &mut || {
+                endpoint.get(path, Duration::from_secs(20)).unwrap();
+            });
+        }
+        stop();
+    }
+
     /// `cargo test --lib live_hub -- --ignored --nocapture`.
     #[test]
     #[ignore = "installs and runs the real Device Hub"]
@@ -1032,10 +1320,17 @@ mod tests {
         crate::device::set_enabled(true, false);
         let started = Instant::now();
         let endpoint = ensure().expect("the hub starts");
-        eprintln!("hub ready on port {} in {:?}", endpoint.port, started.elapsed());
+        eprintln!(
+            "hub ready on port {} in {:?}",
+            endpoint.port,
+            started.elapsed()
+        );
         let list = list().expect("the hub lists devices");
         for device in &list.devices {
-            eprintln!("{:?} {} {} booted={}", device.platform, device.name, device.id, device.booted);
+            eprintln!(
+                "{:?} {} {} booted={}",
+                device.platform, device.name, device.id, device.booted
+            );
         }
         eprintln!("errors: {:?}", list.errors);
         let device = list
@@ -1062,19 +1357,15 @@ mod tests {
     }
 
     #[test]
-    fn android_capture_avoids_software_x264_of_raw_frames() {
-        let doctor = toolchain::Doctor::default();
-        let args = arguments(std::path::Path::new("/hub/cli.mjs"), 4000, &doctor);
+    fn the_hub_streams_with_hardware_encoding_and_scrcpy_on_loopback() {
+        let args = arguments(std::path::Path::new("/hub/cli.mjs"), 4000);
         let pairs: Vec<_> = args.windows(2).collect();
-        assert!(pairs.contains(&&["--encoder".to_string(), "hardware".to_string()][..]));
-        assert!(pairs.contains(&&["--grpc-image-mode".to_string(), "mmap".to_string()][..]));
-        assert!(pairs.contains(&&["--host".to_string(), "127.0.0.1".to_string()][..]));
+        let has = |a: &str, b: &str| pairs.contains(&&[a.to_string(), b.to_string()][..]);
+        assert!(has("--encoder", "hardware"));
+        assert!(has("--stream-source", "scrcpy"));
+        assert!(has("--video-fps", "120"));
+        assert!(has("--max-dimension", "1600"));
+        assert!(has("--host", "127.0.0.1"));
         assert!(args.contains(&"--require-token".to_string()));
-        let with_scrcpy = toolchain::Doctor {
-            scrcpy: true,
-            ..Default::default()
-        };
-        let args = arguments(std::path::Path::new("/hub/cli.mjs"), 4000, &with_scrcpy);
-        assert!(args.windows(2).any(|pair| pair == ["--stream-source", "scrcpy"]));
     }
 }

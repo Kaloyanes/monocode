@@ -3,7 +3,7 @@
 //! like the lead's own subagents instead of living only in the sidebar.
 use super::*;
 use gpui::AnyElement;
-use monocode_core::orchestration::{Plan, State};
+use monocode_core::orchestration::{Plan, State, Team};
 
 const FUCHSIA_300: u32 = 0xf4a8ff;
 const AMBER_400: u32 = 0xffb900;
@@ -50,10 +50,18 @@ pub(crate) struct RunView {
     pub plan: Plan,
     pub phase: Phase,
     pub tasks: Vec<TaskView>,
+    /// The user's team choice; none runs every worker on the lead's model.
+    pub team: Option<Team>,
 }
 impl RunView {
     /// A plan nobody has started, as the planning turn left it.
-    pub(crate) fn review(plan: Plan, phase: Phase, harness: &str, model: &str) -> Self {
+    pub(crate) fn review(
+        plan: Plan,
+        phase: Phase,
+        harness: &str,
+        model: &str,
+        team: Option<Team>,
+    ) -> Self {
         let tasks = plan
             .tasks
             .iter()
@@ -62,7 +70,8 @@ impl RunView {
                 needs_input: false,
                 session: None,
                 harness: task.provider.clone().unwrap_or_else(|| harness.into()),
-                model: task.model.clone().unwrap_or_else(|| model.into()),
+                model: monocode_core::orchestration::tier_model(team, harness, task, 0)
+                    .unwrap_or_else(|| model.into()),
                 steps: 0,
                 note: (!task.depends_on.is_empty())
                     .then(|| format!("after {}", task.depends_on.join(", "))),
@@ -70,7 +79,12 @@ impl RunView {
                 report: String::new(),
             })
             .collect();
-        Self { plan, phase, tasks }
+        Self {
+            plan,
+            phase,
+            tasks,
+            team,
+        }
     }
 }
 
@@ -80,6 +94,8 @@ pub(crate) enum Action {
     Dismiss,
     /// Drops an assignment from the plan under review.
     Remove(String),
+    /// Picks the team behind the plan under review; none is the lead's model.
+    Team(Option<Team>),
     Stop,
     Resume,
     Retry(usize),
@@ -304,17 +320,22 @@ pub(super) fn render(
         .orchestration
         .get(&call.id)
         .cloned()
-        .unwrap_or_else(|| RunView::review(plan.clone(), Phase::Inactive, &view.provider, ""));
+        .unwrap_or_else(|| {
+            RunView::review(plan.clone(), Phase::Inactive, &view.provider, "", None)
+        });
     let key = call.id.clone();
-    let action = move |action: Action| {
-        let call = key.clone();
-        move |_: &mut TranscriptView, cx: &mut Context<TranscriptView>| {
-            cx.emit(OrchestrationAction {
-                call: call.clone(),
-                action: action.clone(),
-            })
-        }
-    };
+    let action =
+        move |action: Action| -> Box<dyn Fn(&mut TranscriptView, &mut Context<TranscriptView>)> {
+            let call = key.clone();
+            Box::new(
+                move |_: &mut TranscriptView, cx: &mut Context<TranscriptView>| {
+                    cx.emit(OrchestrationAction {
+                        call: call.clone(),
+                        action: action.clone(),
+                    })
+                },
+            )
+        };
     let (actions, reason) = actions(&run.phase);
     let buttons: Vec<AnyElement> = actions
         .into_iter()
@@ -616,6 +637,7 @@ pub(super) fn render(
             )
         })
         .children(rows)
+        .when(reviewing, |d| d.child(team_row(&run, start, &action, cx)))
         .when(reviewing, |d| {
             d.child(
                 div()
@@ -628,5 +650,72 @@ pub(super) fn render(
                     .child("Reply to revise the plan. Workers share this checkout; overlapping scopes run one after another."),
             )
         })
+        .into_any_element()
+}
+
+/// The review card's team chooser: the lead's model for everything, or a
+/// tier that picks each Claude worker's model from its difficulty.
+fn team_row(
+    run: &RunView,
+    start: usize,
+    action: &impl Fn(Action) -> Box<dyn Fn(&mut TranscriptView, &mut Context<TranscriptView>)>,
+    cx: &mut Context<TranscriptView>,
+) -> AnyElement {
+    let choices: [(&'static str, Option<Team>); 4] = [
+        ("Lead's model", None),
+        ("Cheap", Some(Team::Cheap)),
+        ("Balanced", Some(Team::Balanced)),
+        ("Strong", Some(Team::Strong)),
+    ];
+    let hint = run
+        .team
+        .map_or("Every worker runs on this chat's model.", Team::hint);
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1p5()
+        .px_2p5()
+        .py_1p5()
+        .border_t_1()
+        .border_color(content(0.06))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(content(0.5))
+                .child("Team"),
+        )
+        .children(choices.into_iter().enumerate().map(|(ix, (label, team))| {
+            let handler = action(Action::Team(team));
+            let selected = run.team == team;
+            div()
+                .id(("orch-team", start * 8 + ix))
+                .role(gpui::Role::RadioButton)
+                .aria_label(label)
+                .aria_selected(selected)
+                .px_2()
+                .py_0p5()
+                .rounded(px(6.))
+                .text_size(px(12.))
+                .cursor_pointer()
+                .when(selected, |d| {
+                    d.bg(tint(FUCHSIA_300, 0.16)).text_color(content(0.92))
+                })
+                .when(!selected, |d| {
+                    d.text_color(content(0.6))
+                        .hover(|s| s.bg(content(0.1)).text_color(content(0.9)))
+                })
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(11.))
+                .text_color(content(0.4))
+                .child(hint),
+        )
         .into_any_element()
 }

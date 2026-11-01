@@ -353,6 +353,7 @@ fn draft_target(name: &str, input: &Value) -> Option<String> {
             format!("open {}", input["url"].as_str().unwrap_or_default())
         }
         _ if input["html"].is_string() => "show a page".into(),
+        _ if input["publish"] == true => "show the draft".into(),
         _ if input["width"].is_number() || input["height"].is_number() => {
             "change the viewport".into()
         }
@@ -836,6 +837,10 @@ mod tests {
                 "change the viewport"
             );
             assert_eq!(shown(name, json!({"draft": "d"})).1, "look again");
+            assert_eq!(
+                shown(name, json!({"draft": "d", "publish": true})).1,
+                "show the draft"
+            );
             assert_eq!(
                 shown(name, json!({"url": "http://localhost:5173"})).1,
                 "open http://localhost:5173"

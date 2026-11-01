@@ -100,8 +100,9 @@ impl Browser {
     fn launch(host: &Path) -> std::io::Result<Arc<Self>> {
         use std::os::unix::process::CommandExt;
         static LAUNCHES: AtomicU64 = AtomicU64::new(0);
-        let receiver = frame_port::Receiver::new(&LAUNCHES.fetch_add(1, Ordering::Relaxed).to_string())
-            .map_err(std::io::Error::other)?;
+        let receiver =
+            frame_port::Receiver::new(&LAUNCHES.fetch_add(1, Ordering::Relaxed).to_string())
+                .map_err(std::io::Error::other)?;
         let pipe = || -> std::io::Result<(i32, i32)> {
             let mut fds = [0; 2];
             if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -196,17 +197,19 @@ impl Browser {
     }
 
     /// Opens a tab `width` × `height` points at `scale`; resolves to its id.
-    pub(super) async fn open_tab(&self, width: u32, height: u32, scale: f32) -> Result<u64, String> {
+    pub(super) async fn open_tab(
+        &self,
+        width: u32,
+        height: u32,
+        scale: f32,
+    ) -> Result<u64, String> {
         let id = self.next_tab.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, receiver) = async_channel::bounded(1);
         self.opening.lock().unwrap().insert(id, reply);
         self.command(&json!({"open": {
             "id": id, "width": width.max(1), "height": height.max(1), "scale": scale,
         }}));
-        receiver
-            .recv()
-            .await
-            .map_err(|_| self.went_away())??;
+        receiver.recv().await.map_err(|_| self.went_away())??;
         Ok(id)
     }
 
@@ -397,7 +400,9 @@ fn route(routes: &Routes, message: Value) {
         }
     } else if let Some(tab) = message["failed"].as_u64() {
         if let Some(reply) = routes.opening.lock().unwrap().remove(&tab) {
-            let error = message["error"].as_str().unwrap_or("Chromium could not open a tab");
+            let error = message["error"]
+                .as_str()
+                .unwrap_or("Chromium could not open a tab");
             let _ = reply.try_send(Err(error.to_owned()));
         }
     } else if let Some(popup) = message.get("popup") {
@@ -489,7 +494,11 @@ mod tests {
             Some("GPU process isn't usable. Goodbye.")
         );
         assert_eq!(
-            fatal_line("called `Result::unwrap()` on an `Err` value: NotFound", true).as_deref(),
+            fatal_line(
+                "called `Result::unwrap()` on an `Err` value: NotFound",
+                true
+            )
+            .as_deref(),
             Some("called `Result::unwrap()` on an `Err` value: NotFound")
         );
         assert_eq!(fatal_line("[1:2:3:ERROR:x.cc:1] Not fatal", false), None);

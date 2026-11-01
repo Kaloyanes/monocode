@@ -121,7 +121,9 @@ impl ProjectGit {
     }
     pub(crate) fn available(&self) -> bool {
         // Home is the whole user folder: never Git-watch or poll it.
-        !self.project.is_empty() && self.project != "~" && !monocode_core::files::is_home_project(&self.project)
+        !self.project.is_empty()
+            && self.project != "~"
+            && !monocode_core::files::is_home_project(&self.project)
     }
     /// The first frame of a switch already shows the new checkout's last
     /// snapshot, never the previous one's files and actions.

@@ -117,7 +117,12 @@ pub(crate) fn host() -> Option<PathBuf> {
         }
     }
     write_plist(&contents.join("Info.plist"), HOST, "dev.monocode.cef").ok()?;
-    write_plist(&helper.join("Info.plist"), HELPER, "dev.monocode.cef.helper").ok()?;
+    write_plist(
+        &helper.join("Info.plist"),
+        HELPER,
+        "dev.monocode.cef.helper",
+    )
+    .ok()?;
     Some(contents.join("MacOS").join(HOST))
 }
 
