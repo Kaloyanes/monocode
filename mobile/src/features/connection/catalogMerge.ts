@@ -32,9 +32,3 @@ export function mergeCatalog(previous: Catalog, next: Catalog): Catalog {
     return previous;
   return { ...next, projects, monos, sessions };
 }
-
-/** Whether any session is working, which is when the phone polls quickly. */
-export const anyBusy = (catalog: Catalog) =>
-  catalog.sessions.some((session) => session.busy) ||
-  catalog.projects.some((project) => project.busy) ||
-  catalog.monos.some((mono) => mono.status === "working");

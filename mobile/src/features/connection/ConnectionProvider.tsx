@@ -31,7 +31,7 @@ import {
 } from "./nativeLink";
 import { backoff, onAppActive, pause, waitForActive } from "./appActivity";
 import { deepEqual } from "./deepEqual";
-import { anyBusy, mergeCatalog } from "./catalogMerge";
+import { mergeCatalog } from "./catalogMerge";
 import { normalizeSelection, type MobileSelection } from "./selection";
 
 export type Catalog = {
@@ -53,10 +53,10 @@ const PAIRING = "monocode.mobile.pairing";
 const IDENTITY = "monocode.mobile.identity";
 const key = (fingerprint: string, kind: string) =>
   `monocode.mobile.${fingerprint}.${kind}`;
-/** How often the workspace is read: quickly while some session works, slowly otherwise. */
-export const BUSY_POLL_MS = 5000;
-export const IDLE_POLL_MS = 15000;
-const MAX_POLL_MS = 60000;
+/** How often the workspace is read while the app is in the foreground. */
+export const POLL_MS = 5000;
+/** After failed reads the wait doubles, up to this. */
+const MAX_POLL_MS = 30000;
 /** The catalog is saved for the next launch at most this often, and when the app leaves the foreground. */
 export const CATALOG_SAVE_MS = 30000;
 
@@ -109,7 +109,6 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
   const active = useRef<Pairing | null>(null);
   const refreshing = useRef(false);
   const failures = useRef(0);
-  const busy = useRef(false);
   // The catalog saved for the next launch is written lazily, not on every change.
   const unsaved = useRef<{ fingerprint: string; catalog: Catalog } | null>(null);
   const savedAt = useRef(0);
@@ -195,7 +194,6 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
         store.set(merged);
         saveCatalog(value.desktop.fingerprint, merged);
       }
-      busy.current = anyBusy(merged);
       failures.current = 0;
       setConnected(true);
       setError(null);
@@ -220,10 +218,8 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
         await refresh();
         await pause(
           failures.current > 0
-            ? backoff(IDLE_POLL_MS, failures.current - 1, MAX_POLL_MS)
-            : busy.current
-              ? BUSY_POLL_MS
-              : IDLE_POLL_MS,
+            ? backoff(POLL_MS, failures.current - 1, MAX_POLL_MS)
+            : POLL_MS,
           stop.signal,
         );
       }

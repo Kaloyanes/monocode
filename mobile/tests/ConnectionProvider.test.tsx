@@ -10,6 +10,7 @@ const world = vi.hoisted(() => ({
   requests: 0,
   catalog: undefined as unknown as Record<string, unknown>,
   addresses: [{ host: "10.0.0.2", port: 1 }],
+  fail: false,
 }));
 vi.mock("react-native", () => ({
   Platform: { OS: "ios" },
@@ -44,6 +45,7 @@ vi.mock("@/features/connection/nativeLink", () => ({
   parseInvitation: () => ({}),
   request: async () => {
     world.requests++;
+    if (world.fail) throw new Error("offline");
     return structuredClone({ ...world.catalog, addresses: world.addresses });
   },
 }));
@@ -93,6 +95,7 @@ beforeEach(async () => {
   world.store.clear();
   world.writes.length = 0;
   world.requests = 0;
+  world.fail = false;
   world.addresses = [{ host: "10.0.0.2", port: 1 }];
   world.catalog = { projects: [], monos: [], sessions: [session("one")] };
   world.store.set(
@@ -119,31 +122,37 @@ afterEach(() => {
 });
 
 describe("ConnectionProvider polling", () => {
-  it("reads every idle interval, not every five seconds", async () => {
+  it("reads every five seconds while the app is active, busy or not", async () => {
     world.requests = 0;
-    await advance(15000 * 4 + 100);
-    expect(world.requests).toBeGreaterThanOrEqual(3);
-    expect(world.requests).toBeLessThanOrEqual(5);
+    await advance(5000 * 12 + 100);
+    expect(world.requests).toBe(12);
+    world.catalog = { projects: [], monos: [], sessions: [session("one", true)] };
+    world.requests = 0;
+    await advance(5000 * 12);
+    expect(world.requests).toBe(12);
   });
 
-  it("polls fast only while a session is busy", async () => {
-    world.catalog = { projects: [], monos: [], sessions: [session("one", true)] };
-    await advance(15000 + 100);
+  it("shows a session started on the desktop within one poll", async () => {
+    const seen = renders.everything;
+    world.catalog = { projects: [], monos: [], sessions: [session("one"), session("new")] };
+    await advance(5000);
+    expect(renders.everything).toBeGreaterThan(seen);
+  });
+
+  it("backs off after failures", async () => {
+    world.fail = true;
+    await advance(5000 * 3);
     world.requests = 0;
-    await advance(30000);
-    expect(world.requests).toBeGreaterThanOrEqual(5);
-    world.catalog = { projects: [], monos: [], sessions: [session("one")] };
-    await advance(10000);
-    world.requests = 0;
-    await advance(30000);
-    expect(world.requests).toBeLessThanOrEqual(3);
+    await advance(300_000);
+    // A fixed 5 s retry would be 60 reads.
+    expect(world.requests).toBeLessThan(15);
   });
 
   it("does not read in the background", async () => {
     world.appState = "background";
-    await advance(15000 * 3);
+    await advance(5000 * 3);
     world.requests = 0;
-    await advance(15000 * 10);
+    await advance(5000 * 30);
     expect(world.requests).toBe(0);
     world.appState = "active";
     await act(async () => {
@@ -166,7 +175,7 @@ describe("ConnectionProvider writes and renders", () => {
 
   it("writes the pairing when the addresses change", async () => {
     world.addresses = [{ host: "10.0.0.3", port: 1 }];
-    await advance(15000 + 100);
+    await advance(5000 + 100);
     expect(pairingWrites()).toBe(1);
   });
 
@@ -195,6 +204,35 @@ describe("ConnectionProvider writes and renders", () => {
     expect(catalogWrites()).toBeGreaterThan(before - 1);
     const saved = JSON.parse(world.store.get("monocode.mobile.fp.catalog") ?? "{}");
     expect(saved.sessions.length).toBe(2);
+  });
+
+  it("a poll that finds nothing new updates no state and renders nothing", async () => {
+    const before = { ...renders };
+    const commits = vi.fn();
+    const { Profiler } = await import("react");
+    await act(async () =>
+      root.render(
+        <Profiler id="p" onRender={commits}>
+          <ConnectionProvider>
+            <CommandOnly />
+            <ToolsOnly />
+            <Everything />
+          </ConnectionProvider>
+        </Profiler>,
+      ),
+    );
+    await settle();
+    // Let the first read land, then count only the polls after it.
+    await advance(5000);
+    const quiet = { ...renders };
+    commits.mockClear();
+    world.requests = 0;
+    await advance(5000 * 12);
+    expect(world.requests).toBe(12);
+    // Twelve reads of the same workspace: no render of any reader, no commit.
+    expect(renders).toEqual(quiet);
+    expect(commits).not.toHaveBeenCalled();
+    expect(before.everything).toBeGreaterThan(0);
   });
 
   it("re-renders command-only and flag-only readers never, whatever the catalog does", async () => {
