@@ -2225,8 +2225,12 @@ impl Draft {
     /// Returns whether the height changed. A page whose height depends on its
     /// own viewport would grow without end, so the same step repeated is
     /// taken as that: the card goes back to where it was and the page scrolls.
+    ///
+    /// A height of 0 is the page not having reported since `lay_out` cleared
+    /// it. Taking it would shrink the card to `MIN_HEIGHT`, and a page as tall
+    /// as its viewport would then report that and stay there.
     fn fit_content(&mut self, content: u64) -> bool {
-        if self.growth.frozen {
+        if self.growth.frozen || content == 0 {
             return false;
         }
         let height = (content.min(u64::from(MAX_HEIGHT)) as u32).max(MIN_HEIGHT);
@@ -2727,6 +2731,28 @@ mod tests {
         cx.run_until_parked();
         assert!(!chromium(cx), "and back to WebKit");
         crate::chromium::INSTALLED_IN_TEST.set(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn a_page_that_has_not_reported_its_height_keeps_its_card(cx: &mut TestAppContext) {
+        let draft = cx.new(|cx| {
+            Draft::new(
+                Some("draft-1-h".into()),
+                1,
+                DraftContent::Html("<p>Hi</p>".into()),
+                (Some(1280), Some(600)),
+                None,
+                None,
+                cx,
+            )
+        });
+        draft.update(cx, |draft, _| {
+            assert!(!draft.fit_content(0), "a cleared height is no height");
+            assert_eq!(draft.height, 600);
+            assert!(draft.fit_content(420));
+            assert_eq!(draft.height, 420);
+        });
     }
 
     #[gpui::test]
