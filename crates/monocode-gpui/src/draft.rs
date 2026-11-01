@@ -2314,14 +2314,21 @@ impl Draft {
         cx: &mut gpui::AsyncApp,
     ) -> Option<DraftLayout> {
         let width = viewport.map_or(own.0, |viewport| viewport.0);
-        evaluate(web, "window.__mc.vw=0;window.__mc.h=0;'ok'", cx).await?;
+        // A page already at this width reports nothing new: Chromium only
+        // renders it at another scale, which fires no resize.
+        let before = state(web, cx).await?;
+        let same = before["vw"].as_u64() == Some(u64::from(width))
+            && before["h"].as_u64().is_some_and(|h| h > 0);
+        if !same {
+            evaluate(web, "window.__mc.vw=0;window.__mc.h=0;'ok'", cx).await?;
+        }
         this.update(cx, |this, cx| {
             this.host.measure_at(viewport, own);
             cx.notify();
         })
         .ok()?;
         let started = std::time::Instant::now();
-        loop {
+        while !same {
             let reading = state(web, cx).await?;
             let laid_out = reading["vw"]
                 .as_u64()
