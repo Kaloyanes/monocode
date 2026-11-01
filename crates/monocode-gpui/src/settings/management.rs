@@ -10,6 +10,8 @@ pub(super) enum Target {
     Skill,
     Worktree,
     DeleteTree(data::Tree),
+    /// Cleanup: worktrees that are clean and merged or pushed.
+    Sweep(Vec<monocode_core::worktree_management::TreeStatus>),
     ResetMono(super::MonoSetting),
 }
 pub(super) struct Editor {
@@ -79,7 +81,7 @@ impl SettingsView {
         let previous = window.focused(cx);
         if matches!(
             target,
-            Target::Cli(_) | Target::DeleteTree(_) | Target::ResetMono(_)
+            Target::Cli(_) | Target::DeleteTree(_) | Target::Sweep(_) | Target::ResetMono(_)
         ) {
             window.focus(&self.focus, cx);
         } else {
@@ -188,19 +190,26 @@ impl SettingsView {
             editor.busy = false;
             match result {
                 Ok(()) => {
-                    if let Some(editor) = &self.management
-                        && let Target::DeleteTree(tree) = &editor.target
-                        && monocode_core::files::is_equal_or_inside(
-                            &self.selected_project,
-                            &tree.tree.path,
-                        )
-                    {
+                    let removed = match &editor.target {
+                        Target::DeleteTree(tree) => vec![tree.tree.path.clone()],
+                        Target::Sweep(list) => list.iter().map(|t| t.tree.path.clone()).collect(),
+                        _ => Vec::new(),
+                    };
+                    if removed.iter().any(|path| {
+                        monocode_core::files::is_equal_or_inside(&self.selected_project, path)
+                    }) {
                         self.selected_project = self.discovery.worktrees.main.clone();
                     }
                     self.management = None;
                     self.refresh(cx);
                 }
-                Err(e) => editor.error = Some(e),
+                Err(e) => {
+                    editor.error = Some(e);
+                    // Some of a cleanup may have been removed before one was skipped.
+                    if matches!(editor.target, Target::Sweep(_)) {
+                        self.refresh(cx);
+                    }
+                }
             }
         }
         cx.notify();
@@ -231,6 +240,14 @@ impl SettingsView {
         editor.error = None;
         if let Target::ResetMono(mono) = target {
             cx.emit(SettingsEvent::ResetMono(mono.id));
+            cx.notify();
+            return;
+        }
+        if let Target::Sweep(list) = target {
+            cx.emit(SettingsEvent::RemoveWorktrees {
+                cwd,
+                paths: list.into_iter().map(|t| t.tree.path).collect(),
+            });
             cx.notify();
             return;
         }
@@ -560,6 +577,7 @@ impl SettingsView {
                     self.discovery.worktrees.default_root.display()
                 )));
             }
+            Target::Sweep(list) => rows.extend(self.sweep_confirmation(&list)),
             Target::DeleteTree(tree) => {
                 let count = self
                     .ctx
@@ -712,7 +730,13 @@ impl SettingsView {
                 );
             }
         }
+        let sweep_label = match &target {
+            Target::Sweep(list) if list.len() == 1 => Some("Remove worktree".to_owned()),
+            Target::Sweep(list) => Some(format!("Remove {} worktrees", list.len())),
+            _ => None,
+        };
         let label = match target {
+            Target::Sweep(_) => sweep_label.as_deref().unwrap_or_default(),
             Target::Cli(_) => "Save path",
             Target::Mcp => {
                 if busy {
@@ -754,7 +778,10 @@ impl SettingsView {
             )
             .child(
                 crate::modal::disabled(
-                    if matches!(target, Target::DeleteTree(_) | Target::ResetMono(_)) {
+                    if matches!(
+                        target,
+                        Target::DeleteTree(_) | Target::Sweep(_) | Target::ResetMono(_)
+                    ) {
                         crate::modal::danger_button("submit-management", label)
                     } else {
                         crate::modal::primary_button("submit-management", label)
@@ -785,6 +812,11 @@ impl SettingsView {
             Target::Mcp => "Add MCP server".into(),
             Target::Worktree => "Create worktree".into(),
             Target::DeleteTree(_) => "Delete worktree?".into(),
+            Target::Sweep(ref list) => format!(
+                "Remove {} {}?",
+                list.len(),
+                if list.len() == 1 { "worktree" } else { "worktrees" }
+            ),
             Target::ResetMono(ref mono) => format!("Reset {} to its defaults?", mono.name),
             _ => String::new(),
         };

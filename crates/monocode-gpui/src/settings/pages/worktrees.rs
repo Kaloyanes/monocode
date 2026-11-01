@@ -194,6 +194,9 @@ impl SettingsView {
                     .into_any_element(),
             );
         }
+        if ready && !self.discovery.worktrees.sweep.is_empty() {
+            page.push(self.worktree_sweep(cx));
+        }
         if ready {
             page.push(note(format!(
                 "New worktrees are created in {}.",

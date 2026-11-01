@@ -61,6 +61,7 @@ mod threads;
 mod title_tabs;
 #[cfg(target_os = "linux")]
 mod window_chrome;
+mod worktree_sweep;
 mod worktrees;
 
 use crate::settings::TitleBarMode;

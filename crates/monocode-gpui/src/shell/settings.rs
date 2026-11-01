@@ -229,6 +229,9 @@ impl Shell {
                     window,
                     cx,
                 ),
+                SettingsEvent::RemoveWorktrees { cwd, paths } => {
+                    this.remove_swept_worktrees(cwd.clone(), paths.clone(), cx)
+                }
                 SettingsEvent::ChooseBackground => this.choose_chat_background(cx),
                 SettingsEvent::ResetMono(id) => {
                     if let Some(m) = this.monos.clone() {
@@ -445,7 +448,7 @@ impl Shell {
         })
         .detach();
     }
-    fn finish_worktree_action(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+    pub(super) fn finish_worktree_action(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
         if let Some(view) = &self.settings {
             view.update(cx, |v, cx| v.management_finished(result, cx));
         }

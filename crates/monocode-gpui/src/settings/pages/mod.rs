@@ -14,6 +14,7 @@ mod monos;
 mod providers;
 mod skills;
 mod visualizations;
+mod worktree_sweep;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
