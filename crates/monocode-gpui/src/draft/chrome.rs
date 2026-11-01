@@ -617,7 +617,11 @@ impl Host {
         let state = self.state.borrow();
         let frame = state.frame.as_ref()?;
         let (_, scale, _) = state.drawn?;
-        Some((frame.pixels.0, frame.pixels.0 / frame.scale * scale, frame.scale))
+        Some((
+            frame.pixels.0,
+            frame.pixels.0 / frame.scale * scale,
+            frame.scale,
+        ))
     }
 
     pub(super) fn column(&self) -> Option<f32> {
@@ -822,8 +826,7 @@ async fn run(
 pub(super) static FRAMES_RECEIVED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 #[cfg(debug_assertions)]
-pub(super) static STREAM_STOPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(super) static STREAM_STOPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Shows the tab's frames as they arrive, until it closes. A card that has
 /// not drawn the page for a while stops them.

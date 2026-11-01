@@ -2038,7 +2038,11 @@ impl Draft {
                 let web = Self::ready(this, cx).await?;
                 let (chromium, frame, (viewport, _)) = this
                     .read_with(cx, |this, _| {
-                        (this.host.is_chromium(), this.host.density(), this.viewport())
+                        (
+                            this.host.is_chromium(),
+                            this.host.density(),
+                            this.viewport(),
+                        )
                     })
                     .map_err(gone)?;
                 let still = engine::picture(&web, cx).await.map(|image| {
