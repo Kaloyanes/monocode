@@ -455,10 +455,10 @@ impl Shell {
                     sessions,
                     collapsed,
                 } => (sessions, *collapsed),
-                Entry::Folder { id, sessions } => {
+                Entry::Folder { archived: true, .. } | Entry::Session(_) => continue,
+                Entry::Folder { id, sessions, .. } => {
                     (sessions, groups.folder(id).is_some_and(|g| g.collapsed))
                 }
-                Entry::Session(_) => continue,
             };
             if !folders {
                 rows.push(Row::Folders);
@@ -485,6 +485,37 @@ impl Shell {
         let mut previous = None;
         let mut first = true;
         for entry in entries {
+            if let Entry::Folder {
+                id,
+                sessions,
+                archived: true,
+            } = entry
+            {
+                // A folder archived whole sits first in the archive, as one
+                // group that folds like a live folder.
+                if previous != Some("Archived") {
+                    rows.push(Row::Heading {
+                        label: "Archived",
+                        first,
+                    });
+                    previous = Some("Archived");
+                    first = false;
+                }
+                rows.push(Row::Group(entry.clone()));
+                if !groups.folder(id).is_some_and(|g| g.collapsed) || !self.query.is_empty() {
+                    rows.extend(
+                        sessions
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, id)| Row::GroupedSession {
+                                id: *id,
+                                first: ix == 0,
+                                last: ix + 1 == sessions.len(),
+                            }),
+                    );
+                }
+                continue;
+            }
             let Entry::Session(id) = entry else {
                 continue;
             };
@@ -526,12 +557,15 @@ impl Shell {
         // Its project navigation and Mono roster belong to the first rail.
         let mut rows = vec![Row::ClassicGap(6)];
         for (ix, entry) in entries.iter().enumerate() {
-            if let Entry::Session(id) = entry
-                && archived_listed
-                && !archive_heading
-                && self.session_metadata(*id, cx).summary.archived
-                && !self.archive_exits.exiting(*id)
-            {
+            let archived_entry = match entry {
+                Entry::Session(id) => {
+                    self.session_metadata(*id, cx).summary.archived
+                        && !self.archive_exits.exiting(*id)
+                }
+                Entry::Folder { archived, .. } => *archived,
+                _ => false,
+            };
+            if archived_entry && archived_listed && !archive_heading {
                 archive_heading = true;
                 if ix > 0 {
                     rows.push(Row::ClassicGap(8));
@@ -550,7 +584,7 @@ impl Shell {
                     sessions,
                     collapsed,
                 } => (sessions, *collapsed),
-                Entry::Folder { id, sessions } => (
+                Entry::Folder { id, sessions, .. } => (
                     sessions,
                     groups.folder(id).is_some_and(|folder| folder.collapsed),
                 ),
@@ -570,7 +604,12 @@ impl Shell {
                             last: ix + 1 == members.len(),
                         }),
                 );
-                if let Entry::Folder { id, .. } = entry {
+                if let Entry::Folder {
+                    id,
+                    archived: false,
+                    ..
+                } = entry
+                {
                     rows.push(Row::ClassicFolderNew(id.clone()));
                 }
             }
@@ -1461,17 +1500,26 @@ mod tests {
 
     #[gpui::test]
     fn classic_lists_archived_threads_under_their_own_heading(cx: &mut TestAppContext) {
-        use super::Row;
+        use super::{Entry, Row};
         let (window, a, b) = super::super::tests::window(cx);
-        window
+        let c = window
             .update(cx, |shell, _, cx| {
                 shell.workspace.classic_layout = true;
                 let project = shell.workspace.project.clone();
+                // A folder with a live member keeps its archived one flat.
+                let mut summary = locked(&shell.store)
+                    .unwrap()
+                    .create("codex", &project)
+                    .unwrap();
+                summary.has_messages = true;
+                let c = summary.id;
+                shell.add(summary, cx);
+                shell.sessions[&c].update(cx, |s, _| s.summary.has_messages = true);
                 shell
                     .groups
                     .entry(project.clone())
                     .or_default()
-                    .create_folder(&[a], "f".into());
+                    .create_folder(&[a, c], "f".into());
                 for id in [a, b] {
                     shell.sessions[&id].update(cx, |s, _| {
                         s.summary.cwd = project.clone();
@@ -1481,6 +1529,7 @@ mod tests {
                 }
                 shell.workspace.preferences.show_archived = true;
                 shell.invalidate_chrome(cx);
+                c
             })
             .unwrap();
         cx.refresh().unwrap();
@@ -1505,6 +1554,33 @@ mod tests {
                 .is_some(),
             "the archived row names the folder it came from"
         );
+        // Archiving the folder's last live thread turns it into one archived
+        // group, without its "new session" row.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.sessions[&c].update(cx, |s, _| s.summary.archived = true);
+                shell.invalidate_chrome(cx);
+                shell.refresh_sidebar_structure(cx);
+                let rows = &shell.sidebar_list.rows;
+                let heading = rows
+                    .iter()
+                    .position(|row| *row == Row::ClassicHeading("Archived"))
+                    .unwrap();
+                let group = rows
+                    .iter()
+                    .position(|row| {
+                        matches!(row, Row::Group(Entry::Folder { id, archived: true, .. }) if id == "f")
+                    })
+                    .expect("the archived folder is one group");
+                assert!(group > heading);
+                assert!(!rows.iter().any(|row| matches!(row, Row::ClassicFolderNew(_))));
+                assert!(!rows.contains(&Row::Session(a)), "its threads sit in the group");
+                assert!(
+                    rows.iter()
+                        .any(|row| matches!(row, Row::ClassicGroupMember { id, .. } if *id == a))
+                );
+            })
+            .unwrap();
         window
             .update(visual, |shell, _, cx| {
                 shell.workspace.preferences.show_archived = false;
@@ -1513,6 +1589,11 @@ mod tests {
                 let rows = &shell.sidebar_list.rows;
                 assert!(!rows.contains(&Row::ClassicHeading("Archived")));
                 assert!(!rows.contains(&Row::Session(a)));
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| matches!(row, Row::Group(Entry::Folder { archived: true, .. })))
+                );
             })
             .unwrap();
     }

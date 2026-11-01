@@ -6401,7 +6401,16 @@ impl Shell {
             return None;
         }
         match self.project_groups().folder_of(id) {
-            Some(folder) => Some(("folder", folder.name.clone())),
+            // A folder archived whole is its own group in the archive, so its
+            // threads need no pill naming it.
+            Some(folder) => folder
+                .session_ids
+                .iter()
+                .any(|member| {
+                    self.session_summaries.contains_key(member)
+                        && !self.session_metadata(*member, cx).summary.archived
+                })
+                .then(|| ("folder", folder.name.clone())),
             None => self
                 .session_metadata(id, cx)
                 .summary
@@ -9801,28 +9810,44 @@ mod tests {
                     .groups
                     .entry(project)
                     .or_default()
-                    .create_folder(&[a], "f".into());
-                let set = |shell: &mut Shell, archived, cx: &mut Context<Shell>| {
-                    shell.sessions[&a].update(cx, |s, _| s.summary.archived = archived)
+                    .create_folder(&[a, b], "f".into());
+                let set = |shell: &mut Shell, id, archived, cx: &mut Context<Shell>| {
+                    shell.sessions[&id].update(cx, |s, _| s.summary.archived = archived)
                 };
-                set(shell, false, cx);
+                set(shell, a, false, cx);
                 let entries = shell.session_entries(&[a, b], cx);
-                assert!(matches!(&entries[0], Entry::Folder { sessions, .. } if sessions == &[a]));
+                assert!(
+                    matches!(&entries[0], Entry::Folder { sessions, .. } if sessions == &[a, b])
+                );
                 assert_eq!(shell.archived_origin(a, cx), None);
 
-                set(shell, true, cx);
+                // With a live member left, the archived one goes flat under a pill.
+                set(shell, a, true, cx);
                 let entries = shell.session_entries(&[a, b], cx);
-                assert!(!entries.iter().any(|e| matches!(e, Entry::Folder { .. })));
+                assert!(
+                    matches!(&entries[0], Entry::Folder { sessions, archived: false, .. } if sessions == &[b])
+                );
                 assert_eq!(entries.last(), Some(&Entry::Session(a)));
                 assert_eq!(
                     shell.archived_origin(a, cx),
                     Some(("folder", "New folder".to_owned()))
                 );
 
-                // Membership was never touched, so unarchiving restores it.
-                set(shell, false, cx);
+                // Archived whole, the folder is one group in the archive.
+                set(shell, b, true, cx);
                 let entries = shell.session_entries(&[a, b], cx);
-                assert!(matches!(&entries[0], Entry::Folder { sessions, .. } if sessions == &[a]));
+                assert!(
+                    matches!(&entries[..], [Entry::Folder { sessions, archived: true, .. }] if sessions.len() == 2)
+                );
+                assert_eq!(shell.archived_origin(a, cx), None, "the group names it");
+
+                // Membership was never touched, so unarchiving restores it.
+                set(shell, a, false, cx);
+                set(shell, b, false, cx);
+                let entries = shell.session_entries(&[a, b], cx);
+                assert!(
+                    matches!(&entries[0], Entry::Folder { sessions, archived: false, .. } if sessions == &[a, b])
+                );
             })
             .unwrap();
     }

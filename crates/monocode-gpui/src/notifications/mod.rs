@@ -11,4 +11,5 @@ pub(crate) mod linked_activity;
 pub(crate) mod platform;
 pub(crate) mod reminders;
 pub(crate) mod surface;
+pub(crate) mod undo_notice;
 pub(crate) mod updater;

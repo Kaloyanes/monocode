@@ -11,6 +11,7 @@ use crate::notifications::{
     layout_notice::{LayoutNotice, LayoutNoticeEvent},
     linked_activity::{Cleanup, LinkedActivity, LinkedActivityEvent},
     platform, reminders,
+    undo_notice::{UndoNotice, UndoNoticeEvent},
     updater::{self, Event as UpdaterEvent, Updater},
 };
 use std::{sync::mpsc::Receiver, time::Duration};
@@ -24,6 +25,10 @@ pub(super) struct State {
     pub installed: Entity<InstalledUpdateNotice>,
     pub updater: Entity<Updater>,
     pub file_error: Entity<FileActionError>,
+    /// The card offering to undo the last folder archive, and what it undoes.
+    pub undo: Entity<UndoNotice>,
+    pub(super) undo_threads: Vec<i64>,
+    undo_timer: Option<gpui::Task<()>>,
     pub reminder_error: Option<String>,
     pub github: Entity<GithubActivity>,
     linked: HashMap<i64, Entity<LinkedActivity>>,
@@ -65,6 +70,9 @@ impl State {
             installed: cx.new(|_| InstalledUpdateNotice::new(None)),
             updater: updater::shared(store, cx),
             file_error: cx.new(|_| FileActionError::new()),
+            undo: cx.new(|_| UndoNotice::new()),
+            undo_threads: Vec::new(),
+            undo_timer: None,
             reminder_error: None,
             github: cx.new(|_| GithubActivity::new(HashMap::new())),
             linked: HashMap::new(),
@@ -269,6 +277,15 @@ impl Shell {
                     .file_error
                     .update(cx, |notice, cx| notice.set_message(None, cx));
                 cx.notify();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &self.notification_state.undo,
+            |this, _, event: &UndoNoticeEvent, cx| {
+                if matches!(event, UndoNoticeEvent::Undo) {
+                    this.undo_folder_archive(cx);
+                }
+                this.dismiss_undo_notice(cx);
             },
         ));
         if let Some(monos) = self.monos.clone() {
@@ -933,6 +950,36 @@ impl Shell {
         cx.notify();
     }
 
+    /// Offers to undo an archive for a few seconds. A newer offer replaces it.
+    pub(super) fn offer_undo(
+        &mut self,
+        message: String,
+        threads: Vec<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        const WINDOW: Duration = Duration::from_secs(8);
+        let state = &mut self.notification_state;
+        state.undo_threads = threads;
+        state
+            .undo
+            .update(cx, |notice, cx| notice.set_message(Some(message), cx));
+        state.undo_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(WINDOW).await;
+            let _ = this.update(cx, |this, cx| this.dismiss_undo_notice(cx));
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn dismiss_undo_notice(&mut self, cx: &mut Context<Self>) {
+        let state = &mut self.notification_state;
+        state.undo_timer = None;
+        state.undo_threads.clear();
+        state
+            .undo
+            .update(cx, |notice, cx| notice.set_message(None, cx));
+        cx.notify();
+    }
+
     pub(super) fn notices_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.notification_state;
         let mono_error = self.monos.as_ref().and_then(|monos| {
@@ -979,6 +1026,9 @@ impl Shell {
             })
             .when(state.file_error.read(cx).is_visible(), |stack| {
                 stack.child(state.file_error.clone())
+            })
+            .when(state.undo.read(cx).is_visible(), |stack| {
+                stack.child(state.undo.clone())
             })
             .when(!state.reminders.read(cx).is_empty(), |d| {
                 d.child(

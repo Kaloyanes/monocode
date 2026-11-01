@@ -9,11 +9,11 @@ import {
 } from "@expo/ui/swift-ui/modifiers";
 import { router, useGlobalSearchParams, usePathname } from "expo-router";
 import { memo, useMemo, useState } from "react";
-import { Alert, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import Animated from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { useConnection, useMonoTools } from "@/features/connection/ConnectionProvider";
+import { useConnection } from "@/features/connection/ConnectionProvider";
 import { PixelMascot } from "@/features/mascots/PixelMascot";
 import { ProjectMascot } from "@/features/mascots/ProjectMascot";
 import { plainText } from "@/features/sessions/markdownParser";
@@ -71,12 +71,10 @@ export function WorkspaceDrawer() {
   const colors = useColors();
   const styles = useStyles();
   const { projects, monos: roster } = useWorkspace();
-  const { command, refresh, selection, select, pairing } = useConnection();
-  const tools = useMonoTools();
+  const { pairing } = useConnection();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [show, setShow] = useState<Show>("both");
-  const [creating, setCreating] = useState(false);
   const unread = useUnreadMonos(pairing?.desktop.fingerprint, roster);
   const pathname = usePathname();
   const params = useGlobalSearchParams<{ projectId?: string; monoId?: string }>();
@@ -136,26 +134,6 @@ export function WorkspaceDrawer() {
   const openSettings = () => {
     if (!isModalRoute(pathname)) router.push("/settings");
   };
-  // A new Mono on the desktop, shown on this phone at once, then its chat with
-  // its look open to name it.
-  const createMono = async () => {
-    if (creating) return;
-    setCreating(true);
-    try {
-      const { monoId } = await command<{ monoId: string }>("mono.create");
-      if (selection) await select({ ...selection, monoIds: [...selection.monoIds, monoId] });
-      await refresh();
-      drawer.closeThen(() => {
-        router.replace({ pathname: "/mono/[monoId]", params: { monoId } });
-        router.push({ pathname: "/mono-profile/[monoId]/edit", params: { monoId } });
-      });
-    } catch (reason) {
-      Alert.alert("Couldn’t create a Mono", reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setCreating(false);
-    }
-  };
-
   // Each kind under its label, as the filter lets it show.
   const listedMonos = show === "projects" ? [] : monos;
   const listedProjects = show === "monos" ? [] : shownProjects;
@@ -226,8 +204,6 @@ export function WorkspaceDrawer() {
           />
           <View style={styles.headerActions}>
             <FilterMenu filter={filter} onFilter={setFilter} show={show} onShow={setShow} />
-            {/* The older desktop app can't make a Mono from the phone. */}
-            {tools ? <CircleButton icon="add" label="New Mono" onPress={() => void createMono()} /> : null}
           </View>
         </View>
 

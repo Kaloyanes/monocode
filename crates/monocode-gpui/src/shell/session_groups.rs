@@ -494,6 +494,30 @@ impl Shell {
             self.session_metadata(*id, cx).summary.archived && !self.archive_exits.exiting(*id)
         });
         archived.sort_by_cached_key(|id| std::cmp::Reverse(self.archived_at(*id, cx)));
+        // A folder with nothing live left leads the archive as one group.
+        let archived_set: HashSet<i64> = archived.iter().copied().collect();
+        let listed: Vec<i64> = archived.iter().chain(&ids).copied().collect();
+        let mut archived_folders = self
+            .project_groups()
+            .archived_folders(&listed, |id| archived_set.contains(&id));
+        archived_folders.sort_by_cached_key(|entry| match entry {
+            Entry::Folder { sessions, .. } => std::cmp::Reverse(
+                sessions
+                    .iter()
+                    .map(|id| self.archived_at(*id, cx))
+                    .max()
+                    .unwrap_or(0),
+            ),
+            _ => std::cmp::Reverse(0),
+        });
+        let grouped: HashSet<i64> = archived_folders
+            .iter()
+            .flat_map(|entry| match entry {
+                Entry::Folder { sessions, .. } => sessions.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        archived.retain(|id| !grouped.contains(id));
         // Chats without messages lead the list, above pins and folders.
         let (fresh, rest): (Vec<i64>, Vec<i64>) = ids
             .iter()
@@ -508,6 +532,7 @@ impl Shell {
                 &self.project_groups(),
                 &reminders,
             ))
+            .chain(archived_folders)
             .chain(archived.into_iter().map(Entry::Session))
             .collect()
     }
@@ -831,12 +856,55 @@ impl Shell {
             }),
         );
         let focus = swatches.read(cx).focus.clone();
-        vec![
+        let (live, archived) = self.folder_threads(folder, cx);
+        let mut items = vec![
             MenuItem::Custom(swatches.into(), focus),
             MenuAction::new("rename", "Rename").shortcut("F2").into(),
             MenuItem::Separator,
-            MenuAction::new("ungroup", "Ungroup").into(),
-        ]
+        ];
+        if live.is_empty() && !archived.is_empty() {
+            // Archived whole, so the folder offers its way back and its end.
+            items.extend([
+                MenuAction::new("unarchive-folder", "Unarchive folder").into(),
+                MenuItem::Separator,
+                MenuAction::new(
+                    "delete-folder",
+                    match archived.len() {
+                        1 => "Delete folder and 1 thread…".to_owned(),
+                        n => format!("Delete folder and {n} threads…"),
+                    },
+                )
+                .danger()
+                .into(),
+            ]);
+        } else if live.is_empty() {
+            items.push(MenuAction::new("ungroup", "Remove folder").into());
+        } else {
+            items.extend([
+                MenuAction::new("archive-folder", "Archive folder").into(),
+                MenuAction::new("ungroup", "Ungroup").into(),
+            ]);
+        }
+        items
+    }
+    /// A folder's threads that exist in this project, live ones and archived.
+    fn folder_threads(&self, folder: &str, cx: &App) -> (Vec<i64>, Vec<i64>) {
+        let groups = self.project_groups();
+        let Some(folder) = groups.folder(folder) else {
+            return Default::default();
+        };
+        folder
+            .session_ids
+            .iter()
+            .copied()
+            .filter(|id| self.session_summaries.contains_key(id))
+            .partition(|id| !self.session_metadata(*id, cx).summary.archived)
+    }
+    fn folder_name(&self, folder: &str) -> String {
+        self.project_groups()
+            .folder(folder)
+            .map(|f| f.name.clone())
+            .unwrap_or_default()
     }
     pub(super) fn run_folder_menu(
         &mut self,
@@ -848,8 +916,130 @@ impl Shell {
         match action {
             "rename" => self.start_rename(RenameTarget::Folder(folder), window, cx),
             "ungroup" => self.update_groups(cx, |groups| groups.dissolve(&folder)),
+            "archive-folder" => self.archive_folder(folder, window, cx),
+            "unarchive-folder" => {
+                let (_, archived) = self.folder_threads(&folder, cx);
+                for id in archived {
+                    self.toggle_archive(id, cx);
+                }
+            }
+            "delete-folder" => self.confirm_delete_folder(folder, window, cx),
             _ => {}
         }
+    }
+
+    /// Archives every live thread of the folder at once. Membership is kept, so
+    /// unarchiving, or Undo, brings the folder back as it was. Archiving stops
+    /// a running thread and Undo cannot resume it, so that case asks first.
+    fn archive_folder(&mut self, folder: String, window: &mut Window, cx: &mut Context<Self>) {
+        let (live, _) = self.folder_threads(&folder, cx);
+        let running = self.running_among(&live, cx);
+        if running == 0 {
+            return self.archive_folder_now(&folder, cx);
+        }
+        let prompt = window.prompt(
+            gpui::PromptLevel::Warning,
+            &format!("Archive “{}”?", self.folder_name(&folder)),
+            Some(&format!(
+                "{} will be stopped, and Undo cannot resume {}.",
+                match running {
+                    1 => "1 running thread".to_owned(),
+                    n => format!("{n} running threads"),
+                },
+                if running == 1 { "it" } else { "them" },
+            )),
+            &["Archive", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if prompt.await != Ok(0) {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| this.archive_folder_now(&folder, cx));
+        })
+        .detach();
+    }
+    fn running_among(&self, ids: &[i64], cx: &App) -> usize {
+        ids.iter()
+            .filter(|id| {
+                self.sessions
+                    .get(id)
+                    .is_some_and(|view| view.read(cx).responding())
+            })
+            .count()
+    }
+    fn archive_folder_now(&mut self, folder: &str, cx: &mut Context<Self>) {
+        let (live, _) = self.folder_threads(folder, cx);
+        if live.is_empty() {
+            return;
+        }
+        let stopped = self.running_among(&live, cx);
+        for id in &live {
+            self.toggle_archive(*id, cx);
+        }
+        let mut message = format!(
+            "Archived {} · {}",
+            self.folder_name(folder),
+            match live.len() {
+                1 => "1 thread".to_owned(),
+                n => format!("{n} threads"),
+            }
+        );
+        if stopped > 0 {
+            message.push_str(&format!(" · {stopped} stopped"));
+        }
+        self.offer_undo(message, live, cx);
+    }
+    /// Undo for the last folder archive: unarchives what it archived.
+    pub(super) fn undo_folder_archive(&mut self, cx: &mut Context<Self>) {
+        for id in std::mem::take(&mut self.notification_state.undo_threads) {
+            if self.session_metadata(id, cx).summary.archived {
+                self.toggle_archive(id, cx);
+            }
+        }
+    }
+    fn confirm_delete_folder(
+        &mut self,
+        folder: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (live, archived) = self.folder_threads(&folder, cx);
+        let ids: Vec<i64> = archived.into_iter().chain(live).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let running = self.running_among(&ids, cx);
+        let mut detail =
+            "The threads, their messages and saved settings are removed permanently.".to_owned();
+        if running > 0 {
+            detail.push_str(&format!(" {running} running will be stopped first."));
+        }
+        let prompt = window.prompt(
+            gpui::PromptLevel::Warning,
+            &format!(
+                "Delete “{}” and its {}?",
+                self.folder_name(&folder),
+                match ids.len() {
+                    1 => "1 thread".to_owned(),
+                    n => format!("{n} threads"),
+                }
+            ),
+            Some(&detail),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if prompt.await != Ok(0) {
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                for id in ids {
+                    this.delete_session(id, window, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Opening a session whose reminder is due dismisses it.
@@ -1182,6 +1372,7 @@ impl Shell {
                     .bg(self.classic_group_fill(&Entry::Folder {
                         id: folder.id.clone(),
                         sessions: Vec::new(),
+                        archived: false,
                     }))
                     .child(
                         div()
@@ -1357,7 +1548,7 @@ impl Shell {
                 *collapsed,
                 sessions,
             ),
-            Entry::Folder { id, sessions } => {
+            Entry::Folder { id, sessions, .. } => {
                 let Some(folder) = folders.folder(id) else {
                     return div().into_any();
                 };
@@ -1802,6 +1993,7 @@ impl Shell {
         let entry = Entry::Folder {
             id: id.to_owned(),
             sessions: Vec::new(),
+            archived: false,
         };
         let folder = id.to_owned();
         div()
@@ -2615,5 +2807,224 @@ mod tests {
         window.update(visual, |shell, _, _| {
             assert!(matches!(&shell.renaming.as_ref().unwrap().target, RenameTarget::Folder(id) if id == "work"));
         }).unwrap();
+    }
+    fn folder_of_both(window: &WindowHandle<Shell>, a: i64, b: i64, cx: &mut TestAppContext) {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.update_groups(cx, |g| {
+                    g.create_folder(&[a, b], "work".into());
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Lets the archived rows finish sliding out so the list regroups them.
+    fn settle_archive_exits(window: &WindowHandle<Shell>, cx: &mut TestAppContext) {
+        let visual = &mut VisualTestContext::from_window((*window).into(), cx);
+        window
+            .update(visual, |shell, _, _| shell.archive_exits.finish())
+            .unwrap();
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn archiving_a_folder_keeps_its_threads_together_and_undo_restores_it(cx: &mut TestAppContext) {
+        let (window, a, b) = setup(cx);
+        folder_of_both(&window, a, b, cx);
+        window
+            .update(cx, |shell, w, cx| {
+                let items = shell.folder_menu_items("work", &mut Vec::new(), cx);
+                let ids: Vec<_> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        MenuItem::Action(action) => Some(action.id.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(ids, ["rename", "archive-folder", "ungroup"]);
+                shell.run_menu(
+                    MenuTarget::Folder("work".into()),
+                    "archive-folder",
+                    None,
+                    w,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                for id in [a, b] {
+                    assert!(shell.session_metadata(id, cx).summary.archived);
+                    assert!(
+                        locked(&shell.store)
+                            .unwrap()
+                            .sessions()
+                            .unwrap()
+                            .iter()
+                            .any(|s| s.id == id && s.archived)
+                    );
+                }
+                assert_eq!(
+                    shell.project_groups().folder("work").unwrap().session_ids,
+                    [a, b],
+                    "membership is kept"
+                );
+                assert!(shell.notification_state.undo.read(cx).is_visible());
+            })
+            .unwrap();
+        settle_archive_exits(&window, cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let entries = shell.session_entries(&[a, b], cx);
+                assert!(
+                    matches!(&entries[..], [Entry::Folder { id, archived: true, sessions }] if id == "work" && sessions.len() == 2),
+                    "{entries:?}"
+                );
+                let items = shell.folder_menu_items("work", &mut Vec::new(), cx);
+                let ids: Vec<_> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        MenuItem::Action(action) => Some(action.id.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(ids, ["rename", "unarchive-folder", "delete-folder"]);
+                shell.undo_folder_archive(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                for id in [a, b] {
+                    assert!(!shell.session_metadata(id, cx).summary.archived);
+                }
+                let entries = shell.session_entries(&[a, b], cx);
+                assert!(matches!(
+                    &entries[..],
+                    [Entry::Folder {
+                        archived: false,
+                        ..
+                    }]
+                ));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn unarchiving_the_folder_brings_every_thread_back(cx: &mut TestAppContext) {
+        let (window, a, b) = setup(cx);
+        folder_of_both(&window, a, b, cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.run_menu(
+                    MenuTarget::Folder("work".into()),
+                    "archive-folder",
+                    None,
+                    w,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        settle_archive_exits(&window, cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.run_menu(
+                    MenuTarget::Folder("work".into()),
+                    "unarchive-folder",
+                    None,
+                    w,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    [a, b]
+                        .iter()
+                        .all(|id| !shell.session_metadata(*id, cx).summary.archived)
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn archiving_a_folder_with_a_running_thread_asks_first(cx: &mut TestAppContext) {
+        let (window, a, b) = setup(cx);
+        folder_of_both(&window, a, b, cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.sessions[&a].update(cx, |session, _| session.busy = true);
+                shell.run_menu(
+                    MenuTarget::Folder("work".into()),
+                    "archive-folder",
+                    None,
+                    w,
+                    cx,
+                );
+            })
+            .unwrap();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    [a, b]
+                        .iter()
+                        .all(|id| !shell.session_metadata(*id, cx).summary.archived)
+                );
+                assert!(!shell.notification_state.undo.read(cx).is_visible());
+                shell.sessions[&a].update(cx, |session, _| assert!(session.busy));
+            })
+            .unwrap();
+        window
+            .update(cx, |shell, w, cx| {
+                shell.run_menu(
+                    MenuTarget::Folder("work".into()),
+                    "archive-folder",
+                    None,
+                    w,
+                    cx,
+                )
+            })
+            .unwrap();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Archive");
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    [a, b]
+                        .iter()
+                        .all(|id| shell.session_metadata(*id, cx).summary.archived)
+                );
+                assert!(shell.notification_state.undo.read(cx).is_visible());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn ungroup_leaves_threads_running_and_unarchived(cx: &mut TestAppContext) {
+        let (window, a, b) = setup(cx);
+        folder_of_both(&window, a, b, cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.sessions[&a].update(cx, |session, _| session.busy = true);
+                shell.run_menu(MenuTarget::Folder("work".into()), "ungroup", None, w, cx);
+                assert!(shell.project_groups().folders.is_empty());
+                shell.sessions[&a].update(cx, |session, _| assert!(session.busy));
+                assert!(!shell.session_metadata(a, cx).summary.archived);
+            })
+            .unwrap();
+        assert!(!cx.has_pending_prompt());
     }
 }
