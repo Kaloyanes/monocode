@@ -62,9 +62,6 @@ pub fn remove(cwd: &Path, path: &Path) -> Result<(), String> {
     crate::git::git(cwd, &["worktree", "remove", "--force", "--", &tree.path]).map(|_| ())
 }
 
-/// Merges are judged against this branch when the repository has it.
-pub const PREFERRED_BASE: &str = "feat/gpui";
-
 /// Why a worktree is not offered for cleanup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Blocker {
@@ -160,25 +157,25 @@ fn ref_exists(cwd: &Path, name: &str) -> bool {
     )
     .is_ok()
 }
-/// The branch merges are judged against: `feat/gpui`, else the remote's
-/// default branch, else `main`/`master`, else the main checkout's branch.
+/// The branch merges are judged against: the remote's default branch, else
+/// `main`/`master`, else the main checkout's branch.
 pub fn detect_base(main: &Path) -> Option<String> {
     let local = |b: &str| ref_exists(main, &format!("refs/heads/{b}")).then(|| b.to_owned());
-    local(PREFERRED_BASE)
-        .or_else(|| {
-            let head = crate::git::git(
-                main,
-                &[
-                    "symbolic-ref",
-                    "--quiet",
-                    "--short",
-                    "refs/remotes/origin/HEAD",
-                ],
-            )
-            .ok()?;
-            let head = head.trim();
-            local(head.strip_prefix("origin/")?).or_else(|| Some(head.to_owned()))
-        })
+    let remote_default = || {
+        let head = crate::git::git(
+            main,
+            &[
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ],
+        )
+        .ok()?;
+        let head = head.trim();
+        local(head.strip_prefix("origin/")?).or_else(|| Some(head.to_owned()))
+    };
+    remote_default()
         .or_else(|| local("main"))
         .or_else(|| local("master"))
         .or_else(|| crate::git::worktree_branch(main))
@@ -462,11 +459,17 @@ mod tests {
         assert_eq!(age_label(0, now), "");
     }
     #[test]
-    fn base_prefers_feat_gpui_then_main() {
+    fn base_prefers_the_remote_default_then_main() {
         let f = Fixture::new();
         assert_eq!(detect_base(&f.main).as_deref(), Some("main"));
-        f.git(&["branch", PREFERRED_BASE]);
-        assert_eq!(detect_base(&f.main).as_deref(), Some(PREFERRED_BASE));
+        f.git(&["branch", "trunk"]);
+        f.git(&["update-ref", "refs/remotes/origin/trunk", "trunk"]);
+        f.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ]);
+        assert_eq!(detect_base(&f.main).as_deref(), Some("trunk"));
     }
     #[test]
     fn main_checkout_is_listed_but_never_removable() {

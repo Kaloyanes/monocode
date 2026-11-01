@@ -41,7 +41,7 @@ fn removable(status: &TreeStatus) -> bool {
     matches!(status.safety(), Safety::Merged | Safety::Pushed)
 }
 
-/// Why a removable worktree may go, e.g. "Merged into feat/gpui".
+/// Why a removable worktree may go, e.g. "Merged into main".
 fn reason(status: &TreeStatus, base: Option<&str>) -> String {
     match (status.safety(), base) {
         (Safety::Merged, Some(base)) => format!("Merged into {base}"),

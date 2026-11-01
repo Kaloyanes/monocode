@@ -223,7 +223,7 @@ fn cleanup_offers_removal_only_for_clean_merged_or_pushed_worktrees(cx: &mut Tes
         .update(cx, |view, _, cx| {
             view.selected_project = "/project".into();
             view.discovery.worktrees.main = "/project".into();
-            view.discovery.worktrees.base = Some("feat/gpui".into());
+            view.discovery.worktrees.base = Some("main".into());
             view.discovery.worktrees.sweep = vec![
                 status("project", &|s| s.tree.main = true),
                 status("merged", &|_| {}),
