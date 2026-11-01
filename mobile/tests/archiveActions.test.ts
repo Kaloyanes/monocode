@@ -119,7 +119,7 @@ describe("archiving a session from the list", () => {
 describe("archiving a Mono's finished sessions", () => {
   it("archives each and counts them", async () => {
     const t = toasts();
-    const archive = vi.fn(async () => {});
+    const archive = vi.fn(async (_id: string) => {});
     await archiveMany([{ id: "a" }, { id: "b" }, { id: "c" }], { archive }, t.sink);
     expect(archive.mock.calls.map(([id]) => id)).toEqual(["a", "b", "c"]);
     expect(t.last()).toEqual({ message: "Archived 3 sessions", undo: undefined });
