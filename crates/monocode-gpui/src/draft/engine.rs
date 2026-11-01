@@ -3,13 +3,19 @@
 //! › Page engine. Open drafts move when the choice changes, and one whose
 //! Chromium cannot start goes back to WebKit.
 use super::{chrome, web};
-use gpui::{AnyWindowHandle, Context, Window, prelude::*};
+use gpui::{
+    AnyWindowHandle, App, Context, ElementId, GlobalElementId, InspectorElementId, LayoutId,
+    Pixels, Style, Window, WindowId, prelude::*,
+};
 use objc2::rc::Retained;
 use objc2_web_kit::WKWebView;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 pub(super) use web::{Load, Placement};
@@ -29,6 +35,15 @@ pub(super) struct Host {
     webkit: web::Host,
     chrome: Option<chrome::Host>,
     agent: Rc<Agent>,
+    /// The frame that holds the card; see `Presence`.
+    shown: Rc<Cell<Option<Claim>>>,
+}
+
+/// One window's claim on a card: whichever paint drew the card last.
+#[derive(Clone, Copy, PartialEq)]
+struct Claim {
+    window: WindowId,
+    serial: u64,
 }
 
 /// The agent's leases on a Chromium draft. Once Chromium gives up, a WebKit
@@ -80,6 +95,16 @@ impl Host {
             webkit,
             chrome,
             agent: Rc::default(),
+            shown: Rc::default(),
+        }
+    }
+
+    /// The card left the frame: a Chromium page stops its frames and pauses,
+    /// a WebKit one steps aside; either keeps running for an agent's lease.
+    fn off_screen(&self) {
+        match self.chrome() {
+            Some(chrome) => chrome.hide(),
+            None => self.webkit.off_screen(),
         }
     }
 
@@ -186,12 +211,20 @@ impl Host {
             None => self.webkit.placement(),
         }
     }
+    /// See `chrome::Host::density`; WebKit draws in a native view at the
+    /// window's backing scale, so it has none.
+    #[cfg(debug_assertions)]
+    pub(super) fn density(&self) -> Option<(f32, f32, f32)> {
+        self.chrome()?.density()
+    }
+    #[cfg(debug_assertions)]
+    pub(super) fn is_chromium(&self) -> bool {
+        self.chrome().is_some()
+    }
+    /// Whether the latest frame of `window` holds the card.
     #[cfg(test)]
     pub(super) fn painted_in(&self, window: gpui::WindowId) -> bool {
-        match self.chrome() {
-            Some(chrome) => chrome.painted_in(window),
-            None => self.webkit.painted_in(window),
-        }
+        self.shown.get().is_some_and(|claim| claim.window == window)
     }
     pub(super) fn column(&self) -> Option<f32> {
         match self.chrome() {
@@ -249,28 +282,152 @@ impl Host {
     }
 }
 
-/// Paints the draft with its engine.
+/// Paints the draft with its engine. `key` names the draft, so its card
+/// keeps its place in GPUI's element state across frames.
 pub(super) fn surface<T: 'static>(
     host: &Host,
+    key: &str,
     placement: Placement,
     window: &mut Window,
     cx: &mut Context<T>,
 ) -> gpui::AnyElement {
-    match host.chrome() {
+    let page = match host.chrome() {
         Some(chrome) => chrome::surface(chrome, placement, window, cx),
         None => web::surface(&host.webkit, placement, window, cx),
+    };
+    gpui::div()
+        .id(ElementId::Name(format!("draft-page-{key}").into()))
+        .relative()
+        .size_full()
+        .child(page)
+        .child(Presence(host.clone()))
+        .into_any_element()
+}
+
+/// Put last in a window's root, for WebKit pages: see `web::sentinel`.
+pub(crate) fn sentinel() -> gpui::AnyElement {
+    web::sentinel()
+}
+
+/// Holds the card's place in the frame. The thread around the card may be
+/// replayed from GPUI's cache rather than painted, which carries this
+/// element's state into the new frame without running any of its code; a
+/// frame that no longer holds the card drops that state, and with it
+/// `Shown`, which takes the page off screen. So the page leaves when its
+/// card does: scrolled away, its conversation in the background, or a
+/// surface such as Settings drawn in the thread's place.
+struct Presence(Host);
+
+/// The card is in a frame of this window. See `Presence`.
+struct Shown {
+    host: Host,
+    claim: Claim,
+}
+
+impl Shown {
+    fn claim(host: &Host, window: WindowId) -> Self {
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        let claim = Claim {
+            window,
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
+        };
+        host.shown.set(Some(claim));
+        host.webkit.set_shown(Some(window));
+        Self {
+            host: host.clone(),
+            claim,
+        }
+    }
+
+    /// Still the latest claim on `host`, from `window`.
+    fn holds(&self, host: &Host, window: WindowId) -> bool {
+        Rc::ptr_eq(&self.host.shown, &host.shown)
+            && self.claim.window == window
+            && host.shown.get() == Some(self.claim)
     }
 }
 
-/// Put last in a window's root: pages whose cards were not painted step
-/// aside (WebKit) or stop their frames (Chromium).
-pub(crate) fn sentinel() -> gpui::AnyElement {
-    gpui::div()
-        .absolute()
-        .size_0()
-        .child(web::sentinel())
-        .child(chrome::sentinel())
-        .into_any_element()
+impl Drop for Shown {
+    fn drop(&mut self) {
+        // A newer paint, in this window or another, holds the card now.
+        if self.host.shown.get() != Some(self.claim) {
+            return;
+        }
+        self.host.shown.set(None);
+        self.host.webkit.set_shown(None);
+        self.host.off_screen();
+    }
+}
+
+impl IntoElement for Presence {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for Presence {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some("draft-presence".into())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let style = Style {
+            position: gpui::Position::Absolute,
+            ..Style::default()
+        };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: gpui::Bounds<Pixels>,
+        _: &mut (),
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: gpui::Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        let Some(id) = id else {
+            return;
+        };
+        let now = window.window_handle().window_id();
+        let host = &self.0;
+        window.with_element_state::<Shown, _>(id, |shown, _| match shown {
+            Some(shown) if shown.holds(host, now) => ((), shown),
+            older => {
+                // Claim first, so the older claim's drop leaves the page up.
+                let fresh = Shown::claim(host, now);
+                drop(older);
+                ((), fresh)
+            }
+        });
+    }
 }
 
 /// Runs `script` in the page's top document and returns its string result.

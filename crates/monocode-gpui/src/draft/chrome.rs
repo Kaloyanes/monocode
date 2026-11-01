@@ -299,9 +299,9 @@ struct State {
     /// Out of sight and not leased: the page's timers and frames are paused,
     /// as WebKit pauses a hidden page.
     frozen: bool,
-    /// When the card last drew the page. A window that stops painting, such
-    /// as a hidden one, stops its frames too.
-    last_paint: Option<Instant>,
+    /// When a frame arrived that no paint has drawn yet. A window that stops
+    /// painting, such as a hidden one, stops its frames too.
+    unpainted: Option<Instant>,
     /// The card's own viewport, and one laid out out of sight to measure.
     layout: (u32, u32),
     measuring: Option<(u32, u32)>,
@@ -309,7 +309,6 @@ struct State {
     area: Option<(f32, f32, f32)>,
     /// Where the page was last drawn, its scale, and the visible part.
     drawn: Option<(Point<Pixels>, f32, Bounds<Pixels>)>,
-    painted: Option<(gpui::WindowId, u64)>,
     scrolls: bool,
     appearance: Option<bool>,
     cursor: CursorStyle,
@@ -344,48 +343,11 @@ pub(super) struct Host {
     wake: async_channel::Sender<()>,
 }
 
-thread_local! {
-    /// Bumped before each paint of a window, so a page can tell whether its
-    /// card was drawn in the paint that just happened.
-    static EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static HOSTS: RefCell<Vec<Weak<RefCell<State>>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Put last in a window's root: stops the frames of pages whose card was not
-/// drawn this time, and starts them again when it is.
-pub(super) fn sentinel() -> gpui::AnyElement {
-    canvas(
-        |_, _, _| EPOCH.with(|epoch| epoch.set(epoch.get() + 1)),
-        |_, _, window, _| {
-            let now = (
-                Window::window_handle(window).window_id(),
-                EPOCH.with(std::cell::Cell::get),
-            );
-            HOSTS.with(|hosts| {
-                hosts.borrow_mut().retain(|state| {
-                    let Some(state) = state.upgrade() else {
-                        return false;
-                    };
-                    let mut state = state.borrow_mut();
-                    if state
-                        .painted
-                        .is_some_and(|painted| painted.0 == now.0 && painted != now)
-                    {
-                        state.stop_streaming();
-                    }
-                    true
-                });
-            });
-        },
-    )
-    .absolute()
-    .size_0()
-    .into_any_element()
-}
-
 impl State {
     fn stop_streaming(&mut self) {
         if self.streaming {
+            #[cfg(debug_assertions)]
+            STREAM_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.streaming = false;
             if let Some(tab) = &self.tab {
                 tab.0.browser.set_hidden(tab.0.id, true);
@@ -519,15 +481,6 @@ impl Host {
             self.state.borrow_mut().failed = Some("Chromium is not installed".into());
             return;
         };
-        HOSTS.with(|hosts| {
-            let mut hosts = hosts.borrow_mut();
-            if !hosts
-                .iter()
-                .any(|state| std::ptr::eq(state.as_ptr(), Rc::as_ptr(&self.state)))
-            {
-                hosts.push(Rc::downgrade(&self.state));
-            }
-        });
         let html = matches!(placement.load, Load::Html(_));
         let weak = Rc::downgrade(&self.state);
         let wake = self.wake.clone();
@@ -638,9 +591,15 @@ impl Host {
         ])
     }
 
-    #[cfg(test)]
-    pub(super) fn painted_in(&self, window: gpui::WindowId) -> bool {
-        self.state.borrow().painted == Some((window, EPOCH.with(std::cell::Cell::get)))
+    /// The newest frame's width in pixels, the width it was drawn at in
+    /// points, and the scale Chromium was asked to render at.
+    #[cfg(debug_assertions)]
+    pub(super) fn density(&self) -> Option<(f32, f32, f32)> {
+        let state = self.state.borrow();
+        let frame = state.frame.as_ref()?;
+        let (_, scale, _) = state.drawn?;
+        let pixels = objc2_core_video::CVPixelBufferGetWidth(&frame.buffer) as f32;
+        Some((pixels, frame.size.0 * scale, state.sent?.scale))
     }
 
     pub(super) fn column(&self) -> Option<f32> {
@@ -839,6 +798,15 @@ async fn run(
     }
 }
 
+/// Every frame any tab has received, and every time a tab was hidden while
+/// it was showing, for the self-test's measurements.
+#[cfg(debug_assertions)]
+pub(super) static FRAMES_RECEIVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(debug_assertions)]
+pub(super) static STREAM_STOPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Shows the tab's frames as they arrive, until it closes. A card that has
 /// not drawn the page for a while stops them.
 async fn show_frames(
@@ -850,6 +818,8 @@ async fn show_frames(
         let Some(state) = weak.upgrade() else {
             return;
         };
+        #[cfg(debug_assertions)]
+        FRAMES_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut s = state.borrow_mut();
             // A page laid out at another width to measure it is not what the
@@ -857,10 +827,15 @@ async fn show_frames(
             if s.measuring.is_some() {
                 continue;
             }
-            if s.last_paint
-                .is_none_or(|at| at.elapsed() > Duration::from_secs(1))
-            {
-                s.stop_streaming();
+            // Frames that keep coming for a second with no paint to draw them
+            // go to a window that is not drawing.
+            match s.unpainted {
+                Some(at) if at.elapsed() > Duration::from_secs(1) => {
+                    s.unpainted = None;
+                    s.stop_streaming();
+                }
+                Some(_) => {}
+                None => s.unpainted = Some(Instant::now()),
             }
             let scale = s.sent.map_or(DEVICE_SCALE, |sent| sent.scale);
             s.frame = Some(Frame {
@@ -955,11 +930,7 @@ fn paint(
     window: &mut Window,
 ) {
     let mut s = state.borrow_mut();
-    s.last_paint = Some(Instant::now());
-    s.painted = Some((
-        Window::window_handle(window).window_id(),
-        EPOCH.with(std::cell::Cell::get),
-    ));
+    s.unpainted = None;
     let zoom = window.content_zoom();
     let available = (f32::from(bounds.size.width), f32::from(bounds.size.height));
     s.area = Some((available.0, available.1, zoom));

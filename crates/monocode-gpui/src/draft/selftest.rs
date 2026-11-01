@@ -49,6 +49,10 @@ fn env_number(name: &str) -> Option<u32> {
 }
 
 pub(crate) fn run(path: OsString) {
+    if let Some(out) = std::env::var_os("MONOCODE_DRAFT_SELFTEST_PERF") {
+        perf::run(path, out);
+        return;
+    }
     let platform = gpui_platform::current_platform(false);
     gpui::Application::with_platform(platform)
         .with_assets(crate::assets::Assets)
@@ -262,4 +266,337 @@ pub(crate) fn run(path: OsString) {
             })
             .detach();
         });
+}
+
+/// `MONOCODE_DRAFT_SELFTEST_PERF=out.json` measures instead: a thread of
+/// filler messages ending in `_DRAFTS` live copies of the page (0 to 3, 1 by
+/// default), drawn the way the conversation draws its thread. After the pages
+/// show, it records for `_HOLD` seconds (8 by default) how long each frame
+/// took from the root's render to the end of its paint, how many frames were
+/// drawn, the app's CPU, and Chromium frames received, then how many pixels
+/// each kind of picture has for the points it is shown at. `_TICK` adds a
+/// view beside the thread that redraws every frame, as a caret or a working
+/// spinner does, to show what the thread costs when it is not what changed.
+mod perf {
+    use super::{Draft, env_number};
+    use gpui::{
+        App, AppContext, Entity, Window, WindowBackgroundAppearance, WindowOptions, canvas, div,
+        prelude::*, px, size,
+    };
+    use monocode_core::{
+        transcript::Row,
+        visual_bridge::{DRAFT_ROLE, DraftCard, DraftContent},
+    };
+    use serde_json::{Value, json};
+    use std::{
+        cell::{Cell, RefCell},
+        ffi::OsString,
+        rc::Rc,
+        sync::atomic::Ordering,
+        time::{Duration, Instant},
+    };
+
+    #[derive(Default)]
+    struct Frames {
+        started: Cell<Option<Instant>>,
+        recording: Cell<bool>,
+        durations: RefCell<Vec<f64>>,
+    }
+
+    struct Ticker;
+    impl Render for Ticker {
+        fn render(&mut self, window: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            window.request_animation_frame();
+            div().size(px(1.))
+        }
+    }
+
+    struct Root {
+        thread: Entity<crate::transcript::TranscriptView>,
+        ticker: Option<Entity<Ticker>>,
+        frames: Rc<Frames>,
+    }
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            self.frames.started.set(Some(Instant::now()));
+            let frames = self.frames.clone();
+            div()
+                .relative()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(crate::conversation::transcript_element(&self.thread)),
+                )
+                .children(self.ticker.clone())
+                .child(crate::draft::sentinel())
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, _, _| {
+                            if let Some(started) = frames.started.take()
+                                && frames.recording.get()
+                            {
+                                frames
+                                    .durations
+                                    .borrow_mut()
+                                    .push(started.elapsed().as_secs_f64() * 1000.);
+                            }
+                        },
+                    )
+                    .absolute()
+                    .size_0(),
+                )
+        }
+    }
+
+    fn row(role: &str, text: String) -> Row {
+        Row {
+            role: role.into(),
+            text,
+            first: true,
+            sent_at: None,
+        }
+    }
+
+    /// Messages of the length and shape a working thread has.
+    fn filler(n: usize) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for i in 0..n {
+            rows.push(row("user", format!("Step {i}: can you tighten the layout of the settings page and check the spacing on small screens?")));
+            rows.push(row(
+                "assistant",
+                format!(
+                    "Here is what I changed in step {i}.\n\n\
+                     - The header now **wraps** below 480 px instead of overflowing.\n\
+                     - Cards use a 12 px gap and the grid drops to one column on phones.\n\
+                     - The save button stays pinned at the bottom.\n\n\
+                     ```rust\nfn layout(width: f32) -> Columns {{\n    if width < 480. {{ Columns::One }} else {{ Columns::Two }}\n}}\n```\n\n\
+                     The spacing scale is unchanged, so the rest of the app lines up with it. \
+                     I also checked the dark theme and the contrast of the muted labels, which pass at 4.6:1."
+                ),
+            ));
+        }
+        rows
+    }
+
+    fn cpu_seconds() -> f64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: getrusage fills the buffer for this process.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return 0.;
+        }
+        // SAFETY: the call succeeded.
+        let usage = unsafe { usage.assume_init() };
+        (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+            + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1e6
+    }
+
+    /// CPU seconds so far of every process by pid, with its parent and name.
+    fn processes() -> std::collections::HashMap<u32, (u32, f64, String)> {
+        let out = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,time=,comm="])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        out.lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let pid = parts.next()?.parse().ok()?;
+                let ppid = parts.next()?.parse().ok()?;
+                // [[H:]MM:]SS.ss
+                let time = parts.next()?.split(':').fold(0., |total, part| {
+                    total * 60. + part.parse::<f64>().unwrap_or(0.)
+                });
+                Some((pid, (ppid, time, parts.collect::<Vec<_>>().join(" "))))
+            })
+            .collect()
+    }
+
+    /// The CPU, in percent of one core, of the Chromium host and its
+    /// helpers (this process's descendants) and of WebKit's processes that
+    /// started after `existing` was taken.
+    fn engine_cpu(
+        before: &std::collections::HashMap<u32, (u32, f64, String)>,
+        after: &std::collections::HashMap<u32, (u32, f64, String)>,
+        existing: &std::collections::HashSet<u32>,
+        seconds: f64,
+    ) -> Value {
+        let me = std::process::id();
+        let descends = |mut pid: u32| {
+            for _ in 0..8 {
+                let Some((parent, _, _)) = after.get(&pid) else {
+                    return false;
+                };
+                if *parent == me {
+                    return true;
+                }
+                pid = *parent;
+            }
+            false
+        };
+        let (mut chromium, mut webkit) = (0., 0.);
+        for (pid, (_, time, name)) in after {
+            let used = time - before.get(pid).map_or(0., |(_, time, _)| *time);
+            if descends(*pid) {
+                chromium += used;
+            } else if name.contains("com.apple.WebKit") && !existing.contains(pid) {
+                webkit += used;
+            }
+        }
+        json!({
+            "chromiumPercent": chromium / seconds * 100.,
+            "webkitPercent": webkit / seconds * 100.,
+        })
+    }
+
+    fn summary(mut durations: Vec<f64>, seconds: f64) -> Value {
+        durations.sort_by(f64::total_cmp);
+        let at = |p: f64| {
+            durations
+                .get(((durations.len() as f64 - 1.) * p).round() as usize)
+                .copied()
+                .unwrap_or(0.)
+        };
+        let mean = durations.iter().sum::<f64>() / durations.len().max(1) as f64;
+        json!({
+            "frames": durations.len(),
+            "fps": durations.len() as f64 / seconds,
+            "mean_ms": mean, "p50_ms": at(0.5), "p95_ms": at(0.95), "max_ms": at(1.),
+            "busy_ms_per_s": durations.iter().sum::<f64>() / seconds,
+        })
+    }
+
+    async fn revise(draft: &gpui::WeakEntity<Draft>, html: &str, cx: &mut gpui::AsyncApp) -> Value {
+        let Ok(id) = draft.read_with(cx, |draft, _| draft.id().to_owned()) else {
+            return Value::Null;
+        };
+        let (reply, _) = std::sync::mpsc::channel();
+        let input = json!({"draft": id, "html": format!("{html}<!-- v2 -->")});
+        let Ok(request) = monocode_core::visual_bridge::DraftRequest::parse(1, &input, reply) else {
+            return Value::Null;
+        };
+        let started = Instant::now();
+        let _ = draft.update(cx, |draft, cx| draft.apply(&request, cx));
+        loop {
+            let shown = draft
+                .read_with(cx, |draft, _| (draft.shown == draft.shared.generation(), draft.layouts.len()))
+                .unwrap_or((true, 0));
+            if shown.0 {
+                return json!({"shownAfterMs": started.elapsed().as_secs_f64() * 1000., "layouts": shown.1});
+            }
+            if started.elapsed() > Duration::from_secs(15) {
+                return json!({"timedOut": true});
+            }
+            cx.background_executor().timer(Duration::from_millis(5)).await;
+        }
+    }
+
+    pub(super) fn run(path: OsString, out: OsString) {
+        let platform = gpui_platform::current_platform(false);
+        gpui::Application::with_platform(platform)
+            .with_assets(crate::assets::Assets)
+            .run(move |cx: &mut App| {
+                crate::popover::bind(cx);
+                let existing: std::collections::HashSet<u32> = processes().into_keys().collect();
+                let html = std::fs::read_to_string(&path).unwrap_or_default();
+                let count = env_number("MONOCODE_DRAFT_SELFTEST_DRAFTS").unwrap_or(1) as usize;
+                let hold = env_number("MONOCODE_DRAFT_SELFTEST_HOLD").unwrap_or(8);
+                let mut rows = filler(16);
+                let mut drafts = Vec::new();
+                for n in 0..count {
+                    let draft = cx.new(|cx| {
+                        Draft::new(None, 1, DraftContent::Html(html.clone()), (None, None), None, None, cx)
+                    });
+                    let id = draft.read(cx).id().to_owned();
+                    crate::draft::register(&id, &draft, cx);
+                    rows.push(row("assistant", format!("Variant {n}:")));
+                    let card = DraftCard { draft: id, title: format!("Variant {n}") };
+                    rows.push(row(DRAFT_ROLE, serde_json::to_string(&card).unwrap_or_default()));
+                    drafts.push(draft);
+                }
+                rows.push(row("assistant", "Pick the one you like.".into()));
+                let thread = cx.new(|cx| {
+                    let mut view = crate::transcript::TranscriptView::new();
+                    view.patch(0, rows, cx);
+                    view
+                });
+                let ticker = std::env::var_os("MONOCODE_DRAFT_SELFTEST_TICK")
+                    .map(|_| cx.new(|_| Ticker));
+                let frames = Rc::new(Frames::default());
+                let handle = cx
+                    .open_window(
+                        WindowOptions {
+                            window_bounds: Some(gpui::WindowBounds::Windowed(
+                                gpui::Bounds::centered(None, size(px(820.), px(1000.)), cx),
+                            )),
+                            window_background: WindowBackgroundAppearance::Blurred,
+                            ..Default::default()
+                        },
+                        {
+                            let frames = frames.clone();
+                            move |_, cx| cx.new(|_| Root { thread, ticker, frames })
+                        },
+                    )
+                    .expect("open the measuring window");
+                cx.activate(true);
+                let weak: Vec<_> = drafts.iter().map(Entity::downgrade).collect();
+                cx.spawn(async move |cx| {
+                    // The shell holds a conversation's drafts; here the task does.
+                    let _drafts = drafts;
+                    for draft in &weak {
+                        let _ = Draft::ready(draft, cx).await;
+                    }
+                    // Let the fades, fits and first frames settle.
+                    cx.background_executor().timer(Duration::from_millis(2500)).await;
+                    let cef_before = super::super::chrome::FRAMES_RECEIVED.load(Ordering::Relaxed);
+                    let stops_before = super::super::chrome::STREAM_STOPS.load(Ordering::Relaxed);
+                    let cpu_before = cpu_seconds();
+                    let engines_before = processes();
+                    let started = Instant::now();
+                    frames.recording.set(true);
+                    cx.background_executor().timer(Duration::from_secs(hold.into())).await;
+                    frames.recording.set(false);
+                    let seconds = started.elapsed().as_secs_f64();
+                    let cpu = (cpu_seconds() - cpu_before) / seconds * 100.;
+                    let engines = engine_cpu(&engines_before, &processes(), &existing, seconds);
+                    let cef = super::super::chrome::FRAMES_RECEIVED.load(Ordering::Relaxed) - cef_before;
+                    let stops = super::super::chrome::STREAM_STOPS.load(Ordering::Relaxed) - stops_before;
+                    let (scale, zoom) = handle
+                        .update(cx, |_, window, _| (window.scale_factor(), window.content_zoom()))
+                        .unwrap_or((0., 0.));
+                    let mut pages = Vec::new();
+                    for draft in &weak {
+                        let placed = draft.read_with(cx, |draft, _| draft.placement()).ok().flatten();
+                        let density = Draft::debug(draft, "density", cx).await.unwrap_or_else(|e| json!({"error": e}));
+                        pages.push(json!({"placed": placed, "density": density}));
+                    }
+                    // A new version from the agent, as `draft_preview` sends one:
+                    // how long the card waits before it shows it.
+                    let revise = match weak.first() {
+                        Some(draft) => revise(draft, &html, cx).await,
+                        None => Value::Null,
+                    };
+                    let report = json!({
+                        "drafts": weak.len(),
+                        "seconds": seconds,
+                        "scaleFactor": scale,
+                        "contentZoom": zoom,
+                        "appCpuPercent": cpu,
+                        "engineCpu": engines,
+                        "cefFramesPerSecond": cef as f64 / seconds,
+                        "cefStreamStops": stops,
+                        "revise": revise,
+                        "frameTime": summary(frames.durations.take(), seconds),
+                        "pages": pages,
+                    });
+                    let _ = std::fs::write(&out, serde_json::to_string_pretty(&report).unwrap_or_default());
+                    cx.update(|cx| cx.quit());
+                })
+                .detach();
+            });
+    }
 }

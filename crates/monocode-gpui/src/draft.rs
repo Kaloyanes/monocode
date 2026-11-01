@@ -1590,7 +1590,7 @@ impl Draft {
             self.host.set_appearance(Some(light));
             self.appearance = Some(light);
         }
-        engine::surface(&self.host, placement, window, cx)
+        engine::surface(&self.host, &self.id, placement, window, cx)
     }
 }
 #[cfg(not(target_os = "macos"))]
@@ -1902,6 +1902,33 @@ impl Draft {
             "send" => {
                 this.update(cx, |this, cx| this.send(cx)).map_err(gone)?;
                 Ok(serde_json::json!({"sent": true}))
+            }
+            // How many pixels each picture of the page has for the points
+            // it is shown at; the self-test divides by the window's scale.
+            "density" => {
+                let web = Self::ready(this, cx).await?;
+                let (chromium, frame, (viewport, _)) = this
+                    .read_with(cx, |this, _| {
+                        (this.host.is_chromium(), this.host.density(), this.viewport())
+                    })
+                    .map_err(gone)?;
+                let still = engine::picture(&web, cx).await.map(|image| {
+                    let size = image.size(0);
+                    (size.width.0, size.height.0)
+                });
+                let agent = engine::png(&web, f64::from(viewport.min(MAX_PICTURE_WIDTH)), cx)
+                    .await
+                    .ok()
+                    .map(|(_, size)| size);
+                Ok(serde_json::json!({
+                    "engine": if chromium { "chromium" } else { "webkit" },
+                    "viewport": viewport,
+                    "frame": frame.map(|(pixels, points, scale)| serde_json::json!({
+                        "pixels": pixels, "points": points, "renderScale": scale,
+                    })),
+                    "still": still,
+                    "agentPicture": agent,
+                }))
             }
             "send_later" => {
                 let weak = this.clone();
