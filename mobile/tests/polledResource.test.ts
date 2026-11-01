@@ -80,23 +80,43 @@ describe("PolledResource", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it("slows to the idle interval while nothing changes and speeds up when it does", async () => {
+  it("keeps reading every 10 s while nothing changes, as it always did", async () => {
+    const resource = new PolledResource<number>({ merge: same });
+    const fetch = vi.fn(async () => 1);
+    resource.hold(fetch);
+    await vi.advanceTimersByTimeAsync(300000);
+    // 1 at once, then one every 10 s: no slowdown for a quiet working copy.
+    expect(fetch.mock.calls.length).toBe(31);
+  });
+
+  it("reads at once when a screen takes hold again after being away, not after the rest of the interval", async () => {
     const resource = new PolledResource<number>({ merge: same });
     let value = 1;
     const fetch = vi.fn(async () => value);
-    resource.hold(fetch);
-    // Five minutes of an unchanging working copy: 1 + 3 quick reads, then every 30 s.
-    await vi.advanceTimersByTimeAsync(300000);
-    const quiet = fetch.mock.calls.length;
-    expect(quiet).toBeLessThanOrEqual(1 + 3 + 10);
-    // The old fixed 10 s poll would have read 31 times.
-    expect(quiet).toBeLessThan(31 / 2);
+    let release = resource.hold(fetch);
+    await flush();
+    // Focus leaves: nothing holds the poller. The working copy changes meanwhile.
+    release();
     value = 2;
-    await vi.advanceTimersByTimeAsync(30000);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(resource.getSnapshot().value).toBe(1);
+    // Focus returns three seconds into the interval: the badge is fresh straight away.
+    release = resource.hold(fetch);
+    await flush();
+    expect(fetch).toHaveBeenCalledTimes(2);
     expect(resource.getSnapshot().value).toBe(2);
-    const before = fetch.mock.calls.length;
+    // And the cadence goes on from that read.
     await vi.advanceTimersByTimeAsync(10000);
-    expect(fetch.mock.calls.length).toBe(before + 1);
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not read twice when two screens take hold together", async () => {
+    const resource = new PolledResource<number>({ merge: same });
+    const fetch = vi.fn(async () => 1);
+    resource.hold(fetch);
+    resource.hold(fetch);
+    await flush();
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("tells subscribers only about changes", async () => {

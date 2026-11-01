@@ -3,11 +3,8 @@ import { isAppActive, onAppActive, backoff } from "./appActivity";
 export type PolledOptions<T> = {
   /** The held value when `next` is no different from it, else `next`; the poller counts a read that returns the held value as unchanged. */
   merge: (held: T | null, next: T) => T;
-  /** Milliseconds between reads while things change. */
+  /** Milliseconds between reads. */
   baseMs?: number;
-  /** Milliseconds between reads once `idleAfter` reads in a row found no change. */
-  idleMs?: number;
-  idleAfter?: number;
   /** The longest wait after failed reads. */
   errorMaxMs?: number;
 };
@@ -17,9 +14,10 @@ type Holder<T> = { fetch: () => Promise<T> };
 /**
  * One poller shared by everything reading the same thing (say a project's
  * changes in one worktree). It reads only while someone holds it (their screen
- * is up and focused) and the app is in the foreground, reads less often while
- * nothing changes, and waits longer after failures. What it last read stays
- * for the next screen to show at once.
+ * is up and focused) and the app is in the foreground, and waits longer after
+ * failures. A screen that takes hold of it reads at once, so what it shows is
+ * never stale on return. What it last read stays for the next screen to show
+ * while that read lands.
  */
 export class PolledResource<T> {
   private value: T | null = null;
@@ -31,7 +29,6 @@ export class PolledResource<T> {
   private stopActive: (() => void) | null = null;
   private inflight = false;
   private again = false;
-  private unchanged = 0;
   private failures = 0;
   private lastAt = 0;
   /** Reads started, for tests and measuring. */
@@ -53,6 +50,9 @@ export class PolledResource<T> {
     const holder: Holder<T> = { fetch };
     this.holders.add(holder);
     if (this.holders.size === 1) this.start();
+    // A screen that comes up, or back into focus, reads now rather than
+    // after the rest of the interval; a read already under way serves it.
+    else if (!this.inflight && isAppActive()) this.runNow();
     return () => {
       if (!this.holders.delete(holder)) return;
       if (this.holders.size === 0) this.stop();
@@ -61,7 +61,6 @@ export class PolledResource<T> {
 
   /** Reads again at once, say after a commit. */
   reload = () => {
-    this.unchanged = 0;
     this.failures = 0;
     if (this.holders.size === 0 || !isAppActive()) return;
     if (this.inflight) this.again = true;
@@ -73,7 +72,7 @@ export class PolledResource<T> {
       // Back in the foreground, read if the last read is old.
       if (this.holders.size > 0 && !this.inflight) this.schedule();
     });
-    this.schedule();
+    if (isAppActive()) this.runNow();
   }
 
   private stop() {
@@ -84,9 +83,8 @@ export class PolledResource<T> {
   }
 
   private delay() {
-    const { baseMs = 10000, idleMs = 30000, idleAfter = 3, errorMaxMs = 60000 } = this.options;
-    if (this.failures > 0) return backoff(baseMs, this.failures, errorMaxMs);
-    return this.unchanged >= idleAfter ? idleMs : baseMs;
+    const { baseMs = 10000, errorMaxMs = 60000 } = this.options;
+    return this.failures > 0 ? backoff(baseMs, this.failures, errorMaxMs) : baseMs;
   }
 
   /** Waits out the rest of the interval since the last read, then reads. */
@@ -115,8 +113,6 @@ export class PolledResource<T> {
     try {
       const next = await holder.fetch();
       const merged = this.options.merge(this.value, next);
-      const changed = merged !== this.value;
-      this.unchanged = changed ? 0 : this.unchanged + 1;
       this.failures = 0;
       this.value = merged;
       this.publish(merged, null);
