@@ -1,27 +1,18 @@
 /** A large file's colours as far as they are collected. */
 export type Highlight = { palette: string[]; lines: [string, number][][] };
 
-/** How soon to ask again while colours keep arriving. */
-export const HIGHLIGHT_FAST_MS = 250;
-/** The longest wait between asks while none arrive. */
-export const HIGHLIGHT_SLOW_MS = 2000;
-/** The screen is given what has been collected at most this often. */
-export const HIGHLIGHT_PUBLISH_MS = 1000;
-
-/** The wait before the next ask: short after a reply with lines, doubling after an empty one. */
-export const nextHighlightDelay = (current: number, gotLines: boolean) =>
-  gotLines ? HIGHLIGHT_FAST_MS : Math.min(HIGHLIGHT_SLOW_MS, current * 2);
+/** How soon to ask again, as it always was: the colours fill in four times a second. */
+export const HIGHLIGHT_POLL_MS = 250;
 
 /**
- * Collects colours as the desktop finishes them and hands them to the screen
- * only now and then. Each hand-over re-renders the whole file, so replies
- * pile up here, in place, between hand-overs.
+ * Collects colours as the desktop finishes them, in place, so a reply costs
+ * only its own lines rather than a copy of everything so far. A reply that
+ * brings nothing new hands over nothing, so the screen does not render for it.
  */
 export class HighlightProgress {
   private palette: string[] = [];
   private lines: [string, number][][] = [];
   private dirty = false;
-  private publishedAt = -Infinity;
 
   /** How many lines are collected, which is where the next ask picks up. */
   get collected() {
@@ -29,18 +20,17 @@ export class HighlightProgress {
   }
 
   add(value: Highlight) {
-    if (value.lines.length === 0 && value.palette.length === this.palette.length) return false;
+    if (value.lines.length === 0 && value.palette.length === this.palette.length) return;
     this.palette = value.palette;
     for (const line of value.lines) this.lines.push(line);
     this.dirty = true;
-    return value.lines.length > 0;
   }
 
-  /** What to show now, if something new is collected and it is time (or `force`). */
-  take(now: number, force = false): Highlight | null {
-    if (!this.dirty || (!force && now - this.publishedAt < HIGHLIGHT_PUBLISH_MS)) return null;
+  /** What to show now, if the last replies brought something new. */
+  take(): Highlight | null {
+    if (!this.dirty) return null;
     this.dirty = false;
-    this.publishedAt = now;
-    return { palette: this.palette, lines: this.lines.slice() };
+    // The lines array is the one grown in place; the object is new, so the screen sees the change.
+    return { palette: this.palette, lines: this.lines };
   }
 }

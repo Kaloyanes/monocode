@@ -1,12 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  HIGHLIGHT_FAST_MS,
-  HIGHLIGHT_PUBLISH_MS,
-  HIGHLIGHT_SLOW_MS,
-  HighlightProgress,
-  nextHighlightDelay,
-} from "@/features/files/highlightProgress";
+import { HIGHLIGHT_POLL_MS, HighlightProgress } from "@/features/files/highlightProgress";
 
 const reply = (count: number, palette = ["#fff"]) => ({
   palette,
@@ -14,47 +8,41 @@ const reply = (count: number, palette = ["#fff"]) => ({
 });
 
 describe("HighlightProgress", () => {
-  it("accumulates replies and hands them over about once a second", () => {
+  it("asks four times a second, as the original did", () => {
+    expect(HIGHLIGHT_POLL_MS).toBe(250);
+  });
+
+  it("shows every reply that brought colours, so the file fills in at the original pace", () => {
     const progress = new HighlightProgress();
-    // A reply every 250 ms for ten seconds: 40 replies, once 40 re-renders.
     let published = 0;
     for (let i = 0; i < 40; i++) {
       progress.add(reply(100));
-      if (progress.take(i * 250)) published++;
+      if (progress.take()) published++;
     }
+    expect(published).toBe(40);
     expect(progress.collected).toBe(4000);
-    expect(published).toBeLessThanOrEqual(11);
-    expect(published).toBeGreaterThanOrEqual(9);
   });
 
-  it("hands over the last of it at once, and only when there is something new", () => {
+  it("hands over nothing for a reply with nothing new", () => {
     const progress = new HighlightProgress();
-    expect(progress.take(0, true)).toBeNull();
     progress.add(reply(3));
-    expect(progress.take(0)?.lines.length).toBe(3);
-    progress.add(reply(2));
-    expect(progress.take(HIGHLIGHT_PUBLISH_MS / 2)).toBeNull();
-    expect(progress.take(HIGHLIGHT_PUBLISH_MS / 2, true)?.lines.length).toBe(5);
-    expect(progress.take(HIGHLIGHT_PUBLISH_MS * 5)).toBeNull();
+    expect(progress.take()?.lines.length).toBe(3);
+    progress.add({ palette: ["#fff"], lines: [] });
+    // The original rendered the whole file again only when lines or palette changed too.
+    expect(progress.take()).toBeNull();
+    progress.add({ palette: ["#fff", "#000"], lines: [] });
+    expect(progress.take()?.palette.length).toBe(2);
   });
 
-  it("gives a new array each time so the screen sees the change", () => {
+  it("collects in place: a reply never copies the lines before it", () => {
     const progress = new HighlightProgress();
     progress.add(reply(1));
-    const first = progress.take(0)!;
+    const first = progress.take()!;
     progress.add(reply(1));
-    const second = progress.take(5000)!;
-    expect(second.lines).not.toBe(first.lines);
-    expect(first.lines.length).toBe(1);
-  });
-});
-
-describe("nextHighlightDelay", () => {
-  it("is quick while lines arrive and doubles up to a ceiling while none do", () => {
-    let delay = HIGHLIGHT_FAST_MS;
-    const waits: number[] = [];
-    for (let i = 0; i < 5; i++) waits.push((delay = nextHighlightDelay(delay, false)));
-    expect(waits).toEqual([500, 1000, HIGHLIGHT_SLOW_MS, HIGHLIGHT_SLOW_MS, HIGHLIGHT_SLOW_MS]);
-    expect(nextHighlightDelay(delay, true)).toBe(HIGHLIGHT_FAST_MS);
+    const second = progress.take()!;
+    // One array grows; the object handed over is new each time, so the screen re-renders.
+    expect(second.lines).toBe(first.lines);
+    expect(second).not.toBe(first);
+    expect(second.lines.length).toBe(2);
   });
 });

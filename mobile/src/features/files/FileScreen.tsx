@@ -13,9 +13,8 @@ import { themedStyles, useColors } from "@/ui/theme";
 import { CodeView, type CodeRow } from "./CodeView";
 import { FileMissing } from "./FileMissing";
 import {
-  HIGHLIGHT_FAST_MS,
+  HIGHLIGHT_POLL_MS,
   HighlightProgress,
-  nextHighlightDelay,
   type Highlight,
 } from "./highlightProgress";
 import {
@@ -82,7 +81,6 @@ export function FileScreen({
     const stop = new AbortController();
     const collected = new HighlightProgress();
     void (async () => {
-      let delay = HIGHLIGHT_FAST_MS;
       while (!stop.signal.aborted) {
         // Nothing to collect for while the app is in the background.
         await waitForActive(stop.signal);
@@ -95,19 +93,17 @@ export function FileScreen({
             from: collected.collected,
           });
           if (stop.signal.aborted) return;
-          delay = nextHighlightDelay(delay, collected.add(value));
+          collected.add(value);
           done = value.done;
         } catch {
           // Missed this time; the next ask picks up from the same line.
           if (stop.signal.aborted) return;
-          delay = nextHighlightDelay(delay, false);
         }
-        // Rendering the whole file again is the costly part, so the colours
-        // are shown about once a second, and the last of them at once.
-        const shown = collected.take(Date.now(), done);
+        // Shown with every reply that brought colours, as before.
+        const shown = collected.take();
         if (shown) setProgress(shown);
         if (done) return;
-        await pause(delay, stop.signal);
+        await pause(HIGHLIGHT_POLL_MS, stop.signal);
       }
     })();
     return () => stop.abort();
