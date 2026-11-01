@@ -17,6 +17,7 @@ pub(crate) mod mobile;
 mod mono;
 mod network_drop;
 mod notifications;
+mod open_pr;
 mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
@@ -189,6 +190,8 @@ pub(crate) struct Conversation {
     /// One of this lead's runs is not finished.
     pub(crate) orchestration_active: bool,
     status: String,
+    /// `/pr` is checking the branch or opening the pull request.
+    pr_busy: bool,
     loaded: bool,
     history_unloaded: bool,
     history_actions: std::collections::VecDeque<history::HistoryAction>,
@@ -340,8 +343,7 @@ impl Conversation {
             })
             .collect()
     }
-    /// A live draft's page is in the thread, so neither the thread nor this
-    /// conversation may be replayed from cache.
+    /// A live draft's page is in the thread.
     pub(crate) fn holds_live_draft(&self, cx: &gpui::App) -> bool {
         self.transcript.read(cx).holds_live_draft(cx)
     }
@@ -675,6 +677,7 @@ impl Conversation {
             orchestration_views: Vec::new(),
             orchestration_active: false,
             status: "Loading conversation…".into(),
+            pr_busy: false,
             loaded: false,
             history_unloaded: false,
             history_actions: Default::default(),
@@ -3665,6 +3668,7 @@ impl Conversation {
                                     .debug_selector(|| "provider-status".into())
                                     .role(Role::Status)
                                     .aria_label(self.status.clone())
+                                    .tip(self.status.clone())
                                     .max_w(px(220.))
                                     .truncate()
                                     .text_size(px(11.))
@@ -4215,6 +4219,17 @@ mod composer_motion_tests {
             .unwrap();
     }
 }
+
+/// The thread as the conversation draws it: replayed from cache when nothing
+/// in it changed. A live draft's card keeps its page right through a replay;
+/// see `draft::engine::Presence`.
+pub(crate) fn transcript_element(transcript: &Entity<TranscriptView>) -> AnyElement {
+    transcript
+        .clone()
+        .cached(StyleRefinement::default().size_full())
+        .into_any_element()
+}
+
 impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self._input_focus.is_none() {
@@ -4280,14 +4295,7 @@ impl Render for Conversation {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(if self.holds_live_draft(cx) {
-                        self.transcript.clone().into_any_element()
-                    } else {
-                        self.transcript
-                            .clone()
-                            .cached(StyleRefinement::default().size_full())
-                            .into_any_element()
-                    })
+                    .child(transcript_element(&self.transcript))
                     // Level with the transcript's jump button, which moves to
                     // the column's other end.
                     .children(pill.map(|pill| {

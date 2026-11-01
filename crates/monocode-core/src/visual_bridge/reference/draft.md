@@ -27,8 +27,9 @@ CSS and JavaScript, or check a running dev server. There is no side panel.
    draft you never publish appears when your turn ends. Pass a title again
    before publishing to rename the card.
 6. The app saves each draft as it changes, so it comes back live after a
-   restart under the same id. draft_keep {draft, title} also leaves a picture
-   card with an Open draft button, for a result worth pointing back to.
+   restart under the same id. draft_keep {draft, title} also saves a picture
+   that takes over the draft's own card once its page is closed, with an Open
+   draft button, for a result worth pointing back to.
    {draft, action:{kind:"close"}} removes the page for good and leaves a note,
    so close only what the person no longer needs.
 

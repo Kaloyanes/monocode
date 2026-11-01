@@ -30,8 +30,8 @@ import type { MobileSelection } from "./selection";
 const FADE = 24;
 
 /**
- * The projects the phone shows, picked as cards; each brings its monos (see
- * selectedWorkspace). First run shows it
+ * The projects the phone shows, picked as cards; a Mono comes with the
+ * projects it works in. First run shows it
  * on its own; Settings shows it `editing`, in its sheet under a native header,
  * which the page scrolls under through iOS's automatic insets.
  */
@@ -56,13 +56,14 @@ export function WorkspacePicker({
   const [error, setError] = useState("");
   const [footer, setFooter] = useState(120);
   const background = editing ? colors.sheet : colors.background;
-  const toggle = (field: keyof MobileSelection, id: string) => {
+  // Only projects are picked; `monoIds` rides along as it was saved.
+  const toggle = (id: string) => {
     void Haptics.selectionAsync();
     setDraft((previous) => ({
       ...previous,
-      [field]: previous[field].includes(id)
-        ? previous[field].filter((value) => value !== id)
-        : [...previous[field], id],
+      projectIds: previous.projectIds.includes(id)
+        ? previous.projectIds.filter((value) => value !== id)
+        : [...previous.projectIds, id],
     }));
   };
   const save = async () => {
@@ -102,8 +103,8 @@ export function WorkspacePicker({
           <>
             <Text style={styles.title}>Your mobile{"\n"}workspace</Text>
             <Text style={styles.subtitle}>
-              Pick the projects you want here. Their monos come
-              along.{"\n"}You can change this anytime in Settings.
+              Pick the projects you want here.{"\n"}You can change this
+              anytime in Settings.
             </Text>
           </>
         )}
@@ -116,7 +117,7 @@ export function WorkspacePicker({
                 editing={editing}
                 label={project.name}
                 selected={draft.projectIds.includes(project.id)}
-                onPress={() => toggle("projectIds", project.id)}
+                onPress={() => toggle(project.id)}
                 icon={
                   <ProjectMascot
                     project={project.path}
@@ -169,7 +170,7 @@ export function WorkspacePicker({
                 : count
                   ? "Continue with " +
                     count +
-                    (count === 1 ? " item" : " items")
+                    (count === 1 ? " project" : " projects")
                   : "Choose later"}
             </Text>
           )}

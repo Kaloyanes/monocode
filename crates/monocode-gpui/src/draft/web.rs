@@ -98,7 +98,7 @@ fn watch_keys(mtm: MainThreadMarker) {
             && let Some(focused) = focused.downcast_ref::<NSView>()
         {
             HOSTS.with(|hosts| {
-                for (view, _, _) in hosts.borrow().iter() {
+                for Tracked { view, .. } in hosts.borrow().iter() {
                     if let Some(view) = view.upgrade()
                         && let Some(hosted) = view.borrow().as_ref()
                         && focused.isDescendantOf(&hosted.web)
@@ -257,9 +257,28 @@ pub(crate) fn fit(width: u32, area: (f32, f32)) -> Fit {
     }
 }
 
-/// A draft's native view, and the window and epoch it was last painted in.
-type Tracked = (std::rc::Weak<RefCell<Option<Hosted>>>, Painted, Leases);
+/// A draft's native view and what the sentinel needs to keep it right.
+struct Tracked {
+    view: std::rc::Weak<RefCell<Option<Hosted>>>,
+    painted: Painted,
+    leases: Leases,
+    shown: Shown,
+    cover: Rc<RefCell<Cover>>,
+    replay: Rc<RefCell<Option<Replay>>>,
+}
 type Leases = Rc<std::cell::Cell<u32>>;
+/// The window whose latest frame holds the draft's card, drawn anew or
+/// replayed from cache; set by `engine::surface`.
+type Shown = Rc<std::cell::Cell<Option<gpui::WindowId>>>;
+
+/// What a frame that replays the card from cache needs to keep the page
+/// clear of popovers: the card's hitbox, which a replay keeps, the card's
+/// view, and a way to redraw it once WebKit hands over a still.
+struct Replay {
+    hitbox: gpui::Hitbox,
+    card: gpui::EntityId,
+    notify: Rc<dyn Fn()>,
+}
 pub(crate) type Painted = Rc<std::cell::Cell<(gpui::WindowId, u64)>>;
 
 thread_local! {
@@ -314,16 +333,38 @@ pub(crate) fn sentinel() -> gpui::AnyElement {
                 EPOCH.with(std::cell::Cell::get),
             );
             HOSTS.with(|hosts| {
-                hosts.borrow_mut().retain(|(view, painted, leases)| {
-                    let Some(view) = view.upgrade() else {
+                hosts.borrow_mut().retain(|tracked| {
+                    let Some(view) = tracked.view.upgrade() else {
                         return false;
                     };
                     // Another window's drafts are its own sentinel's to hide.
-                    if painted.get().0 == now.0
-                        && painted.get() != now
-                        && let Some(hosted) = view.borrow_mut().as_mut()
+                    if tracked.painted.get().0 != now.0 || tracked.painted.get() == now {
+                        return true;
+                    }
+                    let mut view = view.borrow_mut();
+                    let Some(hosted) = view.as_mut() else {
+                        return true;
+                    };
+                    // The thread was replayed from cache with the card in it:
+                    // the page stays where it is, but a popover may have
+                    // opened over it since.
+                    let replay = tracked.replay.borrow();
+                    match replay
+                        .as_ref()
+                        .filter(|_| tracked.shown.get() == Some(now.0))
                     {
-                        hosted.step_aside(leases.get() > 0);
+                        Some(replay) => {
+                            let covered = window.is_hitbox_covered(&replay.hitbox);
+                            keep_clear(
+                                hosted,
+                                &tracked.cover,
+                                covered,
+                                &tracked.leases,
+                                replay,
+                                window,
+                            );
+                        }
+                        None => hosted.step_aside(tracked.leases.get() > 0),
                     }
                     true
                 });
@@ -361,6 +402,8 @@ pub(super) struct Host {
     input: Input,
     wakes: Wakes,
     leases: Leases,
+    shown: Shown,
+    replay: Rc<RefCell<Option<Replay>>>,
 }
 
 /// While held, the agent is working with the page: when its card is not on
@@ -449,13 +492,16 @@ impl Host {
             let mut hosts = hosts.borrow_mut();
             if !hosts
                 .iter()
-                .any(|(view, _, _)| std::ptr::eq(view.as_ptr(), Rc::as_ptr(&self.view)))
+                .any(|tracked| std::ptr::eq(tracked.view.as_ptr(), Rc::as_ptr(&self.view)))
             {
-                hosts.push((
-                    Rc::downgrade(&self.view),
-                    self.painted.clone(),
-                    self.leases.clone(),
-                ));
+                hosts.push(Tracked {
+                    view: Rc::downgrade(&self.view),
+                    painted: self.painted.clone(),
+                    leases: self.leases.clone(),
+                    shown: self.shown.clone(),
+                    cover: self.cover.clone(),
+                    replay: self.replay.clone(),
+                });
             }
         });
     }
@@ -529,6 +575,16 @@ impl Host {
     pub(super) fn hide(&self) {
         if let Some(view) = self.view.borrow_mut().as_mut() {
             view.step_aside(false);
+        }
+    }
+    /// Says which window's frame holds the card, if any; see `Shown`.
+    pub(super) fn set_shown(&self, window: Option<gpui::WindowId>) {
+        self.shown.set(window);
+    }
+    /// The card left the frame: the page steps aside, or parks for the agent.
+    pub(super) fn off_screen(&self) {
+        if let Some(view) = self.view.borrow_mut().as_mut() {
+            view.step_aside(self.leases.get() > 0);
         }
     }
     /// Lays the page out for a new viewport now rather than at the next
@@ -680,6 +736,7 @@ pub(super) fn surface<T: 'static>(
     let input = host.input.clone();
     let wakes = host.wakes.send.clone();
     let leases = host.leases.clone();
+    let replay = host.replay.clone();
     host.track();
     let snapshot = {
         let mut state = cover.borrow_mut();
@@ -690,7 +747,6 @@ pub(super) fn surface<T: 'static>(
         }
         state.snapshot.clone()
     };
-    let still = snapshot.is_some();
     let paint = canvas(
         |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         move |bounds, hitbox, window, _| {
@@ -819,29 +875,23 @@ pub(super) fn surface<T: 'static>(
                 unsafe { hosted.web.setPageZoom(f64::from(scale * zoom)) };
                 hosted.placed = placed;
             }
-            let mut state = cover.borrow_mut();
-            if !covered {
-                state.pending = false;
-                if state.snapshot.is_some() {
-                    state.retired = true;
-                    window.request_animation_frame();
-                }
-            } else if !still && !state.pending {
-                // The page stays up until its still arrives, a frame or two,
-                // rather than leaving a hole.
-                state.pending = true;
+            let notify: Rc<dyn Fn()> = {
                 let app = placement.app.clone();
                 let this = this.clone();
-                still_of(&hosted.web, cover.clone(), move || {
+                Rc::new(move || {
                     let _ = app.update(|cx| this.update(cx, |_, cx| cx.notify()));
-                });
-            }
-            drop(state);
-            if covered && still {
-                hosted.step_aside(leases.get() > 0);
+                })
+            };
+            let shown = Replay {
+                hitbox,
+                card: this.entity_id(),
+                notify,
+            };
+            let clear = keep_clear(hosted, &cover, covered, &leases, &shown, window);
+            *replay.borrow_mut() = Some(shown);
+            if !clear {
                 return;
             }
-            hosted.step_in();
             let alpha = placement.revealed.map_or(0., |at| {
                 let t = (at.elapsed().as_secs_f64() / FADE.as_secs_f64()).min(1.);
                 1. - (1. - t).powi(3)
@@ -863,6 +913,43 @@ pub(super) fn surface<T: 'static>(
         .children(snapshot.map(|image| gpui::img(image).absolute().size_full()))
         .child(paint)
         .into_any_element()
+}
+
+/// Keeps a popover clear of the page: while one covers it, a still of the
+/// page is drawn in its place and the native view steps aside. Returns
+/// whether the page is in view.
+fn keep_clear(
+    hosted: &mut Hosted,
+    cover: &Rc<RefCell<Cover>>,
+    covered: bool,
+    leases: &Leases,
+    card: &Replay,
+    window: &Window,
+) -> bool {
+    let mut state = cover.borrow_mut();
+    let still = state.snapshot.is_some();
+    if !covered {
+        state.pending = false;
+        if still {
+            // The card's next render frees the still.
+            state.retired = true;
+            let card = card.card;
+            window.on_next_frame(move |_, cx| cx.notify(card));
+        }
+    } else if !still && !state.pending {
+        // The page stays up until its still arrives, a frame or two,
+        // rather than leaving a hole.
+        state.pending = true;
+        let notify = card.notify.clone();
+        still_of(&hosted.web, cover.clone(), move || notify());
+    }
+    drop(state);
+    if covered && still {
+        hosted.step_aside(leases.get() > 0);
+        return false;
+    }
+    hosted.step_in();
+    true
 }
 
 /// # Safety

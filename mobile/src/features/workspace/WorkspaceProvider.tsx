@@ -22,6 +22,7 @@ import {
   useConnection,
   type Conversation,
 } from "@/features/connection/ConnectionProvider";
+import { backoff, pause, waitForActive } from "@/features/connection/appActivity";
 import { selectedWorkspace } from "@/features/connection/selection";
 import type { ModelCatalog, ModelChoice } from "@/features/models/types";
 import { toWire, type Attachment } from "@/features/sessions/attachments";
@@ -124,6 +125,9 @@ type Workspace = {
   renameSession: (session: SessionSummary, title: string) => Promise<void>;
   /** Every project on the desktop, chosen for this phone or not, as a Mono can work in any. */
   allProjects: Project[];
+  /** Every Mono on the desktop, whether this phone lists its chat or not: the
+   *  chip on a session it started names it from here. */
+  allMonos: Mono[];
   /**
    * Changes a Mono's look or projects. Shown at once, as the desktop's catalog
    * will have it; undone if the desktop refuses.
@@ -132,8 +136,14 @@ type Workspace = {
   /** Deletes a session on the desktop. It leaves every list at once, and comes
    *  back if the desktop refuses. */
   deleteSession: (conversationId: string) => Promise<void>;
-  /** Archives a session on the desktop; like a delete, it leaves every list at once. */
+  /** Archives a session on the desktop; like a delete, it leaves every list at once,
+   *  and comes back if the desktop refuses. */
   archiveSession: (conversationId: string) => Promise<void>;
+  /** Takes an archive back: the session returns to its lists at once, and leaves
+   *  again if the desktop refuses. Only where `canUnarchive`. */
+  unarchiveSession: (conversationId: string) => Promise<void>;
+  /** Whether the desktop can unarchive; without it an archive can't be undone. */
+  canUnarchive: boolean;
   /** A session as the phone last changed it, or null once deleted here. */
   edited: (session: SessionSummary) => SessionSummary | null;
   nativeTranscriptStatus: (id: string, status: NativeTranscriptStatus) => void;
@@ -330,7 +340,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     const id = watching;
     let disposed = false;
     let watchId: number | null = null;
-    const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const stop = new AbortController();
+    // Failed opens in a row, for waiting longer between them.
+    let failures = 0;
     // What the watch has built so far: frames are changes against it.
     let known: Turn[] = [];
     // The turn a reopened watch was asked to carry on from. If it opens
@@ -383,9 +395,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         }
       }
       while (!disposed) {
+        // Backgrounded: wait to be shown again rather than wake to check.
+        await waitForActive(stop.signal);
+        if (disposed) break;
         const pairing = current.current.pairing;
-        if (AppState.currentState !== "active" || !pairing) {
-          await pause(500);
+        if (!pairing) {
+          await pause(500, stop.signal);
           continue;
         }
         try {
@@ -408,12 +423,18 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           while (!disposed && AppState.currentState === "active") {
             const frames = await nextUpdates<WatchFrame>(watchId, 10_000);
             if (disposed || current.current.pairing !== pairing) break;
+            failures = 0;
             if (frames.length && !apply(frames)) break;
           }
         } catch {
           if (disposed) break;
           await read(id);
-          await pause((starting.current.get(id) ?? 0) > Date.now() ? 200 : 1000);
+          await pause(
+            (starting.current.get(id) ?? 0) > Date.now()
+              ? 200
+              : backoff(1000, failures++, 15_000),
+            stop.signal,
+          );
         }
         if (watchId !== null) void closeWatch(watchId);
         watchId = null;
@@ -430,6 +451,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     });
     return () => {
       disposed = true;
+      stop.abort();
       subscription.remove();
       save();
       if (watchId !== null) void closeWatch(watchId);
@@ -678,6 +700,24 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     (conversationId: string) => removeSession("session.archive", conversationId),
     [removeSession],
   );
+  const unarchiveSession = useCallback(
+    async (conversationId: string) => {
+      setDeleted((previous) => {
+        const next = new Set(previous);
+        next.delete(conversationId);
+        return next;
+      });
+      try {
+        await mutate("session.unarchive", { conversationId });
+      } catch (reason) {
+        // Still archived there, so still off the lists.
+        setDeleted((previous) => new Set(previous).add(conversationId));
+        throw reason;
+      }
+      void refresh();
+    },
+    [mutate, refresh],
+  );
   const readOrchestration = useCallback(
     async (conversationId: string) =>
       (await command<{ runs: OrchestrationRun[] }>("orchestration.read", { conversationId })).runs,
@@ -765,6 +805,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     return {
       projects: selected.projects,
       allProjects: catalog.projects,
+      allMonos: catalog.monos,
       monos: selected.monos.map((mono) => {
         const edits = monoEdits[mono.id];
         if (!edits) return mono;
@@ -792,6 +833,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       editMono,
       deleteSession,
       archiveSession,
+      unarchiveSession,
+      canUnarchive: catalog.sessionUnarchive === true,
       edited,
       nativeTranscriptStatus,
     };
@@ -818,6 +861,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     renameSession,
     deleteSession,
     archiveSession,
+    unarchiveSession,
     nativeTranscriptStatus,
   ]);
   const live = useMemo<Live>(

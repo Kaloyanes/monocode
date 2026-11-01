@@ -60,6 +60,7 @@ mod title_tabs;
 mod visualizations_shots;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
+mod worktree_sweep;
 mod worktrees;
 
 use crate::settings::TitleBarMode;

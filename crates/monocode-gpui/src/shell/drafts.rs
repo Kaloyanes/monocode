@@ -9,7 +9,9 @@ use monocode_core::visual_bridge::{
 };
 
 /// Live pages kept per conversation; opening another retires the oldest, and
-/// its card says so.
+/// its card says so. Only one of them runs at a time, the one last opened or
+/// used; the others sleep, showing a picture of their page until the person
+/// clicks one (see `keep_running`).
 const LIVE_PER_CONVERSATION: usize = 3;
 
 impl Shell {
@@ -104,6 +106,7 @@ impl Shell {
             return Self::reply_draft(&request, Ok(DraftReply::Closed { draft: id }));
         }
         cx.notify();
+        self.keep_running(session, &draft, cx);
         // The page keeps running for the request even when its conversation
         // is in the background. A wait is on the person, who can only use
         // the page where they see it.
@@ -196,6 +199,7 @@ impl Shell {
                     cx.notify();
                 }
                 DraftEvent::Send => this.deliver_draft_notes(session, draft, cx),
+                DraftEvent::Woke => this.keep_running(session, draft, cx),
             },
         ));
         let live = self.drafts.entry(session).or_default();
@@ -209,6 +213,18 @@ impl Shell {
         }
         let id = draft.read(cx).id().to_owned();
         draft::register(&id, draft, cx);
+        self.keep_running(session, draft, cx);
+    }
+
+    /// Runs `draft` and puts the conversation's other drafts to sleep, so
+    /// variants side by side cost what one does.
+    fn keep_running(&mut self, session: i64, draft: &Entity<Draft>, cx: &mut Context<Self>) {
+        draft.update(cx, |draft, cx| draft.wake(cx));
+        for other in self.drafts.get(&session).into_iter().flatten() {
+            if other != draft {
+                other.update(cx, |other, cx| other.sleep(cx));
+            }
+        }
     }
 
     /// The person sent their notes, or used a page control that sends a
@@ -475,6 +491,19 @@ mod tests {
                 assert_eq!(shell.drafts[&open].len(), LIVE_PER_CONVERSATION);
                 assert!(draft::live("draft-1-0", cx).is_none());
                 assert!(draft::live(&format!("draft-1-{LIVE_PER_CONVERSATION}"), cx).is_some());
+                // Only the newest runs; the others sleep.
+                let asleep = |shell: &Shell, cx: &App| {
+                    shell.drafts[&open]
+                        .iter()
+                        .map(|draft| draft.read(cx).is_asleep())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(asleep(shell, cx), [true, true, false]);
+                // Using an older one runs it instead.
+                let (again, _answer) =
+                    request(open, Some("draft-1-2".into()), None, DraftAction::Snapshot);
+                shell.handle_draft_request(again, window, cx);
+                assert_eq!(asleep(shell, cx), [true, false, true]);
             })
             .unwrap();
     }

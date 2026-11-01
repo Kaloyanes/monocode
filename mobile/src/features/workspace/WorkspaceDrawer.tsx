@@ -37,21 +37,22 @@ const FOOTER_HEIGHT = 50;
 const FADE = 16;
 /** The Monocode mark in the header. */
 const MARK = 38;
-/** A Mono row's mascot, as a chat list's avatar. */
+/** A project row's mascot column. */
 const AVATAR = 40;
-/** The rows' inset and their own padding, so a Mono's figure lines up with
+/** The rows' inset and their own padding, so a project's figure lines up with
  *  the header's buttons. */
 const LIST_INSET = 6;
 const ROW_INSET = 10;
 const ROW_GAP = 14;
 
+type Filter = "all" | "working";
+
 /**
- * The phone's counterpart of the desktop's rail, laid out as a messaging
- * app's chat list: the Monocode mark and the filter up top, level with a
- * screen's header; the projects under their own label, and at the foot
- * settings and search, level with a screen's composer. A project's Monos are
- * on its Sessions page. Picking one switches the screen under it as the
- * drawer shuts.
+ * The phone's counterpart of the desktop's rail: the Monocode mark and the
+ * filter up top, level with a screen's header; the projects under their own
+ * label; and at the foot settings and search, level with a screen's composer.
+ * Picking a project switches the screen under it as the drawer shuts. Monos
+ * are not here: each sits pinned on its projects' Sessions pages.
  */
 export function WorkspaceDrawer() {
   const drawer = useDrawerActions();
@@ -63,19 +64,20 @@ export function WorkspaceDrawer() {
   const styles = useStyles();
   const { projects } = useWorkspace();
   const [query, setQuery] = useState("");
-  const [working, setWorking] = useState(false);
+  const [filter, setFilter] = useState<Filter>("all");
   const pathname = usePathname();
-  const params = useGlobalSearchParams<{ projectId?: string; monoId?: string }>();
+  const params = useGlobalSearchParams<{ projectId?: string }>();
   const onProject = pathname.startsWith("/project/");
   const activeProject = onProject
     ? projectForRoute(projects, params.projectId)?.id
     : undefined;
 
+  // Narrowed by the search and the filter.
   const needle = query.trim().toLowerCase();
   const shownProjects = projects.filter(
     (project) =>
       (!needle || project.name.toLowerCase().includes(needle)) &&
-      (!working || project.busy),
+      (filter === "all" || project.busy),
   );
 
   // The drawer shuts at once over a loading cover, and the next screen is
@@ -128,7 +130,9 @@ export function WorkspaceDrawer() {
           ) : null}
           {nothing ? (
             <Text style={styles.empty}>
-              {needle || working ? "Nothing matches." : "No projects on this phone yet."}
+              {needle || filter !== "all"
+                ? "Nothing matches."
+                : "No projects on this phone yet."}
             </Text>
           ) : null}
         </ScrollView>
@@ -143,7 +147,7 @@ export function WorkspaceDrawer() {
             accessibilityIgnoresInvertColors
           />
           <View style={styles.headerActions}>
-            <FilterMenu working={working} onWorking={setWorking} />
+            <FilterMenu filter={filter} onFilter={setFilter} />
           </View>
         </View>
 
@@ -171,31 +175,32 @@ export function WorkspaceDrawer() {
   );
 }
 
-const FILTERS: { value: "all" | "working"; label: string; symbol: "tray.full" | "bolt" }[] = [
+const FILTERS: { value: Filter; label: string; symbol: "tray.full" | "bolt" }[] = [
   { value: "all", label: "All", symbol: "tray.full" },
   { value: "working", label: "Working now", symbol: "bolt" },
 ];
 
-/** The round button in the header: a native menu to show every project or
- *  only those working now. Lit while it narrows the list. */
+/** The round button in the header: a native menu of which projects to show.
+ *  Lit while it narrows the list. */
 function FilterMenu({
-  working,
-  onWorking,
+  filter,
+  onFilter,
 }: {
-  working: boolean;
-  onWorking: (working: boolean) => void;
+  filter: Filter;
+  onFilter: (value: Filter) => void;
 }) {
   const colors = useColors();
+  const on = filter !== "all";
   return (
     <View>
       <LiquidView borderRadius={HEADER_HEIGHT / 2} innerStyle={filterStyles.round}>
-        <Icon name="filter" size={20} color={working ? colors.accent : colors.content} />
+        <Icon name="filter" size={20} color={on ? colors.accent : colors.content} />
       </LiquidView>
       {/* The native menu lies over the glass, its label an invisible box of
           the button's size, as in SessionFilterMenu. */}
       <Host style={StyleSheet.absoluteFill}>
         <Menu
-          modifiers={[accessibilityLabel(working ? "Filter, on" : "Filter")]}
+          modifiers={[accessibilityLabel(on ? "Filter, on" : "Filter")]}
           label={
             <HStack modifiers={[frame({ width: HEADER_HEIGHT, height: HEADER_HEIGHT }), contentShape(shapes.circle())]}>
               <Spacer />
@@ -203,8 +208,8 @@ function FilterMenu({
           }
         >
           <Picker
-            selection={working ? "working" : "all"}
-            onSelectionChange={(next) => onWorking(next === "working")}
+            selection={filter}
+            onSelectionChange={(next) => onFilter(next as Filter)}
             modifiers={[pickerStyle("inline")]}
           >
             {FILTERS.map((option) => (
@@ -290,16 +295,13 @@ const useStyles = themedStyles((colors) => ({
     left: 0,
     right: 0,
   },
-  // Dimmed heading over each kind, inset like the rows' text.
+  // Dimmed heading over the projects, inset like the rows' text.
   sectionLabel: {
     paddingHorizontal: ROW_INSET,
     marginBottom: 4,
     color: colors.muted,
     fontSize: 13,
     fontWeight: "500",
-  },
-  pressed: {
-    opacity: 0.6,
   },
   list: {
     paddingHorizontal: LIST_INSET,

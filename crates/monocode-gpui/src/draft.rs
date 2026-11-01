@@ -48,9 +48,14 @@ const SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
 /// After the agent's own click or typing, effects only need a moment.
 #[cfg(target_os = "macos")]
 const AFTER_ACTION: std::time::Duration = std::time::Duration::from_millis(300);
-/// Pictures are taken at most this many points wide; the display adds its scale.
+/// The agent's pictures are taken at most this many points wide; the display
+/// adds its scale.
 #[cfg(target_os = "macos")]
 const MAX_PICTURE_WIDTH: u32 = 1000;
+/// A kept picture stays in the thread and opens full size, so it keeps a wide
+/// page at its own width, up to this many points.
+#[cfg(target_os = "macos")]
+const MAX_KEPT_WIDTH: u32 = 1600;
 
 /// The shortest a draft's card gets, and the tallest it follows its page to:
 /// a page taller than that scrolls inside its card.
@@ -232,6 +237,8 @@ pub(crate) struct OpenKept {
 pub(crate) enum DraftEvent {
     /// The person closed the draft.
     Closed,
+    /// The person clicked a sleeping draft to run it again.
+    Woke,
     /// The person sent their notes. If the agent is not waiting for them, the
     /// shell delivers them as a message.
     Send,
@@ -274,8 +281,16 @@ pub(crate) struct Draft {
     outline: Vec<OutlineBox>,
     /// The version being replaced, shown until the next one is ready.
     still: Option<Arc<gpui::RenderImage>>,
-    /// The agent sent this version: lay it out at other widths for them.
+    /// Asleep: another draft of the conversation is the one running, and the
+    /// card shows a picture of this page until the person clicks it.
+    asleep: bool,
+    poster: Option<Arc<gpui::RenderImage>>,
+    _sleep: Option<gpui::Task<()>>,
+    /// The agent sent the draft's first version: lay it out at other widths
+    /// for them. Revisions are not, so each shows as soon as it loads; see
+    /// `measure_layouts`.
     measure: bool,
+    measured: bool,
     layouts: Vec<DraftLayout>,
     /// The agent chose the page's width; without one, the full view reflows
     /// the page to fill it.
@@ -485,7 +500,11 @@ impl Draft {
             revealed: None,
             outline: Vec::new(),
             still: None,
+            asleep: false,
+            poster: None,
+            _sleep: None,
             measure: false,
+            measured: false,
             layouts: Vec::new(),
             explicit_width: width.is_some(),
             expanded: false,
@@ -841,6 +860,110 @@ impl Draft {
         }
     }
 
+    /// Stops running the page and shows a picture of it instead, unless the
+    /// person or the agent is using it. The card's page leaves the frame,
+    /// which pauses it; see `engine::Presence`.
+    pub(crate) fn sleep(&mut self, cx: &mut Context<Self>) {
+        if self.asleep
+            || self._sleep.is_some()
+            || self.expanded
+            || self.commenting
+            || self.shared.waiting()
+            || self.shared.control()
+        {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let current = (self.shown == self.shared.generation() && self.host.visible())
+            .then(|| self.host.web())
+            .flatten();
+        self._sleep = Some(cx.spawn(async move |this, cx| {
+            #[cfg(target_os = "macos")]
+            let poster = match current {
+                Some(web) => engine::picture(&web, cx).await,
+                None => None,
+            };
+            #[cfg(not(target_os = "macos"))]
+            let poster = None;
+            let _ = this.update(cx, |this, cx| {
+                this._sleep = None;
+                this.asleep = true;
+                if let Some(old) = std::mem::replace(&mut this.poster, poster) {
+                    cx.drop_image(old, None);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Runs the page again. Returns whether it was asleep.
+    pub(crate) fn wake(&mut self, cx: &mut Context<Self>) -> bool {
+        self._sleep = None;
+        if !std::mem::take(&mut self.asleep) {
+            return false;
+        }
+        if let Some(poster) = self.poster.take() {
+            cx.drop_image(poster, None);
+        }
+        cx.notify();
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_asleep(&self) -> bool {
+        self.asleep || self._sleep.is_some()
+    }
+
+    /// What a sleeping card shows: its page's picture, which a click runs.
+    fn asleep_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let picture = match &self.poster {
+            Some(poster) => div()
+                .absolute()
+                .inset_0()
+                .child(gpui::img(poster.clone()).size_full())
+                .into_any_element(),
+            None => self.placeholder(false),
+        };
+        div()
+            .id("draft-asleep")
+            .debug_selector(|| "draft-asleep".into())
+            .role(gpui::Role::Button)
+            .aria_label("Run this draft again")
+            .absolute()
+            .inset_0()
+            .group("draft-asleep")
+            .cursor(gpui::CursorStyle::PointingHand)
+            .child(picture)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.)
+                    .group_hover("draft-asleep", |style| style.opacity(1.))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .bg(pane_surface())
+                            .border_1()
+                            .border_color(content(0.1))
+                            .text_size(px(12.))
+                            .text_color(content(0.8))
+                            .child("Paused · click to run"),
+                    ),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.wake(cx) {
+                    cx.emit(DraftEvent::Woke);
+                }
+            }))
+            .into_any_element()
+    }
+
     /// Applies what a request changes before it acts.
     pub(crate) fn apply(&mut self, request: &DraftRequest, cx: &mut Context<Self>) {
         if request.width.is_some() || request.height.is_some() {
@@ -851,7 +974,7 @@ impl Draft {
             self.shared.replace(content.clone());
             self.markup = None;
             self.elements.clear();
-            self.measure = matches!(content, DraftContent::Html(_));
+            self.measure = !self.measured && matches!(content, DraftContent::Html(_));
             self.layouts.clear();
             // A parked page has no card painting to hand it the new version.
             #[cfg(target_os = "macos")]
@@ -1158,6 +1281,8 @@ impl Render for Draft {
                 .text_color(content(0.5))
                 .child("Open in full view")
                 .into_any_element()
+        } else if self.asleep {
+            self.asleep_view(cx)
         } else {
             self.surface(window, cx)
         };
@@ -1590,7 +1715,7 @@ impl Draft {
             self.host.set_appearance(Some(light));
             self.appearance = Some(light);
         }
-        engine::surface(&self.host, placement, window, cx)
+        engine::surface(&self.host, &self.id, placement, window, cx)
     }
 }
 #[cfg(not(target_os = "macos"))]
@@ -1782,7 +1907,11 @@ impl Draft {
         } else {
             SETTLE
         };
-        let mut snapshot = Self::capture(this, &web, settle, cx)
+        let widest = match request.action {
+            DraftAction::Keep { .. } => MAX_KEPT_WIDTH,
+            _ => MAX_PICTURE_WIDTH,
+        };
+        let mut snapshot = Self::capture(this, &web, settle, widest, cx)
             .await
             .map_err(|error| {
                 // The click or typing already reached the page.
@@ -1902,6 +2031,37 @@ impl Draft {
             "send" => {
                 this.update(cx, |this, cx| this.send(cx)).map_err(gone)?;
                 Ok(serde_json::json!({"sent": true}))
+            }
+            // How many pixels each picture of the page has for the points
+            // it is shown at; the self-test divides by the window's scale.
+            "density" => {
+                let web = Self::ready(this, cx).await?;
+                let (chromium, frame, (viewport, _)) = this
+                    .read_with(cx, |this, _| {
+                        (
+                            this.host.is_chromium(),
+                            this.host.density(),
+                            this.viewport(),
+                        )
+                    })
+                    .map_err(gone)?;
+                let still = engine::picture(&web, cx).await.map(|image| {
+                    let size = image.size(0);
+                    (size.width.0, size.height.0)
+                });
+                let agent = engine::png(&web, f64::from(viewport.min(MAX_PICTURE_WIDTH)), cx)
+                    .await
+                    .ok()
+                    .map(|(_, size)| size);
+                Ok(serde_json::json!({
+                    "engine": if chromium { "chromium" } else { "webkit" },
+                    "viewport": viewport,
+                    "frame": frame.map(|(pixels, points, scale)| serde_json::json!({
+                        "pixels": pixels, "points": points, "renderScale": scale,
+                    })),
+                    "still": still,
+                    "agentPicture": agent,
+                }))
             }
             "send_later" => {
                 let weak = this.clone();
@@ -2023,7 +2183,10 @@ impl Draft {
             }
             let measure = this
                 .update(cx, |this, _| {
-                    std::mem::take(&mut this.measure) && this.is_html() && !this.expanded
+                    let measure =
+                        std::mem::take(&mut this.measure) && this.is_html() && !this.expanded;
+                    this.measured |= measure;
+                    measure
                 })
                 .unwrap_or(false);
             if measure {
@@ -2062,8 +2225,12 @@ impl Draft {
     /// Returns whether the height changed. A page whose height depends on its
     /// own viewport would grow without end, so the same step repeated is
     /// taken as that: the card goes back to where it was and the page scrolls.
+    ///
+    /// A height of 0 is the page not having reported since `lay_out` cleared
+    /// it. Taking it would shrink the card to `MIN_HEIGHT`, and a page as tall
+    /// as its viewport would then report that and stay there.
     fn fit_content(&mut self, content: u64) -> bool {
-        if self.growth.frozen {
+        if self.growth.frozen || content == 0 {
             return false;
         }
         let height = (content.min(u64::from(MAX_HEIGHT)) as u32).max(MIN_HEIGHT);
@@ -2125,7 +2292,8 @@ impl Draft {
         }
     }
 
-    /// Lays the hidden page out at the common widths and back at its own.
+    /// Lays the hidden page out at the common widths and back at its own,
+    /// about half a second while the new version waits to be shown.
     async fn measure_layouts(
         this: &gpui::WeakEntity<Self>,
         web: &engine::Page,
@@ -2154,14 +2322,21 @@ impl Draft {
         cx: &mut gpui::AsyncApp,
     ) -> Option<DraftLayout> {
         let width = viewport.map_or(own.0, |viewport| viewport.0);
-        evaluate(web, "window.__mc.vw=0;window.__mc.h=0;'ok'", cx).await?;
+        // A page already at this width reports nothing new: Chromium only
+        // renders it at another scale, which fires no resize.
+        let before = state(web, cx).await?;
+        let same = before["vw"].as_u64() == Some(u64::from(width))
+            && before["h"].as_u64().is_some_and(|h| h > 0);
+        if !same {
+            evaluate(web, "window.__mc.vw=0;window.__mc.h=0;'ok'", cx).await?;
+        }
         this.update(cx, |this, cx| {
             this.host.measure_at(viewport, own);
             cx.notify();
         })
         .ok()?;
         let started = std::time::Instant::now();
-        loop {
+        while !same {
             let reading = state(web, cx).await?;
             let laid_out = reading["vw"]
                 .as_u64()
@@ -2297,6 +2472,7 @@ impl Draft {
         this: &gpui::WeakEntity<Self>,
         web: &engine::Page,
         settle: std::time::Duration,
+        widest: u32,
         cx: &mut gpui::AsyncApp,
     ) -> Result<DraftSnapshot, String> {
         cx.background_executor().timer(settle).await;
@@ -2331,7 +2507,7 @@ impl Draft {
         cx.background_executor()
             .timer(std::time::Duration::from_millis(150))
             .await;
-        let (png, size) = engine::png(web, f64::from(width.min(MAX_PICTURE_WIDTH)), cx).await?;
+        let (png, size) = engine::png(web, f64::from(width.min(widest)), cx).await?;
         // The page is clear over the thread; give the agent's picture the
         // thread's color under it.
         let (html, palette) = this
@@ -2555,6 +2731,28 @@ mod tests {
         cx.run_until_parked();
         assert!(!chromium(cx), "and back to WebKit");
         crate::chromium::INSTALLED_IN_TEST.set(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn a_page_that_has_not_reported_its_height_keeps_its_card(cx: &mut TestAppContext) {
+        let draft = cx.new(|cx| {
+            Draft::new(
+                Some("draft-1-h".into()),
+                1,
+                DraftContent::Html("<p>Hi</p>".into()),
+                (Some(1280), Some(600)),
+                None,
+                None,
+                cx,
+            )
+        });
+        draft.update(cx, |draft, _| {
+            assert!(!draft.fit_content(0), "a cleared height is no height");
+            assert_eq!(draft.height, 600);
+            assert!(draft.fit_content(420));
+            assert_eq!(draft.height, 420);
+        });
     }
 
     #[gpui::test]

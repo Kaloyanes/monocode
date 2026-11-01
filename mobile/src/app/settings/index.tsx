@@ -26,6 +26,7 @@ const CATEGORY_ICONS: Record<NotificationCategory, IconName> = {
   agentInput: "lock",
   agentFinished: "check",
   monoMessages: "chat",
+  inbox: "inbox",
 };
 
 export default function SettingsScreen() {

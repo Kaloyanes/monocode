@@ -69,7 +69,9 @@ import {
   type Workspace,
 } from "@/features/workspace/WorkspaceMenu";
 import { ComposerWorkspace } from "@/features/workspace/ComposerWorkspace";
-import { UnreadDot, useAnyUnreadMono } from "@/features/workspace/UnreadDot";
+import { UnreadDot, useAnyUnread } from "@/features/workspace/UnreadDot";
+import { InboxPage } from "@/features/inbox/InboxPage";
+import { useInboxSupported } from "@/features/inbox/InboxProvider";
 import { Icon } from "@/ui/Icon";
 import { androidBackHeader } from "@/ui/AndroidHeader";
 import { GlassBlurTarget, LiquidView } from "@/ui/LiquidView";
@@ -108,7 +110,7 @@ export function ProjectScreen({
   const colors = useColors();
   const drawer = useDrawerActions();
   // Read here: the native header's buttons render outside this tree.
-  const unread = useAnyUnreadMono();
+  const unread = useAnyUnread();
   // A session is pushed over its project and swipes back; only the project
   // itself swipes the drawer open.
   useDrawerSwipe(!sessionId);
@@ -144,7 +146,8 @@ export function ProjectScreen({
     sessionId,
   );
   // Only a new session has pages; a session is the chat alone.
-  const pages = useProjectPages(project.id, !sessionId);
+  const inboxOn = useInboxSupported();
+  const pages = useProjectPages(project.id, !sessionId, inboxOn);
   // Between pages, mid-swipe or springing to one.
   const swiping = useDerivedValue(() => {
     const at = pages.progress.get();
@@ -288,7 +291,7 @@ export function ProjectScreen({
   );
   const menuButton = (
     <ProjectHeaderButton
-      label={unread ? "Projects and monos, new replies" : "Projects and monos"}
+      label={unread ? "Projects, new replies" : "Projects"}
       onPress={drawer.open}
     >
       {/* The drawer's button, as on every screen it opens from. */}
@@ -450,7 +453,7 @@ export function ProjectScreen({
                 }
               : { headerTitle: "", headerBackVisible: !sheet }
             : {
-                headerTitle: () => <ProjectSwitch pages={pages} />,
+                headerTitle: () => <ProjectSwitch pages={pages} projectId={project.id} />,
                 ...(Platform.OS === "android"
                   ? {
                       headerTitleAlign: "center" as const,
@@ -517,6 +520,17 @@ export function ProjectScreen({
                   onOpen={(session) => openSession(session.id)}
                 />
               </Timed>
+            }
+            inbox={
+              inboxOn ? (
+                <Timed id="project inbox page">
+                  <InboxPage
+                    projectId={project.id}
+                    projectName={project.name}
+                    active={focused && pages.view === "inbox"}
+                  />
+                </Timed>
+              ) : undefined
             }
           />
         )}
