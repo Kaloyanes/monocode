@@ -1,3 +1,14 @@
+import Alert01Icon from "@hugeicons/core-free-icons/Alert01Icon";
+import ArrowUpRight01Icon from "@hugeicons/core-free-icons/ArrowUpRight01Icon";
+import CancelCircleIcon from "@hugeicons/core-free-icons/CancelCircleIcon";
+import CheckmarkCircle01Icon from "@hugeicons/core-free-icons/CheckmarkCircle01Icon";
+import CircleIcon from "@hugeicons/core-free-icons/CircleIcon";
+import Clock01Icon from "@hugeicons/core-free-icons/Clock01Icon";
+import Comment01Icon from "@hugeicons/core-free-icons/Comment01Icon";
+import GitPullRequestIcon from "@hugeicons/core-free-icons/GitPullRequestIcon";
+import Link01Icon from "@hugeicons/core-free-icons/Link01Icon";
+import Undo02Icon from "@hugeicons/core-free-icons/Undo02Icon";
+import WifiOff01Icon from "@hugeicons/core-free-icons/WifiOff01Icon";
 import Add01Icon from "@hugeicons/core-free-icons/Add01Icon";
 import AiIdeaIcon from "@hugeicons/core-free-icons/AiIdeaIcon";
 import ArrowDown01Icon from "@hugeicons/core-free-icons/ArrowDown01Icon";
@@ -105,6 +116,18 @@ const icons = {
   plan: AiIdeaIcon,
   operator: CursorMagicSelection04Icon,
   orchestrator: Share02Icon,
+  // The Inbox: snooze, items, checks, and the offline note.
+  clock: Clock01Icon,
+  pullRequest: GitPullRequestIcon,
+  issue: CircleIcon,
+  comment: Comment01Icon,
+  link: Link01Icon,
+  external: ArrowUpRight01Icon,
+  undo: Undo02Icon,
+  offline: WifiOff01Icon,
+  alert: Alert01Icon,
+  passing: CheckmarkCircle01Icon,
+  failing: CancelCircleIcon,
 };
 
 export type IconName = keyof typeof icons;
