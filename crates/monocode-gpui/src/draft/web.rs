@@ -349,10 +349,20 @@ pub(crate) fn sentinel() -> gpui::AnyElement {
                     // the page stays where it is, but a popover may have
                     // opened over it since.
                     let replay = tracked.replay.borrow();
-                    match replay.as_ref().filter(|_| tracked.shown.get() == Some(now.0)) {
+                    match replay
+                        .as_ref()
+                        .filter(|_| tracked.shown.get() == Some(now.0))
+                    {
                         Some(replay) => {
                             let covered = window.is_hitbox_covered(&replay.hitbox);
-                            keep_clear(hosted, &tracked.cover, covered, &tracked.leases, replay, window);
+                            keep_clear(
+                                hosted,
+                                &tracked.cover,
+                                covered,
+                                &tracked.leases,
+                                replay,
+                                window,
+                            );
                         }
                         None => hosted.step_aside(tracked.leases.get() > 0),
                     }

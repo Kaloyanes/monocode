@@ -477,14 +477,20 @@ mod perf {
         };
         let (reply, _) = std::sync::mpsc::channel();
         let input = json!({"draft": id, "html": html});
-        let Ok(request) = monocode_core::visual_bridge::DraftRequest::parse(1, &input, reply) else {
+        let Ok(request) = monocode_core::visual_bridge::DraftRequest::parse(1, &input, reply)
+        else {
             return Value::Null;
         };
         let started = Instant::now();
         let _ = draft.update(cx, |draft, cx| draft.apply(&request, cx));
         loop {
             let shown = draft
-                .read_with(cx, |draft, _| (draft.shown == draft.shared.generation(), draft.layouts.len()))
+                .read_with(cx, |draft, _| {
+                    (
+                        draft.shown == draft.shared.generation(),
+                        draft.layouts.len(),
+                    )
+                })
                 .unwrap_or((true, 0));
             if shown.0 {
                 return json!({"shownAfterMs": started.elapsed().as_secs_f64() * 1000., "layouts": shown.1});
@@ -492,7 +498,9 @@ mod perf {
             if started.elapsed() > Duration::from_secs(15) {
                 return json!({"timedOut": true});
             }
-            cx.background_executor().timer(Duration::from_millis(5)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(5))
+                .await;
         }
     }
 
@@ -511,13 +519,27 @@ mod perf {
                 let mut drafts = Vec::new();
                 for n in 0..count {
                     let draft = cx.new(|cx| {
-                        Draft::new(None, 1, DraftContent::Html(html.clone()), (width, None), None, None, cx)
+                        Draft::new(
+                            None,
+                            1,
+                            DraftContent::Html(html.clone()),
+                            (width, None),
+                            None,
+                            None,
+                            cx,
+                        )
                     });
                     let id = draft.read(cx).id().to_owned();
                     crate::draft::register(&id, &draft, cx);
                     rows.push(row("assistant", format!("Variant {n}:")));
-                    let card = DraftCard { draft: id, title: format!("Variant {n}") };
-                    rows.push(row(DRAFT_ROLE, serde_json::to_string(&card).unwrap_or_default()));
+                    let card = DraftCard {
+                        draft: id,
+                        title: format!("Variant {n}"),
+                    };
+                    rows.push(row(
+                        DRAFT_ROLE,
+                        serde_json::to_string(&card).unwrap_or_default(),
+                    ));
                     drafts.push(draft);
                 }
                 rows.push(row("assistant", "Pick the one you like.".into()));
@@ -526,8 +548,8 @@ mod perf {
                     view.patch(0, rows, cx);
                     view
                 });
-                let ticker = std::env::var_os("MONOCODE_DRAFT_SELFTEST_TICK")
-                    .map(|_| cx.new(|_| Ticker));
+                let ticker =
+                    std::env::var_os("MONOCODE_DRAFT_SELFTEST_TICK").map(|_| cx.new(|_| Ticker));
                 let frames = Rc::new(Frames::default());
                 let handle = cx
                     .open_window(
@@ -540,7 +562,13 @@ mod perf {
                         },
                         {
                             let frames = frames.clone();
-                            move |_, cx| cx.new(|_| Root { thread, ticker, frames })
+                            move |_, cx| {
+                                cx.new(|_| Root {
+                                    thread,
+                                    ticker,
+                                    frames,
+                                })
+                            }
                         },
                     )
                     .expect("open the measuring window");
@@ -564,7 +592,9 @@ mod perf {
                     let _drafts = drafts;
                     // Let the fades, fits and first frames settle, and the thread
                     // come to rest with every card on screen.
-                    cx.background_executor().timer(Duration::from_millis(2500)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(2500))
+                        .await;
                     let settled = Instant::now();
                     while settled.elapsed() < Duration::from_secs(5) {
                         let on_screen = weak.iter().rev().take(1).all(|draft| {
@@ -579,7 +609,9 @@ mod perf {
                         if on_screen {
                             break;
                         }
-                        cx.background_executor().timer(Duration::from_millis(100)).await;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
                     }
                     let cef_before = super::super::chrome::FRAMES_RECEIVED.load(Ordering::Relaxed);
                     let stops_before = super::super::chrome::STREAM_STOPS.load(Ordering::Relaxed);
@@ -587,20 +619,31 @@ mod perf {
                     let engines_before = processes();
                     let started = Instant::now();
                     frames.recording.set(true);
-                    cx.background_executor().timer(Duration::from_secs(hold.into())).await;
+                    cx.background_executor()
+                        .timer(Duration::from_secs(hold.into()))
+                        .await;
                     frames.recording.set(false);
                     let seconds = started.elapsed().as_secs_f64();
                     let cpu = (cpu_seconds() - cpu_before) / seconds * 100.;
                     let engines = engine_cpu(&engines_before, &processes(), &existing, seconds);
-                    let cef = super::super::chrome::FRAMES_RECEIVED.load(Ordering::Relaxed) - cef_before;
-                    let stops = super::super::chrome::STREAM_STOPS.load(Ordering::Relaxed) - stops_before;
+                    let cef =
+                        super::super::chrome::FRAMES_RECEIVED.load(Ordering::Relaxed) - cef_before;
+                    let stops =
+                        super::super::chrome::STREAM_STOPS.load(Ordering::Relaxed) - stops_before;
                     let (scale, zoom) = handle
-                        .update(cx, |_, window, _| (window.scale_factor(), window.content_zoom()))
+                        .update(cx, |_, window, _| {
+                            (window.scale_factor(), window.content_zoom())
+                        })
                         .unwrap_or((0., 0.));
                     let mut pages = Vec::new();
                     for draft in &weak {
-                        let placed = draft.read_with(cx, |draft, _| draft.placement()).ok().flatten();
-                        let density = Draft::debug(draft, "density", cx).await.unwrap_or_else(|e| json!({"error": e}));
+                        let placed = draft
+                            .read_with(cx, |draft, _| draft.placement())
+                            .ok()
+                            .flatten();
+                        let density = Draft::debug(draft, "density", cx)
+                            .await
+                            .unwrap_or_else(|e| json!({"error": e}));
                         pages.push(json!({"placed": placed, "density": density}));
                     }
                     // A new version from the agent, as `draft_preview` sends one:
@@ -626,7 +669,10 @@ mod perf {
                         "frameTime": summary(frames.durations.take(), seconds),
                         "pages": pages,
                     });
-                    let _ = std::fs::write(&out, serde_json::to_string_pretty(&report).unwrap_or_default());
+                    let _ = std::fs::write(
+                        &out,
+                        serde_json::to_string_pretty(&report).unwrap_or_default(),
+                    );
                     cx.update(|cx| cx.quit());
                 })
                 .detach();
