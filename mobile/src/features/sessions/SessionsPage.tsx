@@ -7,17 +7,21 @@ import {
   useRef,
   useState,
 } from "react";
+import { router } from "expo-router";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
 import Animated, { FadeIn, FadeOut, LinearTransition } from "react-native-reanimated";
 
+import { useConnection } from "@/features/connection/ConnectionProvider";
 import { FileSearchBar, SEARCH_BAR } from "@/features/files/FileSearchBar";
+import { useUnreadMonos } from "@/features/workspace/monoSeen";
 import type { Harness, SessionSummary, Worktree } from "@/features/workspace/types";
 import { useWorkspace } from "@/features/workspace/WorkspaceProvider";
 import { AnimationsPaused } from "@/ui/AnimationsPaused";
 import { GradualBlur } from "@/ui/GradualBlur";
 import { themedStyles, useColors } from "@/ui/theme";
 
+import { ListChips, ListHeading, MonoRow, type ListView } from "./MonosSublist";
 import { SessionCard } from "./SessionCard";
 import {
   filterSessions,
@@ -30,8 +34,12 @@ import { ARRIVE_MS, useArrivals } from "./useArrivals";
 import { REMOVE_MS, useSessionActions } from "./useSessionActions";
 import { useSessionPages, visibleSessions } from "./useSessionPages";
 
+/** The list with the sessions left out, kept one array so it isn't seen as a change. */
+const NONE: SessionSummary[] = [];
+
 /**
- * A project's sessions, newest first and paged in as the list scrolls. Each
+ * A project's Monos, then its sessions, newest first and paged in as the list
+ * scrolls, under chips for All, Monos and Working now. Each session
  * swipes left to rename or delete, as on the desktop sidebar. Searched and
  * filtered from the bar where the composer rests on the chat page, and
  * narrowed to `worktree` when the header's menu picks one, as the desktop's
@@ -51,7 +59,8 @@ export function SessionsPage({
 }) {
   const colors = useColors();
   const styles = useStyles();
-  const { sessions, edited, rememberSession } = useWorkspace();
+  const { sessions, monos: roster, edited, rememberSession } = useWorkspace();
+  const desktop = useConnection().pairing?.desktop.fingerprint;
   const { pageTop, dockBottom } = useSessionLayout();
   // Room for the search bar where the composer rests, and the blur under it.
   const bottom = dockBottom + SEARCH_BAR + 16;
@@ -64,8 +73,29 @@ export function SessionsPage({
     inWorktree(session, worktree),
   );
   const visible = filterSessions(listed, filter);
+  // The Monos that work in this project, and any that work in none, as the
+  // search and Working now narrow them.
+  const [view, setView] = useState<ListView>("all");
+  const unread = useUnreadMonos(desktop, roster);
+  const projectMonos = useMemo(
+    () =>
+      roster
+        .filter((mono) => !mono.projectIds.length || mono.projectIds.includes(projectId))
+        .sort((a, b) => (b.lastActiveAt || 0) - (a.lastActiveAt || 0)),
+    [roster, projectId],
+  );
+  const monos = projectMonos.filter(
+    (mono) =>
+      (!needle || mono.name.toLowerCase().includes(needle)) &&
+      (!filter.working || mono.status !== "idle"),
+  );
+  const onlyMonos = view === "monos" && projectMonos.length > 0;
+  const openMono = useCallback(
+    (monoId: string) => router.replace({ pathname: "/mono/[monoId]", params: { monoId } }),
+    [],
+  );
   const scope = JSON.stringify([projectId, needle, filter, worktree?.path, !!pages]);
-  const arrivals = useArrivals(visible, scope, active);
+  const arrivals = useArrivals(onlyMonos ? NONE : visible, scope, active);
   // The agents to filter by: those in the list, in the order first seen.
   const harnesses = [...new Set<Harness>(listed.map((session) => session.harness))];
   if (filter.harness && !harnesses.includes(filter.harness)) harnesses.push(filter.harness);
@@ -128,8 +158,38 @@ export function SessionsPage({
           keyExtractor={(session) => session.id}
           renderItem={renderItem}
           ItemSeparatorComponent={Divider}
+          ListHeaderComponent={
+            <View>
+              <ListChips
+                view={onlyMonos ? "monos" : "all"}
+                onView={setView}
+                working={filter.working}
+                onWorking={(working) => setFilter((previous) => ({ ...previous, working }))}
+                monos={projectMonos.length}
+              />
+              {monos.length ? (
+                <View style={styles.monos}>
+                  <ListHeading>Monos</ListHeading>
+                  {monos.map((mono) => (
+                    <MonoRow
+                      key={mono.id}
+                      mono={mono}
+                      unread={unread.has(mono.id)}
+                      shimmer={active}
+                      onPress={openMono}
+                    />
+                  ))}
+                </View>
+              ) : null}
+              {onlyMonos ? null : <ListHeading>Sessions</ListHeading>}
+            </View>
+          }
           ListEmptyComponent={
-            pages ? (
+            onlyMonos ? (
+              monos.length ? null : (
+                <Text style={styles.empty}>No matching Monos.</Text>
+              )
+            ) : pages ? (
               <Text style={styles.empty}>
                 {narrowed ? "No matching sessions." : "No sessions yet."}
               </Text>
@@ -246,6 +306,9 @@ const useStyles = themedStyles((colors) => ({
   },
   list: {
     paddingHorizontal: 10,
+  },
+  monos: {
+    paddingBottom: 18,
   },
   empty: {
     paddingHorizontal: 14,

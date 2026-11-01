@@ -27,6 +27,7 @@ import {
   useSessionChoice,
 } from "@/features/models/sessionChoice";
 import { useModelCatalog } from "@/features/models/useModelCatalog";
+import { useCreateMono } from "@/features/workspace/useCreateMono";
 import { useOpenSessionAfterStarting } from "@/features/settings/newSessions";
 import type { Attachment } from "@/features/sessions/attachments";
 import { Composer } from "@/features/sessions/Composer";
@@ -103,6 +104,7 @@ export function ProjectScreen({
 }) {
   const { startSession, sendMessage, stop, sessions } = useWorkspace();
   const [openAfterStarting] = useOpenSessionAfterStarting();
+  const createMono = useCreateMono(project.id);
   const colors = useColors();
   const drawer = useDrawerActions();
   // Read here: the native header's buttons render outside this tree.
@@ -382,6 +384,7 @@ export function ProjectScreen({
             effort={effort}
             harness={harness}
             modes
+            onNewMono={createMono}
             slash={{
               projectId: project.id,
               ...(worktreePath ? { worktreePath } : {}),

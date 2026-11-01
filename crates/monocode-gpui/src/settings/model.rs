@@ -688,6 +688,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "api key issues teams connect",
     ),
     (
+        "auto-archive",
+        Section::Archive,
+        "Auto-archive inactive conversations",
+        "old stale expire idle days weeks month clean up automatically",
+    ),
+    (
         "show-archived",
         Section::Archive,
         "Show archived in the sidebar",

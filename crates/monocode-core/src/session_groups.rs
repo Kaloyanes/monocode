@@ -120,6 +120,28 @@ impl Groups {
     pub fn dissolve(&mut self, folder: &str) {
         self.folders.retain(|f| f.id != folder);
     }
+    /// Folders whose listed members are all archived, each with those members
+    /// in `visible`'s order. Archiving every thread of a folder hides it from
+    /// the live list but keeps its membership, so unarchiving puts it back.
+    pub fn archived_folders(&self, visible: &[i64], archived: impl Fn(i64) -> bool) -> Vec<Entry> {
+        self.folders
+            .iter()
+            .filter_map(|folder| {
+                let members: Vec<i64> = visible
+                    .iter()
+                    .copied()
+                    .filter(|id| folder.session_ids.contains(id))
+                    .collect();
+                (!members.is_empty() && members.iter().all(|&id| archived(id))).then(|| {
+                    Entry::Folder {
+                        id: folder.id.clone(),
+                        sessions: members,
+                        archived: true,
+                    }
+                })
+            })
+            .collect()
+    }
     pub fn toggle_folder(&mut self, folder: &str) {
         if let Some(f) = self.folder_mut(folder) {
             f.collapsed = !f.collapsed;
@@ -144,6 +166,9 @@ pub enum Entry {
     Folder {
         id: String,
         sessions: Vec<i64>,
+        /// Every listed member is archived: the folder sits in the archive
+        /// list at the end, not among the live folders.
+        archived: bool,
     },
     /// Loose pinned sessions, shown as ordinary cards under a Pinned label.
     Pinned {
@@ -189,6 +214,7 @@ pub fn build_list(
             entries.push(Entry::Folder {
                 id: folder.id.clone(),
                 sessions: members,
+                archived: false,
             });
         }
     }
@@ -500,6 +526,40 @@ mod tests {
     }
 
     #[test]
+    fn folders_with_every_listed_thread_archived_move_to_the_archive() {
+        let mut groups = Groups::default();
+        groups.create_folder(&[1, 2], "a".into());
+        groups.create_folder(&[3, 4], "b".into());
+        let archived = |id: i64| matches!(id, 1 | 2 | 4);
+        let visible = [4, 3, 2, 1];
+        assert_eq!(
+            groups.archived_folders(&visible, archived),
+            vec![Entry::Folder {
+                id: "a".into(),
+                sessions: vec![2, 1],
+                archived: true,
+            }],
+            "b keeps a live thread"
+        );
+        // Members hidden from the list do not count either way.
+        assert_eq!(groups.archived_folders(&[4], archived).len(), 1);
+        assert!(groups.archived_folders(&[], archived).is_empty());
+        // Membership is kept, so the folder is whole again once unarchived.
+        assert_eq!(groups.folder("a").unwrap().session_ids, vec![1, 2]);
+        assert!(groups.archived_folders(&visible, |_| false).is_empty());
+        // The live list drops a folder with nothing left to show.
+        let live: Vec<i64> = visible
+            .iter()
+            .copied()
+            .filter(|&id| !archived(id))
+            .collect();
+        let list = build_list(&live, |_| false, &groups, &[]);
+        assert!(!list
+            .iter()
+            .any(|e| matches!(e, Entry::Folder { id, .. } if id == "a")));
+    }
+
+    #[test]
     fn list_orders_reminders_folders_then_pins_and_loose_sessions() {
         let mut groups = Groups::default();
         groups.create_folder(&[2, 3], "f".into());
@@ -519,7 +579,8 @@ mod tests {
                 },
                 Entry::Folder {
                     id: "f".into(),
-                    sessions: vec![2]
+                    sessions: vec![2],
+                    archived: false,
                 },
                 Entry::Pinned { sessions: vec![5] },
                 Entry::Session(1),
@@ -677,8 +738,16 @@ mod tests {
         for tool in [
             failed,
             running,
-            call("Bash", serde_json::json!({"command": "gh pr view 1187"}), created),
-            call("Bash", serde_json::json!({"command": "echo gh pr creates"}), created),
+            call(
+                "Bash",
+                serde_json::json!({"command": "gh pr view 1187"}),
+                created,
+            ),
+            call(
+                "Bash",
+                serde_json::json!({"command": "echo gh pr creates"}),
+                created,
+            ),
             call(
                 "Bash",
                 serde_json::json!({"command": "git push -u origin feat/x"}),

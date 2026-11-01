@@ -48,6 +48,21 @@ fn yes() -> bool {
     true
 }
 
+impl Device {
+    /// A phone on USB is on while it is plugged in: MonoCode can show and
+    /// drive it, but not boot, shut down or delete it.
+    pub fn ensure_virtual(&self, action: &str) -> Result<(), String> {
+        if self.physical {
+            Err(format!(
+                "{} is a phone connected over USB; MonoCode can't {action} it.",
+                self.name
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct DeviceList {
     pub devices: Vec<Device>,
@@ -61,9 +76,7 @@ impl DeviceList {
         for key in ["simulators", "emulators"] {
             for device in value[key].as_array().into_iter().flatten() {
                 if let Ok(device) = serde_json::from_value::<Device>(device.clone()) {
-                    if !device.physical {
-                        devices.push(device);
-                    }
+                    devices.push(device);
                 }
             }
         }
@@ -290,7 +303,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hub_lists_become_booted_first_without_physical_devices() {
+    fn hub_lists_become_booted_first_with_usb_phones() {
         let value = json!({
             "simulators": [
                 {"id":"A","name":"iPhone 17","version":"iOS 27.0","platform":"ios","booted":false},
@@ -304,7 +317,8 @@ mod tests {
         });
         let list = DeviceList::from_hub(&value).unwrap();
         let ids: Vec<_> = list.devices.iter().map(|d| d.id.as_str()).collect();
-        assert_eq!(ids, ["emulator-5554", "B", "A"]);
+        assert_eq!(ids, ["R5C", "emulator-5554", "B", "A"]);
+        assert!(list.find("R5C").is_some_and(|d| d.physical));
         assert_eq!(list.errors, ["other"]);
         assert!(list.find("A").is_some_and(|d| d.supported));
     }

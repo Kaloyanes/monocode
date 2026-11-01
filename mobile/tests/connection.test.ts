@@ -6,7 +6,11 @@ import {
 import { parseInvitation } from "@/features/connection/invitation";
 const catalog = {
   projects: [{ id: "a" }, { id: "b" }],
-  monos: [{ id: "m" }, { id: "n" }],
+  monos: [
+    { id: "m", projectIds: ["b"] },
+    { id: "n", projectIds: ["a", "b"] },
+    { id: "o", projectIds: [] },
+  ],
   sessions: [
     { id: "s1", projectId: "a" },
     { id: "s2", projectId: "b" },
@@ -14,15 +18,22 @@ const catalog = {
   ],
 };
 describe("mobile workspace choices", () => {
-  it("shows the picked projects and monos, with their sessions", () => {
+  it("shows the picked projects with the monos that work in them, and their sessions", () => {
     const selected = selectedWorkspace(catalog, {
       projectIds: ["a"],
-      monoIds: ["m"],
+      monoIds: [],
     });
     expect(selected.projects).toEqual([{ id: "a" }]);
-    expect(selected.monos).toEqual([{ id: "m" }]);
-    // A mono's session counts even in a project left out.
-    expect(selected.sessions.map((session) => session.id)).toEqual(["s1", "s3"]);
+    // "m" works only in "b", which is left out; "o" works in none, so it stays.
+    expect(selected.monos.map((mono) => mono.id)).toEqual(["n", "o"]);
+    expect(selected.sessions.map((session) => session.id)).toEqual(["s1"]);
+    const both = selectedWorkspace(catalog, { projectIds: ["b"], monoIds: [] });
+    expect(both.monos.map((mono) => mono.id)).toEqual(["m", "n", "o"]);
+    expect(both.sessions.map((session) => session.id)).toEqual(["s2", "s3"]);
+  });
+  it("ignores the monos an earlier version picked on their own", () => {
+    const selected = selectedWorkspace(catalog, { projectIds: ["a"], monoIds: ["m"] });
+    expect(selected.monos.map((mono) => mono.id)).toEqual(["n", "o"]);
   });
   it("preserves an explicit empty choice on restore", () => {
     const restored = normalizeSelection(

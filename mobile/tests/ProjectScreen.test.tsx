@@ -258,6 +258,9 @@ vi.mock("@/ui/ScenePager", () => ({
   useSceneSwitching: () => false,
 }));
 vi.mock("@/ui/DitherLoading", () => ({ DitherLoading: () => null }));
+vi.mock("@/features/workspace/useCreateMono", () => ({
+  useCreateMono: () => undefined,
+}));
 vi.mock("@/features/workspace/UnreadDot", () => ({
   UnreadDot: () => null,
   useAnyUnreadMono: () => false,

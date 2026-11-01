@@ -130,6 +130,8 @@ pub(crate) struct Preferences {
     pub mono_menu_bar_icon: bool,
     // Archive
     pub show_archived: bool,
+    /// Archive conversations idle this many days; 0 never does.
+    pub auto_archive_days: u32,
     // Keybindings: a changed shortcut, or `None` for a disabled one.
     pub keybindings: HashMap<String, Option<String>>,
 }
@@ -225,6 +227,7 @@ impl Default for Preferences {
             rail_monos_pinned: false,
             mono_menu_bar_icon: true,
             show_archived: false,
+            auto_archive_days: 0,
             keybindings: HashMap::new(),
         }
     }

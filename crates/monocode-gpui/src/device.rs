@@ -618,10 +618,12 @@ impl DevicePanel {
                             .on_click(cx.listener(|this, _, _, _| this.send(Input::Rotate))),
                     )
                 })
-                .child(
-                    icon_action("device-shutdown", "Shut down", "power", true)
-                        .on_click(cx.listener(|this, _, _, cx| this.shutdown(cx))),
-                );
+                .when(!self.selected.as_ref().is_some_and(|d| d.physical), |h| {
+                    h.child(
+                        icon_action("device-shutdown", "Shut down", "power", true)
+                            .on_click(cx.listener(|this, _, _, cx| this.shutdown(cx))),
+                    )
+                });
         } else {
             header = header.child(
                 icon_action("device-refresh", "Refresh", "refresh-cw", !self.listing)

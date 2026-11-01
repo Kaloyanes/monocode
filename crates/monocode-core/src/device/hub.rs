@@ -651,6 +651,10 @@ fn checked(response: ureq::Response, action: &str) -> Result<Value, String> {
 /// Blocking: boots a device and, for a simulator, attaches its stream helper.
 /// Returns the id the device has once booted (an emulator's serial).
 pub fn boot(device: &Device) -> Result<String, String> {
+    if device.booted && device.physical {
+        return Ok(device.id.clone());
+    }
+    device.ensure_virtual("start")?;
     let endpoint = ensure()?;
     let body = json!({"platform": device.platform, "id": device.id, "name": device.name});
     let value = checked(
@@ -714,6 +718,7 @@ pub fn forget_attached(udid: &str) {
 /// Blocking: shuts a device down. serve-sim's own shutdown also closes its
 /// capture session, which the hub's generic one can leave cached.
 pub fn shutdown(device: &Device) -> Result<(), String> {
+    device.ensure_virtual("shut down")?;
     let endpoint = ensure()?;
     forget_attached(&device.id);
     let result = match device.platform {
@@ -1025,6 +1030,7 @@ fn free_space(path: &std::path::Path) -> Option<u64> {
 /// Blocking: shuts a device down and deletes it, with its apps and data.
 /// An emulator is deleted by its AVD name, whatever serial it runs under.
 pub fn remove(device: &Device) -> Result<(), String> {
+    device.ensure_virtual("delete")?;
     let endpoint = ensure()?;
     let body = json!({"platform": device.platform, "id": device.id, "name": device.name});
     checked(

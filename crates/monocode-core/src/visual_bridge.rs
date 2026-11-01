@@ -1501,10 +1501,10 @@ fn device_tool_definitions() -> Vec<Value> {
         json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read_only,"destructiveHint":false,"openWorldHint":false}})
     };
     vec![
-        tool("device_list", "List the iOS Simulators and Android Emulators on this Mac, booted first.", json!({}), vec![], true),
+        tool("device_list", "List the iOS Simulators and Android Emulators on this Mac, and Android phones connected over USB (physical: true), booted first.", json!({}), vec![], true),
         tool("device_open", "Boot a simulator or emulator if needed and show it in the user's Device panel. Returns the agent-device command and the exact arguments that drive this device (tap, type, swipe, snapshot of the accessibility tree); run it from your shell.", json!({"device":device,"platform":{"enum":["ios","android"]}}), vec!["device"], false),
         tool("device_screenshot", "Take a screenshot of a device, by default the one in the Device panel.", json!({"device":device}), vec![], true),
-        tool("device_close", "Shut a simulator or emulator down.", json!({"device":device}), vec!["device"], false),
+        tool("device_close", "Shut a simulator or emulator down. Phones connected over USB can't be shut down.", json!({"device":device}), vec!["device"], false),
         tool("device_set", "Change an iOS Simulator's setting or simulated location, by default on the one in the Device panel. The user sees the change listed under the phone, marked as yours, and can put it back; it lasts until reset, so set it back when you are done unless the user wants to keep it. Values: appearance light|dark; text-size extra-small … accessibility-extra-extra-extra-large, or XS, S, M, L (the default), XL, XXL, XXXL, AX1 … AX5; color-filter none|grayscale|red-green|green-red|blue-yellow; liquid-glass clear|tinted; reduce-motion, increase-contrast, reduce-transparency, voiceover and show-borders on|off; location \"latitude,longitude\" or clear.", json!({"device":device,"setting":{"enum":crate::device::SETTINGS},"value":{"type":"string"}}), vec!["setting", "value"], false),
     ]
 }

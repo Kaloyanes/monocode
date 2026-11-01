@@ -8,7 +8,41 @@ use crate::{
 use gpui::{AnyElement, Context, Role, SharedString, div, prelude::*, px};
 impl SettingsView {
     pub(super) fn archive_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut rows = vec![self.row(
+        let days = self.prefs.auto_archive_days;
+        let mut rows = vec![
+            self.row(
+                Some("auto-archive"),
+                false,
+                "Auto-archive inactive conversations",
+                Some(
+                    "Archives conversations with no activity for this long. Running, drafted, open and pinned ones are kept."
+                        .into(),
+                ),
+                vec![self.select(
+                    "auto-archive",
+                    "Auto-archive inactive conversations",
+                    &days.to_string(),
+                    [
+                        (0, "Never"),
+                        (1, "After 1 day"),
+                        (3, "After 3 days"),
+                        (7, "After 1 week"),
+                        (14, "After 2 weeks"),
+                        (30, "After 1 month"),
+                    ]
+                    .into_iter()
+                    .map(|(v, l)| (v.to_string(), SharedString::from(l), None))
+                    .collect(),
+                    Some(150.),
+                    cx,
+                    |this, v, cx| {
+                        if let Ok(v) = v.parse() {
+                            this.update(cx, |p| p.auto_archive_days = v)
+                        }
+                    },
+                )],
+            ),
+            self.row(
             Some("show-archived"),
             true,
             "Show archived in the sidebar",

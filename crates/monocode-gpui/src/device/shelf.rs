@@ -416,6 +416,7 @@ impl DevicePanel {
                     "No simulators or emulators yet. Make one to see and use it here.",
                 )))
             })
+            .children(self.phones(&list, cx))
             .child(self.section(Platform::Ios, &list, cx))
             .child(self.section(Platform::Android, &list, cx))
             .children(
@@ -475,7 +476,7 @@ impl DevicePanel {
             .devices
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.platform == platform)
+            .filter(|(_, d)| d.platform == platform && !d.physical)
             .collect();
         let creating: Vec<&String> = self
             .creating
@@ -512,6 +513,35 @@ impl DevicePanel {
                     .child(self.new_tile(platform, cx)),
             )
             .into_any_element()
+    }
+
+    /// Android phones on USB, while any are plugged in. They have no ⋯ menu:
+    /// there is nothing to start, shut down or delete.
+    fn phones(&self, list: &DeviceList, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let phones: Vec<(usize, &Device)> = list
+            .devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.physical)
+            .collect();
+        if phones.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .pt_2()
+                .flex()
+                .flex_col()
+                .child(section_label("Connected Phones").px_4().pt_2())
+                .child(
+                    div().px_2().grid().grid_cols(3).gap(px(2.)).children(
+                        phones
+                            .into_iter()
+                            .map(|(ix, device)| self.tile(ix, device, cx)),
+                    ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn tile_frame(id: impl Into<gpui::ElementId>) -> Stateful<gpui::Div> {
@@ -555,10 +585,17 @@ impl DevicePanel {
         let menu_open = self.menu.as_ref().is_some_and(|m| m.device.id == device.id);
         let detail: SharedString = if deleting {
             "Deleting…".into()
-        } else if device.version.is_empty() {
-            device.platform.label().into()
         } else {
-            device.version.clone().into()
+            let version = if device.version.is_empty() {
+                device.platform.label()
+            } else {
+                device.version.as_str()
+            };
+            if device.physical {
+                format!("{version} · USB").into()
+            } else {
+                version.to_owned().into()
+            }
         };
         let entry = device.clone();
         let for_menu = device.clone();
@@ -600,17 +637,19 @@ impl DevicePanel {
                 d.cursor_pointer()
                     .hover(|s| s.bg(content(0.05)))
                     .on_click(cx.listener(move |this, _, _, cx| this.select(entry.clone(), cx)))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.menu = Some(TileMenu {
-                                device: for_right.clone(),
-                                at: Some(event.position),
-                            });
-                            cx.notify();
-                        }),
-                    )
-                    .child(more)
+            })
+            .when(!deleting && !device.physical, |d| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.menu = Some(TileMenu {
+                            device: for_right.clone(),
+                            at: Some(event.position),
+                        });
+                        cx.notify();
+                    }),
+                )
+                .child(more)
             })
             .child(
                 phone(device.platform, device.booted).when(device.booted, |d| {
@@ -1241,6 +1280,11 @@ mod shots {
                     "Android 16.0",
                     false,
                 ),
+                Device {
+                    id: "R5CT20ABCDE".into(),
+                    physical: true,
+                    ..device(Platform::Android, "samsung SM-S928B", "Android 15.0", true)
+                },
             ],
             errors: vec![],
         };

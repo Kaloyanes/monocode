@@ -135,6 +135,7 @@ export function Composer({
   workspace,
   notice,
   modes = false,
+  onNewMono,
   slash,
   compact = false,
   reply,
@@ -166,6 +167,8 @@ export function Composer({
   notice?: { text: string; dismiss: () => void } | null;
   /** Offers the composer modes; a Mono's chat has none. */
   modes?: boolean;
+  /** Adds "New Mono" to the add menu, after the modes; absent where a Mono can't be made. */
+  onNewMono?: () => void;
   /** Where skills and commands come from; a Mono's chat has none. */
   slash?: SlashScope;
   /**
@@ -579,6 +582,7 @@ export function Composer({
           onFiles={() => void attach(pickFiles)}
           mode={mode}
           onMode={modes ? toggleMode : undefined}
+          onNewMono={onNewMono}
           onSkills={slash ? openSkills : undefined}
         />
       </Animated.View>
@@ -657,7 +661,8 @@ export function Composer({
 
 /**
  * The add button: a native menu to attach photos or files, with `onSkills`
- * to list skills and commands and, with `onMode`, to pick a mode. The menu
+ * to list skills and commands, with `onMode` to pick a mode and with
+ * `onNewMono` to make a Mono. The menu
  * lies over the button, its label an invisible box of the button's size, as
  * in SessionFilterMenu.
  */
@@ -666,12 +671,14 @@ function AddMenu({
   onFiles,
   mode,
   onMode,
+  onNewMono,
   onSkills,
 }: {
   onPhotos: () => void;
   onFiles: () => void;
   mode: ComposerMode | null;
   onMode?: (mode: ComposerMode) => void;
+  onNewMono?: () => void;
   onSkills?: () => void;
 }) {
   const styles = useStyles();
@@ -689,6 +696,7 @@ function AddMenu({
             onPress: () => onMode(entry.id),
           }))
         : []),
+      ...(onNewMono ? [{ label: "New Mono", onPress: onNewMono }] : []),
     ]}>
       <View style={styles.round}><Icon name="add" size={18} color={colors.content} /></View>
     </ChoiceMenu>
@@ -729,6 +737,8 @@ function AddMenu({
                 />
               ))
             : null}
+          {onNewMono ? <Divider /> : null}
+          {onNewMono ? <Button label="New Mono" systemImage="plus" onPress={onNewMono} /> : null}
         </Menu>
       </Host>
     </View>
