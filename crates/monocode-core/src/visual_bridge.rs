@@ -230,6 +230,71 @@ pub struct DraftCard {
     pub title: String,
 }
 
+/// Where a kept draft's picture belongs: on the card the draft already has,
+/// not in a second card beside it. `rows` is the source of one conversation
+/// (or one turn of it); the result lists `(card, picture)` pairs by the index
+/// of each message's first row. The `draft_keep` call that precedes a picture
+/// names the draft it was made from, so no title is guessed.
+pub fn kept_upgrades(rows: &[crate::transcript::Row]) -> Vec<(usize, usize)> {
+    use crate::tool::ToolCall;
+    use crate::transcript::images::{ImageDocument, ROLE as IMAGE_ROLE};
+
+    let mut cards: Vec<(usize, String)> = Vec::new();
+    let mut keeps: Vec<(usize, String)> = Vec::new();
+    let mut pictures: Vec<usize> = Vec::new();
+    let mut at = 0;
+    while at < rows.len() {
+        let end = (at + 1..rows.len())
+            .find(|&i| rows[i].first)
+            .unwrap_or(rows.len());
+        let role = rows[at].role.as_str();
+        let text = || rows[at..end].iter().map(|r| r.text.as_str()).collect::<String>();
+        if role == DRAFT_ROLE {
+            if let Ok(card) = serde_json::from_str::<DraftCard>(&text()) {
+                cards.push((at, card.draft));
+            }
+        } else if role == "tool" && rows[at].text.contains("draft_keep") {
+            let named = serde_json::from_str::<ToolCall>(&text())
+                .ok()
+                .filter(|call| call.name.ends_with("draft_keep"))
+                .and_then(|call| serde_json::from_str::<Value>(&call.input).ok())
+                .and_then(|input| input["draft"].as_str().map(str::to_owned));
+            if let Some(draft) = named {
+                keeps.push((at, draft));
+            }
+        } else if role == IMAGE_ROLE
+            && serde_json::from_str::<ImageDocument>(&text())
+                .is_ok_and(|image| image.draft().is_some())
+        {
+            pictures.push(at);
+        }
+        at = end;
+    }
+    let mut claimed = vec![false; keeps.len()];
+    let mut pairs = Vec::new();
+    for (n, &picture) in pictures.iter().enumerate() {
+        // The call that made it comes first; a provider that reports a call
+        // only when it finishes puts it after, before the next picture.
+        let next = pictures.get(n + 1).copied().unwrap_or(usize::MAX);
+        let keep = (0..keeps.len())
+            .rev()
+            .find(|&k| !claimed[k] && keeps[k].0 < picture)
+            .or_else(|| {
+                (0..keeps.len()).find(|&k| !claimed[k] && (picture..next).contains(&keeps[k].0))
+            });
+        let Some(keep) = keep else { continue };
+        claimed[keep] = true;
+        let card = cards
+            .iter()
+            .rev()
+            .find(|(card, draft)| *card < picture && *draft == keeps[keep].1);
+        if let Some((card, _)) = card {
+            pairs.push((*card, picture));
+        }
+    }
+    pairs
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub enum Content {
     Visual(VisualDocument),
@@ -556,14 +621,8 @@ fn serve_draft(mut stream: TcpStream, hub: &Hub, wire: &Value) -> Result<(), Str
         if request.draft.is_none() && request.content.is_some() {
             request.draft = same_turn_draft(hub, session, request.title.as_deref());
         }
-        let created = (request.draft.is_none() && request.content.is_some()).then(|| {
-            let card = DraftCard {
-                draft: format!("draft-{session}-{:08x}", rand::random::<u32>()),
-                title: request.title.clone().unwrap_or_default(),
-            };
-            request.id = Some(card.draft.clone());
-            card
-        });
+        let revises = request_draft.is_none().then(|| request.draft.clone()).flatten();
+        let mut created = new_card(session, &mut request);
         let mut hidden = request
             .draft
             .as_deref()
@@ -579,7 +638,25 @@ fn serve_draft(mut stream: TcpStream, hub: &Hub, wire: &Value) -> Result<(), Str
             }
         }
         handler(request);
-        let reply = result.recv_timeout(Duration::from_secs(45));
+        let mut reply = result.recv_timeout(Duration::from_secs(45));
+        // The person may have closed the page this call would have revised,
+        // though the agent never named it: start a fresh draft instead.
+        if let Some(gone) = revises.as_deref().filter(|_| {
+            matches!(&reply, Ok(Err(error)) if error.starts_with(DRAFT_GONE))
+        }) {
+            forget_draft(hub, session, Some(gone));
+            unhide(hub, session, gone, None, true);
+            hidden = None;
+            let (again_reply, again_result) = mpsc::channel();
+            reply = match DraftRequest::parse(session, &wire["draft_request"], again_reply) {
+                Ok(mut again) => {
+                    created = new_card(session, &mut again);
+                    handler(again);
+                    again_result.recv_timeout(Duration::from_secs(45))
+                }
+                Err(error) => Ok(Err(error)),
+            };
+        }
         release(session);
         let reply = reply
             .map_err(|_| "The draft timed out".to_string())
@@ -619,6 +696,23 @@ fn serve_draft(mut stream: TcpStream, hub: &Hub, wire: &Value) -> Result<(), Str
         .set_write_timeout(Some(Duration::from_secs(20)))
         .map_err(|e| e.to_string())?;
     writeln!(stream, "{response}").map_err(|e| e.to_string())
+}
+
+/// What a draft request that carries the page of a draft the app no longer
+/// has is refused with: the page was closed or replaced.
+pub const DRAFT_GONE: &str = "That draft was closed or replaced";
+
+/// The card of the draft a request starts, if it starts one. The bridge
+/// names the draft so the conversation's card can point at it.
+fn new_card(session: i64, request: &mut DraftRequest) -> Option<DraftCard> {
+    (request.draft.is_none() && request.content.is_some()).then(|| {
+        let card = DraftCard {
+            draft: format!("draft-{session}-{:08x}", rand::random::<u32>()),
+            title: request.title.clone().unwrap_or_default(),
+        };
+        request.id = Some(card.draft.clone());
+        card
+    })
 }
 
 fn normalized_title(title: &str) -> String {
@@ -1816,6 +1910,15 @@ mod tests {
                     let _ = request.reply.send(Err("The page did not open".into()));
                     return;
                 }
+                if request.title.as_deref() == Some("Vanished")
+                    && request.draft.is_some()
+                    && request.content.is_some()
+                {
+                    let _ = request
+                        .reply
+                        .send(Err(format!("{DRAFT_GONE}. Start a new one with html or url.")));
+                    return;
+                }
                 let reply = match &request.action {
                     DraftAction::Close => {
                         let draft = request.draft.clone().unwrap_or_default();
@@ -1978,6 +2081,117 @@ mod tests {
         });
         assert_eq!(ids[0], ids[1], "same title is the same draft");
         assert_ne!(ids[0], ids[2]);
+    }
+
+    fn row(role: &str, text: String) -> crate::transcript::Row {
+        crate::transcript::Row {
+            role: role.into(),
+            text,
+            first: true,
+            sent_at: None,
+        }
+    }
+
+    #[test]
+    fn a_kept_picture_goes_on_the_card_of_the_draft_the_keep_call_names() {
+        use crate::tool::ToolCall;
+        let dir = tempfile::tempdir().unwrap();
+        let picture = |name: &str, kept: bool| {
+            let path = dir.path().join(format!("{name}.png"));
+            if kept {
+                std::fs::write(path.with_extension("html"), "<p>kept</p>").unwrap();
+            }
+            row(
+                crate::transcript::images::ROLE,
+                serde_json::to_string(&crate::transcript::images::ImageDocument {
+                    title: name.into(),
+                    path,
+                    mime_type: "image/png".into(),
+                    width: 2,
+                    height: 2,
+                })
+                .unwrap(),
+            )
+        };
+        let card = |draft: &str| {
+            row(
+                DRAFT_ROLE,
+                serde_json::to_string(&DraftCard {
+                    draft: draft.into(),
+                    title: "Pricing".into(),
+                })
+                .unwrap(),
+            )
+        };
+        let keep = |name: &str, draft: &str| {
+            let mut call = ToolCall::new("k", name);
+            call.input = json!({"draft": draft, "title": "Pricing"}).to_string();
+            row("tool", serde_json::to_string(&call).unwrap())
+        };
+        // Two drafts; the person's keep names the first, not the latest.
+        let rows = vec![
+            row("user", "Mock it".into()),
+            card("draft-1-a"),
+            card("draft-1-b"),
+            keep("mcp__monocode__draft_keep", "draft-1-a"),
+            picture("kept-a", true),
+            // A screenshot is not a kept draft and takes nothing.
+            picture("shot", false),
+            row("assistant", "Done".into()),
+        ];
+        assert_eq!(kept_upgrades(&rows), vec![(1, 4)]);
+
+        // A keep call reported only once it finished comes after its picture.
+        let late = vec![
+            row("user", "Mock it".into()),
+            card("draft-1-a"),
+            picture("kept-a", true),
+            keep("monocode:draft_keep", "draft-1-a"),
+            picture("kept-b", true),
+            card("draft-1-b"),
+            keep("monocode:draft_keep", "draft-1-b"),
+        ];
+        assert_eq!(kept_upgrades(&late), vec![(1, 2)]);
+
+        // A keep of a draft with no card in view leaves the picture its own.
+        let orphan = vec![
+            row("user", "Mock it".into()),
+            keep("draft_keep", "draft-9-z"),
+            picture("kept-z", true),
+        ];
+        assert!(kept_upgrades(&orphan).is_empty());
+    }
+
+    #[test]
+    fn a_retry_after_the_person_closed_the_draft_starts_a_new_one() {
+        let _turn = DRAFT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        install_draft_handler();
+        let server = Server::start(25).unwrap();
+        let environment = server.environment(std::path::Path::new("/test/app"));
+        let call = |input: Value| draft_with_environment(&input, &environment);
+        let cards = Mutex::new(Vec::new());
+        let ids = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let first =
+                    call(json!({"html":"<p>a</p>","title":"Vanished","publish":true})).unwrap();
+                // The card was closed in the app; the agent knows nothing of it.
+                let retry =
+                    call(json!({"html":"<p>b</p>","title":"Vanished","publish":true})).unwrap();
+                [first, retry].map(|r| r["draft"].as_str().unwrap().to_owned())
+            });
+            while !worker.is_finished() {
+                if let Ok(publication) = server.publications.recv_timeout(Duration::from_millis(20))
+                {
+                    if let Content::Draft(card) = &publication.content {
+                        cards.lock().unwrap().push(card.draft.clone());
+                    }
+                    let _ = publication.reply.send(Ok(json!({"saved":true})));
+                }
+            }
+            worker.join().unwrap()
+        });
+        assert_ne!(ids[0], ids[1], "the closed draft cannot be revised");
+        assert_eq!(cards.into_inner().unwrap(), ids, "each page has its card");
     }
 
     #[test]
