@@ -147,8 +147,12 @@ enum Body {
     Markdown(Arc<MarkdownRow>),
     Visual(Arc<monocode_core::visual::VisualDocument>),
     Image(Arc<monocode_core::transcript::images::ImageDocument>),
-    /// A live page the agent opened here.
-    Draft(Arc<monocode_core::visual_bridge::DraftCard>),
+    /// A live page the agent opened here, with the picture the agent kept of
+    /// it, which takes over the card once the page is gone.
+    Draft(
+        Arc<monocode_core::visual_bridge::DraftCard>,
+        Option<Arc<monocode_core::transcript::images::ImageDocument>>,
+    ),
     Plain(SharedString),
     Interjection(monocode_core::transcript::Interjection),
     Shell(Arc<monocode_core::shell_run::ShellRun>),
@@ -3108,6 +3112,21 @@ impl TranscriptView {
                 message_ix -= 1;
             }
         }
+        if !self.mono
+            && self.source[current_turn..current_end]
+                .iter()
+                .any(|r| r.role == monocode_core::visual_bridge::DRAFT_ROLE)
+            && self.source[start.min(current_end)..current_end]
+                .iter()
+                .any(|r| r.role == monocode_core::transcript::images::ROLE)
+        {
+            // A picture kept from a draft belongs on the draft's card, which
+            // stands above it: rebuild from the turn's first message so the
+            // card learns of the picture.
+            while message_ix > 0 && self.messages[message_ix - 1].start >= current_turn {
+                message_ix -= 1;
+            }
+        }
         if self.mono {
             // A run's prose hides behind later work, and a completion run
             // takes over the actions of the turn it continues, so rebuild from
@@ -3409,35 +3428,51 @@ impl TranscriptView {
                     serde_json::from_str::<monocode_core::transcript::images::ImageDocument>(&text)
                         .ok()
                         .filter(|document| document.validate().is_ok());
+                // A picture kept from a draft is that draft's card, upgraded
+                // where the card already stands.
+                let upgrades_card = document
+                    .as_ref()
+                    .is_some_and(|document| self.card_holds(document));
                 let body = match document {
                     Some(document) => Body::Image(Arc::new(document)),
                     None => Body::Plain("This image could not be loaded.".into()),
                 };
-                self.rows.push(UiRow {
-                    key: (0, 0),
-                    body,
-                    message,
-                    first: false,
-                    last: false,
-                    work: false,
-                    work_tail: false,
-                    thought_phase: None,
-                });
+                if !upgrades_card {
+                    self.rows.push(UiRow {
+                        key: (0, 0),
+                        body,
+                        message,
+                        first: false,
+                        last: false,
+                        work: false,
+                        work_tail: false,
+                        thought_phase: None,
+                    });
+                }
             } else if role == monocode_core::visual_bridge::DRAFT_ROLE {
-                let body = match serde_json::from_str(&text) {
-                    Ok(card) => Body::Draft(Arc::new(card)),
-                    Err(_) => Body::Plain("This draft could not be loaded.".into()),
+                let body = match serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(
+                    &text,
+                ) {
+                    // One card per draft: the page is a single native view.
+                    Ok(card) if self.shows_draft(&card.draft) => None,
+                    Ok(card) => {
+                        let kept = self.kept_picture(at, turn, turn_end);
+                        Some(Body::Draft(Arc::new(card), kept))
+                    }
+                    Err(_) => Some(Body::Plain("This draft could not be loaded.".into())),
                 };
-                self.rows.push(UiRow {
-                    key: (0, 0),
-                    body,
-                    message,
-                    first: false,
-                    last: false,
-                    work: false,
-                    work_tail: false,
-                    thought_phase: None,
-                });
+                if let Some(body) = body {
+                    self.rows.push(UiRow {
+                        key: (0, 0),
+                        body,
+                        message,
+                        first: false,
+                        last: false,
+                        work: false,
+                        work_tail: false,
+                        thought_phase: None,
+                    });
+                }
             } else if role == "visual" {
                 let document = serde_json::from_str::<monocode_core::visual::VisualDocument>(&text)
                     .ok()
@@ -4772,7 +4807,7 @@ impl TranscriptView {
             Body::RemotePlan(plan) => self.remote_plan_card(&plan, cx),
             Body::Visual(document) => self.visual_row(message_start, document, cx),
             Body::Image(document) => self.image_row(document, cx),
-            Body::Draft(card) => self.draft_row(&card, cx),
+            Body::Draft(card, kept) => self.draft_row(&card, kept, cx),
             Body::Interjection(ref note) => {
                 let open = self.expanded.contains(&message_start);
                 let long = note.text.lines().count() > 4 || note.text.len() > 300;

@@ -35,9 +35,11 @@ a draft, or `draft` to continue one, with an optional `action`:
 Every call returns a screenshot, the page text, controls with refs, console
 output and diagnostics. The screenshots go to the agent only: the thread shows
 the card, not a picture per call. `draft_keep {draft, title}` saves a picture
-and the page; the thread gets a picture card whose **Open draft** button turns
-it back into the live page in place, after the draft is gone or the app was
-restarted.
+and the page. The picture does not add a second card: the draft's own card, at
+the place it was published, shows it once the page is gone, with an **Open
+draft** button that turns it back into the live page in place, also after the
+app was restarted. A card names a draft once; a second row for the same draft
+is not drawn.
 
 ## Feedback loop
 
