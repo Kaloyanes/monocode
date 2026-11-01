@@ -143,6 +143,7 @@ impl Completion {
                 "/btw",
                 "/stage",
                 "/commit",
+                "/pr",
             ]
             .map(str::to_owned)
             .into_iter()
@@ -211,6 +212,7 @@ impl Completion {
             "/btw",
             "/stage",
             "/commit",
+            "/pr",
         ]
         .map(str::to_owned)
         .into_iter()
@@ -603,6 +605,7 @@ impl Completion {
                     "/btw",
                     "/stage",
                     "/commit",
+                    "/pr",
                 ]
                 .map(str::to_owned)
                 .into_iter()
@@ -819,11 +822,16 @@ impl Completion {
                     "Commit",
                     "Stage and commit this session's changes",
                 ),
+                (
+                    "pr",
+                    "Open pull request",
+                    "Push this branch and open a GitHub pull request",
+                ),
             ]
             .into_iter()
             .enumerate()
             {
-                if matches!(id, "stage" | "commit") && self.has_user_command(id) {
+                if matches!(id, "stage" | "commit" | "pr") && self.has_user_command(id) {
                     continue;
                 }
                 if id == "btw"
@@ -849,7 +857,7 @@ impl Completion {
                             label: label.into(),
                             detail: detail.into(),
                             insertion: format!("/{id}"),
-                            mode: (!matches!(id, "compact" | "btw" | "stage" | "commit"))
+                            mode: (!matches!(id, "compact" | "btw" | "stage" | "commit" | "pr"))
                                 .then_some(id),
                             file: false,
                             server: None,
@@ -1374,6 +1382,7 @@ mod tests {
                         "/mcp",
                         "/stage",
                         "/commit",
+                        "/pr",
                         "/alpha",
                         "/zebra",
                     ]
