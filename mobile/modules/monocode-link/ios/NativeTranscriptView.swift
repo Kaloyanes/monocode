@@ -58,6 +58,8 @@ final class NativeTranscriptView: ExpoView, UIScrollViewDelegate, UIGestureRecog
   /// True while the follow link itself moves the offset, so the scroll callback
   /// it fires can tell a programmatic glide from a drag.
   private var followTicking = false
+  /// How far the offset still was from the follow's target at the latest tick.
+  private var followRemaining: CGFloat = 0
   /// The content offset the layout worker last heard about. The follow glide
   /// republishes only once it has moved a fraction of a screen from here,
   /// since the engine already prepares rows two screens ahead.
@@ -696,9 +698,7 @@ final class NativeTranscriptView: ExpoView, UIScrollViewDelegate, UIGestureRecog
     else { return }
     let link = CADisplayLink(
       target: displayTarget, selector: #selector(TranscriptDisplayTarget.tick(_:)))
-    // The glide is a critically damped spring stepped by elapsed time, so 60 Hz
-    // looks the same as 120 Hz at half the cost (each tick moves the offset).
-    link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+    link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
     link.add(to: .main, forMode: .common)
     displayLink = link
     trace("follow start → \(Int(targetOffset()))")
@@ -721,24 +721,31 @@ final class NativeTranscriptView: ExpoView, UIScrollViewDelegate, UIGestureRecog
     let next = (x + (v + omega * x) * dt) * decay
     followVelocity = (v - omega * (v + omega * x) * dt) * decay
     if abs(next) < 0.5 && abs(followVelocity) < 20 {
-      moveFollow(to: target)
+      moveFollow(to: target, target: target)
       trace("follow done")
       stopFollowingAnimation()
       return
     }
-    moveFollow(to: target + next)
+    moveFollow(to: target + next, target: target)
   }
-  private func moveFollow(to offset: CGFloat) {
+  private func moveFollow(to offset: CGFloat, target: CGFloat) {
     followTicking = true
+    followRemaining = abs(target - offset)
     scroll.contentOffset.y = offset
     followTicking = false
   }
-  /// Whether a scroll callback should wake the layout worker: always, unless it
-  /// came from a follow tick that has not yet moved a quarter screen.
+  /// Whether a scroll callback should wake the layout worker. Always, unless it
+  /// came from a follow tick that is both short of a quarter screen from the
+  /// last publish and has no more than a screen left to glide. The worker
+  /// prepares rows two screens either side of what it last heard, so a gated
+  /// offset can stray at most a quarter screen plus the screen left to go from
+  /// that, well inside the runway. A longer glide (a jump to the end from far
+  /// up) publishes on every tick, exactly as before.
   static func shouldPublish(
-    followTick: Bool, offset: CGFloat, published: CGFloat, viewportHeight: CGFloat
+    followTick: Bool, offset: CGFloat, published: CGFloat, viewportHeight: CGFloat,
+    remaining: CGFloat
   ) -> Bool {
-    guard followTick, !published.isNaN else { return true }
+    guard followTick, !published.isNaN, remaining <= viewportHeight else { return true }
     return abs(offset - published) >= viewportHeight * followPublishFraction
   }
   private func stopFollowingAnimation() {
@@ -861,7 +868,7 @@ final class NativeTranscriptView: ExpoView, UIScrollViewDelegate, UIGestureRecog
     displayRows()
     if Self.shouldPublish(
       followTick: followTicking, offset: scroll.contentOffset.y, published: publishedOffset,
-      viewportHeight: bounds.height)
+      viewportHeight: bounds.height, remaining: followRemaining)
     {
       publishViewport()
     }
