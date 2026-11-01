@@ -334,8 +334,7 @@ impl Conversation {
             })
             .collect()
     }
-    /// A live draft's page is in the thread, so neither the thread nor this
-    /// conversation may be replayed from cache.
+    /// A live draft's page is in the thread.
     pub(crate) fn holds_live_draft(&self, cx: &gpui::App) -> bool {
         self.transcript.read(cx).holds_live_draft(cx)
     }
@@ -4184,6 +4183,17 @@ mod composer_motion_tests {
             .unwrap();
     }
 }
+
+/// The thread as the conversation draws it: replayed from cache when nothing
+/// in it changed. A live draft's card keeps its page right through a replay;
+/// see `draft::engine::Presence`.
+pub(crate) fn transcript_element(transcript: &Entity<TranscriptView>) -> AnyElement {
+    transcript
+        .clone()
+        .cached(StyleRefinement::default().size_full())
+        .into_any_element()
+}
+
 impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self._input_focus.is_none() {
@@ -4249,14 +4259,7 @@ impl Render for Conversation {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(if self.holds_live_draft(cx) {
-                        self.transcript.clone().into_any_element()
-                    } else {
-                        self.transcript
-                            .clone()
-                            .cached(StyleRefinement::default().size_full())
-                            .into_any_element()
-                    })
+                    .child(transcript_element(&self.transcript))
                     // Level with the transcript's jump button, which moves to
                     // the column's other end.
                     .children(pill.map(|pill| {
