@@ -3,13 +3,14 @@
 mod avatar;
 mod media;
 pub use media::png as media_png;
-pub use media::{image_bytes as media_image_bytes, is_image_url};
+pub use media::{image_bytes as media_image_bytes, is_image_url, phone_image};
 pub mod azure_devops;
 pub use avatar::png as avatar_png;
 mod github;
 pub mod gitlab;
 pub mod jira;
 pub mod linear;
+pub mod patch;
 
 use crate::{desktop_preferences::DesktopPreferences, session_groups::WorkItem, store::Store};
 use chrono::{Datelike, Local, TimeZone};
@@ -506,6 +507,61 @@ impl Seen {
             self.seeded = true;
         }
     }
+    /// Reads the item as unread again, until it is opened or marked.
+    pub fn unmark(&mut self, item: &Item) {
+        self.items.remove(&item.key());
+    }
+}
+
+/// Most entries `Triage` keeps for finished items; the oldest go first.
+const MAX_DONE: usize = 5000;
+
+/// What the user did with an item, kept next to `Seen` and keyed the same way
+/// (`Item::key()`), so the desktop and a paired phone share it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Triage {
+    /// When each finished item was marked done, in ms.
+    pub done: BTreeMap<String, i64>,
+    /// Until when each snoozed item stays out of the lists, in ms.
+    pub snoozed: BTreeMap<String, i64>,
+}
+impl Triage {
+    pub fn is_done(&self, key: &str) -> bool {
+        self.done.contains_key(key)
+    }
+    /// The time a snooze ends, while it still hides the item.
+    pub fn snoozed_until(&self, key: &str, now: i64) -> Option<i64> {
+        self.snoozed.get(key).copied().filter(|until| *until > now)
+    }
+    pub fn mark_done(&mut self, key: &str, now: i64) {
+        self.snoozed.remove(key);
+        self.done.insert(key.to_owned(), now);
+        while self.done.len() > MAX_DONE {
+            let Some(oldest) = self
+                .done
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.done.remove(&oldest);
+        }
+    }
+    pub fn undo_done(&mut self, key: &str) {
+        self.done.remove(key);
+    }
+    pub fn snooze(&mut self, key: &str, until: i64) {
+        self.snoozed.insert(key.to_owned(), until);
+    }
+    pub fn unsnooze(&mut self, key: &str) {
+        self.snoozed.remove(key);
+    }
+    /// Forgets snoozes that have ended, so their items show again.
+    pub fn prune(&mut self, now: i64) {
+        self.snoozed.retain(|_, until| *until > now);
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -513,6 +569,7 @@ pub struct ViewState {
     pub source: String,
     pub filters: Filters,
     pub seen: Seen,
+    pub triage: Triage,
     pub hidden_linear_teams: Vec<String>,
     pub hidden_jira_projects: Vec<String>,
     pub list_width: f32,
@@ -523,6 +580,7 @@ impl Default for ViewState {
             source: "github".into(),
             filters: Filters::default(),
             seen: Seen::default(),
+            triage: Triage::default(),
             hidden_linear_teams: vec![],
             hidden_jira_projects: vec![],
             list_width: 280.,
@@ -704,6 +762,29 @@ fn repo_checkouts<'a>(
         }
     }
     checkouts
+}
+/// Gives GitHub rows the reason the viewer should look: a requested review,
+/// then an assignment, then a mention. A reason a row already has stays.
+fn mark_github_attention(rows: &mut [Item], viewer: &str, reviews: &[i64], mentions: &[i64]) {
+    for row in rows {
+        if !row.attention_reason.is_empty() {
+            continue;
+        }
+        row.attention_reason = if reviews.contains(&row.number) {
+            "review_requested"
+        } else if row
+            .assignees
+            .iter()
+            .any(|assignee| assignee.login.eq_ignore_ascii_case(viewer))
+        {
+            "assigned"
+        } else if mentions.contains(&row.number) {
+            "mentioned"
+        } else {
+            continue;
+        }
+        .into();
+    }
 }
 fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> Result<U, String> {
     serde_json::from_value(serde_json::to_value(value).map_err(|e| e.to_string())?)
@@ -912,6 +993,25 @@ impl Service {
                                 Some(limit),
                             )?)?,
                         };
+                        let mut rows = rows;
+                        if provider == "github" {
+                            if let Some(viewer) = snapshot.viewers.get("github") {
+                                // Best effort: a failed search leaves the rows as listed.
+                                let involved = |involvement| {
+                                    github::git_github_involved_for(
+                                        project, &repo, kind, involvement, viewer,
+                                    )
+                                    .unwrap_or_default()
+                                };
+                                let reviews = if kind == "pr" {
+                                    involved(github::Involvement::ReviewRequested)
+                                } else {
+                                    vec![]
+                                };
+                                let mentions = involved(github::Involvement::Mentioned);
+                                mark_github_attention(&mut rows, viewer, &reviews, &mentions);
+                            }
+                        }
                         items.extend(rows.into_iter().map(|mut item| {
                             item.provider = provider.into();
                             item.project_path = project.to_string_lossy().into_owned();
@@ -1311,6 +1411,52 @@ mod notification_tests {
                 "from {cwd:?}: {checkouts:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    fn row(number: i64, assignees: &[&str]) -> Item {
+        Item {
+            provider: "github".into(),
+            kind: "pr".into(),
+            number,
+            assignees: assignees
+                .iter()
+                .map(|login| Person {
+                    login: (*login).into(),
+                    ..Person::default()
+                })
+                .collect(),
+            ..Item::default()
+        }
+    }
+
+    #[test]
+    fn rows_get_the_reason_the_viewer_is_wanted() {
+        let mut rows = vec![
+            row(1, &[]),
+            row(2, &["Octocat"]),
+            row(3, &["octocat"]),
+            row(4, &[]),
+            row(5, &["hubot"]),
+        ];
+        rows[3].attention_reason = "build_failed".into();
+        mark_github_attention(&mut rows, "octocat", &[1, 3, 4], &[1, 2, 5]);
+        let reasons: Vec<_> = rows.iter().map(|r| r.attention_reason.as_str()).collect();
+        assert_eq!(
+            reasons,
+            ["review_requested", "assigned", "review_requested", "build_failed", "mentioned"]
+        );
+    }
+
+    #[test]
+    fn rows_nobody_asked_about_have_no_reason() {
+        let mut rows = vec![row(1, &["hubot"]), row(2, &[])];
+        mark_github_attention(&mut rows, "octocat", &[], &[]);
+        assert!(rows.iter().all(|r| r.attention_reason.is_empty()));
     }
 }
 

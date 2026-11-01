@@ -3,6 +3,7 @@
 //! the same paths as the sidebar, composer and Changes panel.
 mod composer;
 mod drafts;
+mod inbox;
 
 use super::*;
 use crate::{
@@ -66,6 +67,8 @@ pub(super) struct Mobile {
     /// session, with the update time it was read at: read again only once
     /// the conversation has changed.
     mono_previews: HashMap<i64, MonoPreview>,
+    /// Avatar addresses handed to phones as opaque keys.
+    inbox_avatars: monocode_core::mobile::inbox::AvatarBook,
 }
 
 #[derive(Clone)]
@@ -572,6 +575,9 @@ impl Shell {
                 project["branch"] = json!(mobile_catalog::checkout_branch(&cwd, &mut branches));
                 project
             }).collect();
+            let origins = monocode_core::mobile::catalog::launch_origins(
+                monos.iter().map(|(mono, _)| (mono.id.as_str(), mono.launches.iter().map(|l| l.session_id).collect())),
+            );
             let mut sessions = Vec::new();
             for entry in entries {
                 let Some(id) = ids.get(&entry.id) else {
@@ -592,6 +598,9 @@ impl Shell {
                 let mut session = mobile_catalog::session(&entry.summary, id, &entry.project, &metadata, entry.live.as_ref(), &branch);
                 if let Some(lead) = lead {
                     session["leadId"] = json!(lead);
+                }
+                if let Some(mono) = origins.get(&entry.id) {
+                    session["monoId"] = json!(mono);
                 }
                 sessions.push(session);
             }
@@ -635,7 +644,8 @@ impl Shell {
                 // and its phones hide them. `push`: it notifies phones through
                 // Expo, so they no longer post their own alerts. `monoFiles`:
                 // it reads and saves a Mono's soul and memory for the phone.
-                json!({"projects": projects, "monos": monos, "sessions": sessions, "monoTools": true, "push": true, "monoFiles": true}),
+                // `inbox`: it answers the phone's `inbox.*` requests.
+                json!({"projects": projects, "monos": monos, "sessions": sessions, "monoTools": true, "push": true, "monoFiles": true, "inbox": true, "sessionUnarchive": true}),
                 ids,
                 previews,
             ))
@@ -776,6 +786,9 @@ impl Shell {
             "draft.read" => self.mobile_draft_read(request, window, cx),
             "draft.frame" => self.mobile_draft_frame(request, window, cx),
             "composer.read" => self.mobile_composer_read(request, cx),
+            method if method.starts_with("inbox.") && method != "inbox.start" => {
+                self.mobile_inbox(request, window, cx)
+            }
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }
@@ -1356,6 +1369,7 @@ impl Shell {
         match request.method.as_str() {
             "session.start" => self.mobile_start(request, finish, cx),
             "conversation.send" => self.mobile_send(request, finish, cx),
+            "inbox.start" => self.mobile_inbox_start(request, finish, cx),
             _ => {
                 let result = self.mobile_session_command(&request, window, cx);
                 finish(self, request, result);
@@ -1447,6 +1461,12 @@ impl Shell {
                 }
                 Ok(reply)
             }
+            ("session.unarchive", Target::Session(id)) => {
+                if self.session_metadata(*id, cx).summary.archived {
+                    self.toggle_archive(*id, cx);
+                }
+                Ok(reply)
+            }
             ("session.delete", Target::Session(id)) => {
                 self.delete_session(*id, window, cx);
                 Ok(reply)
@@ -1496,7 +1516,7 @@ impl Shell {
             ("session.rename", Target::Mono(_)) => {
                 Err("A Mono's conversation can't be renamed".into())
             }
-            ("session.archive" | "session.delete", Target::Mono(_)) => {
+            ("session.archive" | "session.unarchive" | "session.delete", Target::Mono(_)) => {
                 Err("This session can't be changed from the phone".into())
             }
             _ => Err("Unsupported mobile command".into()),
