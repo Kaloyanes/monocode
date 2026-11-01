@@ -1,17 +1,41 @@
+import { useIsFocused } from "expo-router";
 import { useEffect, useRef, useState } from "react";
-import { AppState, Image, ScrollView, Text, useWindowDimensions, View } from "react-native";
+import { Image, ScrollView, Text, useWindowDimensions, View } from "react-native";
 
+import { backoff, pause, waitForActive } from "@/features/connection/appActivity";
 import { useCommand } from "@/features/connection/ConnectionProvider";
 import { themedStyles, useColors } from "@/ui/theme";
 
 /** How often the phone asks for a new picture while it shows one. */
 const FRAME_MS = 1000;
-/** After a failed ask, the phone tries again this much later. */
+/** While the last two pictures were the same, it asks this seldom. */
+const STILL_MS = 2000;
+/** The widest picture asked for; a phone screen shows no more than this well. */
+const MAX_PIXELS = 750;
+/** A still picture is drawn again after this many, in case the sample missed a change. */
+const REFRESH_EVERY = 5;
+/** After a failed ask, the phone tries again this much later, doubling up to this. */
 const RETRY_MS = 3000;
+const RETRY_MAX_MS = 30000;
 
 type Frame = { frame: string; width: number; height: number };
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * A cheap stand-in for comparing two pictures: the length and a few dozen
+ * small samples across the data. A change in a JPEG shifts the bytes after it,
+ * so a sample nearly always shows it; the screen also draws a still picture
+ * again now and then.
+ */
+export function frameSignature(frame: string): string {
+  const samples = 48;
+  const size = 16;
+  let signature = String(frame.length);
+  for (let i = 0; i < samples; i++) {
+    const at = Math.floor(((frame.length - size) * i) / (samples - 1));
+    signature += frame.slice(Math.max(0, at), Math.max(0, at) + size);
+  }
+  return signature;
+}
 const reason = (value: unknown) => (value instanceof Error ? value.message : String(value));
 
 /** The address without its scheme, as the person typed it. */
@@ -42,16 +66,22 @@ export function DraftFrame({
   const [front, setFront] = useState<0 | 1 | null>(null);
   const frontRef = useRef<0 | 1 | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const pixels = Math.round(width * scale);
+  const pixels = Math.min(MAX_PIXELS, Math.round(width * scale));
+  // Pictures of a page nobody sees (another screen on top) are not asked for.
+  const focused = useIsFocused();
 
   useEffect(() => {
+    if (!focused) return;
     let alive = true;
+    const stop = new AbortController();
     void (async () => {
+      let failures = 0;
+      let last: string | null = null;
+      // Pictures in a row that matched the one before.
+      let still = 0;
       while (alive) {
-        if (AppState.currentState !== "active") {
-          await sleep(FRAME_MS);
-          continue;
-        }
+        await waitForActive(stop.signal);
+        if (!alive) return;
         try {
           const reply = await command<Frame | { live: false }>("draft.frame", {
             conversationId,
@@ -60,25 +90,32 @@ export function DraftFrame({
           });
           if (!alive) return;
           if (!("frame" in reply)) return setError("This draft was closed.");
+          failures = 0;
           setError(null);
-          setSlots((current) => {
-            const back = frontRef.current === 0 ? 1 : 0;
-            const next: [Frame | null, Frame | null] = [...current];
-            next[back] = reply;
-            return next;
-          });
-          await sleep(FRAME_MS);
+          const signature = frameSignature(reply.frame);
+          still = signature === last ? still + 1 : 0;
+          last = signature;
+          // The same picture again isn't decoded or drawn, bar a refresh now and then.
+          if (still === 0 || still % REFRESH_EVERY === 0)
+            setSlots((current) => {
+              const back = frontRef.current === 0 ? 1 : 0;
+              const next: [Frame | null, Frame | null] = [...current];
+              next[back] = reply;
+              return next;
+            });
+          await pause(still >= 1 ? STILL_MS : FRAME_MS, stop.signal);
         } catch (value) {
           if (!alive) return;
           setError(reason(value));
-          await sleep(RETRY_MS);
+          await pause(backoff(RETRY_MS, failures++, RETRY_MAX_MS), stop.signal);
         }
       }
     })();
     return () => {
       alive = false;
+      stop.abort();
     };
-  }, [command, conversationId, draft, pixels]);
+  }, [command, conversationId, draft, pixels, focused]);
 
   const shown = front == null ? null : slots[front];
   const status = error ?? (url ? `Live from your desktop · ${shortUrl(url)}` : "Live from your desktop");
