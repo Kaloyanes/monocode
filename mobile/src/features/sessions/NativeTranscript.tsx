@@ -23,7 +23,7 @@ import {
 } from "react-native";
 import { withTiming } from "react-native-reanimated";
 
-import { useConnection } from "@/features/connection/ConnectionProvider";
+import { usePairing } from "@/features/connection/ConnectionProvider";
 import { hasNativeTranscript } from "@/features/connection/nativeLink";
 import { openDraft } from "@/features/drafts/openDraft";
 import { useCollapsedToolCalls } from "@/features/settings/toolCalls";
@@ -106,7 +106,7 @@ export function NativeTranscript({
   agent?: TranscriptAgent;
   pushed?: boolean;
 }) {
-  const { pairing } = useConnection();
+  const pairing = usePairing();
   const { pending, onStatus } = useNativeTranscript(conversationId);
   const layout = useSessionLayout();
   const colors = useColors();

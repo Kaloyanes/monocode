@@ -1,10 +1,12 @@
 import * as Haptics from "expo-haptics";
+import { useIsFocused } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Alert, AppState, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Alert, Pressable, Text, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import type { ShouldStartLoadRequest } from "react-native-webview/lib/WebViewTypes";
 
-import { useConnection } from "@/features/connection/ConnectionProvider";
+import { backoff, pause, waitForActive } from "@/features/connection/appActivity";
+import { useCommand } from "@/features/connection/ConnectionProvider";
 import { makeCommandId } from "@/features/connection/nativeLink";
 import { radii, themedStyles, useColors, useScheme, withAlpha } from "@/ui/theme";
 
@@ -27,7 +29,8 @@ const RETRY_MS = 2000;
 /** Taps and keys are sent together, at most this often. */
 const TRAIL_MS = 600;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** After repeated failures the phone waits longer, up to this. */
+const RETRY_MAX_MS = 30000;
 const reason = (value: unknown) => (value instanceof Error ? value.message : String(value));
 
 type Press = { action: "send" } | { action: "handBack" };
@@ -44,7 +47,7 @@ export function DraftScreen({
   conversationId: string;
   draft: string;
 }) {
-  const { command } = useConnection();
+  const command = useCommand();
   const light = useScheme() === "light";
   const colors = useColors();
   const styles = useStyles();
@@ -111,15 +114,18 @@ export function DraftScreen({
 
   // Read at once, then follow the record: each read waits on the desktop
   // until the draft changes.
+  // Only while this screen is the one shown and the app is in the foreground.
+  const focused = useIsFocused();
   useEffect(() => {
+    if (!focused) return;
     let alive = true;
+    const stop = new AbortController();
     held.current = null;
     void (async () => {
+      let failures = 0;
       while (alive) {
-        if (AppState.currentState !== "active") {
-          await sleep(1000);
-          continue;
-        }
+        await waitForActive(stop.signal);
+        if (!alive) return;
         const known = current.current?.live ? current.current : null;
         try {
           const reply = await command<DraftRecord>("draft.read", {
@@ -130,20 +136,22 @@ export function DraftScreen({
             generation: held.current ?? undefined,
           });
           if (!alive) return;
+          failures = 0;
           setError(null);
           apply(reply);
           if (!reply.live) return;
         } catch (value) {
           if (!alive) return;
           setError(reason(value));
-          await sleep(RETRY_MS);
+          await pause(backoff(RETRY_MS, failures++, RETRY_MAX_MS), stop.signal);
         }
       }
     })();
     return () => {
       alive = false;
+      stop.abort();
     };
-  }, [apply, command, conversationId, draft, light]);
+  }, [apply, command, conversationId, draft, light, focused]);
 
   useEffect(
     () => () => {
