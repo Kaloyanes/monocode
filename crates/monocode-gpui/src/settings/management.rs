@@ -577,7 +577,7 @@ impl SettingsView {
                     self.discovery.worktrees.default_root.display()
                 )));
             }
-            Target::Sweep(list) => rows.extend(self.sweep_confirmation(&list)),
+            Target::Sweep(list) => rows.extend(self.sweep_confirmation(list)),
             Target::DeleteTree(tree) => {
                 let count = self
                     .ctx
@@ -815,7 +815,11 @@ impl SettingsView {
             Target::Sweep(ref list) => format!(
                 "Remove {} {}?",
                 list.len(),
-                if list.len() == 1 { "worktree" } else { "worktrees" }
+                if list.len() == 1 {
+                    "worktree"
+                } else {
+                    "worktrees"
+                }
             ),
             Target::ResetMono(ref mono) => format!("Reset {} to its defaults?", mono.name),
             _ => String::new(),

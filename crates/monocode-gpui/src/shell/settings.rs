@@ -430,7 +430,11 @@ impl Shell {
         })
         .detach();
     }
-    pub(super) fn finish_worktree_action(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+    pub(super) fn finish_worktree_action(
+        &mut self,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(view) = &self.settings {
             view.update(cx, |v, cx| v.management_finished(result, cx));
         }

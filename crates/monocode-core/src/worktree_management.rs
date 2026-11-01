@@ -178,7 +178,12 @@ pub fn detect_base(main: &Path) -> Option<String> {
     remote_default()
         .or_else(|| local("main"))
         .or_else(|| local("master"))
-        .or_else(|| crate::git::worktree_branch(main))
+        .or_else(|| {
+            crate::git::git(main, &["branch", "--show-current"])
+                .ok()
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty())
+        })
 }
 
 fn count(cwd: &Path, args: &[&str]) -> Option<usize> {
@@ -249,7 +254,7 @@ pub fn age_label(unix: i64, now_ms: u64) -> String {
     match crate::time::relative(at, now_ms).as_str() {
         "" => String::new(),
         "now" => "just now".into(),
-        r if r.ends_with(|c: char| c == 'm' || c == 'h' || c == 'd') => format!("{r} ago"),
+        r if r.ends_with(['m', 'h', 'd']) => format!("{r} ago"),
         r => r.into(),
     }
 }
