@@ -9,7 +9,12 @@ const attrName=k=>'s'+k[0].toUpperCase()+k.slice(1);
 // property (--s-radius) and booleans to a data attribute (data-s-glow="on"), so a
 // page can react in plain CSS. The values also go to the agent, who sees them in
 // the next draft snapshot as `state`.
-const state=init=>{const cur={...init},subs=new Set(),el=document.documentElement;let timer=0;
+// The page has one store: mc.state() returns it, and a later mc.state({...})
+// or mc.controls adds its keys (with their starting values) to the same store
+// instead of starting a rival one the agent can't see.
+let page=null;
+const state=init=>{if(page){const fresh=Object.entries(init||{}).filter(([k])=>!page.has(k));if(fresh.length)page.add(Object.fromEntries(fresh));return page}
+const base={...init},cur={...base},subs=new Set(),el=document.documentElement;let timer=0;
 const put=(k,v)=>{if(typeof v==='boolean')el.dataset[attrName(k)]=v?'on':'off';else if(v==null)el.style.removeProperty(cssName(k));else el.style.setProperty(cssName(k),String(v))};
 const tell=()=>{clearTimeout(timer);timer=setTimeout(()=>{try{const v=JSON.stringify(cur);if(v.length<4000)parent.postMessage({__mc:1,k:'v',v:JSON.parse(v)},'*')}catch(e){}},120)};
 for(const[k,v]of Object.entries(cur))put(k,v);tell();
@@ -17,11 +22,14 @@ const publish=()=>{subs.forEach(f=>{try{f({...cur})}catch(e){console.error(e)}})
 const s={get:k=>cur[k],
 set(k,v){if(cur[k]===v)return s;cur[k]=v;put(k,v);publish();return s},
 patch(o){let changed=false;for(const[k,v]of Object.entries(o))if(cur[k]!==v){cur[k]=v;put(k,v);changed=true}if(changed)publish();return s},
-reset(){return s.patch(init)},
+reset(){return s.patch(base)},
+has:k=>k in cur,
+add(o){Object.assign(base,o);for(const[k,v]of Object.entries(o)){cur[k]=v;put(k,v)}publish();return s},
 // Calls f now and after every change; returns a function that stops it.
 on(f){subs.add(f);try{f({...cur})}catch(e){console.error(e)}return()=>subs.delete(f)},
 get values(){return{...cur}}};
-// The agent's {kind:'set'} action patches the newest store, by its own keys.
+page=s;
+// The agent's {kind:'set'} action patches the store, by its own keys.
 window.__mcSet=o=>{if(!o||typeof o!=='object'||Array.isArray(o))return 'values must be an object';
 const bad=Object.keys(o).filter(k=>!(k in cur));if(bad.length)return 'Unknown state '+bad.join(', ')+'; this page has '+(Object.keys(cur).join(', ')||'none');
 s.patch(o);return ''};

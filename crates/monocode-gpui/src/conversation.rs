@@ -22,6 +22,7 @@ pub(crate) mod remote_plans;
 mod response_menu;
 mod restart;
 mod shell;
+pub(crate) mod subagents;
 #[cfg(test)]
 mod submission_tests;
 mod threads;
@@ -52,12 +53,12 @@ use gpui::{
 pub(crate) use mobile::{Waiting as MobileWaiting, mobile_access_modes};
 pub(crate) use mono::QueueChanged as MonoQueueChanged;
 pub(crate) use mono::Submitted as MonoSubmitted;
-pub(crate) use restart::CONTINUE_PROMPT;
 use monocode_core::{
     agent::{AccessMode, Approval, Control, Decision, Settings},
     catalog::{self, Model},
 };
 use monocode_core::{provider::Kind, store::Session};
+pub(crate) use restart::CONTINUE_PROMPT;
 use std::{
     path::Path,
     sync::{
@@ -201,9 +202,15 @@ pub(crate) struct Conversation {
     /// Automation runs and orchestration workers: their owners recover them,
     /// so a relaunch only settles their interrupted turns.
     pub(crate) managed: bool,
+    /// The lead that drives this subagent. The user can watch it, answer
+    /// its approvals and stop it, but not send it messages.
     pub(crate) driven_by: Option<i64>,
-    pub(crate) thread_driver: String,
+    /// The lead's title, for the read-only bar.
     pub(crate) thread_lead_title: String,
+    /// The thread whose message the next turn delivers, kept on its receipt.
+    pub(crate) thread_sender: Option<i64>,
+    /// This lead's subagents, for the strip above its composer.
+    subagents: Vec<subagents::Subagent>,
     /// The provider model for the next turn; `None` uses its configured default.
     model: Option<String>,
     resolved_model: Option<String>,
@@ -216,6 +223,9 @@ pub(crate) struct Conversation {
     catalog: Vec<Model>,
     catalog_epoch: u64,
     account_switching: bool,
+    /// The message a cache compaction holds back until the summary is
+    /// written, shown waiting in the thread meanwhile with its files.
+    compacting_prompt: Option<crate::transcript::PendingMessage>,
     network_drop: network_drop::NetworkDrop,
     _usage_clock: gpui::Task<()>,
     _account_usage: Option<Subscription>,
@@ -670,8 +680,9 @@ impl Conversation {
             draft_hint: false,
             managed: false,
             driven_by: None,
-            thread_driver: String::new(),
             thread_lead_title: String::new(),
+            thread_sender: None,
+            subagents: Vec::new(),
             model: std::env::var(format!(
                 "MONOCODE_{}_MODEL",
                 summary.provider.to_uppercase()
@@ -689,6 +700,7 @@ impl Conversation {
             catalog: Vec::new(),
             catalog_epoch: 0,
             account_switching: false,
+            compacting_prompt: None,
             network_drop: Default::default(),
             _usage_clock: usage_clock,
             _account_usage: account_usage,
@@ -1213,6 +1225,8 @@ impl Conversation {
                     .or_insert_with(|| control.current.clone());
             }
         }
+        let sender = self.thread_sender.take();
+        self.transcript.update(cx, |t, _| t.live_sender = sender);
         settings.turn_model = Some(monocode_core::agent::TurnInfo {
             provider: self.summary.provider.clone(),
             model: model_label.to_string(),
@@ -1221,6 +1235,7 @@ impl Conversation {
                 .map(|model| model.id.clone())
                 .or(self.model.clone()),
             started_at: Some(monocode_core::time::now_ms()),
+            sender,
             ..Default::default()
         });
         if !self.is_remote() && settings.prepared_prompt.is_none() {
@@ -1718,6 +1733,16 @@ impl Conversation {
         if self.driven_by.is_some() && prompt.is_some() {
             return;
         }
+        self.install_lead_transfer(settings, prompt, cx);
+    }
+    /// install_transfer for a lead or the Orchestrator starting work on its
+    /// own subagent, which the user can't send messages to.
+    pub(crate) fn install_lead_transfer(
+        &mut self,
+        settings: Settings,
+        prompt: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.editing_last_turn.pending() {
             self.defer_edit_transfer(settings, prompt, cx);
             return;
@@ -1739,7 +1764,7 @@ impl Conversation {
                             this.install_transfer(settings, None, cx);
                             this.enqueue_restored_prompt(prompt, cx);
                         }
-                        prompt => this.install_transfer(settings, prompt, cx),
+                        prompt => this.install_lead_transfer(settings, prompt, cx),
                     }
                 },
                 cx,
@@ -3041,6 +3066,7 @@ impl Conversation {
             .children(self.orchestration_card(cx))
             .children(if self.is_remote() { None } else { self.usage_notice(false, cx) })
             .children(self.goal_shelf(cx))
+            .children(self.subagent_strip(cx))
             .child(self.background_shelf(window, cx))
             .children(self.shell_queue(cx))
             .child(self.message_queue(window, cx))
@@ -3484,7 +3510,7 @@ impl Conversation {
         // Home chats work on the computer, not a checkout.
         let home = monocode_core::files::is_home_project(&self.summary.cwd);
         let label = if home {
-            "Home"
+            "No project"
         } else if new {
             "New worktree"
         } else if linked {
@@ -3494,8 +3520,7 @@ impl Conversation {
         };
         let enabled = !self.busy && !self.preparing_worktree && self.git.is_some();
         // Still reading git is not unavailable: don't dim, then brighten.
-        let dimmed =
-            !home && !enabled && (self.loaded || self.busy || self.preparing_worktree);
+        let dimmed = !home && !enabled && (self.loaded || self.busy || self.preparing_worktree);
         let folder_icon = if home {
             "home-01"
         } else if new || linked {
@@ -3504,22 +3529,18 @@ impl Conversation {
             "folder"
         };
         let workspace = if draft {
-            bar_trigger(
-                "composer-workspace",
-                folder_icon,
-                label.into(),
-            )
-            .aria_label(format!("Workspace {label}"))
-            .aria_expanded(self.menu_is(ComposerMenu::Workspace))
-            .child(self.workspace_anchor.probe())
-            .when(dimmed, |d| d.opacity(0.4))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if enabled {
-                    this.refresh_git(cx);
-                    this.toggle_menu(ComposerMenu::Workspace, window, cx);
-                }
-            }))
-            .into_any_element()
+            bar_trigger("composer-workspace", folder_icon, label.into())
+                .aria_label(format!("Workspace {label}"))
+                .aria_expanded(self.menu_is(ComposerMenu::Workspace))
+                .child(self.workspace_anchor.probe())
+                .when(dimmed, |d| d.opacity(0.4))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if enabled {
+                        this.refresh_git(cx);
+                        this.toggle_menu(ComposerMenu::Workspace, window, cx);
+                    }
+                }))
+                .into_any_element()
         } else {
             // WorkspaceIdentity: a started conversation owns this working copy.
             div()
@@ -4209,24 +4230,6 @@ impl Render for Conversation {
             .flex()
             .flex_col()
             .size_full()
-            .when_some(self.driven_by, |d, lead| {
-                d.child(
-                    div()
-                        .id("thread-breadcrumb")
-                        .role(gpui::Role::Button)
-                        .aria_label("Open lead thread")
-                        .px_4()
-                        .py_2()
-                        .text_size(px(12.))
-                        .text_color(content(0.5))
-                        .cursor_pointer()
-                        .child(format!(
-                            "{} › {}",
-                            self.thread_lead_title, self.summary.title
-                        ))
-                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenThread(lead)))),
-                )
-            })
             .min_w_0()
             .when_some(self.response_menu.as_ref(), |d, menu| {
                 let panel =

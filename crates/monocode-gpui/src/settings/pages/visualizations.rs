@@ -80,22 +80,24 @@ impl SettingsView {
                         .into_any_element(),
                 ],
             ),
-            Install::Idle if installed && chosen == "chromium" && chromium::failure().is_some() => (
-                "Chromium could not start",
-                format!(
-                    "{} Drafts use WebKit instead. Try again starts Chromium for the next draft.",
-                    sentence(&chromium::failure().unwrap_or_default())
-                ),
-                vec![
-                    secondary_button("chromium-start-again", "Try again", false, false)
-                        .child("Try again")
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            chromium::report_failure(None);
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                ],
-            ),
+            Install::Idle if installed && chosen == "chromium" && chromium::failure().is_some() => {
+                (
+                    "Chromium could not start",
+                    format!(
+                        "{} Drafts use WebKit instead. Try again starts Chromium for the next draft.",
+                        sentence(&chromium::failure().unwrap_or_default())
+                    ),
+                    vec![
+                        secondary_button("chromium-start-again", "Try again", false, false)
+                            .child("Try again")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                chromium::report_failure(None);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    ],
+                )
+            }
             Install::Idle if installed => (
                 "Chromium",
                 format!(

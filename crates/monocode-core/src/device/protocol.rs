@@ -349,7 +349,10 @@ fn rewrite_sps(sps: &[u8]) -> Option<Vec<u8>> {
     }
     let mut result = vec![sps[0]];
     let mut zeros = 0;
-    for byte in out.chunks(8).map(|bits| bits.iter().fold(0u8, |acc, bit| acc << 1 | u8::from(*bit))) {
+    for byte in out
+        .chunks(8)
+        .map(|bits| bits.iter().fold(0u8, |acc, bit| acc << 1 | u8::from(*bit)))
+    {
         if zeros >= 2 && byte <= 3 {
             result.push(3);
             zeros = 0;
@@ -500,7 +503,10 @@ pub fn button(platform: super::Platform, button: Button) -> Option<Message> {
                 Button::Power => "lock",
                 Button::Back => return None,
             };
-            Some(Message::Binary(tagged(ios::BUTTON, json!({"button": name}))))
+            Some(Message::Binary(tagged(
+                ios::BUTTON,
+                json!({"button": name}),
+            )))
         }
         super::Platform::Android => {
             let kind = match button {
@@ -627,7 +633,9 @@ pub fn key_press(
                 _ => None,
             };
             if let Some(code) = code {
-                return vec![Message::Text(json!({"type": "key", "keycode": code}).to_string())];
+                return vec![Message::Text(
+                    json!({"type": "key", "keycode": code}).to_string(),
+                )];
             }
             match character {
                 Some(text) if !text.is_empty() && !modifiers.command && !modifiers.control => {
@@ -844,7 +852,8 @@ mod tests {
                 .orientation,
             Orientation::Portrait
         );
-        assert!(ScreenConfig::parse(br#"{"width":0,"height":20,"orientation":"portrait"}"#)
-            .is_none());
+        assert!(
+            ScreenConfig::parse(br#"{"width":0,"height":20,"orientation":"portrait"}"#).is_none()
+        );
     }
 }

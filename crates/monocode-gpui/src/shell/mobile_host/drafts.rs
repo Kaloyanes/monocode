@@ -347,7 +347,11 @@ mod tests {
             name: "Go".into(),
             x: 140.,
             y: 33.333,
-            at: Some(DraftAnchor { path: "0.1;alert(1)".into(), ax: 0.5, ay: 0.5 }),
+            at: Some(DraftAnchor {
+                path: "0.1;alert(1)".into(),
+                ax: 0.5,
+                ay: 0.5,
+            }),
         });
         assert_eq!(note.note.len(), 600);
         assert_eq!(note.tag.len(), 20);

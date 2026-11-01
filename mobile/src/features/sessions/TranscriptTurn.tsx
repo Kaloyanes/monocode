@@ -305,16 +305,27 @@ function UserMessage({
     );
   }
 
-  const withTail = tail && !item.compact;
+  const sender = item.sender;
+  const withTail = tail && !item.compact && !sender;
   // A skill or command the message opens with stands out, as the desktop
   // composer marks one.
   const lead = leadingCommand(item.text);
   return (
     <View style={[styles.userRow, item.compact && styles.userRowCompact]}>
+      {sender ? (
+        <View style={styles.sender}>
+          <ProviderLogo harness={sender.harness} size={14} />
+          <Text style={styles.senderText} numberOfLines={1}>
+            <Text style={styles.senderTitle}>{sender.title}</Text>
+            {sender.started ? " · started this thread" : " · message"}
+          </Text>
+        </View>
+      ) : null}
       <View
         style={[
           styles.bubble,
           singleLine ? styles.bubbleRound : styles.bubbleSquare,
+          sender && styles.bubbleFromThread,
         ]}
       >
         {item.attachments ? (
@@ -625,6 +636,29 @@ const useStyles = themedStyles((colors) => ({
   command: {
     color: colors.accent,
     fontWeight: "600",
+  },
+  sender: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    maxWidth: "100%",
+    marginBottom: 4,
+  },
+  senderText: {
+    flexShrink: 1,
+    color: withAlpha(colors.content, 0.45),
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  senderTitle: {
+    color: withAlpha(colors.content, 0.8),
+    fontWeight: "500",
+  },
+  bubbleFromThread: {
+    backgroundColor: "transparent",
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: withAlpha(colors.content, 0.3),
   },
   attachments: {
     color: colors.muted,

@@ -79,7 +79,10 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
             && let Ok(mut call) = serde_json::from_str::<ToolCall>(&rows[at].text)
         {
             if call.is_draft_tool()
-                || matches!(call.thread_action(), Some("wait" | "send" | "stop" | "close"))
+                || matches!(
+                    call.thread_action(),
+                    Some("wait" | "send" | "stop" | "close")
+                )
             {
                 result.hidden.insert(at);
                 at = end;

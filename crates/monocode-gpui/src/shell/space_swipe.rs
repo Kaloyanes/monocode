@@ -32,14 +32,12 @@ const IDLE_RELEASE: Duration = Duration::from_millis(180);
 /// `Shell` itself; a neighbour's is swapped in only while it draws.
 pub(super) struct SidebarPage {
     list: sidebar_list::SidebarList,
-    rails: rails::Rails,
 }
 
 impl SidebarPage {
     fn new(cx: &mut Context<Shell>) -> Self {
         Self {
             list: sidebar_list::SidebarList::new(cx),
-            rails: Default::default(),
         }
     }
 }
@@ -257,7 +255,6 @@ impl Shell {
             .remove(&self.workspace.project)
             .unwrap_or_else(|| SidebarPage::new(cx));
         std::mem::swap(&mut self.sidebar_list, &mut page.list);
-        std::mem::swap(&mut self.rails, &mut page.rails);
         self.space_swipe.wrap = None;
         self.space_swipe.pages.insert(previous.clone(), page);
         // Its rows carry over, but hit targets were only kept for the old
@@ -381,14 +378,12 @@ impl Shell {
             .remove(project)
             .unwrap_or_else(|| SidebarPage::new(cx));
         std::mem::swap(&mut self.sidebar_list, &mut page.list);
-        std::mem::swap(&mut self.rails, &mut page.rails);
         let live = std::mem::replace(&mut self.workspace.project, project.to_owned());
         self.space_swipe.drawing_neighbour = true;
         let drawn = draw(self, cx);
         self.space_swipe.drawing_neighbour = false;
         self.workspace.project = live;
         std::mem::swap(&mut self.sidebar_list, &mut page.list);
-        std::mem::swap(&mut self.rails, &mut page.rails);
         self.space_swipe.pages.insert(project.to_owned(), page);
         drawn
     }
@@ -716,7 +711,9 @@ mod tests {
         visual.run_until_parked();
         // The window drew its first project before this one was set, so the
         // pill starts behind; let it land before a test measures it.
-        visual.executor().advance_clock(std::time::Duration::from_secs(2));
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_secs(2));
         window
             .update(&mut visual, |shell, _, cx| shell.invalidate_chrome(cx))
             .unwrap();

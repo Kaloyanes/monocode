@@ -1,24 +1,32 @@
 # Drafts
 
-A draft is a live page you build inside the conversation. It appears as a card
-at this point in the thread, between your messages, and the user watches it
-take shape and can click around in it right there. Use it to design UI, mock a
+A draft is a live page you build for the conversation. You build and check it
+out of sight; once you publish it, it appears as a card at that point in the
+thread, between your messages, and the user can click around in it right there. Use it to design UI, mock a
 screen, try an interaction, build a small tool or explainer with full HTML,
 CSS and JavaScript, or check a running dev server. There is no side panel.
 
 ## The loop
 
-1. draft_preview {html, title} (or {url}) puts the card in the thread and
+1. draft_preview {html, title} (or {url}) opens the page out of sight and
    returns a screenshot, the page text, controls with refs, console output and
    diagnostics.
 2. Look at the screenshot. Fix console errors, clipping, overflow and anything
-   that reads badly. draft_preview {draft, html} replaces the page in the same
-   card.
+   that reads badly. draft_preview {draft, html} replaces the page.
 3. Test it like a person would: {draft, action:{kind:"click", reference:"REF"}},
-   then {draft, action:{kind:"type", text:"hello", replace:true}} for the focused
-   input. Refs expire on the next snapshot, so inspect again before reusing one.
+   then {draft, action:{kind:"type", reference:"REF", text:"hello",
+   replace:true}} for a field (without reference it types into the focused
+   one). A ref stays valid for as long as its element is on the page, so you
+   can act on several controls from one look; a new version of the page
+   gives new refs.
 4. {draft, width:375, appearance:"dark"} checks another viewport and theme.
-5. The app saves each draft as it changes, so it comes back live after a
+5. When it is ready for the person, {draft, publish:true} puts its card in the
+   thread here (publish:true also works alongside html or an action). From then
+   on every version you send appears in that card as you send it. draft_wait
+   and draft_keep publish a draft too, since the person needs to see it, and a
+   draft you never publish appears when your turn ends. Pass a title again
+   before publishing to rename the card.
+6. The app saves each draft as it changes, so it comes back live after a
    restart under the same id. draft_keep {draft, title} also leaves a picture
    card with an Open draft button, for a result worth pointing back to.
    {draft, action:{kind:"close"}} removes the page for good and leaves a note,
@@ -36,13 +44,12 @@ desktop mock stays a desktop mock. Up to three drafts stay live per
 conversation; opening a fourth retires the oldest.
 
 The page runs for each of your requests whether or not the person can see its
-card: in a conversation in the background, scrolled out of view, or before the
-card was ever on screen. Start and drive a draft whenever it helps; the card
-shows the latest version when the person gets to it. draft_wait is the
-exception: it waits for the person, who has to see the card. A new draft's
-card appears once its first call succeeds; a call that fails leaves nothing
-behind, so just try again. Several screenshots in a row are fine: they never
-appear in the thread, only the card does.
+card: before you publish it, in a conversation in the background, or scrolled
+out of view. Start and drive a draft whenever it helps; a published card shows
+the latest version when the person gets to it. draft_wait is the exception: it
+waits for the person, who has to see the card. A new draft's first call that
+fails leaves nothing behind, so just try again. Several screenshots in a row
+are fine: they never appear in the thread, only the card does.
 
 ## Other widths and the full view
 
@@ -145,7 +152,16 @@ Make the page look like part of the conversation:
   carries the title, and the page is part of your reply.
 - Fluid width with no side padding on the outermost element.
 - A box that needs its own background (a mock of a screen, a control panel)
-  gets at least 16px of padding and var(--radius) corners.
+  gets at least 16px of padding and var(--radius) corners. That box may paint
+  --background, --sidebar and the other tokens itself: only a fill on the
+  outermost element is removed.
+- When the draft mocks MonoCode itself, or the user's own software, read
+  visual_docs {topic:"app"} first, use its design language, and draw the real
+  window, sidebar and chrome inside such a box so the mock looks like the app.
+  For anything else, be as creative as the intent calls for.
+- Revising a draft with the same title in the same turn replaces that draft
+  rather than adding a second card; pass a different title for a variant that
+  should stay beside it.
 After showing a draft, don't describe it again in your reply: say only what the
 page doesn't.
 

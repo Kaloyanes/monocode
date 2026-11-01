@@ -25,6 +25,7 @@ fn action_id(action: &Action) -> &'static str {
         Action::Start => "start",
         Action::Dismiss => "dismiss",
         Action::Remove(_) => "remove",
+        Action::Team(_) => "team",
         Action::Stop => "stop",
         Action::Resume => "resume",
         Action::Retry(_) => "retry",
@@ -162,6 +163,7 @@ mod tests {
             depends_on,
             provider: None,
             model: None,
+            difficulty: None,
         };
         Plan {
             title: "Split settings".into(),
@@ -172,7 +174,13 @@ mod tests {
 
     #[test]
     fn a_plan_under_review_offers_start_and_removal_but_no_retry() {
-        let view = RunView::review(plan(), Phase::Review { blocked: None }, "claude", "Opus");
+        let view = RunView::review(
+            plan(),
+            Phase::Review { blocked: None },
+            "claude",
+            "Opus",
+            None,
+        );
         let value = run(Some("call-1"), &view, |_| None);
         assert_eq!(value["phase"], "review");
         assert_eq!(value["call"], "call-1");
@@ -186,7 +194,7 @@ mod tests {
 
     #[test]
     fn a_running_card_names_its_workers_and_who_needs_input() {
-        let mut view = RunView::review(plan(), Phase::Running, "claude", "Opus");
+        let mut view = RunView::review(plan(), Phase::Running, "claude", "Opus", None);
         view.tasks[0].state = State::Running;
         view.tasks[0].needs_input = true;
         view.tasks[0].session = Some(7);
@@ -202,7 +210,10 @@ mod tests {
 
     #[test]
     fn phone_actions_need_the_assignment_they_name() {
-        assert_eq!(action("remove", Some("a"), None), Some(Action::Remove("a".into())));
+        assert_eq!(
+            action("remove", Some("a"), None),
+            Some(Action::Remove("a".into()))
+        );
         assert_eq!(action("remove", None, None), None);
         assert_eq!(action("retry", None, Some(1)), Some(Action::Retry(1)));
         assert_eq!(action("retry", None, None), None);

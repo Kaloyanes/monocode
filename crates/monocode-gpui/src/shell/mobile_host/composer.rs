@@ -27,7 +27,8 @@ impl Shell {
                 let read = || locked(&store).and_then(|s| s.composer_text(session));
                 let text = loop {
                     match read() {
-                        Ok(text) if since == Some(text.rev) && executor.now() - started < READ_WAIT => {}
+                        Ok(text)
+                            if since == Some(text.rev) && executor.now() - started < READ_WAIT => {}
                         result => break result,
                     }
                     executor.timer(READ_POLL).await;
@@ -95,7 +96,9 @@ mod tests {
     fn the_phone_and_the_desktop_composer_share_one_draft(cx: &mut gpui::TestAppContext) {
         let (window, _, _) = crate::shell::tests::window(cx);
         let open = window
-            .update(cx, |shell, _, _| shell.visible_session().expect("a conversation is open"))
+            .update(cx, |shell, _, _| {
+                shell.visible_session().expect("a conversation is open")
+            })
             .unwrap();
         let conversation = window
             .update(cx, |shell, _, _| shell.mobile_session_id(open))
@@ -103,7 +106,8 @@ mod tests {
         let write = |cx: &mut gpui::TestAppContext, text: &str, base: Value| {
             window
                 .update(cx, |shell, _, cx| {
-                    let params = json!({"conversationId": conversation, "text": text, "base": base});
+                    let params =
+                        json!({"conversationId": conversation, "text": text, "base": base});
                     shell.mobile_composer_write(&params, cx).unwrap()
                 })
                 .unwrap()
@@ -111,7 +115,12 @@ mod tests {
         let composer = |cx: &mut gpui::TestAppContext| {
             window
                 .update(cx, |shell, _, cx| {
-                    shell.sessions[&open].read(cx).input.read(cx).content.to_string()
+                    shell.sessions[&open]
+                        .read(cx)
+                        .input
+                        .read(cx)
+                        .content
+                        .to_string()
                 })
                 .unwrap()
         };
@@ -127,8 +136,9 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 shell.sessions[&open].update(cx, |view, cx| {
-                    view.input
-                        .update(cx, |input, cx| input.set_text("from the desktop".into(), cx));
+                    view.input.update(cx, |input, cx| {
+                        input.set_text("from the desktop".into(), cx)
+                    });
                     view.flush_composer_draft(cx);
                 })
             })
@@ -153,24 +163,24 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 shell.sessions[&open].update(cx, |view, cx| {
-                    view.clear_composer_text_sent_from_phone(
-                        "phone, now",
-                        kept["rev"].as_u64(),
-                        cx,
-                    )
+                    view.clear_composer_text_sent_from_phone("phone, now", kept["rev"].as_u64(), cx)
                 })
             })
             .unwrap();
         cx.run_until_parked();
         assert_eq!(composer(cx), "");
         let read = window
-            .update(cx, |shell, _, _| locked(&shell.store).unwrap().composer_text(open).unwrap())
+            .update(cx, |shell, _, _| {
+                locked(&shell.store).unwrap().composer_text(open).unwrap()
+            })
             .unwrap();
         assert_eq!(read, ComposerText::default());
 
         let mono = json!({"conversationId": "mono:none", "text": "x", "base": 0});
         window
-            .update(cx, |shell, _, cx| assert!(shell.mobile_composer_write(&mono, cx).is_err()))
+            .update(cx, |shell, _, cx| {
+                assert!(shell.mobile_composer_write(&mono, cx).is_err())
+            })
             .unwrap();
     }
 }

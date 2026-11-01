@@ -15,7 +15,6 @@ impl Shell {
             .ok_or("Caller is not available")?
             .read(cx);
         if self.thread_parents.contains_key(&call.session)
-            || caller.driven_by.is_some()
             || self.orchestration_worker(call.session)
             || caller.settings.mono.is_some()
             || self
@@ -25,8 +24,10 @@ impl Shell {
         {
             return Err("Only top-level threads can use thread tools".into());
         }
-        if matches!(call.action.as_str(), "threads.start" | "threads.send")
-            && caller.thread_stopping()
+        if matches!(
+            call.action.as_str(),
+            "threads.start" | "threads.new" | "threads.send"
+        ) && caller.thread_stopping()
         {
             return Err("Lead thread was stopped".into());
         }
@@ -150,7 +151,8 @@ impl Shell {
                     Err("Child is busy, loading, or has an unsent draft".into())
                 } else {
                     app::prompt(&call.input).map(|prompt| {
-                        view.update(cx, |v, cx| v.send_thread_prompt(prompt, cx));
+                        let sender = call.session;
+                        view.update(cx, |v, cx| v.send_thread_message(prompt, sender, cx));
                         json!({"threadId":id,"accepted":true,"submitted":true})
                     })
                 }
@@ -294,10 +296,6 @@ impl Shell {
                 self.release_thread_waiters(id, Ok(status), cx);
             }
         }
-        let lead_info = self.sessions.get(&lead).map(|v| {
-            let v = v.read(cx);
-            (v.summary.title.clone(), v.driver_label())
-        });
         let states: HashMap<_, _> = all
             .iter()
             .map(|&child| {
@@ -312,19 +310,8 @@ impl Shell {
             let transcript = view.read(cx).transcript.clone();
             transcript.update(cx, |t, cx| t.set_thread_states(states, cx));
         }
-        if let Some((title, model)) = lead_info {
-            for child in &children {
-                if let Some(view) = self.sessions.get(child) {
-                    view.update(cx, |v, cx| {
-                        v.thread_driver = model.clone();
-                        v.thread_lead_title = title.clone();
-                        v.transcript.update(cx, |t, cx| {
-                            t.thread_driver = Some(format!("{model} · from {title}"));
-                            cx.notify();
-                        });
-                    });
-                }
-            }
+        for &child in &children {
+            self.name_thread_senders(child, cx);
         }
         let mut tasks: Vec<_> = children
             .iter()
@@ -372,6 +359,173 @@ impl Shell {
         self.invalidate_chrome(cx);
         cx.notify();
     }
+    /// The lead a subagent belongs to: the thread that started it with
+    /// thread_start, or the Orchestrator whose run it works on. A thread
+    /// opened with new_thread has none; it is the user's own.
+    pub(crate) fn subagent_lead(&self, id: i64) -> Option<i64> {
+        self.thread_parents
+            .get(&id)
+            .copied()
+            .or_else(|| self.orchestration_lead(id))
+    }
+    /// A subagent opens in a pane beside its lead, never as a tab of its own,
+    /// and one at a time: opening another takes the shown one's place.
+    pub(super) fn open_subagent(
+        &mut self,
+        lead: i64,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigation_revision += 1;
+        if self.workspace.tab_of(id).is_some()
+            && self.workspace.tab_of(id) == self.workspace.tab_of(lead)
+        {
+            self.activate_session(id, window, cx);
+            return;
+        }
+        if !self.session_summaries.contains_key(&lead) || self.deleting.contains(&lead) {
+            // Its lead is gone; show it on its own rather than not at all.
+            self.activate_session(id, window, cx);
+            return;
+        }
+        if self.workspace.active != Some(lead) {
+            self.replace_blank_pane(lead, cx);
+            self.activate_session(lead, window, cx);
+        }
+        let Some(tab) = self.workspace.tab_of(lead) else {
+            return;
+        };
+        let before = self.active_leaves();
+        let shown = self
+            .workspace
+            .layout(tab)
+            .leaf_ids()
+            .into_iter()
+            .find(|&pane| pane != id && self.subagent_lead(pane) == Some(lead));
+        match shown {
+            Some(shown) => {
+                self.workspace.place(id, shown, Edge::Right);
+                self.workspace.close_pane(shown);
+            }
+            None => self.workspace.place(id, lead, Edge::Right),
+        }
+        self.begin_pane_motion(before, cx);
+        self.fit_sidebar(cx);
+        self.activate_session(id, window, cx);
+    }
+    /// The lead's subagents for the strip above its composer.
+    pub(super) fn subagent_strip(
+        &self,
+        lead: i64,
+        cx: &App,
+    ) -> Vec<crate::conversation::subagents::Subagent> {
+        use crate::conversation::subagents::{Subagent, SubagentState};
+        let Some(summary) = self.orchestration_summaries.get(&lead) else {
+            return Vec::new();
+        };
+        summary
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                let id = task.session?;
+                let needs_input = self
+                    .sessions
+                    .get(&id)
+                    .is_some_and(|view| view.read(cx).needs_approval());
+                Some(Subagent {
+                    id,
+                    title: task.title.clone(),
+                    provider: task.provider.clone(),
+                    state: SubagentState::of(&task.status, summary.live, needs_input),
+                })
+            })
+            .collect()
+    }
+    pub(super) fn push_subagent_strip(&self, lead: i64, cx: &mut Context<Self>) {
+        let Some(view) = self.sessions.get(&lead).cloned() else {
+            return;
+        };
+        let strip = self.subagent_strip(lead, cx);
+        view.update(cx, |v, cx| v.set_subagents(strip, cx));
+    }
+    /// Every subagent of the lead, archived or closed ones included: its
+    /// thread_start children, then its Orchestrator agents.
+    pub(crate) fn subagents(&self, lead: i64) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .thread_parents
+            .iter()
+            .filter(|(_, parent)| **parent == lead)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        if let Some(summary) = self.orchestration_summaries.get(&lead) {
+            for id in summary.tasks.iter().filter_map(|t| t.session) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+    /// The thread that started `id`, as messages it sent there name it.
+    pub(super) fn thread_senders(
+        &self,
+        id: i64,
+    ) -> HashMap<i64, crate::transcript::threads::Sender> {
+        self.started_by
+            .get(&id)
+            .and_then(|from| Some((*from, self.session_summaries.get(from)?)))
+            .map(|(from, summary)| {
+                let sender = crate::transcript::threads::Sender {
+                    title: monocode_core::session_title::display_title(
+                        &summary.title,
+                        &summary.provider,
+                    )
+                    .replace('\n', " ")
+                    .into(),
+                    provider: summary.provider.clone(),
+                };
+                (from, sender)
+            })
+            .into_iter()
+            .collect()
+    }
+    /// "from X" under a session another thread started.
+    pub(super) fn started_from_line(&self, id: i64, cx: &App) -> Option<gpui::Div> {
+        let from = *self.started_by.get(&id)?;
+        if !self.session_summaries.contains_key(&from) && !self.sessions.contains_key(&from) {
+            return None;
+        }
+        let title = self.session_metadata(from, cx).display_title();
+        Some(
+            div()
+                .debug_selector(move || format!("session-origin-{id}"))
+                .h(px(16.))
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(content(0.45))
+                .child(icon("arrow-turn-down-right", 12.).text_color(content(0.4)))
+                .child(div().min_w_0().truncate().child(format!("from {title}"))),
+        )
+    }
+    pub(super) fn name_thread_senders(&self, id: i64, cx: &mut Context<Self>) {
+        let senders = self.thread_senders(id);
+        if let Some(view) = self.sessions.get(&id) {
+            view.update(cx, |v, cx| {
+                v.transcript.update(cx, |t, cx| {
+                    if t.senders != senders {
+                        t.senders = senders;
+                        cx.notify();
+                    }
+                })
+            });
+        }
+    }
     pub(super) fn set_agent_summary(
         &mut self,
         lead: i64,
@@ -396,6 +550,7 @@ impl Shell {
         });
         self.agent_summary_writes.insert(lead, write);
         self.orchestration_summaries.insert(lead, summary);
+        self.push_subagent_strip(lead, cx);
         self.invalidate_chrome(cx);
     }
 }

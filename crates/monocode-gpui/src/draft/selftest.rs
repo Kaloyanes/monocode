@@ -25,11 +25,7 @@ use std::{ffi::OsString, time::Duration};
 
 /// The draft on its own, or inside a thread when `_THREAD` is set, with
 /// whatever the last `away`, `cover` or `back` step left in its place.
-struct Root(
-    gpui::AnyView,
-    Entity<Draft>,
-    &'static str,
-);
+struct Root(gpui::AnyView, Entity<Draft>, &'static str);
 impl Render for Root {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()

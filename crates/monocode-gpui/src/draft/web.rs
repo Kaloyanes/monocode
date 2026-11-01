@@ -411,7 +411,11 @@ impl Host {
             };
             unsafe { load(&hosted.web, &placement.load) };
             hosted.loaded = Some((placement.generation, placement.load.clone()));
-            parent.addSubview_positioned_relativeTo(&hosted.clip, NSWindowOrderingMode::Above, None);
+            parent.addSubview_positioned_relativeTo(
+                &hosted.clip,
+                NSWindowOrderingMode::Above,
+                None,
+            );
             hosted.step_aside(true);
             // Laid out at life size until the card gives it a column.
             if self.area.get().is_none() {

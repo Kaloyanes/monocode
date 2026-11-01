@@ -55,7 +55,7 @@ const MAX_PICTURE_WIDTH: u32 = 1000;
 /// The shortest a draft's card gets, and the tallest it follows its page to:
 /// a page taller than that scrolls inside its card.
 #[cfg(target_os = "macos")]
-const MIN_HEIGHT: u32 = 120;
+const MIN_HEIGHT: u32 = 32;
 #[cfg(target_os = "macos")]
 const MAX_HEIGHT: u32 = 12_000;
 
@@ -518,8 +518,7 @@ impl Draft {
     /// after any reload.
     #[cfg(target_os = "macos")]
     fn follow_engine(&mut self, cx: &mut Context<Self>) {
-        if self._switch.is_some() || self.host.made_for_chromium() == engine::chromium_chosen(cx)
-        {
+        if self._switch.is_some() || self.host.made_for_chromium() == engine::chromium_chosen(cx) {
             return;
         }
         let current = (self.shown == self.shared.generation() && self.host.visible())
@@ -587,14 +586,18 @@ impl Draft {
             this.shared.report_state(state);
         }
         this.saved = Some(path);
-        cx.default_global::<Reopening>().saved.insert(this.id.clone());
+        cx.default_global::<Reopening>()
+            .saved
+            .insert(this.id.clone());
         this
     }
 
     /// Saves the page at `path` from now on, whenever it changes.
     pub(crate) fn save_to(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
         self.saved = Some(path);
-        cx.default_global::<Reopening>().saved.insert(self.id.clone());
+        cx.default_global::<Reopening>()
+            .saved
+            .insert(self.id.clone());
         self.persist(cx);
     }
 
@@ -1637,31 +1640,20 @@ fn jpeg(png: &[u8]) -> Option<Vec<u8>> {
 
 /// The wrapper's state as JSON.
 #[cfg(target_os = "macos")]
-async fn state(
-    web: &engine::Page,
-    cx: &gpui::AsyncApp,
-) -> Option<serde_json::Value> {
+async fn state(web: &engine::Page, cx: &gpui::AsyncApp) -> Option<serde_json::Value> {
     let text = evaluate(web, "window.__mc ? JSON.stringify(window.__mc) : ''", cx).await?;
     serde_json::from_str(&text).ok()
 }
 
 #[cfg(target_os = "macos")]
-async fn evaluate(
-    web: &engine::Page,
-    script: &str,
-    cx: &gpui::AsyncApp,
-) -> Option<String> {
+async fn evaluate(web: &engine::Page, script: &str, cx: &gpui::AsyncApp) -> Option<String> {
     engine::evaluate(web, script, cx).await
 }
 
 /// Posts reports to the wrapper the way the page's probe does, so they take
 /// the same path, wake included.
 #[cfg(all(target_os = "macos", debug_assertions))]
-async fn report(
-    web: &engine::Page,
-    reports: &str,
-    cx: &gpui::AsyncApp,
-) {
+async fn report(web: &engine::Page, reports: &str, cx: &gpui::AsyncApp) {
     let script =
         format!("[{reports}].forEach(m=>window.postMessage(Object.assign({{__mc:1}},m),'*'));'ok'");
     evaluate(web, &script, cx).await;
@@ -1740,16 +1732,23 @@ impl Draft {
                     .map_err(gone)?;
             }
         }
+        let target = match &request.action {
+            DraftAction::Click { reference } => Some(reference),
+            DraftAction::Type { reference, .. } => reference.as_ref(),
+            _ => None,
+        };
+        if let Some(reference) = target {
+            let known = this
+                .read_with(cx, |this, _| {
+                    this.elements.iter().any(|e| &e.reference == reference)
+                })
+                .map_err(gone)?;
+            if !known {
+                return Err("Element reference expired; inspect the draft again".into());
+            }
+        }
         match &request.action {
             DraftAction::Click { reference } => {
-                let known = this
-                    .read_with(cx, |this, _| {
-                        this.elements.iter().any(|e| &e.reference == reference)
-                    })
-                    .map_err(gone)?;
-                if !known {
-                    return Err("Element reference expired; inspect the draft again".into());
-                }
                 act(
                     &web,
                     serde_json::json!({"kind":"click","ref":reference}),
@@ -1757,10 +1756,14 @@ impl Draft {
                 )
                 .await?;
             }
-            DraftAction::Type { text, replace } => {
+            DraftAction::Type {
+                text,
+                replace,
+                reference,
+            } => {
                 act(
                     &web,
-                    serde_json::json!({"kind":"type","text":text,"replace":replace}),
+                    serde_json::json!({"kind":"type","text":text,"replace":replace,"ref":reference}),
                     cx,
                 )
                 .await?;
@@ -2237,7 +2240,10 @@ impl Draft {
                 });
             }
             if started.elapsed() > std::time::Duration::from_secs(10) {
-                let failure = this.read_with(cx, |this, _| this.host.failure()).ok().flatten();
+                let failure = this
+                    .read_with(cx, |this, _| this.host.failure())
+                    .ok()
+                    .flatten();
                 return Err(match failure {
                     Some(failure) => format!("The draft's page did not open: Chromium could not run it ({failure}) and WebKit did not take over in time. Try again."),
                     None => "The draft's page did not open in time. Its card may be out of sight while you wait for the person, who has to see it: ask them to scroll to it and try again.".into(),
@@ -2575,16 +2581,28 @@ mod tests {
         // No card ever paints it: the agent's lease alone asks for the page,
         // and this build ships no Chromium host, so the start fails.
         let lease = window
-            .update(cx, |_, window, cx| draft.update(cx, |draft, cx| draft.lease(window, cx)))
+            .update(cx, |_, window, cx| {
+                draft.update(cx, |draft, cx| draft.lease(window, cx))
+            })
             .unwrap();
         let waiting = |cx: &mut TestAppContext| {
             draft.read_with(cx, |draft, _| draft.host.leased_without_page())
         };
-        assert_eq!(waiting(cx), Some(window.into()), "the lease waits for a page");
-        assert!(draft.read_with(cx, |draft, _| draft.host.failure()).is_some());
+        assert_eq!(
+            waiting(cx),
+            Some(window.into()),
+            "the lease waits for a page"
+        );
+        assert!(
+            draft
+                .read_with(cx, |draft, _| draft.host.failure())
+                .is_some()
+        );
 
         window
-            .update(cx, |_, window, cx| draft.update(cx, |draft, cx| draft.keep_leased(window, cx)))
+            .update(cx, |_, window, cx| {
+                draft.update(cx, |draft, cx| draft.keep_leased(window, cx))
+            })
             .unwrap();
         assert_eq!(waiting(cx), None, "WebKit took the page");
         assert!(draft.read_with(cx, |draft, _| draft.host.standing_in()));

@@ -58,12 +58,7 @@ impl Shell {
         let _ = request.reply.send(result);
     }
 
-    pub(super) fn draft_named(
-        &self,
-        session: i64,
-        id: &str,
-        cx: &App,
-    ) -> Option<Entity<Draft>> {
+    pub(super) fn draft_named(&self, session: i64, id: &str, cx: &App) -> Option<Entity<Draft>> {
         self.drafts
             .get(&session)?
             .iter()
@@ -80,7 +75,9 @@ impl Shell {
         let session = request.session;
         let draft = match (&request.draft, &request.content) {
             (Some(id), _) => {
-                match self.draft_named(session, id, cx) {
+                // A retired page, or one not drawn since a restart, comes
+                // back from its saved file under the same id.
+                match self.reopen_draft(session, id, window, cx) {
                     Some(draft) => draft,
                     None => {
                         return Self::reply_draft(
@@ -331,9 +328,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_draft_lives_in_its_conversation_whether_or_not_it_is_open(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn a_draft_lives_in_its_conversation_whether_or_not_it_is_open(cx: &mut gpui::TestAppContext) {
         let (window, _, _) = crate::shell::tests::window(cx);
         window
             .update(cx, |shell, window, cx| {
@@ -366,8 +361,12 @@ mod tests {
                 assert!(!shell.workspace.right_panel_open);
 
                 // Trying again on that card with new content keeps one card.
-                let (retry, _answer) =
-                    request(open, Some("draft-1-abc".into()), html(), DraftAction::Snapshot);
+                let (retry, _answer) = request(
+                    open,
+                    Some("draft-1-abc".into()),
+                    html(),
+                    DraftAction::Snapshot,
+                );
                 shell.handle_draft_request(retry, window, cx);
                 assert_eq!(shell.drafts[&open].len(), 1);
 
@@ -427,7 +426,8 @@ mod tests {
                     .update(cx, |draft, cx| draft.page_reported(values, cx));
             })
             .unwrap();
-        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
         cx.run_until_parked();
         assert!(file.is_file(), "the draft is saved in its conversation");
 
@@ -446,8 +446,7 @@ mod tests {
                 assert!(draft::live(id, cx).is_some());
 
                 // Closed by the agent: no longer saved, so it stays closed.
-                let (close, _answer) =
-                    request(open, Some(id.into()), None, DraftAction::Close);
+                let (close, _answer) = request(open, Some(id.into()), None, DraftAction::Close);
                 shell.handle_draft_request(close, window, cx);
                 assert!(!file.exists());
                 assert!(shell.reopen_draft(open, id, window, cx).is_none());

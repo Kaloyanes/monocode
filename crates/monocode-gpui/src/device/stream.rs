@@ -6,7 +6,9 @@ use super::http;
 use monocode_core::device::{
     Platform,
     hub::{self, Endpoint},
-    protocol::{self, Button, Chunk, Message, Modifiers, Orientation, ParameterSets, Phase, ScreenConfig},
+    protocol::{
+        self, Button, Chunk, Message, Modifiers, Orientation, ParameterSets, Phase, ScreenConfig,
+    },
 };
 use std::{
     os::fd::AsRawFd,
@@ -69,7 +71,11 @@ impl Wake {
         }
         for fd in fds {
             unsafe {
-                libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK);
+                libc::fcntl(
+                    fd,
+                    libc::F_SETFL,
+                    libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+                );
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
         }
@@ -172,7 +178,13 @@ impl Drop for Stream {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
         self.shared.wake.ring();
-        for closer in self.shared.closers.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        for closer in self
+            .shared
+            .closers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
             closer.close();
         }
     }
@@ -296,6 +308,9 @@ fn ios_video(shared: &Shared, endpoint: &Endpoint, device: &str, sink: &dyn Sink
         &format!("/helper/{}/stream.avcc", hub::encode(device)),
     );
     let mut first = true;
+    // Set when the helper seems gone: attaches are remembered per hub run,
+    // and a helper that died needs starting again.
+    let mut reattach = false;
     while !shared.stopped() {
         if !first {
             shared.pause(Duration::from_secs(1));
@@ -304,14 +319,26 @@ fn ios_video(shared: &Shared, endpoint: &Endpoint, device: &str, sink: &dyn Sink
             }
         }
         first = false;
-        let (mut body, closer) =
-            match http::get(endpoint.port, &path, &endpoint.authorization(), VIDEO_SILENCE) {
-                Ok(opened) => opened,
-                Err(error) => {
-                    shared.emit(Event::Connecting(Some(format!("Video: {error}"))));
-                    continue;
-                }
-            };
+        if std::mem::take(&mut reattach) {
+            hub::forget_attached(device);
+            if let Err(error) = hub::attach(endpoint, device) {
+                shared.emit(Event::Connecting(Some(error)));
+                continue;
+            }
+        }
+        let (mut body, closer) = match http::get(
+            endpoint.port,
+            &path,
+            &endpoint.authorization(),
+            VIDEO_SILENCE,
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                shared.emit(Event::Connecting(Some(format!("Video: {error}"))));
+                reattach = true;
+                continue;
+            }
+        };
         shared
             .closers
             .lock()
@@ -368,6 +395,9 @@ fn ios_video(shared: &Shared, endpoint: &Endpoint, device: &str, sink: &dyn Sink
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|other| !other.same(&closer));
+        // Ending before any frame showed is a missing helper, not the
+        // reconnect that asks serve-sim for a keyframe.
+        reattach = !feed.streaming;
         if !shared.stopped() {
             shared.emit(Event::Connecting(Some(reason)));
         }
@@ -439,16 +469,20 @@ fn flush(socket: &mut Socket) -> Result<(), String> {
     Err("The device stopped reading input.".into())
 }
 
-/// serve-sim only accepts input and reports its screen once capture runs,
-/// and asking for the MJPEG stream is what reliably starts it.
+/// serve-sim only accepts input and reports its screen once capture runs.
+/// The video request starts it too, and admits input in about 0.1 s, so this
+/// is only for a retry: waiting on it first held input back half a second.
 fn prime_ios(endpoint: &Endpoint, device: &str) {
     let path = hub::vendor_path(
         Platform::Ios,
         &format!("/helper/{}/stream.mjpeg", hub::encode(device)),
     );
-    if let Ok((mut body, closer)) =
-        http::get(endpoint.port, &path, &endpoint.authorization(), Duration::from_secs(2))
-    {
+    if let Ok((mut body, closer)) = http::get(
+        endpoint.port,
+        &path,
+        &endpoint.authorization(),
+        Duration::from_secs(2),
+    ) {
         let mut buf = [0u8; 1024];
         let _ = std::io::Read::read(&mut body, &mut buf);
         closer.close();
@@ -464,9 +498,9 @@ fn ios_input(shared: &Shared, endpoint: &Endpoint, device: &str, inputs: &mpsc::
     while !shared.stopped() {
         if !first {
             shared.pause(Duration::from_secs(1));
+            prime_ios(endpoint, device);
         }
         first = false;
-        prime_ios(endpoint, device);
         if shared.stopped() {
             break;
         }
@@ -541,7 +575,9 @@ fn ios_input(shared: &Shared, endpoint: &Endpoint, device: &str, inputs: &mpsc::
 fn ios_messages(input: Input, screen: Option<&ScreenConfig>) -> Vec<Message> {
     match input {
         Input::Touch(phase, x, y) => vec![protocol::touch(Platform::Ios, screen, phase, x, y)],
-        Input::Button(button) => protocol::button(Platform::Ios, button).into_iter().collect(),
+        Input::Button(button) => protocol::button(Platform::Ios, button)
+            .into_iter()
+            .collect(),
         Input::Key {
             key,
             character,
@@ -560,7 +596,9 @@ fn ios_messages(input: Input, screen: Option<&ScreenConfig>) -> Vec<Message> {
             })
             .collect(),
         Input::Rotate => vec![protocol::orientation(
-            screen.map_or(Orientation::Portrait, |s| s.orientation).next(),
+            screen
+                .map_or(Orientation::Portrait, |s| s.orientation)
+                .next(),
         )],
     }
 }
@@ -572,7 +610,10 @@ fn android(
     inputs: &mpsc::Receiver<Input>,
     sink: &dyn Sink,
 ) {
-    let path = format!("/vendor/serve-emu/ws?device={}&frame-meta=1", hub::encode(device));
+    let path = format!(
+        "/vendor/serve-emu/ws?device={}&frame-meta=1",
+        hub::encode(device)
+    );
     let mut first = true;
     while !shared.stopped() {
         if !first {
@@ -619,7 +660,12 @@ fn android(
                         key,
                         character,
                         modifiers,
-                    } => protocol::key_press(Platform::Android, &key, character.as_deref(), modifiers),
+                    } => protocol::key_press(
+                        Platform::Android,
+                        &key,
+                        character.as_deref(),
+                        modifiers,
+                    ),
                     Input::Text(text) => protocol::text_messages(&text),
                     Input::Rotate => Vec::new(),
                 };
@@ -714,19 +760,37 @@ mod tests {
         let (shared, events) = shared();
         let sink = Recorder::default();
         let mut feed = Feed::new(&sink);
-        assert!(matches!(feed.frame(&shared, &[0, 0, 0, 1, 0x41], false), Fed::NeedKey));
+        assert!(matches!(
+            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
+            Fed::NeedKey
+        ));
         let sets = ParameterSets {
             sps: vec![vec![0x67]],
             pps: vec![vec![0x68]],
         };
         feed.configure(&shared, sets.clone()).unwrap();
         feed.configure(&shared, sets).unwrap();
-        assert!(matches!(feed.frame(&shared, &[0, 0, 0, 1, 0x41], false), Fed::NeedKey));
-        assert!(matches!(feed.frame(&shared, &[0, 0, 0, 1, 0x65], true), Fed::Shown));
-        assert!(matches!(feed.frame(&shared, &[0, 0, 0, 1, 0x41], false), Fed::Shown));
+        assert!(matches!(
+            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
+            Fed::NeedKey
+        ));
+        assert!(matches!(
+            feed.frame(&shared, &[0, 0, 0, 1, 0x65], true),
+            Fed::Shown
+        ));
+        assert!(matches!(
+            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
+            Fed::Shown
+        ));
         sink.fail.store(true, Ordering::Relaxed);
-        assert!(matches!(feed.frame(&shared, &[0, 0, 0, 1, 0x41], false), Fed::NeedKey));
-        assert!(matches!(feed.frame(&shared, &[0, 0, 0, 1, 0x41], false), Fed::NeedKey));
+        assert!(matches!(
+            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
+            Fed::NeedKey
+        ));
+        assert!(matches!(
+            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
+            Fed::NeedKey
+        ));
         let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
         assert_eq!(seen, [Event::Size(1206, 2622), Event::Streaming]);
         assert_eq!(sink.frames.lock().unwrap().len(), 3);

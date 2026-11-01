@@ -245,6 +245,8 @@ export type TurnItem =
       emojiOnly?: boolean;
       attachments?: number;
       compact?: boolean;
+      /** Another thread sent this message; `started` when it opened the thread. */
+      sender?: { id: number; title: string; harness: Harness; started: boolean };
     }
   | { type: "text"; id: string; text: string; streaming?: boolean }
   | {

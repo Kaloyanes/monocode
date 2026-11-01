@@ -24,34 +24,84 @@ fn tool(name: &str, input: Value, output: Value) -> Row {
 }
 
 #[test]
-#[ignore = "Requires Metal; writes child-thread UI screenshots using an in-memory fixture"]
+#[ignore = "Requires Metal; writes subagent UI screenshots using an in-memory fixture"]
 fn thread_ui_shots() {
     let directory = std::env::var("THREAD_UI_SHOTS")
         .unwrap_or_else(|_| "/private/tmp/monocode-thread-shots".into());
     std::fs::create_dir_all(&directory).unwrap();
     let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
-    let mut lead = store.create("claude", "/thread-ui-fixture").unwrap();
-    let mut child = store.create("codex", "/thread-ui-fixture").unwrap();
+    let cwd = "/thread-ui-fixture";
+    let mut lead = store.create("claude", cwd).unwrap();
+    let mut review = store.create("codex", cwd).unwrap();
+    let mut tests = store.create("claude", cwd).unwrap();
+    let mut thread = store.create("claude", cwd).unwrap();
     lead.title = "Review live thread ownership".into();
-    child.title = "Independent ownership review".into();
-    for session in [&mut lead, &mut child] {
+    review.title = "Ownership review".into();
+    tests.title = "Write the tests".into();
+    thread.title = "Refactor sidebar rows".into();
+    for session in [&mut lead, &mut review, &mut tests, &mut thread] {
         store.title(session.id, &session.title).unwrap();
         session.has_messages = true;
     }
-    let reply = "The child is owned by its lead. Cross-thread sends are rejected, and the composer remains locked after the lead finishes.";
     store.write_rows(lead.id,0,&[
-        row("user","Start a Codex thread to review ownership, then debate its findings."),
-        tool("thread_start",json!({"prompt":"Review child ownership","title":child.title,"harness":"codex"}),json!({"threadId":child.id,"harness":"codex","model":"gpt-6.1"})),
-        tool("thread_wait",json!({"threadId":child.id}),json!({"threadId":child.id,"status":"idle","reply":reply})),
-        tool("thread_send",json!({"threadId":child.id,"prompt":"Does the composer stay locked once I finish?"}),json!({"threadId":child.id,"accepted":true})),
-        row("assistant","The ownership checks hold, and the child stays read-only after this turn."),
+        row("user","Audit thread ownership. Start a Codex subagent for the review and one to write tests, and open a separate thread for the sidebar refactor so I can take it over."),
+        tool("thread_start",json!({"prompt":"Review child ownership in shell/threads.rs and report problems.","title":review.title,"harness":"codex"}),json!({"threadId":review.id,"harness":"codex","model":"gpt-6.1"})),
+        tool("thread_start",json!({"prompt":"Write tests for thread ownership.","title":tests.title}),json!({"threadId":tests.id,"harness":"claude","model":"claude-opus-5"})),
+        tool("new_thread",json!({"prompt":"Refactor the sidebar rows.","title":thread.title}),json!({"sessionId":thread.id})),
+        row("assistant","Two subagents report back to me here; the sidebar refactor is its own thread for you to continue."),
     ]).unwrap();
-    store.write_rows(child.id,0,&[
-        row("user","Review child ownership"),row("reasoning","Checking the bridge authorization and alternate send routes."),
-        row("assistant",reply),row("user","Does the composer stay locked once I finish?"),row("assistant","Yes. The persisted parent marker keeps the composer locked after completion and reopening."),
+    store.write_rows(review.id,0,&[
+        row("user","Review child ownership in shell/threads.rs and report problems."),
+        row("reasoning","Reading shell/threads.rs and app_commands.rs."),
+        row("assistant","Two problems so far: a stopped lead can still queue a send, and closing a child doesn't release its waiters. Checking the restart path next."),
     ]).unwrap();
-    store.save_started_link(child.id, lead.id).unwrap();
-    store.save_thread_parent(child.id, lead.id).unwrap();
+    store
+        .write_rows(
+            tests.id,
+            0,
+            &[
+                row("user", "Write tests for thread ownership."),
+                row(
+                    "assistant",
+                    "Added four tests covering ownership, stop and close.",
+                ),
+            ],
+        )
+        .unwrap();
+    store
+        .write_rows(
+            thread.id,
+            0,
+            &[
+                row("user", "Refactor the sidebar rows."),
+                row("assistant", "Started on the row layout."),
+            ],
+        )
+        .unwrap();
+    for (child, model) in [(&review, "gpt-6.1"), (&tests, "claude-opus-5")] {
+        store.save_started_link(child.id, lead.id).unwrap();
+        store.save_thread_parent(child.id, lead.id).unwrap();
+        store
+            .save_agent_settings(
+                child.id,
+                &Settings {
+                    model: Some(model.into()),
+                    turns: [(
+                        1,
+                        monocode_core::agent::TurnInfo {
+                            provider: child.provider.clone(),
+                            sender: Some(lead.id),
+                            ..Default::default()
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    // new_thread: started by the lead, but the user's own.
+    store.save_started_link(thread.id, lead.id).unwrap();
     store
         .save_agent_settings(
             lead.id,
@@ -61,21 +111,11 @@ fn thread_ui_shots() {
             },
         )
         .unwrap();
-    store
-        .save_agent_settings(
-            child.id,
-            &Settings {
-                model: Some("gpt-6.1".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
     let mut workspace = Workspace::default();
     workspace.add_project(&lead.cwd);
     workspace.open(lead.id);
     let saved = serde_json::to_string(&workspace).unwrap();
-    let lead_id = lead.id;
-    let child_id = child.id;
+    let (lead_id, review_id, tests_id, thread_id) = (lead.id, review.id, tests.id, thread.id);
     let store = Arc::new(Mutex::new(store));
     let mut cx = HeadlessAppContext::with_platform(
         Arc::new(gpui_apple::AppleTextSystem::new()),
@@ -95,8 +135,8 @@ fn thread_ui_shots() {
             cx.new(|cx| {
                 Shell::new(
                     store,
-                    vec![lead, child],
-                    "/thread-ui-fixture".into(),
+                    vec![lead, review, tests, thread],
+                    cwd.into(),
                     Some(saved),
                     cx,
                 )
@@ -105,13 +145,16 @@ fn thread_ui_shots() {
         .unwrap();
     window
         .update(&mut cx, |shell, _, cx| {
-            shell
-                .ensure_session(child_id, cx)
-                .unwrap()
-                .update(cx, |v, cx| v.load(cx));
-            shell.thread_session_changed(child_id, cx);
-            let transcript = shell.sessions[&lead_id].read(cx).transcript.clone();
-            transcript.update(cx, |t, cx| t.toggle_thread(child_id, 1, cx));
+            for id in [review_id, tests_id] {
+                shell
+                    .ensure_session(id, cx)
+                    .unwrap()
+                    .update(cx, |v, cx| v.load(cx));
+            }
+            // The review is still working; the tests are done.
+            shell.sessions[&review_id].update(cx, |v, _| v.busy = true);
+            shell.thread_session_changed(review_id, cx);
+            shell.thread_session_changed(tests_id, cx);
         })
         .unwrap();
     let shot = |cx: &mut HeadlessAppContext, name: &str| {
@@ -140,8 +183,24 @@ fn thread_ui_shots() {
     shot(&mut cx, "lead");
     window
         .update(&mut cx, |shell, window, cx| {
-            shell.open(child_id, window, cx)
+            shell.open(review_id, window, cx)
         })
         .unwrap();
-    shot(&mut cx, "child-finished");
+    shot(&mut cx, "subagent-open");
+    // Another chat in front: the lead's tree folds back to its summary.
+    window
+        .update(&mut cx, |shell, window, cx| {
+            shell.open(thread_id, window, cx)
+        })
+        .unwrap();
+    shot(&mut cx, "other-thread");
+    // Full two-line cards, the lead in front again.
+    window
+        .update(&mut cx, |shell, window, cx| {
+            shell.workspace.compact_session_cards = false;
+            shell.open(lead_id, window, cx);
+            shell.invalidate_chrome(cx);
+        })
+        .unwrap();
+    shot(&mut cx, "lead-full-cards");
 }

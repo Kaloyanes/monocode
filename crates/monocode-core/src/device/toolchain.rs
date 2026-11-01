@@ -125,7 +125,6 @@ pub struct Doctor {
     pub xcode: bool,
     pub android_sdk: Option<PathBuf>,
     pub ffmpeg: bool,
-    pub scrcpy: bool,
 }
 
 impl Doctor {
@@ -152,7 +151,6 @@ impl Doctor {
             xcode,
             android_sdk: android_sdk(),
             ffmpeg: which("ffmpeg").is_some(),
-            scrcpy: which("scrcpy").is_some(),
         }
     }
     /// Node 22.12 or newer, which agent-device asks for.
@@ -208,27 +206,41 @@ pub fn install(tool: Tool) -> Result<PathBuf, String> {
         .env("PATH", search_path())
         .current_dir(staging.path());
     crate::process::configure_child(&mut command);
-    let output = command.output().map_err(|e| format!("Could not run npm: {e}"))?;
+    let output = command
+        .output()
+        .map_err(|e| format!("Could not run npm: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.lines().rev().take(6).collect::<Vec<_>>();
         let detail = detail.into_iter().rev().collect::<Vec<_>>().join("\n");
-        return Err(format!("npm could not install {}.\n{detail}", tool.package()));
+        return Err(format!(
+            "npm could not install {}.\n{detail}",
+            tool.package()
+        ));
     }
     let mut staged = staging.path().join("node_modules").join(tool.package());
     for part in tool.entry() {
         staged.push(part);
     }
     if !staged.is_file() {
-        return Err(format!("{} installed without its entry point.", tool.package()));
+        return Err(format!(
+            "{} installed without its entry point.",
+            tool.package()
+        ));
     }
-    std::fs::write(staging.path().join(SENTINEL), format!("{}\n", tool.version()))
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        staging.path().join(SENTINEL),
+        format!("{}\n", tool.version()),
+    )
+    .map_err(|e| e.to_string())?;
     let staging = staging.keep();
     if let Err(error) = std::fs::rename(&staging, &final_dir) {
         let _ = std::fs::remove_dir_all(&staging);
         if !tool.installed() {
-            return Err(format!("Could not move {} into place: {error}", tool.package()));
+            return Err(format!(
+                "Could not move {} into place: {error}",
+                tool.package()
+            ));
         }
     }
     remove_other_versions(tool);
@@ -266,7 +278,9 @@ pub fn remove_all() -> Result<(), String> {
 /// user's Node.
 pub fn agent_launcher() -> Result<PathBuf, String> {
     if !Tool::AgentDevice.installed() {
-        return Err("agent-device is not installed. Turn on agent access in Settings › Devices.".into());
+        return Err(
+            "agent-device is not installed. Turn on agent access in Settings › Devices.".into(),
+        );
     }
     let node = node().ok_or("Node.js was not found.")?;
     let dir = root().join("bin");
@@ -314,8 +328,6 @@ mod tests {
     fn tools_live_under_their_pinned_version() {
         let entry = Tool::Hub.entry_path();
         assert!(entry.ends_with("node_modules/expo-device-hub/dist/server/cli.mjs"));
-        assert!(entry
-            .to_string_lossy()
-            .contains(Tool::Hub.version()));
+        assert!(entry.to_string_lossy().contains(Tool::Hub.version()));
     }
 }

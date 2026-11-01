@@ -375,7 +375,9 @@ final class TranscriptRowView: UIView, UIScrollViewDelegate {
       view.layer.cornerRadius = surface.radius
       view.layer.maskedCorners = surface.corners
       view.layer.borderColor = surface.border?.cgColor
-      view.layer.borderWidth = surface.border == nil ? 0 : 1 / (window?.screen.scale ?? 3)
+      view.layer.borderWidth =
+        surface.border == nil || surface.dashed ? 0 : 1 / (window?.screen.scale ?? 3)
+      dash(view, surface)
     }
     for index in model.surfaces.count..<surfaces.count { surfaces[index].isHidden = true }
     decoration.frame = bounds
@@ -633,6 +635,36 @@ final class TranscriptRowView: UIView, UIScrollViewDelegate {
       onHorizontalScroll?(group, horizontal.contentOffset.x)
     }
   }
+  /// A dashed outline for `surface`, kept on its view and hidden otherwise.
+  private func dash(_ view: UIView, _ surface: TranscriptSurface) {
+    let existing = view.layer.sublayers?.first { $0.name == "dash" } as? CAShapeLayer
+    guard surface.dashed, let color = surface.border else {
+      existing?.isHidden = true
+      return
+    }
+    let layer =
+      existing
+      ?? {
+        let layer = CAShapeLayer()
+        layer.name = "dash"
+        layer.fillColor = nil
+        layer.lineWidth = 1
+        layer.lineDashPattern = [4, 3]
+        view.layer.addSublayer(layer)
+        return layer
+      }()
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    layer.isHidden = false
+    layer.frame = view.bounds
+    layer.strokeColor = color.cgColor
+    layer.path =
+      UIBezierPath(
+        roundedRect: view.bounds.insetBy(dx: 0.5, dy: 0.5), cornerRadius: surface.radius
+      ).cgPath
+    CATransaction.commit()
+  }
+
   private func configureVisual(_ model: TranscriptRowModel) {
     guard model.kind == "visual" else {
       visualView?.removeFromSuperview()

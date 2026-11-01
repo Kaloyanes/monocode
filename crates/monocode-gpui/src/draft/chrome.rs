@@ -8,9 +8,9 @@ use super::{
     web::{Input, Load, Placement, fit},
 };
 use gpui::{
-    App, Bounds, ClipboardItem, ContentMask, CursorStyle, DispatchPhase, FocusHandle, KeyDownEvent, KeyUpEvent,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    RenderImage, ScrollWheelEvent, Task, Window, canvas, div, prelude::*, px,
+    App, Bounds, ClipboardItem, ContentMask, CursorStyle, DispatchPhase, FocusHandle, KeyDownEvent,
+    KeyUpEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, RenderImage, ScrollWheelEvent, Task, Window, canvas, div, prelude::*, px,
 };
 use serde_json::{Value, json};
 use std::{
@@ -96,8 +96,14 @@ impl Tab {
         host: &std::path::Path,
         html: bool,
         (width, height): (u32, u32),
-    ) -> Result<(Self, async_channel::Receiver<Value>, async_channel::Receiver<cdp::Frame>), String>
-    {
+    ) -> Result<
+        (
+            Self,
+            async_channel::Receiver<Value>,
+            async_channel::Receiver<cdp::Frame>,
+        ),
+        String,
+    > {
         let browser = Browser::shared(host)?;
         let id = browser.open_tab(width, height, DEVICE_SCALE).await?;
         let session = id.to_string();

@@ -40,6 +40,9 @@ pub(crate) struct Source<'a> {
     /// Approvals and questions the live chat waits on. Rows never record
     /// them, so they come from the conversation and end the latest turn.
     pub pending: &'a [Pending],
+    /// Threads that sent prompts here, by id: a prompt one of them sent
+    /// names it, as on desktop.
+    pub senders: &'a HashMap<i64, crate::transcript::threads::Sender>,
 }
 
 /// An approval or question waiting on the desktop.
@@ -238,6 +241,30 @@ fn user_items(rows: &[Row], run: Run, out: &mut Vec<Value>, by_row: &mut HashMap
     }
 }
 
+/// Names the thread that sent a prompt on its first bubble, and whether that
+/// prompt started this thread.
+fn mark_sender(source: &Source, run: Run, items: &mut [Value]) {
+    let Some((id, sender)) = info(source, run)
+        .and_then(|info| info.sender)
+        .and_then(|id| Some((id, source.senders.get(&id)?)))
+    else {
+        return;
+    };
+    let Some(Value::Object(item)) = items
+        .iter_mut()
+        .find(|item| item["type"] == "user" && item["shell"].is_null())
+    else {
+        return;
+    };
+    let started = !source.rows[..run.prompt]
+        .iter()
+        .any(|row| row.first && row.role == "user");
+    item.insert(
+        "sender".into(),
+        json!({"id": id, "title": sender.title.as_ref(), "harness": sender.provider, "started": started}),
+    );
+}
+
 /// Messages stacked one after another share the last one's time.
 fn compact(items: &mut [Value]) {
     for at in 1..items.len() {
@@ -280,7 +307,8 @@ fn notice(rows: &[Row], at: usize, end: usize) -> Option<Value> {
         }
         // The phone opens a draft's page itself, live with the desktop's.
         monocode_core::visual_bridge::DRAFT_ROLE => {
-            let card = serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(&text).ok()?;
+            let card =
+                serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(&text).ok()?;
             let title = Some(card.title)
                 .filter(|title| !title.is_empty())
                 .unwrap_or_else(|| "Draft".into());
@@ -293,11 +321,7 @@ fn notice(rows: &[Row], at: usize, end: usize) -> Option<Value> {
                     .filter(|document| document.validate().is_ok());
             let kept = document.as_ref().and_then(|document| {
                 let page = document.draft()?;
-                Some(format!(
-                    "{}{}",
-                    KEPT_DRAFT,
-                    page.file_name()?.to_str()?
-                ))
+                Some(format!("{}{}", KEPT_DRAFT, page.file_name()?.to_str()?))
             });
             let title = document
                 .map(|document| document.title)
@@ -471,6 +495,7 @@ fn agent_turn(source: &Source, turn: &Turn, live: bool) -> Value {
     let run = turn.runs[0];
     let mut items = Vec::new();
     user_items(rows, run, &mut items, &mut HashMap::new());
+    mark_sender(source, run, &mut items);
     let header_at = items.len();
 
     let tail = run.end == rows.len();
@@ -833,6 +858,7 @@ mod tests {
             waiting: None,
             mono: None,
             pending: &[],
+            senders: Box::leak(Box::default()),
         }
     }
     fn all(source: &Source) -> Vec<Value> {
@@ -896,8 +922,14 @@ mod tests {
                 monocode_core::visual_bridge::DRAFT_ROLE,
                 &serde_json::to_string(&card).unwrap(),
             ),
-            row(monocode_core::transcript::images::ROLE, &image(&png, "Kept pricing")),
-            row(monocode_core::transcript::images::ROLE, &image(&plain, "Screenshot")),
+            row(
+                monocode_core::transcript::images::ROLE,
+                &image(&png, "Kept pricing"),
+            ),
+            row(
+                monocode_core::transcript::images::ROLE,
+                &image(&plain, "Screenshot"),
+            ),
             row("assistant", "Ready"),
         ];
         let info = HashMap::new();
@@ -912,9 +944,12 @@ mod tests {
         // Nothing of the desktop's paths goes to the phone.
         assert!(!turns[0].to_string().contains(dir.to_str().unwrap()));
         // A plain image is still a line saying where to see it.
-        assert!(items
-            .iter()
-            .any(|i| i["type"] == "notice" && i["text"] == "Screenshot · Open on desktop to view"));
+        assert!(
+            items
+                .iter()
+                .any(|i| i["type"] == "notice"
+                    && i["text"] == "Screenshot · Open on desktop to view")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
     fn types(turn: &Value) -> Vec<&str> {
@@ -1153,5 +1188,45 @@ mod tests {
         let turn = &all(&live)[0];
         assert_eq!(types(turn), ["user", "header"]);
         assert_eq!(turn["items"][1]["label"], "Reading file…");
+    }
+    #[test]
+    fn only_prompts_another_thread_sent_name_their_sender_on_the_phone() {
+        let rows = vec![
+            row("user", "Review ownership"),
+            row("assistant", "Done"),
+            row("user", "Check restart"),
+            row("assistant", "Restored"),
+            row("user", "Thanks"),
+            row("assistant", "Sure"),
+        ];
+        let from_lead = |provider: &str| TurnInfo {
+            provider: provider.into(),
+            sender: Some(7),
+            ..Default::default()
+        };
+        // Receipts are keyed by the first row after each prompt.
+        let turns = HashMap::from([(1, from_lead("codex")), (3, from_lead("codex"))]);
+        let senders = HashMap::from([(
+            7,
+            crate::transcript::threads::Sender {
+                title: "Lead thread".into(),
+                provider: "claude".into(),
+            },
+        )]);
+        let built = all(&Source {
+            senders: &senders,
+            ..source(&rows, &turns, false)
+        });
+        let sender = |turn: usize| built[turn]["items"][0]["sender"].clone();
+        assert_eq!(
+            sender(0),
+            json!({"id":7,"title":"Lead thread","harness":"claude","started":true})
+        );
+        assert_eq!(sender(1)["started"], false, "a later message only sent it");
+        assert!(sender(2).is_null(), "the user's own message is unmarked");
+        assert!(
+            all(&source(&rows, &turns, false))[0]["items"][0]["sender"].is_null(),
+            "an unknown sender is not named"
+        );
     }
 }

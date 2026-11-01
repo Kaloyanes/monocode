@@ -197,6 +197,8 @@ fn run_turn_using(
             .and_then(|(_, info)| info.metrics?.total_cost_usd);
     }
     let mut usage_limit = None;
+    // Where the cards of drafts the agent never published begin.
+    let mut unpublished_start = None;
     let result = (|| {
         if let Some(reason) = locked(&store)?.edit_recovery_reason(summary.id)? {
             return Err(reason);
@@ -613,7 +615,7 @@ fn run_turn_using(
         if !raw_native_command && settings.operator_enabled {
             let cli = std::env::current_exe().map_err(|e| e.to_string())?;
             prompt = format!(
-                "You have MonoCode app access for this project. Use the CLI: {} app ACTION --json JSON. Supported actions: models.list {{}}, sessions.list {{}}, sessions.read {{sessionId}}, sessions.start {{prompt,harness?,model?,title?,draft?,reveal?}}, sessions.send/draft {{sessionId,prompt}}, sessions.stop {{sessionId}}, folders.list {{}}, folders.move {{sessionId,folderId?,newFolderName?}}, notes.list {{}}, notes.read {{id}}, notes.write {{id?,title,body}}, worktrees.list {{}}. Scope is this thread's project. App credentials are in the environment; never print them. Respect the user’s request and selected access policy.\n\n{prompt}",
+                "You have MonoCode app access for this project. Use the CLI: {} app ACTION --json JSON. Supported actions: models.list {{}}, sessions.list {{}}, sessions.read {{sessionId}}, sessions.start {{prompt,harness?,model?,title?,draft?,reveal?}} (opens a new top-level thread for the user; for a subagent that reports back, use thread_start), sessions.send/draft {{sessionId,prompt}}, sessions.stop {{sessionId}}, folders.list {{}}, folders.move {{sessionId,folderId?,newFolderName?}}, notes.list {{}}, notes.read {{id}}, notes.write {{id?,title,body}}, worktrees.list {{}}. Scope is this thread's project. App credentials are in the environment; never print them. Respect the user’s request and selected access policy.\n\n{prompt}",
                 shlex_quote(&cli.to_string_lossy())
             );
         }
@@ -1071,6 +1073,20 @@ fn run_turn_using(
                 publication_result
             })
         });
+        // A draft the agent never published still reaches the person: its
+        // card joins the conversation as the turn ends.
+        for card in visual_bridge
+            .as_ref()
+            .map(|bridge| bridge.unpublished())
+            .unwrap_or_default()
+        {
+            if let Ok(text) = serde_json::to_string(&card) {
+                let at = transcript.begin(monocode_core::visual_bridge::DRAFT_ROLE);
+                transcript.append(&text);
+                pending.changed(at);
+                unpublished_start.get_or_insert(at);
+            }
+        }
         if result.is_ok()
             && let Some(fingerprint) = &mono_fingerprint
         {
@@ -1125,7 +1141,7 @@ fn run_turn_using(
     let mut final_start = if result.is_err() {
         turn_start
     } else {
-        transcript.rows.len()
+        unpublished_start.unwrap_or(transcript.rows.len())
     };
     for (ix, row) in transcript.rows.iter_mut().enumerate().skip(turn_start) {
         if row.role != "tool" {

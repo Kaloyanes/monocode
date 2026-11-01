@@ -195,7 +195,8 @@ let s=document.getElementById('__mcmode');if(on&&!s){s=document.createElement('s
 if(on&&!hl){hl=ui('div',{position:'fixed',pointerEvents:'none',border:'2px solid var(--accent,#4da3f5)',borderRadius:'4px',background:'rgba(77,163,245,.12)',zIndex:'2147483645',display:'none'});document.documentElement.appendChild(hl)}};
 addEventListener('mousemove',e=>{if(!mode||pending||!hl)return;const t=e.target;if(!t||!t.closest||t.closest('[data-mc-ui]')||t===document.documentElement){hl.style.display='none';return}const r=t.getBoundingClientRect();css(hl,{display:'block',left:r.left+'px',top:r.top+'px',width:r.width+'px',height:r.height+'px'})},true);
 for(const type of ['pointerdown','mousedown','mouseup','click']){addEventListener(type,e=>{if(!mode||!e.target.closest||e.target.closest('[data-mc-ui]'))return;e.preventDefault();e.stopPropagation();if(type==='click'&&!pending)open(e)},true)}
-const refs=new Map();
+/* An element keeps its ref for as long as it is on the page, so the agent can act on several from one look. The prefix is per page load, so a ref from an earlier version never reaches a new element. */
+const refs=new Map(),refOf=new WeakMap(),load=(Math.random()*1296|0).toString(36);let nextRef=0;
 const rgba=c=>{const m=/rgba?\(([^)]+)\)/.exec(c);if(!m)return null;const p=m[1].split(/[ ,\/]+/).filter(Boolean).map(Number);return {r:p[0],g:p[1],b:p[2],a:p.length>3?p[3]:1}};
 const lum=c=>{const f=v=>{v/=255;return v<=.03928?v/12.92:Math.pow((v+.055)/1.055,2.4)};return .2126*f(c.r)+.7152*f(c.g)+.0722*f(c.b)};
 const base=()=>{const v=getComputedStyle(document.documentElement).getPropertyValue('--background').trim(),m=/^#([0-9a-f]{6})$/i.exec(v);return m?{r:parseInt(m[1].slice(0,2),16),g:parseInt(m[1].slice(2,4),16),b:parseInt(m[1].slice(4,6),16)}:{r:255,g:255,b:255}};
@@ -222,8 +223,9 @@ fire(el,'pointerover',PointerEvent,i);fire(el,'mouseover',MouseEvent,i);fire(el,
 fire(el,'pointerdown',PointerEvent,i);const go=fire(el,'mousedown',MouseEvent,i);
 if(go&&el.focus&&(el.isContentEditable||/^(TEXTAREA|SELECT)$/.test(el.tagName)||(el.tagName==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|color|file|image)$/.test(el.type))))el.focus({preventScroll:true});
 i.buttons=0;fire(el,'pointerup',PointerEvent,i);fire(el,'mouseup',MouseEvent,i);el.click()};
-const typing=(text,replace)=>{const el=document.activeElement;
-if(!el||el===document.body||el===document.documentElement)return 'Click an input before typing';
+const typing=(text,replace,ref)=>{if(ref!=null){const t=refs.get(ref);if(!t||!t.isConnected)return 'Element reference expired; inspect the draft again';if(document.activeElement!==t){t.scrollIntoView({block:'nearest',inline:'nearest'});if(t.focus)t.focus({preventScroll:true})}if(document.activeElement!==t&&!t.isContentEditable)return 'That element does not take typing'}
+const el=document.activeElement;
+if(!el||el===document.body||el===document.documentElement)return 'Pass the field\'s reference, or click an input before typing';
 const edit=(type,data,inputType)=>fire(el,type,InputEvent,{data,inputType});
 if(el.isContentEditable){if(replace)document.execCommand('selectAll');document.execCommand(text?'insertText':'delete',false,text||null);return ''}
 if(el.tagName==='SELECT'){const o=Array.from(el.options).find(o=>o.text.trim()===text||o.value===text);if(!o)return 'No option matches '+JSON.stringify(text);el.value=o.value;fire(el,'input',Event);fire(el,'change',Event);return ''}
@@ -243,13 +245,13 @@ if(typeof d.__mcComment==='boolean')setMode(d.__mcComment);
 if(d.__mcState&&typeof d.__mcState==='object'&&typeof window.__mcSet==='function')window.__mcSet(d.__mcState);
 if(d.__mcPin&&Number.isFinite(d.__mcPin.x)&&Number.isFinite(d.__mcPin.y)){pins++;pin({px:d.__mcPin.x,py:d.__mcPin.y,at:d.__mcPin.at},pins)}
 if(typeof d.__mcTheme==='string'){const s=document.getElementById('mc-theme');if(s){const k=document.createElement('style');k.textContent='*,*::before,*::after{transition:none!important}';document.head.appendChild(k);s.textContent=d.__mcTheme;getComputedStyle(document.body).color;setTimeout(()=>k.remove(),80)}}
-if(d.__mcAct){const a=d.__mcAct;let err='';try{if(a.kind==='click'){const el=refs.get(a.ref);if(!el||!el.isConnected)err='Element reference expired; inspect the draft again';else click(el)}else if(a.kind==='type')err=typing(String(a.text),!!a.replace);else if(a.kind==='set')err=typeof window.__mcSet==='function'?window.__mcSet(a.values)||'':'The page has no mc.state to set'}catch(x){err=String(x&&x.message||x)}
+if(d.__mcAct){const a=d.__mcAct;let err='';try{if(a.kind==='click'){const el=refs.get(a.ref);if(!el||!el.isConnected)err='Element reference expired; inspect the draft again';else click(el)}else if(a.kind==='type')err=typing(String(a.text),!!a.replace,a.ref);else if(a.kind==='set')err=typeof window.__mcSet==='function'?window.__mcSet(a.values)||'':'The page has no mc.state to set'}catch(x){err=String(x&&x.message||x)}
 post({k:'r',id:a.id,err})}
-if(typeof d.__mcInspect==='string'){refs.clear();
+if(typeof d.__mcInspect==='string'){for(const[k,el]of refs)if(!el.isConnected)refs.delete(k);
 const elements=[];for(const el of document.querySelectorAll('button,input:not([type=hidden]),select,textarea,a[href],summary,[role=button],[role=switch],[role=tab],[role=checkbox],[role=menuitem],[contenteditable=""],[contenteditable=true],[tabindex]:not([tabindex="-1"])')){
 const r=el.getBoundingClientRect(),style=getComputedStyle(el);if(r.width<=0||r.height<=0||style.visibility==='hidden'||style.display==='none'||el.disabled||el.closest('[data-mc-ui]'))continue;
 const name=el.getAttribute('aria-label')||(el.labels&&Array.from(el.labels).map(l=>l.textContent).join(' '))||el.textContent||el.placeholder||el.tagName;
-const ref=d.__mcInspect+'-'+elements.length;refs.set(ref,el);
+let ref=refOf.get(el);if(!ref){ref=load+'-'+(++nextRef);refOf.set(el,ref)}refs.set(ref,el);
 elements.push({ref,name:String(name).trim().replace(/\s+/g,' ').slice(0,160),role:el.getAttribute('role')||el.tagName.toLowerCase(),x:r.x,y:r.y,width:r.width,height:r.height,value:el.getAttribute('aria-checked')??el.getAttribute('aria-selected')??(typeof el.value==='string'?el.value:null)});if(elements.length>=128)break}
 metrics();post({k:'s',id:d.__mcInspect,elements,issues:audit(),text:(document.body.innerText||'').slice(0,8000),url:location.href,title:document.title})}});
 const outline=()=>{const out=[],y0=-document.documentElement.getBoundingClientRect().top;let seen=0;

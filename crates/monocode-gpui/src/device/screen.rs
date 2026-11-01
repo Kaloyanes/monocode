@@ -15,18 +15,25 @@ use crate::draft::{Overlay, Painted, mark_painted, track_overlay};
 use gpui::{Window, canvas, prelude::*};
 use monocode_core::device::protocol::{Modifiers, ParameterSets, Phase};
 use objc2::{
-    ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
-    runtime::AnyObject, sel,
+    ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    rc::Retained, runtime::AnyObject, sel,
 };
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventPhase, NSView, NSWindowOrderingMode};
 use objc2_av_foundation::{AVLayerVideoGravityResize, AVSampleBufferDisplayLayer};
-use objc2_core_foundation::{CFBoolean, CFDictionary, CFMutableDictionary, CFRetained, kCFBooleanTrue};
-use objc2_core_media::{
-    CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMVideoFormatDescriptionCreateFromH264ParameterSets,
-    CMVideoFormatDescriptionGetDimensions, kCMBlockBufferAssureMemoryNowFlag,
-    kCMSampleAttachmentKey_DisplayImmediately,
+use objc2_core_foundation::{
+    CFBoolean, CFDictionary, CFMutableDictionary, CFRetained, kCFBooleanTrue,
 };
-use objc2_core_video::CVPixelBuffer;
+use objc2_core_media::{
+    CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
+    CMVideoFormatDescriptionCreateFromH264ParameterSets, CMVideoFormatDescriptionGetDimensions,
+    kCMBlockBufferAssureMemoryNowFlag, kCMSampleAttachmentKey_DisplayImmediately,
+};
+use objc2_core_video::{
+    CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
+    CVPixelBufferGetWidth, kCVPixelBufferIOSurfacePropertiesKey,
+    kCVPixelBufferMetalCompatibilityKey, kCVPixelFormatType_32BGRA,
+    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
+};
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
@@ -82,7 +89,8 @@ impl Renderer {
         if !responds {
             return None;
         }
-        let buffer: *mut CVPixelBuffer = unsafe { msg_send![&*self.target, copyDisplayedPixelBuffer] };
+        let buffer: *mut CVPixelBuffer =
+            unsafe { msg_send![&*self.target, copyDisplayedPixelBuffer] };
         // A `copy` method returns a reference the caller owns.
         NonNull::new(buffer).map(|buffer| unsafe { CFRetained::from_raw(buffer) })
     }
@@ -114,7 +122,10 @@ impl Sink for Renderer {
         let format = unsafe { CFRetained::from_raw(format) };
         let dimensions = unsafe { CMVideoFormatDescriptionGetDimensions(&format) };
         *self.format.lock().unwrap_or_else(|e| e.into_inner()) = Some(format);
-        Ok((dimensions.width.max(1) as u32, dimensions.height.max(1) as u32))
+        Ok((
+            dimensions.width.max(1) as u32,
+            dimensions.height.max(1) as u32,
+        ))
     }
 
     fn frame(&self, avcc: &[u8]) -> bool {
@@ -122,7 +133,11 @@ impl Sink for Renderer {
         if status == STATUS_FAILED {
             return false;
         }
-        let format = self.format.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let format = self
+            .format
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let Some(format) = format else {
             return false;
         };
@@ -137,6 +152,81 @@ impl Sink for Renderer {
 
     fn flush(&self) {
         let _: () = unsafe { msg_send![&*self.target, flush] };
+    }
+}
+
+/// Whether GPUI's surface pipeline paints this pixel format; it asserts on
+/// any other.
+fn paintable(format: u32) -> bool {
+    format == kCVPixelFormatType_32BGRA || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+}
+
+#[link(name = "VideoToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn VTPixelTransferSessionCreate(allocator: *const c_void, session: *mut *mut c_void) -> i32;
+    fn VTPixelTransferSessionTransferImage(
+        session: *mut c_void,
+        source: *const CVPixelBuffer,
+        destination: *const CVPixelBuffer,
+    ) -> i32;
+    fn VTPixelTransferSessionInvalidate(session: *mut c_void);
+}
+
+unsafe extern "C" {
+    fn CFRelease(cf: *const c_void);
+}
+
+/// `frame` in a format GPUI can paint. The decoder hands back video-range
+/// YCbCr, which GPUI's surface shader does not take, so VideoToolbox
+/// converts it to BGRA using the frame's own colour matrix and range.
+fn paintable_frame(frame: CFRetained<CVPixelBuffer>) -> Option<CFRetained<CVPixelBuffer>> {
+    if paintable(CVPixelBufferGetPixelFormatType(&frame)) {
+        return Some(frame);
+    }
+    let (width, height) = (
+        CVPixelBufferGetWidth(&frame),
+        CVPixelBufferGetHeight(&frame),
+    );
+    // GPUI makes a Metal texture of it, which needs IOSurface backing.
+    let surface =
+        CFDictionary::<objc2_core_foundation::CFString, objc2_core_foundation::CFType>::empty();
+    let attributes = unsafe {
+        CFDictionary::<objc2_core_foundation::CFString, objc2_core_foundation::CFType>::from_slices(
+            &[
+                kCVPixelBufferIOSurfacePropertiesKey,
+                kCVPixelBufferMetalCompatibilityKey,
+            ],
+            &[surface.as_ref(), kCFBooleanTrue?.as_ref()],
+        )
+    };
+    let mut converted: *mut CVPixelBuffer = std::ptr::null_mut();
+    let status = unsafe {
+        CVPixelBufferCreate(
+            None,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            Some(attributes.as_opaque()),
+            NonNull::from(&mut converted),
+        )
+    };
+    // SAFETY: a `Create` function returns a reference the caller owns.
+    let converted = unsafe {
+        CFRetained::from_raw(NonNull::new(converted).filter(|_| status == kCVReturnSuccess)?)
+    };
+    unsafe {
+        let mut session: *mut c_void = std::ptr::null_mut();
+        if VTPixelTransferSessionCreate(std::ptr::null(), &mut session) != 0 || session.is_null() {
+            return None;
+        }
+        let status = VTPixelTransferSessionTransferImage(
+            session,
+            CFRetained::as_ptr(&frame).as_ptr(),
+            CFRetained::as_ptr(&converted).as_ptr(),
+        );
+        VTPixelTransferSessionInvalidate(session);
+        CFRelease(session);
+        (status == 0).then_some(converted)
     }
 }
 
@@ -184,12 +274,16 @@ unsafe fn sample(format: &CMFormatDescription, data: &[u8]) -> Option<CFRetained
         if let Some(attachments) = sample.sample_attachments_array(true)
             && attachments.count() > 0
         {
-            let dictionary = attachments.value_at_index(0).cast::<CFDictionary>().cast_mut();
+            let dictionary = attachments
+                .value_at_index(0)
+                .cast::<CFDictionary>()
+                .cast_mut();
             let dictionary = dictionary.cast::<CFMutableDictionary>();
             if let (Some(dictionary), Some(yes)) = (dictionary.as_ref(), kCFBooleanTrue) {
                 CFMutableDictionary::set_value(
                     Some(dictionary),
-                    (kCMSampleAttachmentKey_DisplayImmediately as *const objc2_core_foundation::CFString)
+                    (kCMSampleAttachmentKey_DisplayImmediately
+                        as *const objc2_core_foundation::CFString)
                         .cast(),
                     (yes as *const CFBoolean).cast(),
                 );
@@ -283,7 +377,8 @@ fn clipboard_text() -> Option<String> {
         unsafe { msg_send![objc2::class!(NSPasteboard), generalPasteboard] };
     let text: Option<Retained<objc2_foundation::NSString>> =
         unsafe { msg_send![&*board?, stringForType: &*kind] };
-    text.map(|text| text.to_string()).filter(|text| !text.is_empty())
+    text.map(|text| text.to_string())
+        .filter(|text| !text.is_empty())
 }
 
 impl ScreenView {
@@ -311,7 +406,9 @@ impl ScreenView {
         let phase = event.phase();
         let bounds = self.bounds();
         let state = &self.ivars().scroll;
-        if phase.contains(NSEventPhase::Began) || (state.get().is_none() && phase.contains(NSEventPhase::Changed)) {
+        if phase.contains(NSEventPhase::Began)
+            || (state.get().is_none() && phase.contains(NSEventPhase::Changed))
+        {
             let start = self.point(event);
             state.set(Some(start));
             self.send(Input::Touch(Phase::Begin, start.0, start.1));
@@ -383,6 +480,9 @@ pub(crate) struct Screen {
     /// Frame and corner radius as last applied, so an unchanged paint
     /// touches nothing native.
     placed: Cell<[f64; 5]>,
+    /// The frame painted in the view's place while something covers it,
+    /// taken once when the cover starts.
+    still: RefCell<Option<CFRetained<CVPixelBuffer>>>,
 }
 
 impl Overlay for Screen {
@@ -414,6 +514,7 @@ impl Screen {
             renderer,
             painted: Default::default(),
             placed: Cell::new([f64::NAN; 5]),
+            still: RefCell::new(None),
         });
         let overlay: Rc<dyn Overlay> = screen.clone();
         track_overlay(&overlay, &screen.painted);
@@ -427,6 +528,7 @@ impl Screen {
     }
     /// Clears the picture, as when the device changes.
     pub(crate) fn clear(&self) {
+        self.still.take();
         #[allow(deprecated)]
         unsafe {
             self.renderer.layer.flushAndRemoveImage();
@@ -449,7 +551,10 @@ impl Screen {
         canvas(
             move |bounds, window, _| {
                 let fitted = fit(bounds, aspect);
-                (fitted, window.insert_hitbox(fitted, gpui::HitboxBehavior::Normal))
+                (
+                    fitted,
+                    window.insert_hitbox(fitted, gpui::HitboxBehavior::Normal),
+                )
             },
             move |_, (fitted, hitbox), window, _| {
                 #[cfg(debug_assertions)]
@@ -458,15 +563,21 @@ impl Screen {
                 window.paint_quad(gpui::fill(fitted, backdrop).corner_radii(gpui::px(corner)));
                 if !live {
                     screen.step_aside();
+                    screen.still.take();
                     return;
                 }
                 if window.is_hitbox_covered(&hitbox) {
                     screen.step_aside();
-                    if let Some(still) = screen.renderer.displayed() {
+                    let mut still = screen.still.borrow_mut();
+                    if still.is_none() {
+                        *still = screen.renderer.displayed().and_then(paintable_frame);
+                    }
+                    if let Some(still) = still.clone() {
                         window.paint_surface(fitted, still);
                     }
                     return;
                 }
+                screen.still.take();
                 screen.place(fitted, corner, window);
             },
         )
@@ -552,6 +663,92 @@ impl Drop for Screen {
 }
 
 #[cfg(test)]
+mod still_tests {
+    use super::*;
+    use objc2_core_foundation::{CFString, CFType};
+    use objc2_core_video::{
+        CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+        CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetIOSurface,
+        CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    };
+
+    /// A frame like the decoder's: video-range YCbCr, IOSurface-backed,
+    /// filled with one luma and chroma value.
+    fn video_range_frame(luma: u8, chroma: u8) -> CFRetained<CVPixelBuffer> {
+        let attributes = CFDictionary::<CFString, CFType>::from_slices(
+            &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }],
+            &[CFDictionary::<CFString, CFType>::empty().as_ref()],
+        );
+        let mut frame: *mut CVPixelBuffer = std::ptr::null_mut();
+        let status = unsafe {
+            CVPixelBufferCreate(
+                None,
+                64,
+                128,
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                Some(attributes.as_opaque()),
+                NonNull::from(&mut frame),
+            )
+        };
+        assert_eq!(status, kCVReturnSuccess);
+        let frame = unsafe { CFRetained::from_raw(NonNull::new(frame).unwrap()) };
+        unsafe {
+            CVPixelBufferLockBaseAddress(&frame, CVPixelBufferLockFlags::empty());
+            for (plane, rows, value) in [(0, 128, luma), (1, 64, chroma)] {
+                let base = CVPixelBufferGetBaseAddressOfPlane(&frame, plane).cast::<u8>();
+                let row = CVPixelBufferGetBytesPerRowOfPlane(&frame, plane);
+                std::ptr::write_bytes(base, value, row * rows);
+            }
+            CVPixelBufferUnlockBaseAddress(&frame, CVPixelBufferLockFlags::empty());
+        }
+        frame
+    }
+
+    fn first_pixel(frame: &CVPixelBuffer) -> [u8; 4] {
+        unsafe {
+            CVPixelBufferLockBaseAddress(frame, CVPixelBufferLockFlags::ReadOnly);
+            let base = CVPixelBufferGetBaseAddress(frame).cast::<u8>();
+            let row = CVPixelBufferGetBytesPerRow(frame);
+            let middle = base.add(row * 64 + 32 * 4);
+            let pixel = [*middle, *middle.add(1), *middle.add(2), *middle.add(3)];
+            CVPixelBufferUnlockBaseAddress(frame, CVPixelBufferLockFlags::ReadOnly);
+            pixel
+        }
+    }
+
+    #[test]
+    fn decoder_frames_become_bgra_gpui_can_paint() {
+        let frame = video_range_frame(235, 128);
+        assert!(!paintable(CVPixelBufferGetPixelFormatType(&frame)));
+        let still = paintable_frame(frame).expect("converted");
+        assert_eq!(
+            CVPixelBufferGetPixelFormatType(&still),
+            kCVPixelFormatType_32BGRA
+        );
+        assert_eq!(
+            (
+                CVPixelBufferGetWidth(&still),
+                CVPixelBufferGetHeight(&still)
+            ),
+            (64, 128)
+        );
+        // GPUI makes a Metal texture of it, which needs an IOSurface.
+        assert!(CVPixelBufferGetIOSurface(Some(&still)).is_some());
+        // Video-range white is white, not the grey a full-range reading gives.
+        let [b, g, r, a] = first_pixel(&still);
+        assert!(
+            b >= 250 && g >= 250 && r >= 250 && a == 255,
+            "{:?}",
+            [b, g, r, a]
+        );
+        // Video-range black is black.
+        let [b, g, r, _] = first_pixel(&paintable_frame(video_range_frame(16, 128)).unwrap());
+        assert!(b <= 3 && g <= 3 && r <= 3, "{:?}", [b, g, r]);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::device::stream::{self, Event};
@@ -609,8 +806,12 @@ mod tests {
     #[ignore = "runs the real Device Hub against a booted simulator"]
     fn live_stream_reaches_the_video_layer() {
         device::set_enabled(true, false);
+        let stage = Instant::now();
         let endpoint = hub::ensure().expect("the hub starts");
+        eprintln!("timing: hub start {:?}", stage.elapsed());
+        let stage = Instant::now();
         let list = hub::list().expect("the hub lists devices");
+        eprintln!("timing: device list {:?}", stage.elapsed());
         let platform = match std::env::var("MONOCODE_DEVICE_PLATFORM").as_deref() {
             Ok("android") => Platform::Android,
             _ => Platform::Ios,
@@ -625,10 +826,17 @@ mod tests {
         if !target.booted {
             let booting = Instant::now();
             target.id = hub::boot(&target).expect("the device boots");
-            eprintln!("booted {} as {} in {:?}", target.name, target.id, booting.elapsed());
+            eprintln!(
+                "booted {} as {} in {:?}",
+                target.name,
+                target.id,
+                booting.elapsed()
+            );
         }
         if platform == Platform::Ios {
+            let stage = Instant::now();
             hub::attach(&endpoint, &target.id).expect("the simulator attaches");
+            eprintln!("timing: attach {:?}", stage.elapsed());
         }
         let path = std::env::var_os("MONOCODE_DEVICE_CAPTURE")
             .map(std::path::PathBuf::from)
@@ -665,17 +873,47 @@ mod tests {
         assert!(first_frame.is_some(), "a frame arrives");
         assert!(input.is_some(), "input is admitted");
         // Go home, then swipe between its pages so the picture keeps changing.
-        live.send(stream::Input::Button(monocode_core::device::protocol::Button::Home));
+        live.send(stream::Input::Button(
+            monocode_core::device::protocol::Button::Home,
+        ));
         std::thread::sleep(Duration::from_millis(1500));
         let before = sink.frames.load(Ordering::Relaxed);
         let window = Instant::now();
+        let mut latencies = Vec::new();
         for round in 0..4 {
-            let (from, to) = if round % 2 == 0 { (0.85, 0.15) } else { (0.15, 0.85) };
+            let (from, to) = if round % 2 == 0 {
+                (0.85, 0.15)
+            } else {
+                (0.15, 0.85)
+            };
             live.send(stream::Input::Touch(Phase::Begin, from, 0.5));
             for step in 1..=12 {
                 let x = from + (to - from) * step as f64 / 12.;
                 std::thread::sleep(Duration::from_millis(16));
+                let sent = Instant::now();
                 live.send(stream::Input::Touch(Phase::Move, x, 0.5));
+                if step == 1 {
+                    // The screen was still; the first frame after the first
+                    // move is the touch reaching the picture.
+                    let deadline = sent + Duration::from_millis(1000);
+                    loop {
+                        let after = sink
+                            .times
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|t| **t > sent)
+                            .copied();
+                        if let Some(at) = after {
+                            latencies.push(at.duration_since(sent).as_secs_f64() * 1000.);
+                            break;
+                        }
+                        if Instant::now() > deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
             }
             live.send(stream::Input::Touch(Phase::End, to, 0.5));
             std::thread::sleep(Duration::from_millis(600));
@@ -685,12 +923,81 @@ mod tests {
         let times = sink.times.lock().unwrap().clone();
         let peak = times
             .iter()
-            .map(|start| times.iter().filter(|t| **t >= *start && t.duration_since(*start) < Duration::from_millis(250)).count())
+            .map(|start| {
+                times
+                    .iter()
+                    .filter(|t| {
+                        **t >= *start && t.duration_since(*start) < Duration::from_millis(250)
+                    })
+                    .count()
+            })
             .max()
             .unwrap_or(0);
-        let gaps: Vec<f64> = times.windows(2).map(|w| w[1].duration_since(w[0]).as_secs_f64() * 1000.).filter(|gap| *gap < 100.).collect();
+        let gaps: Vec<f64> = times
+            .windows(2)
+            .map(|w| w[1].duration_since(w[0]).as_secs_f64() * 1000.)
+            .filter(|gap| *gap < 100.)
+            .collect();
         let mean_gap = gaps.iter().sum::<f64>() / gaps.len().max(1) as f64;
-        eprintln!("peak {} fps over 250 ms; mean gap between consecutive frames while moving {mean_gap:.1} ms", peak * 4);
+        eprintln!(
+            "peak {} fps over 250 ms; mean gap between consecutive frames while moving {mean_gap:.1} ms",
+            peak * 4
+        );
+        // A finger held down and moved every 4 ms for 3 s: the screen changes
+        // on every frame the device draws, so this is the pipeline's ceiling.
+        if std::env::var_os("MONOCODE_DEVICE_DRAG").is_some() {
+            let begin = Instant::now();
+            live.send(stream::Input::Touch(Phase::Begin, 0.5, 0.5));
+            let mut x: f64 = 0.5;
+            let mut dir = -1.0;
+            while begin.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(4));
+                x += dir * 0.006;
+                if !(0.2..=0.8).contains(&x) {
+                    dir = -dir;
+                }
+                live.send(stream::Input::Touch(Phase::Move, x, 0.5));
+            }
+            live.send(stream::Input::Touch(Phase::End, x, 0.5));
+            let drag: Vec<Instant> = sink
+                .times
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|t| {
+                    *t > begin + Duration::from_millis(300) && *t < begin + Duration::from_secs(3)
+                })
+                .collect();
+            let gaps: Vec<f64> = drag
+                .windows(2)
+                .map(|w| w[1].duration_since(w[0]).as_secs_f64() * 1000.)
+                .collect();
+            let mut sorted = gaps.clone();
+            sorted.sort_by(f64::total_cmp);
+            let stalls: Vec<String> = drag
+                .windows(2)
+                .filter(|w| w[1].duration_since(w[0]) > Duration::from_millis(50))
+                .map(|w| {
+                    format!(
+                        "{:.0}ms@{:.2}s",
+                        w[1].duration_since(w[0]).as_secs_f64() * 1000.,
+                        w[0].duration_since(begin).as_secs_f64()
+                    )
+                })
+                .collect();
+            eprintln!("drag stalls: {stalls:?}");
+            eprintln!(
+                "drag: {} frames in 2.7 s = {:.0} fps; gap median {:.1} p90 {:.1} max {:.1} ms",
+                drag.len(),
+                drag.len() as f64 / 2.7,
+                sorted.get(sorted.len() / 2).copied().unwrap_or(0.),
+                sorted.get(sorted.len() * 9 / 10).copied().unwrap_or(0.),
+                sorted.last().copied().unwrap_or(0.)
+            );
+        }
+        latencies.sort_by(f64::total_cmp);
+        eprintln!("timing: touch to new frame (ms) {latencies:.0?}");
         let frames = sink.frames.load(Ordering::Relaxed) - before;
         drop(live);
         hub::stop();
@@ -702,7 +1009,11 @@ mod tests {
             path.display()
         );
         assert!(size.is_some(), "the picture has a size");
-        assert_eq!(sink.refused.load(Ordering::Relaxed), 0, "the layer takes every frame");
+        assert_eq!(
+            sink.refused.load(Ordering::Relaxed),
+            0,
+            "the layer takes every frame"
+        );
         assert!(frames > 30, "swiping streams frames");
     }
 }

@@ -343,6 +343,10 @@ fn thread_actions_validate_prompts_targets_and_bounded_waits() {
             "threads.start",
             json!({"prompt":"Review", "harness":"codex", "workspaceMode":"worktree"}),
         ),
+        (
+            "threads.new",
+            json!({"prompt":"Plan drafts", "title":"Drafts", "draft":true, "reveal":false}),
+        ),
         ("threads.send", json!({"threadId":7,"prompt":"Explain"})),
         ("threads.wait", json!({"threadId":7,"timeoutSeconds":50})),
         ("threads.wait", json!({"threadId":7,"timeoutSeconds":0})),
@@ -370,6 +374,10 @@ fn thread_actions_validate_prompts_targets_and_bounded_waits() {
             "threads.start",
             json!({"prompt":"x","runtimeMode":"full-access"}),
         ),
+        ("threads.new", json!({"prompt":" "})),
+        // A new thread is the user's own; it has no lead to place it beside.
+        ("threads.new", json!({"prompt":"x","placement":"right"})),
+        ("threads.start", json!({"prompt":"x","draft":true})),
         ("threads.send", json!({"threadId":0,"prompt":"x"})),
         ("threads.send", json!({"threadId":7})),
         ("threads.wait", json!({"threadId":7,"timeoutSeconds":51})),

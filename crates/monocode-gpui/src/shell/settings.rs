@@ -373,6 +373,14 @@ impl Shell {
             self.workspace.preferences.devices && cfg!(target_os = "macos"),
             self.workspace.preferences.device_agents,
         );
+        // Readies a device already running, once; never in tests, where it
+        // would start the real hub.
+        #[cfg(not(test))]
+        if monocode_core::device::enabled() {
+            cx.background_executor()
+                .spawn(async { monocode_core::device::hub::prewarm() })
+                .detach();
+        }
         self.sync_right_panel(cx);
         if let Some(center) = crate::accounts::get(cx) {
             center.update(cx, |center, cx| {

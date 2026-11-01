@@ -4,6 +4,94 @@ use monocode_core::tool::threads::ThreadRun;
 impl gpui::EventEmitter<crate::conversation::OpenThread> for TranscriptView {}
 impl gpui::EventEmitter<crate::conversation::CloseThreads> for TranscriptView {}
 
+/// Another thread, as the messages it sent here name it.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Sender {
+    pub(crate) title: SharedString,
+    pub(crate) provider: String,
+}
+
+impl TranscriptView {
+    /// The thread that sent the prompt at `start`, when another thread did.
+    pub(super) fn prompt_sender(&self, start: usize) -> Option<i64> {
+        // Receipts are keyed by the first row after the prompt block.
+        let turn = (start..self.source.len())
+            .find(|&at| !self.source[at].is_prompt())
+            .unwrap_or(self.source.len());
+        self.turns
+            .get(&turn)?
+            .sender
+            .filter(|id| self.senders.contains_key(id))
+    }
+    /// The line above another thread's message: its harness, its title,
+    /// which opens it, and whether it started this thread.
+    pub(super) fn sender_label(
+        &self,
+        start: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let id = self.prompt_sender(start)?;
+        let sender = self.senders.get(&id)?;
+        let opened = !self.source[..start]
+            .iter()
+            .any(|row| row.first && row.role == "user");
+        let title = sender.title.clone();
+        Some(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(COLUMN))
+                        .px_4()
+                        .pt_2()
+                        .flex()
+                        .when(self.chat_layout, |d| d.justify_end())
+                        .child(
+                            div()
+                                .debug_selector(move || format!("thread-sender-{start}"))
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(11.))
+                                .line_height(px(16.))
+                                .text_color(content(0.45))
+                                .child(provider_icon(&sender.provider, 14.).flex_shrink_0())
+                                .child(
+                                    div()
+                                        .id(("thread-sender", start))
+                                        .role(gpui::Role::Button)
+                                        .aria_label(format!("Open {title}"))
+                                        .min_w_0()
+                                        .truncate()
+                                        .cursor_pointer()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(content(0.8))
+                                        .hover(|s| s.text_color(content(1.)))
+                                        .child(title)
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.emit(crate::conversation::OpenThread(id))
+                                        })),
+                                )
+                                .child(div().flex_shrink_0().child(if opened {
+                                    if self.subagent {
+                                        "· started this subagent"
+                                    } else {
+                                        "· started this thread"
+                                    }
+                                } else {
+                                    "· message"
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 /// How a child thread reads in the spawn tree.
 #[derive(Clone, Copy, PartialEq)]
 enum Tone {
@@ -134,7 +222,9 @@ fn child(view: &TranscriptView, call: &ToolCall, run: &ThreadRun) -> Child {
     let harness = state
         .and_then(|v| v["harness"].as_str())
         .or(run.harness.as_deref())
-        .unwrap_or("codex")
+        .filter(|harness| !harness.is_empty())
+        // thread_start defaults to the lead's own harness.
+        .unwrap_or(&view.provider)
         .to_owned();
     let model = state
         .and_then(|v| v["model"].as_str())
@@ -479,4 +569,75 @@ pub(super) fn render(
                 }),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn row(role: &str, text: &str) -> Row {
+        Row {
+            role: role.into(),
+            text: text.into(),
+            first: true,
+            sent_at: None,
+        }
+    }
+
+    #[gpui::test]
+    fn only_prompts_another_thread_sent_name_their_sender(cx: &mut TestAppContext) {
+        let lead = 7;
+        let view = cx.new(|cx| {
+            let mut view = TranscriptView::new();
+            view.senders = [(
+                lead,
+                Sender {
+                    title: "Refactor provider lifecycle".into(),
+                    provider: "claude".into(),
+                },
+            )]
+            .into();
+            view.turns = [(
+                1,
+                monocode_core::agent::TurnInfo {
+                    sender: Some(lead),
+                    ..Default::default()
+                },
+            )]
+            .into();
+            view.restore_history(
+                vec![
+                    row("user", "Audit the parked paths"),
+                    row("assistant", "Three paths."),
+                    row("user", "Check restart too"),
+                    row("assistant", "Safe."),
+                ],
+                cx,
+            );
+            view
+        });
+        view.update(cx, |view, cx| {
+            assert_eq!(view.prompt_sender(0), Some(lead));
+            assert!(view.sender_label(0, cx).is_some());
+            assert_eq!(view.prompt_sender(2), None, "the user's own message");
+            assert!(view.sender_label(2, cx).is_none());
+
+            // A live turn the lead opened names it; a steer the user adds does not.
+            view.live_sender = Some(lead);
+            view.streaming(true, cx);
+            view.patch(
+                4,
+                vec![row("user", "Draft path 2"), row("assistant", "")],
+                cx,
+            );
+            assert_eq!(view.prompt_sender(4), Some(lead));
+            view.patch(6, vec![row("user", "Keep it small")], cx);
+            assert_eq!(view.prompt_sender(6), None);
+
+            // A sender this thread can't name is not shown.
+            view.senders.clear();
+            assert_eq!(view.prompt_sender(0), None);
+        });
+    }
 }

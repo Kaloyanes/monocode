@@ -278,6 +278,53 @@ fn github_auth_token() -> Option<String> {
     super::run_gh(&home, &["auth", "token"], false).ok()
 }
 
+const IMAGE_EXTENSIONS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
+
+/// Whether `url` names an image file on a host `fetch` may read, so a click can
+/// preview it in the app. The query (a `?token=` on private raw files) is ignored.
+pub fn is_image_url(url: &str) -> bool {
+    let Ok(parsed) = parse_allowed_media_url(url) else {
+        return false;
+    };
+    let extension = parsed
+        .path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    extension.is_some_and(|extension| IMAGE_EXTENSIONS.contains(&extension.as_str()))
+}
+
+/// The image at `url` at full resolution with its MIME type, for a zoomable
+/// preview. A stale `?token=` query is dropped on a second try, since the
+/// account's own credentials already cover private files.
+pub fn image_bytes(url: &str) -> Result<(Vec<u8>, &'static str), String> {
+    let bytes = match fetch(url) {
+        Ok(bytes) => bytes,
+        Err(error) => match url.split_once('?') {
+            Some((bare, _)) => fetch(bare).map_err(|_| error)?,
+            None => return Err(error),
+        },
+    };
+    let mime = image_mime(&bytes).ok_or_else(|| "That URL is not an image".to_string())?;
+    Ok((bytes, mime))
+}
+
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Png) => Some("image/png"),
+        Ok(image::ImageFormat::Jpeg) => Some("image/jpeg"),
+        Ok(image::ImageFormat::Gif) => Some("image/gif"),
+        Ok(image::ImageFormat::WebP) => Some("image/webp"),
+        Ok(image::ImageFormat::Bmp) => Some("image/bmp"),
+        _ => {
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]).to_ascii_lowercase();
+            (head.contains("<svg") || head.trim_start().starts_with("<?xml"))
+                .then_some("image/svg+xml")
+        }
+    }
+}
+
 /// Decode bounded image bytes before handing them to the native image cache.
 pub fn png(url: &str) -> Result<Vec<u8>, String> {
     let bytes = fetch(url)?;
@@ -332,6 +379,38 @@ mod tests {
         )
         .is_err());
         assert!(parse_allowed_media_url("https://127.0.0.1/shot.png").is_err());
+    }
+
+    #[test]
+    fn image_urls_need_an_allowed_host_and_an_image_extension() {
+        assert!(is_image_url(
+            "https://raw.githubusercontent.com/acme/web/issue-assets/img/pr-849/before.PNG?token=GHSAT0AAAA"
+        ));
+        assert!(is_image_url(
+            "https://github.com/acme/web/blob/main/a.webp?raw=true"
+        ));
+        assert!(is_image_url("https://uploads.linear.app/org/uuid/shot.jpg"));
+        assert!(!is_image_url(
+            "https://raw.githubusercontent.com/acme/web/main/README.md"
+        ));
+        assert!(!is_image_url("https://github.com/acme/web/pull/849"));
+        assert!(!is_image_url("https://evil.example/shot.png"));
+        assert!(!is_image_url(
+            "http://raw.githubusercontent.com/acme/web/main/a.png"
+        ));
+        assert!(!is_image_url(
+            "https://raw.githubusercontent.com/acme/web/main/png"
+        ));
+    }
+
+    #[test]
+    fn image_mime_is_sniffed_from_the_bytes() {
+        assert_eq!(image_mime(b"\x89PNG\r\n\x1a\n0000"), Some("image/png"));
+        assert_eq!(
+            image_mime(b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
+            Some("image/svg+xml")
+        );
+        assert_eq!(image_mime(b"<html></html>"), None);
     }
 
     #[test]

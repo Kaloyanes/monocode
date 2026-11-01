@@ -42,7 +42,8 @@ export default async function (pi) {
       parameters: schema(tool.inputSchema),
       async execute(_id, input, signal) {
         const { requestId = randomUUID(), ...args } = input;
-        const { stdout } = await execute(executable, ["app", tool.name.replace("thread_", "threads."), "--json", JSON.stringify(args), "--request-id", requestId], { signal, timeout: 65000, maxBuffer: 4194304 });
+        const action = tool.name === "new_thread" ? "threads.new" : tool.name.replace("thread_", "threads.");
+        const { stdout } = await execute(executable, ["app", action, "--json", JSON.stringify(args), "--request-id", requestId], { signal, timeout: 65000, maxBuffer: 4194304 });
         const result = JSON.parse(stdout);
         if (!result.ok) throw new Error(result.error ?? "Thread request failed");
         return { content: [{ type: "text", text: JSON.stringify(result.result) }], details: result.result };

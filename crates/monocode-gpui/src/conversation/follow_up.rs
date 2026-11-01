@@ -308,16 +308,14 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) -> Result<ComposerWrite, String> {
         if self.driven_by.is_some() {
-            return Err("This child thread is driven by its lead".into());
+            return Err("A subagent is driven by its lead".into());
         }
         // A save still waiting on the typing pause is the newer text.
         self.flush_composer_draft(cx);
         let id = self.summary.id;
-        if self
-            .composer_draft
-            .typed
-            .is_some_and(|at| cx.background_executor().now().saturating_duration_since(at) < PHONE_HOLD)
-        {
+        if self.composer_draft.typed.is_some_and(|at| {
+            cx.background_executor().now().saturating_duration_since(at) < PHONE_HOLD
+        }) {
             return locked(&self.store)?
                 .composer_text(id)
                 .map(ComposerWrite::Stale);
@@ -328,8 +326,7 @@ impl Conversation {
         {
             let typed = self.composer_draft.typed;
             let text = saved.text.clone();
-            self.input
-                .update(cx, |input, cx| input.set_text(text, cx));
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
             // Already in the store; this is not typing here.
             self.composer_draft.saved = self.composer_draft(cx);
             self.composer_draft.pending = None;
@@ -598,23 +595,29 @@ impl Conversation {
             .iter()
             .any(|(card, _)| card.read(cx).blocks_steering());
         let label = Kind::from_id(&self.summary.provider).label();
+        let steers =
+            self.steers_in_thread()
+                .into_iter()
+                .map(|m| crate::transcript::PendingMessage {
+                    id: m.id.clone(),
+                    text: m.text.clone().into(),
+                    error: None,
+                    sent_at: m.sent_at,
+                    attachments: m.attachments.clone(),
+                    caption: Some(
+                        if asking && self.follow_ups.requested.as_deref() != Some(m.id.as_str()) {
+                            "Sends after you answer the question".into()
+                        } else {
+                            format!("{label} reads this after its current step").into()
+                        },
+                    ),
+                });
+        // A message held for compaction was sent before any of the steers.
         let pending = self
-            .steers_in_thread()
+            .compacting_prompt
+            .clone()
             .into_iter()
-            .map(|m| crate::transcript::PendingMessage {
-                id: m.id.clone(),
-                text: m.text.clone().into(),
-                error: None,
-                sent_at: m.sent_at,
-                attachments: m.attachments.clone(),
-                caption: Some(
-                    if asking && self.follow_ups.requested.as_deref() != Some(m.id.as_str()) {
-                        "Sends after you answer the question".into()
-                    } else {
-                        format!("{label} reads this after its current step").into()
-                    },
-                ),
-            })
+            .chain(steers)
             .collect();
         self.transcript
             .update(cx, |t, cx| t.set_pending(pending, cx));
@@ -917,51 +920,214 @@ impl Conversation {
             .iter()
             .any(|m| m.error.is_some());
         let card = composer_shelf::card("message-queue-card", self.classic_layout)
-            .when(self.follow_ups.state.paused && !self.follow_ups.resuming, |d| d.child(
-                div().h(px(28.)).flex().items_center().gap_2().border_b_1().border_color(content(0.1))
-                    .child(icon("queue-pause", 14.))
-                    .child(div().flex_1().min_w_0().truncate().child(if failed { "A message couldn't be sent" } else { "Queue paused because you interrupted" }))
-                    .child(queue_button("queue-resume", if failed { "Retry queue" } else { "Resume queue" }, "queue-play").w_auto().px(px(6.)).gap(px(6.)).child(if failed { "Retry" } else { "Resume" }).on_click(cx.listener(|this, _, _, cx| this.resume_queue(cx))))
-            ))
-            .when_some(self.queue_waits_on(), |d, note| d.child(
-                div().id("queue-waiting").debug_selector(|| "queue-waiting".into()).role(Role::Status).h(px(28.)).flex().items_center().gap_2().border_b_1().border_color(content(0.1)).text_color(content(0.5))
-                    .child(icon("bot", 14.))
-                    .child(div().flex_1().min_w_0().truncate().child(note))
-            ))
+            .when(
+                self.follow_ups.state.paused && !self.follow_ups.resuming,
+                |d| {
+                    d.child(
+                        div()
+                            .h(px(28.))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(content(0.1))
+                            .child(icon("queue-pause", 14.))
+                            .child(div().flex_1().min_w_0().truncate().child(if failed {
+                                "A message couldn't be sent"
+                            } else {
+                                "Queue paused because you interrupted"
+                            }))
+                            .child(
+                                queue_button(
+                                    "queue-resume",
+                                    if failed {
+                                        "Retry queue"
+                                    } else {
+                                        "Resume queue"
+                                    },
+                                    "queue-play",
+                                )
+                                .w_auto()
+                                .px(px(6.))
+                                .gap(px(6.))
+                                .child(if failed { "Retry" } else { "Resume" })
+                                .on_click(cx.listener(|this, _, _, cx| this.resume_queue(cx))),
+                            ),
+                    )
+                },
+            )
+            .when_some(self.queue_waits_on(), |d, note| {
+                d.child(
+                    div()
+                        .id("queue-waiting")
+                        .debug_selector(|| "queue-waiting".into())
+                        .role(Role::Status)
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(content(0.1))
+                        .text_color(content(0.5))
+                        .child(icon("bot", 14.))
+                        .child(div().flex_1().min_w_0().truncate().child(note)),
+                )
+            })
             .children(messages.iter().enumerate().map(|(index, message)| {
                 let id = message.id.clone();
                 let editing = self.follow_ups.edit.as_ref().filter(|edit| edit.id == id);
                 let sending = self.follow_ups.sending.as_ref() == Some(&id);
-                div().id(SharedString::from(format!("queued-{id}"))).role(Role::Group).aria_label(format!("Queued message: {}", message.label())).min_h(px(32.)).flex().items_center().gap(px(10.)).when(index > 0, |d| d.border_t_1().border_color(content(0.05)))
+                div()
+                    .id(SharedString::from(format!("queued-{id}")))
+                    .role(Role::Group)
+                    .aria_label(format!("Queued message: {}", message.label()))
+                    .min_h(px(32.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .when(index > 0, |d| d.border_t_1().border_color(content(0.05)))
                     .child(icon("queue-list", 14.).text_color(content(0.35)))
-                    .map(|row| if let Some(edit) = editing {
-                        row.child(div().flex_1().min_w_0().px(px(6.)).py(px(2.)).rounded_md().border_1().border_color(content(0.3)).bg(content(0.05)).on_action(cx.listener(|this, _: &crate::shell::DismissMenu, window, cx| { this.finish_queue_edit(false, window, cx); cx.stop_propagation(); })).child(edit.input.clone()))
-                            .child(queue_button("queue-save", "Save queued message", "check").on_click(cx.listener(|this, _, window, cx| this.finish_queue_edit(true, window, cx))))
-                            .child(queue_button("queue-cancel", "Cancel queued message edit", "close").on_click(cx.listener(|this, _, window, cx| this.finish_queue_edit(false, window, cx))))
-                    } else {
-                        let (steer, edit, remove) = (id.clone(), id.clone(), id);
-                        row.children(queued_attachments(&message.id, &message.attachments)).child(div().flex_1().min_w_0().py_1().child(div().id("queued-message-text").role(Role::Label).aria_label(message.label()).truncate().text_color(content(0.75)).child(message.label())).when_some(message.error.clone(), |d, error| d.child(div().id("queue-error").role(Role::Alert).text_color(gpui::rgb(0xf87171)).child(error))))
-                            .when(Kind::from_id(&self.summary.provider).can_steer(), |d| d.child(queue_button("queue-steer", "Steer queued message", "queue-steer").w_auto().px_2().gap(px(6.)).opacity(if sending { 0.4 } else { 1. }).child("Steer").on_click(cx.listener(move |this, _, _, cx| {
-                                if !sending && let Some(message) = this.follow_ups.state.messages.iter_mut().find(|m| m.id == steer) {
-                                    if !message.can_steer() && this.busy { return; }
-                                    message.steer = true;
-                                    message.error = None;
-                                    this.follow_ups.requested = Some(steer.clone());
-                                    this.save_follow_ups(cx);
-                                }
-                            }))))
-                            .child(queue_button("queue-edit", "Edit queued message", "pencil-edit").opacity(if sending { 0.4 } else { 1. }).on_click(cx.listener(move |this, _, window, cx| { if !sending { this.edit_queued(edit.clone(), window, cx); } })))
-                            .child(queue_button("queue-remove", "Remove queued message", "trash").opacity(if sending { 0.4 } else { 1. }).on_click(cx.listener(move |this, _, _, cx| {
-                                if !sending {
-                                    this.follow_ups.state.messages.retain(|m| m.id != remove);
-                                    this.follow_ups.continuations.retain(|id| id != &remove);
-                                    if this.follow_ups.requested.as_ref() == Some(&remove) { this.follow_ups.requested = this.follow_ups.continuations.front().cloned(); }
-                                    this.unpause_empty_queue();
-                                    this.save_follow_ups(cx);
-                                }
-                            })))
+                    .map(|row| {
+                        if let Some(edit) = editing {
+                            row.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px(px(6.))
+                                    .py(px(2.))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(content(0.3))
+                                    .bg(content(0.05))
+                                    .on_action(cx.listener(
+                                        |this, _: &crate::shell::DismissMenu, window, cx| {
+                                            this.finish_queue_edit(false, window, cx);
+                                            cx.stop_propagation();
+                                        },
+                                    ))
+                                    .child(edit.input.clone()),
+                            )
+                            .child(
+                                queue_button("queue-save", "Save queued message", "check")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.finish_queue_edit(true, window, cx)
+                                    })),
+                            )
+                            .child(
+                                queue_button("queue-cancel", "Cancel queued message edit", "close")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.finish_queue_edit(false, window, cx)
+                                    })),
+                            )
+                        } else {
+                            let (steer, edit, remove) = (id.clone(), id.clone(), id);
+                            row.children(queued_attachments(&message.id, &message.attachments))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .py_1()
+                                        .child(
+                                            div()
+                                                .id("queued-message-text")
+                                                .role(Role::Label)
+                                                .aria_label(message.label())
+                                                .truncate()
+                                                .text_color(content(0.75))
+                                                .child(message.label()),
+                                        )
+                                        .when_some(message.error.clone(), |d, error| {
+                                            d.child(
+                                                div()
+                                                    .id("queue-error")
+                                                    .role(Role::Alert)
+                                                    .text_color(gpui::rgb(0xf87171))
+                                                    .child(error),
+                                            )
+                                        }),
+                                )
+                                .when(Kind::from_id(&self.summary.provider).can_steer(), |d| {
+                                    d.child(
+                                        queue_button(
+                                            "queue-steer",
+                                            "Steer queued message",
+                                            "queue-steer",
+                                        )
+                                        .w_auto()
+                                        .px_2()
+                                        .gap(px(6.))
+                                        .opacity(if sending { 0.4 } else { 1. })
+                                        .child("Steer")
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if !sending
+                                                    && let Some(message) = this
+                                                        .follow_ups
+                                                        .state
+                                                        .messages
+                                                        .iter_mut()
+                                                        .find(|m| m.id == steer)
+                                                {
+                                                    if !message.can_steer() && this.busy {
+                                                        return;
+                                                    }
+                                                    message.steer = true;
+                                                    message.error = None;
+                                                    this.follow_ups.requested = Some(steer.clone());
+                                                    this.save_follow_ups(cx);
+                                                }
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    queue_button(
+                                        "queue-edit",
+                                        "Edit queued message",
+                                        "pencil-edit",
+                                    )
+                                    .opacity(if sending { 0.4 } else { 1. })
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            if !sending {
+                                                this.edit_queued(edit.clone(), window, cx);
+                                            }
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    queue_button("queue-remove", "Remove queued message", "trash")
+                                        .opacity(if sending { 0.4 } else { 1. })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if !sending {
+                                                this.follow_ups
+                                                    .state
+                                                    .messages
+                                                    .retain(|m| m.id != remove);
+                                                this.follow_ups
+                                                    .continuations
+                                                    .retain(|id| id != &remove);
+                                                if this.follow_ups.requested.as_ref()
+                                                    == Some(&remove)
+                                                {
+                                                    this.follow_ups.requested = this
+                                                        .follow_ups
+                                                        .continuations
+                                                        .front()
+                                                        .cloned();
+                                                }
+                                                this.unpause_empty_queue();
+                                                this.save_follow_ups(cx);
+                                            }
+                                        })),
+                                )
+                        }
                     })
-                    .map(|row| self.follow_ups.motion.row(&message.id, row, row_width, window))
+                    .map(|row| {
+                        self.follow_ups
+                            .motion
+                            .row(&message.id, row, row_width, window)
+                    })
             }));
         composer_shelf::shelf("message-queue")
             .child(self.follow_ups.motion.card(card, card_width, window))

@@ -1,43 +1,35 @@
-//! Sidebar.tsx's rails: an orchestrator's agents (OrchestrationSidebarAgents,
-//! `tree`) and the sessions an /operator thread started hang off a line under
-//! its row. Each rail opens while its thread, or one of the thread's
-//! sessions, is in view, chosen or working, and RevealHeight grows it in.
+//! Session cards in the sidebar, and the summary a lead's row gives of its
+//! subagents. Subagents (threads a lead drives, and an Orchestrator's agents)
+//! are never rows of their own: while their lead is the focused chat they
+//! branch off its card on a curved tree, and open beside it. Threads another
+//! thread only opened are ordinary rows.
 use super::*;
-use crate::reveal::{Disclosure, bezier};
+use crate::reveal::bezier;
 use std::time::{Duration, Instant};
 
 /// RevealHeight's `reveal-height-in` and `reveal-height-out`.
 pub(super) const OPEN: Duration = Duration::from_millis(240);
 pub(super) const CLOSE: Duration = Duration::from_millis(180);
-/// As a rail opens its rows drop into place one after another, each a
-/// little after the row above.
-const CASCADE_STAGGER: Duration = Duration::from_millis(38);
-const CASCADE_MOVE: Duration = Duration::from_millis(220);
-const CASCADE_FADE: Duration = Duration::from_millis(160);
-const CASCADE_RISE: f32 = 5.;
-/// Rows further down share the last delay, so a long rail never trails.
-const CASCADE_RANK: u32 = 8;
-/// A working agent's dot breathes at this pace.
-const BREATHE: Duration = Duration::from_millis(1200);
 /// More agents than this show only the count on their lead.
 const PROGRESS_PILLS: usize = 8;
 /// A sidebar narrower than this shows only the count.
 const PROGRESS_PILLS_WIDTH: f32 = 300.;
+/// One subagent on the lead's tree.
+const TREE_ROW: f32 = 24.;
+/// Space between the lead's last line and its tree.
+const TREE_TOP: f32 = 4.;
+/// From the trunk to where a subagent's mark starts.
+const TREE_INDENT: f32 = 16.;
+/// The elbow's corner, as the card's own corners.
+const TREE_CURVE: f32 = 8.;
 
-fn cascade_length(rows: usize) -> Duration {
-    CASCADE_STAGGER * (rows.saturating_sub(1) as u32).min(CASCADE_RANK) + CASCADE_MOVE
-}
-
+/// Each lead's subagent tree, growing open while it is the focused chat.
 #[derive(Default)]
 pub(crate) struct Rails {
-    pub(super) motions: HashMap<i64, Motion>,
-    /// Agent rows opened to their details, by lead and task.
-    open_tasks: HashSet<(i64, usize)>,
-    /// This frame's /operator groups, and the sessions they took from the list.
-    pub(super) started: HashMap<i64, Vec<i64>>,
-    pub(super) children: HashSet<i64>,
+    motions: HashMap<i64, Motion>,
     frames: Option<gpui::Task<()>>,
 }
+
 #[derive(Clone, Copy)]
 pub(super) struct Motion {
     pub(super) open: bool,
@@ -60,59 +52,18 @@ impl Motion {
     pub(super) fn settled(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.start) >= if self.open { OPEN } else { CLOSE }
     }
-    /// Opening from shut, the rows cascade in. Closing, or turning back
-    /// midway, they simply follow the fold.
-    fn cascades(&self) -> bool {
-        self.open && self.from <= 0.
-    }
-    /// A row's opacity and how far above its slot it still is.
-    fn row(&self, ix: usize, now: Instant) -> (f32, f32) {
-        if !self.cascades() {
-            return (1., 0.);
-        }
-        let at = now
-            .saturating_duration_since(self.start)
-            .saturating_sub(CASCADE_STAGGER * (ix as u32).min(CASCADE_RANK))
-            .as_secs_f32();
-        let fade = (at / CASCADE_FADE.as_secs_f32()).min(1.);
-        let travel = bezier(
-            (at / CASCADE_MOVE.as_secs_f32()).min(1.),
-            0.33,
-            1.,
-            0.68,
-            1.,
-        );
-        (fade, CASCADE_RISE * (1. - travel))
-    }
 }
 
-/// Where an orchestrated agent stands, as its dot on the rail shows it.
+/// Where a subagent stands, as the lead's progress pills show it.
 struct Standing {
     tone: gpui::Hsla,
-    working: bool,
     alert: bool,
     done: bool,
-    needs_input: bool,
 }
 
-/// A status dot: still, or breathing while its agent works.
-fn status_dot(id: SharedString, tone: gpui::Hsla, working: bool) -> AnyElement {
-    let dot = move |alpha: f32| div().size(px(6.)).rounded_full().bg(tone).opacity(alpha);
-    if working {
-        crate::pulse::looping(id, BREATHE, crate::pulse::Rate::Smooth, move |phase| {
-            dot(0.35 + 0.65 * (0.5 + 0.5 * (phase * std::f32::consts::TAU).cos()))
-        })
-        .into_any_element()
-    } else {
-        dot(1.).into_any_element()
-    }
-}
-
-/// What hangs under a sidebar row.
+/// What a lead's sidebar row summarizes.
 pub(crate) enum Rail {
-    /// Sessions this /operator thread started, newest first.
-    Started(Vec<i64>),
-    /// This orchestrator's agents.
+    /// Its subagents: threads it drives, or its Orchestrator agents.
     Agents(monocode_core::orchestration::Summary),
 }
 
@@ -127,101 +78,237 @@ pub(super) fn step(last: bool, child: impl IntoElement) -> gpui::Div {
         .child(child)
 }
 
-/// A step whose status sits where its branch meets the row.
-fn status_step(last: bool, dot: AnyElement, child: impl IntoElement) -> gpui::Div {
-    step(last, child).child(
-        div()
-            .absolute()
-            .left(px(15.))
-            .top(px(13.))
-            .size(px(6.))
-            .child(dot),
-    )
-}
-
 impl Shell {
-    fn in_play(&self, id: i64, cx: &App) -> bool {
-        (self.workspace.active == Some(id) && !self.mono_active(cx))
-            || self.selected_sessions.contains(&id)
-            || self
-                .sessions
-                .get(&id)
-                .is_some_and(|s| s.read(cx).responding())
-    }
-    /// groupStartedSessions: each listed session another started joins the
-    /// listed session at the top of its chain; one whose caller is not listed
-    /// stays where it is.
-    pub(super) fn started_groups(&self, ids: &[i64]) -> (HashMap<i64, Vec<i64>>, HashSet<i64>) {
-        let listed: HashSet<i64> = ids.iter().copied().collect();
-        let caller = |id: i64| {
-            self.started_by
-                .get(&id)
-                .copied()
-                .filter(|p| listed.contains(p))
-        };
-        let mut groups: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut children = HashSet::new();
-        for &id in ids {
-            let Some(mut root) = caller(id) else {
-                continue;
-            };
-            let mut seen = HashSet::from([id]);
-            while let Some(up) = caller(root) {
-                if !seen.insert(root) {
-                    break;
-                }
-                root = up;
-            }
-            children.insert(id);
-            groups.entry(root).or_default().push(id);
-        }
-        (groups, children)
-    }
     /// Orchestrated workers live on their lead's rail, never in the list.
     pub(super) fn orchestration_worker(&self, id: i64) -> bool {
         self.orchestration_lead(id).is_some()
     }
-    /// The lead whose run a worker session belongs to.
+    /// The lead whose run a worker session belongs to. A thread another
+    /// started is a session of its own, even though its lead tracks it.
     pub(super) fn orchestration_lead(&self, id: i64) -> Option<i64> {
+        if self.thread_parents.contains_key(&id) {
+            return None;
+        }
         self.orchestration_summaries
             .iter()
             .find(|(_, s)| s.tasks.iter().any(|t| t.session == Some(id)))
             .map(|(lead, _)| *lead)
     }
-    fn rail(&self, id: i64, started: &HashMap<i64, Vec<i64>>) -> Option<Rail> {
-        if let Some(summary) = self.orchestration_summaries.get(&id)
-            && !summary.tasks.is_empty()
-        {
-            return Some(Rail::Agents(summary.clone()));
-        }
-        started
-            .get(&id)
-            .filter(|c| !c.is_empty())
-            .map(|c| Rail::Started(c.clone()))
+    /// The lead's orchestrated agents, without the threads it started.
+    /// What the lead's row summarizes: all of its subagents.
+    fn rail(&self, id: i64) -> Option<Rail> {
+        let summary = self.orchestration_summaries.get(&id)?;
+        (!summary.tasks.is_empty()).then(|| Rail::Agents(summary.clone()))
     }
-    fn rail_open(&self, id: i64, rail: &Rail, cx: &App) -> bool {
+    /// A lead shows its subagents while it, or one of them, is the chat in
+    /// front.
+    fn rail_open(&self, lead: i64, cx: &App) -> bool {
+        if self.mono_active(cx) || self.app_view_open() {
+            return false;
+        }
+        self.workspace
+            .active
+            .is_some_and(|active| active == lead || self.subagent_lead(active) == Some(lead))
+    }
+    /// Moves each lead's tree toward its open state. A tree the sidebar first
+    /// shows is simply there; later changes grow and fold.
+    pub(super) fn sync_rails(&mut self, ids: &[i64], cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let reduced = cx.reduce_motion();
+        let mut animating = false;
+        let mut seen = HashSet::new();
+        for &id in ids {
+            if self.rail(id).is_none() {
+                continue;
+            }
+            seen.insert(id);
+            let open = self.rail_open(id, cx);
+            match self.rails.motions.get(&id).copied() {
+                None => {
+                    self.rails.motions.insert(
+                        id,
+                        Motion {
+                            open,
+                            from: f32::from(open),
+                            start: now - OPEN,
+                        },
+                    );
+                }
+                Some(motion) if motion.open != open => {
+                    self.rails.motions.insert(
+                        id,
+                        Motion {
+                            open,
+                            from: if reduced {
+                                f32::from(open)
+                            } else {
+                                motion.value(now)
+                            },
+                            start: if reduced { now - OPEN } else { now },
+                        },
+                    );
+                }
+                _ => {}
+            }
+            animating |= !self.rails.motions[&id].settled(now);
+        }
+        self.rails.motions.retain(|id, _| seen.contains(id));
+        if animating && self.rails.frames.is_none() {
+            self.rails.frames = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.rails.frames = None;
+                    this.notify_sidebar(cx);
+                });
+            }));
+        }
+    }
+    /// How far the lead's tree is open, 0 to 1.
+    fn rail_progress(&self, lead: i64, cx: &App) -> f32 {
+        match self.rails.motions.get(&lead) {
+            Some(motion) => motion.value(Instant::now()),
+            None => f32::from(self.rail_open(lead, cx)),
+        }
+    }
+    /// The lead's subagents on a trunk under `trunk_x`, each branching off
+    /// on a curved elbow; the open share of its height, or nothing when shut.
+    pub(super) fn rail_tree(
+        &self,
+        lead: i64,
+        rail: Option<&Rail>,
+        trunk_x: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let Rail::Agents(summary) = rail?;
+        let progress = self.rail_progress(lead, cx);
+        if progress <= 0. {
+            return None;
+        }
+        use crate::conversation::subagents::{SubagentState, mark};
+        let line = content(0.16);
+        let count = summary.tasks.len();
+        let height = TREE_TOP + count as f32 * TREE_ROW;
+        let rows = summary.tasks.iter().enumerate().map(|(ix, task)| {
+            let needs_input = task.session.is_some_and(|s| {
+                self.sessions
+                    .get(&s)
+                    .is_some_and(|v| v.read(cx).needs_approval())
+            });
+            let state = SubagentState::of(&task.status, summary.live, needs_input);
+            let tone: gpui::Hsla = match state {
+                SubagentState::Working => accent_color(),
+                SubagentState::NeedsYou => rgb(0xfbbf24).into(),
+                SubagentState::Failed => rgb(0xf87171).into(),
+                SubagentState::Done => rgb(0x34d399).into(),
+                SubagentState::Waiting => content(0.45),
+            };
+            let first = ix == 0;
+            let last = ix + 1 == count;
+            // The first elbow reaches up to the lead's line through the gap.
+            let reach = if first { TREE_TOP } else { 0. };
+            let session = task.session;
+            div()
+                .id(("rail-subagent", ix))
+                .debug_selector(move || format!("rail-subagent-{lead}-{ix}"))
+                .relative()
+                .w_full()
+                .h(px(TREE_ROW))
+                .pl(px(trunk_x + TREE_INDENT))
+                .flex()
+                .items_center()
+                // The trunk carries on past every subagent but the last.
+                .when(!last, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left(px(trunk_x))
+                            .top(px(-reach))
+                            .bottom_0()
+                            .w(px(1.))
+                            .bg(line),
+                    )
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(trunk_x))
+                        .top(px(-reach))
+                        .w(px(TREE_INDENT - 4.))
+                        .h(px(reach + TREE_ROW / 2.))
+                        .border_l_1()
+                        .border_b_1()
+                        .border_color(line)
+                        .rounded_bl(px(TREE_CURVE)),
+                )
+                .child(
+                    div()
+                        .id(("rail-subagent-open", ix))
+                        .role(Role::Button)
+                        .aria_label(format!("Open subagent {}, {}", task.title, state.label()))
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(TREE_ROW))
+                        .px_1()
+                        .rounded(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(12.))
+                        .text_color(content(0.75))
+                        .when(session.is_some(), |d| {
+                            d.cursor_pointer()
+                                .hover(|s| s.bg(content(0.07)).text_color(content(1.)))
+                        })
+                        .child(mark(lead as usize * 64 + ix, state))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(task.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(tone)
+                                .child(state.label()),
+                        )
+                        // The lead's card must not take the press as its own.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .when_some(session, |d, session| {
+                            d.on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open(session, window, cx);
+                            }))
+                        }),
+                )
+        });
+        Some(
+            div()
+                .id(("rail-tree", lead as usize))
+                .debug_selector(move || format!("rail-tree-{lead}"))
+                .role(Role::Group)
+                .aria_label("Subagents")
+                .w_full()
+                .h(px(height * progress))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .opacity(progress)
+                .child(div().pt(px(TREE_TOP)).flex().flex_col().children(rows))
+                .into_any_element(),
+        )
+    }
+    /// The height the lead's tree takes now, for rows of a fixed height.
+    pub(super) fn rail_tree_height(&self, lead: i64, rail: Option<&Rail>, cx: &App) -> f32 {
         match rail {
-            // orchestrationExpanded: the lead in view, chosen or working.
-            Rail::Agents(summary) => {
-                self.in_play(id, cx)
-                    || summary
-                        .tasks
-                        .iter()
-                        .filter_map(|t| t.session)
-                        .any(|child| self.in_play(child, cx))
+            Some(Rail::Agents(summary)) => {
+                (TREE_TOP + summary.tasks.len() as f32 * TREE_ROW) * self.rail_progress(lead, cx)
             }
-            Rail::Started(children) => {
-                self.in_play(id, cx) || children.iter().any(|c| self.in_play(*c, cx))
-            }
+            None => 0.,
         }
-    }
-    /// The rail's motion while its rows cascade in.
-    fn cascade(&self, id: i64, cx: &App) -> Option<Motion> {
-        self.rails
-            .motions
-            .get(&id)
-            .copied()
-            .filter(|m| m.cascades() && !cx.reduce_motion())
     }
     fn standing(
         &self,
@@ -247,20 +334,7 @@ impl Shell {
         } else {
             content(0.45)
         };
-        Standing {
-            tone,
-            working,
-            alert,
-            done,
-            needs_input,
-        }
-    }
-    /// How long a worker spent on its turns: 45s, 14m.
-    fn run_time(&self, session: Option<i64>, cx: &App) -> Option<String> {
-        let view = self.sessions.get(&session?)?;
-        let stats =
-            monocode_core::context::SessionStats::from_turns(view.read(cx).settings.turns.values());
-        (stats.working_ms >= 1000).then(|| monocode_core::context::format_span(stats.working_ms))
+        Standing { tone, alert, done }
     }
     /// The lead's share of its agents that are done: a pill each, then 3/4.
     /// A compact row, or a narrow sidebar, shows only the count so the title
@@ -313,78 +387,6 @@ impl Shell {
             )
             .into_any_element()
     }
-    /// Moves each rail toward its open state. A rail the sidebar first shows
-    /// is simply there; later changes grow and fold.
-    pub(super) fn sync_rails(&mut self, ids: &[i64], cx: &mut Context<Self>) {
-        let (started, children) = if self.workspace.classic_layout {
-            // Original Sidebar.tsx leaves /operator launches in the list.
-            (HashMap::new(), HashSet::new())
-        } else {
-            self.started_groups(ids)
-        };
-        let now = Instant::now();
-        let mut animating = false;
-        let mut seen = HashSet::new();
-        for &id in ids {
-            let Some(rail) = self.rail(id, &started) else {
-                continue;
-            };
-            seen.insert(id);
-            let open = self.rail_open(id, &rail, cx);
-            let reduced = cx.reduce_motion();
-            match self.rails.motions.get(&id).copied() {
-                None => {
-                    self.rails.motions.insert(
-                        id,
-                        Motion {
-                            open,
-                            from: if open { 1. } else { 0. },
-                            start: now - OPEN,
-                        },
-                    );
-                }
-                Some(motion) if motion.open != open => {
-                    let from = if reduced {
-                        if open { 1. } else { 0. }
-                    } else {
-                        motion.value(now)
-                    };
-                    self.rails.motions.insert(
-                        id,
-                        Motion {
-                            open,
-                            from,
-                            start: if reduced { now - OPEN } else { now },
-                        },
-                    );
-                }
-                _ => {}
-            }
-            // A working agent's spinner keeps itself turning on the shared clock.
-            let motion = self.rails.motions[&id];
-            let rows = match &rail {
-                Rail::Started(children) => children.len(),
-                Rail::Agents(summary) => summary.tasks.len(),
-            };
-            animating |= !motion.settled(now)
-                || (motion.cascades()
-                    && now.saturating_duration_since(motion.start) < cascade_length(rows));
-        }
-        self.rails.motions.retain(|id, _| seen.contains(id));
-        self.rails.started = started;
-        self.rails.children = children;
-        if animating && self.rails.frames.is_none() {
-            self.rails.frames = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    this.rails.frames = None;
-                    this.notify_sidebar(cx);
-                });
-            }));
-        }
-    }
     /// A session row and, under it, whatever rail it has.
     pub(super) fn session_card(&self, id: i64, cx: &mut Context<Self>) -> AnyElement {
         self.session_card_at_depth(id, false, cx)
@@ -400,58 +402,11 @@ impl Shell {
         if self.workspace.classic_layout {
             return self.classic_session_card_at_depth(id, nested, false, cx);
         }
-        let Some(rail) = self.rail(id, &self.rails.started) else {
-            return if nested {
-                self.session_row_with(id, true, None, cx)
-            } else {
-                self.session_row(id, cx)
-            };
-        };
-        let now = Instant::now();
-        let progress = self.rails.motions.get(&id).map_or(0., |m| m.value(now));
-        let open = self.rails.motions.get(&id).is_some_and(|m| m.open);
-        let row = self.session_row_with(id, nested, Some((&rail, open)), cx);
-        if progress <= 0. {
-            return row;
+        let rail = self.rail(id);
+        if rail.is_none() && !nested {
+            return self.session_row(id, cx);
         }
-        let cascade = self.cascade(id, cx);
-        let body = match &rail {
-            Rail::Started(children) => div()
-                .pt_1()
-                .flex()
-                .flex_col()
-                .children(children.iter().enumerate().map(|(ix, child)| {
-                    let (opacity, rise) = cascade.map_or((1., 0.), |m| m.row(ix, now));
-                    step(
-                        ix + 1 == children.len(),
-                        self.session_row_with(*child, true, None, cx),
-                    )
-                    .top(px(-rise))
-                    .opacity(opacity)
-                }))
-                .into_any_element(),
-            Rail::Agents(summary) => self.agents(id, summary, cx),
-        };
-        // The rail drops from under the row's mark.
-        let width =
-            px((self.workspace.sidebar_width - 16. - 10. - if nested { 30. } else { 0. }).max(0.));
-        let body = div().ml(px(10.)).child(body);
-        div()
-            .flex()
-            .flex_col()
-            .child(row)
-            .child(if progress >= 1. {
-                body.into_any_element()
-            } else {
-                div()
-                    .ml(px(10.))
-                    // Cascading rows fade in on their own.
-                    .opacity(if cascade.is_some() { 1. } else { progress })
-                    .overflow_hidden()
-                    .child(Disclosure::new(body.ml(px(0.)), width, progress))
-                    .into_any_element()
-            })
-            .into_any_element()
+        self.session_row_with(id, nested, rail.as_ref(), cx)
     }
 
     /// The original sidebar uses the full, three-line SessionCard. Folder
@@ -464,21 +419,8 @@ impl Shell {
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rail = self
-            .rail(id, &self.rails.started)
-            .filter(|rail| matches!(rail, Rail::Agents(_)));
-        let open = self
-            .rails
-            .motions
-            .get(&id)
-            .is_some_and(|motion| motion.open);
-        self.classic_session_row_with(
-            id,
-            nested,
-            compact,
-            rail.as_ref().map(|rail| (rail, open)),
-            cx,
-        )
+        let rail = self.rail(id);
+        self.classic_session_row_with(id, nested, compact, rail.as_ref(), cx)
     }
 
     fn classic_session_row_with(
@@ -486,7 +428,7 @@ impl Shell {
         id: i64,
         nested: bool,
         compact: bool,
-        rail: Option<(&Rail, bool)>,
+        rail: Option<&Rail>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(row) = self.rename_row(&session_groups::RenameTarget::Session(id), cx) {
@@ -494,10 +436,6 @@ impl Shell {
         }
         let work_item = self.work_item_badge(id, false, cx);
         let origin = self.archived_origin_badge(id, cx);
-        let agents = match rail {
-            Some((Rail::Agents(summary), true)) => Some(self.agents(id, summary, cx)),
-            _ => None,
-        };
         let session = self.session_metadata(id, cx);
         let archived = session.summary.archived;
         let selected = self.selected_sessions.contains(&id);
@@ -505,17 +443,7 @@ impl Shell {
             self.workspace.active == Some(id) && !self.mono_active(cx) && !self.app_view_open();
         let draft = session.shows_draft();
         let approval = session.needs_approval();
-        let orchestration = matches!(rail, Some((Rail::Agents(_), true)));
-        let header = !compact || orchestration;
-        let started_in_view = match rail {
-            Some((Rail::Started(children), _)) => children.iter().any(|child| {
-                self.selected_sessions.contains(child)
-                    || (self.workspace.active == Some(*child)
-                        && !self.mono_active(cx)
-                        && !self.app_view_open())
-            }),
-            _ => false,
-        };
+        let header = !compact;
         let saved = self.session_details.get(&id);
         let (model, branch) = self
             .sessions
@@ -627,7 +555,7 @@ impl Shell {
                         )
                     }),
             )
-            .children(agents)
+            .children(self.started_from_line(id, cx).map(|line| line.mt_1()))
             .child(
                 div()
                     .mt_1()
@@ -674,17 +602,8 @@ impl Shell {
                                 self.automation_state.session_automations.contains_key(&id),
                                 |d| d.child(icon("zap", 12.).text_color(rgb(0xfbbf24))),
                             )
-                            .when_some(rail, |d, (rail, _)| {
-                                d.child(
-                                    icon(
-                                        match rail {
-                                            Rail::Agents(_) => "share",
-                                            Rail::Started(_) => "cursor-magic",
-                                        },
-                                        13.,
-                                    )
-                                    .text_color(content(0.5)),
-                                )
+                            .when(rail.is_some(), |d| {
+                                d.child(icon("share", 13.).text_color(content(0.5)))
                             }),
                     ),
             );
@@ -715,23 +634,13 @@ impl Shell {
             .rounded_md()
             .px(px(if nested { 6. } else { 10. }))
             .pt(px(if compact { 6. } else { 8. }))
-            .pb(px(if orchestration {
-                10.
-            } else if compact {
-                6.
-            } else {
-                8.
-            }))
+            .pb(px(if compact { 6. } else { 8. }))
             .flex()
             .flex_col()
             .text_color(content(0.8))
             .when(selected, |d| d.bg(selected_fill))
             .when(!selected && approval, |d| d.bg(content(0.2)))
             .when(!selected && !approval && active, |d| d.bg(content(0.1)))
-            .when(
-                !selected && !approval && !active && (started_in_view || orchestration),
-                |d| d.bg(content(0.05)),
-            )
             .when(draft || approval, |d| {
                 d.border_dashed()
                     .border_color(content(if active || selected || approval {
@@ -742,7 +651,7 @@ impl Shell {
             })
             .when(!selected && !approval && !active, |d| {
                 d.hover(|s| {
-                    let s = s.bg(content(if orchestration { 0.1 } else { 0.05 }));
+                    let s = s.bg(content(0.05));
                     if archived { s.opacity(0.9) } else { s }
                 })
             })
@@ -761,6 +670,7 @@ impl Shell {
             // Archived threads recede, and come back to full strength on hover.
             .when(archived, |d| d.opacity(0.55))
             .child(body)
+            .children(self.rail_tree(id, rail, 6., cx))
             .children(self.sidebar_drop_mark(id))
             .child(anchor.probe())
             .on_hover(cx.listener(move |this, hovered, window, cx| {
@@ -931,314 +841,6 @@ impl Shell {
                 .into_any_element()
         }
     }
-    /// OrchestrationSidebarAgents, `tree`.
-    fn agents(
-        &self,
-        lead: i64,
-        summary: &monocode_core::orchestration::Summary,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let classic = self.workspace.classic_layout;
-        let cascade = self.cascade(lead, cx).filter(|_| !classic);
-        let now = Instant::now();
-        div()
-            .when(!classic, |d| d.pt_1().pb_1())
-            .when(classic, |d| {
-                d.mt_1p5().child(
-                    div()
-                        .mb_0p5()
-                        .px_0p5()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .text_size(px(11.))
-                        .line_height(px(16.5))
-                        .text_color(content(0.45))
-                        .child(format!(
-                            "{} {}",
-                            summary.tasks.len(),
-                            if summary.tasks.len() == 1 {
-                                "agent"
-                            } else {
-                                "agents"
-                            }
-                        ))
-                        .child(format!(
-                            "{}/{} done",
-                            summary
-                                .tasks
-                                .iter()
-                                .filter(|task| task.status == "completed")
-                                .count(),
-                            summary.tasks.len()
-                        )),
-                )
-            })
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .when(classic, |d| d.mx(px(-8.)).gap_px())
-                    .children(summary.tasks.iter().enumerate().map(|(ix, task)| {
-                        let task_session = task.session;
-                        let Standing {
-                            tone,
-                            working,
-                            alert,
-                            done,
-                            needs_input,
-                        } = self.standing(summary, task, cx);
-                        let open = self.rails.open_tasks.contains(&(lead, ix)) || needs_input;
-                        let label = task.label(summary, needs_input);
-                        // The status rail: the dot says how it stands, the row
-                        // how long it ran, or what it needs.
-                        let run_time = (!classic && done && !alert)
-                            .then(|| self.run_time(task_session, cx))
-                            .flatten();
-                        let model = crate::pickers::model_name(
-                            Kind::from_id(&task.provider),
-                            task.model.as_deref(),
-                        )
-                        .to_string();
-                        let group: SharedString = format!("rail-agent-{lead}-{ix}").into();
-                        let header = div()
-                            .id(("rail-agent", (lead as usize) << 8 | ix))
-                            .debug_selector(move || format!("rail-agent-{lead}-{ix}"))
-                            .role(Role::Button)
-                            .aria_label(format!("Agent details: {}", task.title))
-                            .aria_expanded(open)
-                            .group(group.clone())
-                            .h(px(if classic { 28.5 } else { 28. }))
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .px(px(if classic { 8. } else { 6. }))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(open && !classic, |d| d.bg(content(0.1)))
-                            .when(!open, |d| d.hover(|s| s.bg(content(0.1))))
-                            .when(classic, |d| {
-                                d.child(
-                                    div()
-                                        .size(px(14.))
-                                        .flex_shrink_0()
-                                        .relative()
-                                        .opacity(0.75)
-                                        .child(
-                                            div()
-                                                .when(classic && open, |d| d.invisible())
-                                                .when(classic, |d| {
-                                                    d.group_hover(group.clone(), |s| s.invisible())
-                                                })
-                                                .child(provider_icon(&task.provider, 14.)),
-                                        )
-                                        .when(classic, |d| {
-                                            d.child(
-                                                div()
-                                                    .absolute()
-                                                    .top_0()
-                                                    .left_0()
-                                                    .size_full()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .invisible()
-                                                    .when(open, |d| d.visible())
-                                                    .group_hover(group.clone(), |s| s.visible())
-                                                    .child(
-                                                        icon(
-                                                            if open {
-                                                                "chevron-down"
-                                                            } else {
-                                                                "chevron-right"
-                                                            },
-                                                            12.,
-                                                        )
-                                                        .text_color(content(0.45)),
-                                                    ),
-                                            )
-                                        }),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_size(px(if classic { 12. } else { 13. }))
-                                    .when(classic, |d| d.line_height(px(16.5)))
-                                    .text_color(content(if classic {
-                                        0.8
-                                    } else if open {
-                                        1.
-                                    } else {
-                                        0.55
-                                    }))
-                                    .when(!classic && !open, |d| {
-                                        d.group_hover(group.clone(), |s| s.text_color(content(0.8)))
-                                    })
-                                    .child(task.title.clone()),
-                            )
-                            .when(!classic, |d| {
-                                d.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_size(px(11.))
-                                        .when_some(run_time, |d, time| {
-                                            d.text_color(content(0.4)).child(time)
-                                        })
-                                        .when(alert, |d| d.text_color(tone).child(label))
-                                        .when(!alert && !working && !done, |d| {
-                                            d.text_color(content(0.45)).child(label)
-                                        }),
-                                )
-                            })
-                            .when(classic, |d| {
-                                d.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_size(px(11.))
-                                        .line_height(px(16.5))
-                                        .text_color(tone)
-                                        .when(alert, |d| {
-                                            d.child(icon("circle-alert", 12.).text_color(tone))
-                                        })
-                                        .when(working, |d| {
-                                            d.child(crate::pulse::looping(
-                                                SharedString::from(format!(
-                                                    "rail-spinner-{lead}-{ix}"
-                                                )),
-                                                crate::session_mark::SPINNER_PERIOD,
-                                                crate::pulse::Rate::Half,
-                                                crate::session_mark::spinner_at,
-                                            ))
-                                        })
-                                        .when(done && !alert, |d| {
-                                            d.child(icon("check", 12.).text_color(tone))
-                                        })
-                                        .child(label),
-                                )
-                            })
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                // A task with its own thread opens it; the
-                                // details only stand in until it has one.
-                                if let Some(worker) = task_session {
-                                    this.open(worker, window, cx);
-                                    return;
-                                }
-                                if !this.rails.open_tasks.remove(&(lead, ix)) {
-                                    this.rails.open_tasks.insert((lead, ix));
-                                }
-                                this.notify_sidebar(cx);
-                            }));
-                        let worker = task.session;
-                        let running = worker.is_some_and(|s| {
-                            summary.live
-                                && self
-                                    .sessions
-                                    .get(&s)
-                                    .is_some_and(|v| v.read(cx).responding())
-                        });
-                        let solid = |id: &'static str, label: &'static str| {
-                            div()
-                                .id((id, (lead as usize) << 8 | ix))
-                                .role(Role::Button)
-                                .aria_label(label)
-                                .rounded(px(4.))
-                                .bg(content(0.15))
-                                .px(px(6.))
-                                .py(px(2.))
-                                .text_size(px(11.))
-                                .text_color(content(0.75))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(content(0.25)).text_color(content(1.)))
-                                .child(label)
-                        };
-                        let details = div()
-                            .pl(px(if classic { 26. } else { 6. }))
-                            .pt(px(if classic { 0. } else { 6. }))
-                            .pb_3()
-                            .pr_2()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .text_size(px(11.))
-                                    .text_color(content(0.45))
-                                    .child(provider_icon(&task.provider, 14.))
-                                    .child(div().min_w_0().truncate().child(model)),
-                            )
-                            .when(worker.is_some() || running, |d| {
-                                d.child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .gap_1()
-                                        .when_some(worker, |d, worker| {
-                                            d.child(
-                                                solid("rail-agent-open", "See details").on_click(
-                                                    cx.listener(move |this, _, window, cx| {
-                                                        this.open(worker, window, cx)
-                                                    }),
-                                                ),
-                                            )
-                                        })
-                                        .when_some(worker.filter(|_| running), |d, worker| {
-                                            d.child(
-                                                solid("rail-agent-cancel", "Cancel task").on_click(
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        if let Some(view) =
-                                                            this.sessions.get(&worker)
-                                                        {
-                                                            view.update(cx, |v, cx| {
-                                                                v.stop_if_busy(cx)
-                                                            });
-                                                        }
-                                                    }),
-                                                ),
-                                            )
-                                        }),
-                                )
-                            });
-                        let row = div()
-                            .flex()
-                            .flex_col()
-                            .when(classic, |d| {
-                                d.rounded_md().when(open, |d| d.bg(content(0.1)))
-                            })
-                            .child(header)
-                            .when(open, |d| d.child(details));
-                        if classic {
-                            row.into_any_element()
-                        } else {
-                            let (opacity, rise) = cascade.map_or((1., 0.), |m| m.row(ix, now));
-                            status_step(
-                                ix + 1 == summary.tasks.len(),
-                                status_dot(format!("rail-dot-{lead}-{ix}").into(), tone, working),
-                                row,
-                            )
-                            .top(px(-rise))
-                            .opacity(opacity)
-                            .into_any_element()
-                        }
-                    })),
-            )
-            .into_any_element()
-    }
 }
 
 #[cfg(test)]
@@ -1249,30 +851,22 @@ mod tests {
     fn bounds(cx: &mut VisualTestContext, selector: String) -> Option<gpui::Bounds<Pixels>> {
         cx.debug_bounds(Box::leak(selector.into_boxed_str()))
     }
-    /// Rail motion runs on the wall clock, as the window's frames do.
-    fn settle(window: gpui::WindowHandle<Shell>, cx: &mut VisualTestContext) {
-        for _ in 0..2 {
-            std::thread::sleep(OPEN + Duration::from_millis(20));
-            window
-                .update(cx, |shell, _, cx| {
-                    shell.invalidate_chrome(cx);
-                    cx.notify();
-                })
-                .unwrap();
-            cx.run_until_parked();
-        }
-    }
 
     #[gpui::test]
-    fn operator_and_orchestrator_threads_hang_their_work_on_a_rail_that_follows_selection(
-        cx: &mut TestAppContext,
-    ) {
+    fn subagents_stay_off_the_sidebar_and_threads_are_rows(cx: &mut TestAppContext) {
         let (window, _, lead) = crate::shell::tests::window(cx);
         let cx = &mut VisualTestContext::from_window(window.into(), cx);
-        let (child, other, worker) = window
+        let task = |session: Option<i64>, status: &str| monocode_core::orchestration::SummaryTask {
+            session,
+            title: "Write the tests".into(),
+            provider: "codex".into(),
+            model: None,
+            status: status.into(),
+        };
+        let (thread, subagent, orchestrator, worker) = window
             .update(cx, |shell, _, cx| {
                 let mut ids = Vec::new();
-                for _ in 0..3 {
+                for _ in 0..4 {
                     let summary = locked(&shell.store)
                         .unwrap()
                         .create("codex", &shell.workspace.project)
@@ -1283,90 +877,131 @@ mod tests {
                 for id in ids.iter().copied().chain([lead]) {
                     shell.sessions[&id].update(cx, |s, _| s.summary.has_messages = true);
                 }
-                let (child, other, worker) = (ids[0], ids[1], ids[2]);
-                shell.started_by.insert(child, lead);
+                let (thread, subagent, orchestrator, worker) = (ids[0], ids[1], ids[2], ids[3]);
+                // new_thread: only started by the lead.
+                shell.started_by.insert(thread, lead);
+                // thread_start: driven by it too.
+                shell.started_by.insert(subagent, lead);
+                shell.thread_parents.insert(subagent, lead);
                 shell.orchestration_summaries.insert(
-                    other,
+                    lead,
+                    monocode_core::orchestration::Summary {
+                        live: true,
+                        tasks: vec![task(Some(subagent), "running")],
+                    },
+                );
+                shell.orchestration_summaries.insert(
+                    orchestrator,
                     monocode_core::orchestration::Summary {
                         live: false,
-                        tasks: vec![monocode_core::orchestration::SummaryTask {
-                            session: Some(worker),
-                            title: "Write the tests".into(),
-                            provider: "codex".into(),
-                            model: None,
-                            status: "completed".into(),
-                        }],
+                        tasks: vec![task(Some(worker), "completed"), task(None, "pending")],
                     },
                 );
                 shell.selected_sessions.clear();
                 shell.workspace.active = Some(lead);
                 shell.invalidate_chrome(cx);
-                (child, other, worker)
+                (thread, subagent, orchestrator, worker)
             })
             .unwrap();
-        settle(window, cx);
-        let head = bounds(cx, format!("sidebar-session-{lead}")).expect("the thread is listed");
-        let nested =
-            bounds(cx, format!("sidebar-session-{child}")).expect("its session hangs below");
-        assert!(nested.top() >= head.bottom(), "under its caller");
-        assert!(nested.left() > head.left(), "on the rail, inset");
-        assert_eq!(nested.size.height, px(28.));
+        cx.run_until_parked();
+        let head = bounds(cx, format!("sidebar-session-{lead}")).expect("the lead is listed");
+        let row = bounds(cx, format!("sidebar-session-{thread}")).expect("a thread is listed");
+        assert_eq!(row.left(), head.left(), "an ordinary row, not inset");
+        assert_eq!(row.size.height, px(48.), "with its \"from\" line");
+        assert!(bounds(cx, format!("session-origin-{thread}")).is_some());
+        for id in [subagent, worker] {
+            assert!(
+                bounds(cx, format!("sidebar-session-{id}")).is_none(),
+                "a subagent is never a row of its own"
+            );
+        }
+        for id in [lead, orchestrator] {
+            assert!(
+                bounds(cx, format!("rail-progress-{id}")).is_some(),
+                "a lead sums up its subagents on its row"
+            );
+        }
+        assert!(bounds(cx, format!("rail-agent-{orchestrator}-0")).is_none());
+        window
+            .read_with(cx, |shell, _| {
+                assert_eq!(shell.subagent_lead(subagent), Some(lead));
+                assert_eq!(shell.subagent_lead(worker), Some(orchestrator));
+                assert_eq!(shell.subagent_lead(thread), None);
+                assert_eq!(shell.subagents(lead), [subagent]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_focused_leads_subagents_branch_off_its_card(cx: &mut TestAppContext) {
+        let (window, _, lead) = crate::shell::tests::window(cx);
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        let task = |session: Option<i64>, status: &str| monocode_core::orchestration::SummaryTask {
+            session,
+            title: "Write the tests".into(),
+            provider: "codex".into(),
+            model: None,
+            status: status.into(),
+        };
+        let (other, subagent) = window
+            .update(cx, |shell, _, cx| {
+                let mut ids = Vec::new();
+                for _ in 0..2 {
+                    let summary = locked(&shell.store)
+                        .unwrap()
+                        .create("codex", &shell.workspace.project)
+                        .unwrap();
+                    ids.push(summary.id);
+                    shell.add(summary, cx);
+                }
+                for id in ids.iter().copied().chain([lead]) {
+                    shell.sessions[&id].update(cx, |s, _| s.summary.has_messages = true);
+                }
+                let (other, subagent) = (ids[0], ids[1]);
+                shell.thread_parents.insert(subagent, lead);
+                shell.orchestration_summaries.insert(
+                    lead,
+                    monocode_core::orchestration::Summary {
+                        live: true,
+                        tasks: vec![task(Some(subagent), "running"), task(None, "pending")],
+                    },
+                );
+                shell.selected_sessions.clear();
+                shell.workspace.active = Some(lead);
+                shell.invalidate_chrome(cx);
+                (other, subagent)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let card = bounds(cx, format!("sidebar-session-{lead}")).expect("the lead is listed");
+        let tree = bounds(cx, format!("rail-tree-{lead}")).expect("focused, its tree is open");
         assert!(
-            bounds(cx, format!("sidebar-session-{worker}")).is_none(),
-            "a worker is never listed on its own"
+            card.contains(&tree.origin),
+            "the tree sits inside the lead's card"
         );
-        assert!(
-            bounds(cx, format!("rail-agent-{other}-0")).is_none(),
-            "an orchestrator's rail is closed while it is out of play"
-        );
-        // Clicking the orchestrator opens its agents and folds the other rail;
-        // the click does not also land on an agent that grows in under it.
-        let row = bounds(cx, format!("sidebar-session-{other}")).unwrap();
-        let clicked = Instant::now();
-        cx.simulate_click(row.center(), Default::default());
+        assert_eq!(tree.size.height, px(TREE_TOP + 2. * TREE_ROW));
+        let first = bounds(cx, format!("rail-subagent-{lead}-0")).unwrap();
+        assert!(bounds(cx, format!("rail-subagent-{lead}-1")).is_some());
+
+        // Its subagent opens beside it, and the tree stays while it's in front.
+        cx.simulate_click(first.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         window
             .read_with(cx, |shell, _| {
-                assert_eq!(shell.workspace.active, Some(other));
-                assert!(shell.rails.open_tasks.is_empty());
+                assert_eq!(shell.workspace.active, Some(subagent));
+                let tab = shell.workspace.tab_of(lead).unwrap();
+                assert_eq!(shell.workspace.tab_of(subagent), Some(tab));
             })
             .unwrap();
-        let opening = window
-            .read_with(cx, |shell, _| shell.rails.motions[&other])
-            .unwrap();
-        // A motion that starts at the click, rather than one already settled.
-        assert!(
-            opening.open && opening.start >= clicked,
-            "the rail grows in"
-        );
-        assert!(opening.value(opening.start) < 0.01);
-        settle(window, cx);
-        let agent = bounds(cx, format!("rail-agent-{other}-0")).expect("its agents show");
+        assert!(bounds(cx, format!("rail-tree-{lead}")).is_some());
+
+        // Another chat in front folds it away.
         window
-            .read_with(cx, |shell, _| assert!(shell.rails.open_tasks.is_empty()))
+            .update(cx, |shell, window, cx| shell.open(other, window, cx))
             .unwrap();
-        cx.simulate_click(agent.center(), Default::default());
         cx.run_until_parked();
-        window
-            .read_with(cx, |shell, _| {
-                assert!(
-                    shell.rails.open_tasks.contains(&(other, 0)),
-                    "a click opens its details"
-                )
-            })
-            .unwrap();
-        settle(window, cx);
-        let agent = bounds(cx, format!("rail-agent-{other}-0")).unwrap();
-        cx.simulate_click(agent.center(), Default::default());
-        cx.run_until_parked();
-        window
-            .read_with(cx, |shell, _| {
-                assert!(shell.rails.open_tasks.is_empty(), "and closes them")
-            })
-            .unwrap();
-        assert!(
-            bounds(cx, format!("sidebar-session-{child}")).is_none(),
-            "the operator rail folds away once its thread leaves play"
-        );
+        assert!(bounds(cx, format!("rail-tree-{lead}")).is_none());
+        assert!(bounds(cx, format!("rail-progress-{lead}")).is_some());
     }
 }

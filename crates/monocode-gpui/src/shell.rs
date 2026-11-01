@@ -11,10 +11,14 @@ mod classic_surfaces;
 mod devices;
 mod drafts;
 mod file_panes;
+#[cfg(all(test, target_os = "macos"))]
+mod home_shots;
 mod idle_agents;
 #[cfg(test)]
 mod image_lightbox_tests;
 mod interrupted_turns;
+#[cfg(all(test, target_os = "macos"))]
+mod keep_awake_shots;
 mod layout;
 mod list_cascade;
 mod live_agents;
@@ -32,14 +36,6 @@ mod project_removal;
 mod project_settings;
 mod quick_composer;
 mod quick_open;
-#[cfg(all(test, target_os = "macos"))]
-mod rail_shots;
-#[cfg(all(test, target_os = "macos"))]
-mod home_shots;
-#[cfg(all(test, target_os = "macos"))]
-mod keep_awake_shots;
-#[cfg(all(test, target_os = "macos"))]
-mod visualizations_shots;
 mod rails;
 mod remote_projects;
 mod remote_sessions;
@@ -59,6 +55,8 @@ mod space_swipe;
 mod terminal_dock;
 mod threads;
 mod title_tabs;
+#[cfg(all(test, target_os = "macos"))]
+mod visualizations_shots;
 #[cfg(target_os = "linux")]
 mod window_chrome;
 mod worktrees;
@@ -616,7 +614,6 @@ pub(crate) struct Shell {
     thread_waiters: HashMap<i64, Vec<monocode_core::mono::bridge::Call>>,
     agent_summary_writes: HashMap<i64, gpui::Task<()>>,
     /// The sidebar rails under orchestrators and /operator threads.
-    rails: rails::Rails,
     usage_footer: Entity<UsageFooter>,
     /// The footer's high-usage chip and its running-work dialog.
     resources: Entity<ResourceMonitor>,
@@ -671,6 +668,8 @@ pub(crate) struct Shell {
     live_agents_expanded: bool,
     /// The live agents card's list folding open and shut.
     live_fold: live_agents::Fold,
+    /// How far each lead's subagent tree is open in the sidebar.
+    rails: rails::Rails,
     /// Repaints the live agents card's elapsed times once a second.
     live_tick: Option<gpui::Task<()>>,
     busy_sessions: HashSet<i64>,
@@ -995,9 +994,8 @@ impl Shell {
             }
         });
         let keep_awake_prefs = workspace.preferences.keep_awake.clone();
-        let keep_awake = cx.new(|cx| {
-            crate::keep_awake::KeepAwake::new(keep_awake_prefs, crate::data_dir(), cx)
-        });
+        let keep_awake =
+            cx.new(|cx| crate::keep_awake::KeepAwake::new(keep_awake_prefs, crate::data_dir(), cx));
         let keep_awake_changes = cx.subscribe(
             &keep_awake,
             |this, _, crate::keep_awake::PrefsChanged(prefs), cx| {
@@ -1041,7 +1039,6 @@ impl Shell {
             thread_parents: sidebar_metadata.thread_parents,
             thread_waiters: HashMap::new(),
             agent_summary_writes: HashMap::new(),
-            rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
             keep_awake,
@@ -1087,6 +1084,7 @@ impl Shell {
             live_marks: HashMap::new(),
             live_agents_expanded: false,
             live_fold: Default::default(),
+            rails: Default::default(),
             live_tick: None,
             busy_sessions: HashSet::new(),
             notification_state,
@@ -1324,7 +1322,10 @@ impl Shell {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(2))
                     .await;
-                if this.update(cx, |this, cx| this.sync_keep_awake(cx)).is_err() {
+                if this
+                    .update(cx, |this, cx| this.sync_keep_awake(cx))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1441,23 +1442,23 @@ impl Shell {
             {
                 view.restore_composer_draft(draft, cx);
             }
-            view.driven_by = self.thread_parents.get(&id).copied();
-            view.managed |= view.driven_by.is_some() || self.orchestration_worker(id);
-            if let Some(lead) = view.driven_by {
-                let title = self
-                    .session_summaries
-                    .get(&lead)
-                    .map(|s| s.title.as_str())
-                    .unwrap_or("Lead");
-                view.thread_lead_title = title.to_owned();
-                view.thread_driver = self
-                    .sessions
-                    .get(&lead)
-                    .map(|v| v.read(cx).driver_label())
-                    .unwrap_or_else(|| "The lead".into());
-                view.transcript
-                    .update(cx, |t, _| t.thread_driver = Some(format!("From {title}")));
-            }
+            view.driven_by = self.subagent_lead(id);
+            view.managed |= view.driven_by.is_some();
+            view.thread_lead_title = view
+                .driven_by
+                .and_then(|lead| self.session_summaries.get(&lead))
+                .map(|s| {
+                    monocode_core::session_title::display_title(&s.title, &s.provider)
+                        .replace('\n', " ")
+                })
+                .unwrap_or_default();
+            let senders = self.thread_senders(id);
+            let subagent = view.driven_by.is_some();
+            view.transcript.update(cx, |t, _| {
+                t.senders = senders;
+                t.subagent = subagent;
+            });
+            view.set_subagents(self.subagent_strip(id, cx), cx);
             view.settings.usage_limit = self.usage_limits.get(&id).cloned();
             if let Some(bridge) = &self.app_bridge {
                 view.set_app_environment(bridge.environment(id));
@@ -1487,6 +1488,10 @@ impl Shell {
                 this.sync_search_session(id, cx);
                 this.orchestration_session_changed(id, cx);
                 this.thread_session_changed(id, cx);
+                // A subagent waiting on an approval shows on its lead's strip.
+                if let Some(lead) = this.subagent_lead(id) {
+                    this.push_subagent_strip(lead, cx);
+                }
                 this.automation_session_changed(id, cx);
                 this.sync_review_locks(cx);
                 this.refresh_session_mark(id, cx);
@@ -1668,8 +1673,23 @@ impl Shell {
                         }
                         this.refresh_session_mark(id, cx);
                         if this.thread_parents.contains_key(&id) {
-                            // A restored child returns to its lead's rail.
+                            // A restored child returns to its lead's strip.
                             this.thread_session_changed(id, cx);
+                        }
+                        // Subagents never outlive their lead: archiving it
+                        // stops its run and archives them, and restoring it
+                        // brings them back.
+                        if archived && this.orchestrations.active(id) {
+                            this.stop_orchestration(id, cx);
+                        }
+                        for sub in this.subagents(id) {
+                            if this
+                                .session_summaries
+                                .get(&sub)
+                                .is_some_and(|s| s.archived != archived)
+                            {
+                                this.toggle_archive(sub, cx);
+                            }
                         }
                         if archived {
                             this.start_archive_exit(id, window, cx);
@@ -1832,9 +1852,10 @@ impl Shell {
     fn sync_right_panel(&mut self, cx: &mut Context<Self>) {
         let opening = self.right_slide.as_ref().is_some_and(PaneSlide::opening);
         // Classic shows the panel only for the plan and a device.
-        let device_tab = self.right_panel.as_ref().is_some_and(|panel| {
-            panel.read(cx).tab() == crate::right_panel::RightTab::Device
-        });
+        let device_tab = self
+            .right_panel
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).tab() == crate::right_panel::RightTab::Device);
         let shown = !self.mono_active(cx)
             && (!self.workspace.classic_layout || device_tab)
             && self.workspace.right_panel_open
@@ -1989,6 +2010,9 @@ impl Shell {
             |this, _, event: &crate::device::DeviceEvent, window, cx| match event {
                 crate::device::DeviceEvent::OpenSettings => {
                     this.open_settings(crate::settings::Section::Devices, window, cx)
+                }
+                crate::device::DeviceEvent::Attach(paths) => {
+                    this.attach_to_visible_message(paths.clone(), window, cx)
                 }
             },
         ));
@@ -4331,6 +4355,10 @@ impl Shell {
         if !self.session_summaries.contains_key(&id) || self.deleting.contains(&id) {
             return;
         }
+        if let Some(lead) = self.subagent_lead(id) {
+            self.open_subagent(lead, id, window, cx);
+            return;
+        }
         self.navigation_revision += 1;
         self.replace_blank_pane(id, cx);
         self.activate_session(id, window, cx);
@@ -6313,64 +6341,39 @@ impl Shell {
     fn session_row(&self, id: i64, cx: &mut Context<Self>) -> AnyElement {
         self.session_row_with(id, false, None, cx)
     }
-    /// SessionCard, dense: `nested` for a session on another's rail; `rail`
-    /// for a thread with one under it, and whether it is open.
+    /// SessionCard, dense: `nested` for a folder member; `rail` for a lead,
+    /// whose row sums up its subagents.
     fn session_row_with(
         &self,
         id: i64,
         nested: bool,
-        rail: Option<(&rails::Rail, bool)>,
+        rail: Option<&rails::Rail>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(row) = self.rename_row(&session_groups::RenameTarget::Session(id), cx) {
             return row;
         }
-        // A collapsed thread shows a chevron in its mark's place on hover:
-        // selecting it opens the rail below.
-        let expandable = rail.is_some_and(|(_, open)| !open);
-        let mode = rail.map(|(rail, _)| match rail {
+        let mode = rail.map(|rail| match rail {
             rails::Rail::Agents(summary) => (
                 "share",
                 // fuchsia-200/90
                 gpui::Hsla::from(rgb(0xf5d0fe)).opacity(0.9),
                 format!(
-                    "Orchestrator, {} {}",
+                    "{} {}",
                     summary.tasks.len(),
                     if summary.tasks.len() == 1 {
-                        "agent"
+                        "subagent"
                     } else {
-                        "agents"
-                    }
-                ),
-            ),
-            rails::Rail::Started(children) => (
-                "cursor-magic",
-                // sky-200/90
-                gpui::Hsla::from(rgb(0xbae6fd)).opacity(0.9),
-                format!(
-                    "Operator, started {} {}",
-                    children.len(),
-                    if children.len() == 1 {
-                        "session"
-                    } else {
-                        "sessions"
+                        "subagents"
                     }
                 ),
             ),
         });
-        // startedInView: one of its sessions is the one in view or chosen,
-        // so the thread keeps its hover fill as the group's head.
-        let started_in_view = match rail {
-            Some((rails::Rail::Started(children), _)) => children.iter().any(|c| {
-                self.selected_sessions.contains(c)
-                    || (self.workspace.active == Some(*c)
-                        && !self.mono_active(cx)
-                        && !self.app_view_open())
-            }),
-            _ => false,
-        };
         let compact = nested || self.workspace.compact_session_cards;
         let side = if nested || !compact { 14. } else { 16. };
+        // A focused lead's subagents branch off under its mark or branch icon.
+        let tree = self.rail_tree(id, rail, if compact { side / 2. } else { 6. }, cx);
+        let tree_height = self.rail_tree_height(id, rail, cx);
         if let Some(mark) = self.session_marks.get(&id) {
             mark.update(cx, |mark, cx| mark.set_size(side, cx));
         }
@@ -6452,29 +6455,7 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .when(nested, |d| d.overflow_hidden())
-                .child(
-                    div()
-                        .size_full()
-                        .when(expandable, |d| {
-                            d.group_hover("session-row", |s| s.opacity(0.))
-                        })
-                        .child(mark),
-                )
-                .when(expandable, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .opacity(0.)
-                            .group_hover("session-row", |s| s.opacity(1.))
-                            .child(icon("chevron-down", 14.).text_color(content(0.6))),
-                    )
-                })
+                .child(mark)
         };
         let title = div()
             .debug_selector(move || format!("session-title-{id}"))
@@ -6510,12 +6491,12 @@ impl Shell {
                 self.automation_state.session_automations.contains_key(&id),
                 |row| row.child(icon("zap", 12.).text_color(content(0.35))),
             )
-            // An orchestrator says how far its agents have got.
+            // A lead says how far its subagents have got.
             .children(match rail {
-                Some((rails::Rail::Agents(summary), _)) => {
+                Some(rails::Rail::Agents(summary)) => {
                     Some(self.agent_progress(id, summary, compact, cx))
                 }
-                _ => None,
+                None => None,
             })
             // Marked on the right like a linked issue or PR, in its mode's colour.
             .when_some(mode, |d, (glyph, color, label)| {
@@ -6533,16 +6514,27 @@ impl Shell {
                 )
             });
         let suffix = self.session_suffix(id, &session, compact, cx);
+        let origin = self.started_from_line(id, cx);
+        let has_origin = origin.is_some();
         let body = if compact {
+            let gap = if nested { 6. } else { 8. };
             div()
                 .w_full()
                 .flex()
-                .items_center()
-                .gap(px(if nested { 6. } else { 8. }))
-                .child(mark)
-                .child(title)
-                .when(has_badges, |d| d.child(badges))
-                .child(suffix)
+                .flex_col()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(gap))
+                        .child(mark)
+                        .child(title)
+                        .when(has_badges, |d| d.child(badges))
+                        .child(suffix),
+                )
+                // Under the title, past the mark.
+                .children(origin.map(|line| line.pl(px(side + gap))))
                 .into_any_element()
         } else {
             div()
@@ -6563,6 +6555,7 @@ impl Shell {
                         .child(title)
                         .child(suffix),
                 )
+                .children(origin)
                 .child(
                     div()
                         .h(px(20.))
@@ -6635,7 +6628,12 @@ impl Shell {
                 56.
             } else {
                 60.
-            }))
+            } + if has_origin {
+                // The "from" line, and its gap in a full card.
+                if compact { 16. } else { 20. }
+            } else {
+                0.
+            } + tree_height))
             // Sidebar.tsx's `px-2` inside its 1px card border.
             .px(px(if nested { 7. } else { 9. }))
             .rounded_md()
@@ -6657,7 +6655,6 @@ impl Shell {
             .flex()
             .items_center()
             .when(active, |d| d.bg(content(0.1)))
-            .when(started_in_view && !active, |d| d.bg(content(0.05)))
             .hover(|s| {
                 let s = s.bg(content(if active { 0.1 } else { 0.05 }));
                 if archived { s.opacity(0.9) } else { s }
@@ -6669,7 +6666,15 @@ impl Shell {
             .when(self.deleting.contains(&id), |d| d.opacity(0.5))
             // Archived threads recede, and come back to full strength on hover.
             .when(session.summary.archived, |d| d.opacity(0.55))
-            .child(body)
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(body)
+                    .children(tree),
+            )
             .children(self.sidebar_drop_mark(id))
             .child(anchor.probe())
             .relative()
@@ -6937,7 +6942,7 @@ impl Shell {
                 && (s.summary.has_messages
                     || s.has_composer_draft()
                     || self.is_fresh_session(id, cx))
-                && !self.orchestration_worker(id)
+                && self.subagent_lead(id).is_none()
                 && self.in_sidebar_worktree_scope(id, cx)
         };
         let shown: HashSet<_> = self

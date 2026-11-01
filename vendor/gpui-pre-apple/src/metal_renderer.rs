@@ -1925,7 +1925,12 @@ impl MetalRenderer {
                 );
                 continue;
             }
-            assert_eq!(format, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+            // Anything else would be drawn with the wrong colours, or not at
+            // all; a frame without it beats taking the app down.
+            if format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                log::error!("skipped a surface in unsupported pixel format {format:#x}");
+                continue;
+            }
             command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
 
             let plane_texture = |plane, format| unsafe {
@@ -1941,16 +1946,17 @@ impl MetalRenderer {
                     plane,
                     ptr::NonNull::from(&mut texture),
                 );
-                assert_eq!(
-                    status, kCVReturnSuccess,
-                    "failed to create CoreVideo Metal texture"
-                );
-                CFRetained::<CVMetalTexture>::from_raw(
-                    ptr::NonNull::new(texture).expect("CoreVideo returned a null texture"),
-                )
+                ptr::NonNull::new(texture)
+                    .filter(|_| status == kCVReturnSuccess)
+                    .map(|texture| CFRetained::<CVMetalTexture>::from_raw(texture))
             };
-            let y_texture = plane_texture(0, objc2_metal::MTLPixelFormat::R8Unorm);
-            let cb_cr_texture = plane_texture(1, objc2_metal::MTLPixelFormat::RG8Unorm);
+            let (Some(y_texture), Some(cb_cr_texture)) = (
+                plane_texture(0, objc2_metal::MTLPixelFormat::R8Unorm),
+                plane_texture(1, objc2_metal::MTLPixelFormat::RG8Unorm),
+            ) else {
+                log::error!("failed to create Metal textures for a YCbCr surface");
+                continue;
+            };
 
             command_encoder.set_vertex_bytes(
                 SurfaceInputIndex::TextureSize as u64,
@@ -2805,5 +2811,47 @@ mod tests {
             assert!(blue.abs_diff(128) <= 2);
             assert_eq!(*alpha, 255);
         }
+    }
+    /// A video decoder's video-range frame, which the surface shader does not
+    /// take, is skipped rather than aborting the app.
+    #[test]
+    fn unsupported_surface_format_is_skipped() {
+        let attributes = CFDictionary::from_slices(
+            &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }],
+            &[&*CFDictionary::<CFType, CFType>::empty()],
+        );
+        let mut image_buffer = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                CVPixelBufferCreate(
+                    None,
+                    16,
+                    16,
+                    objc2_core_video::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                    Some(attributes.as_opaque()),
+                    ptr::NonNull::from(&mut image_buffer),
+                )
+            },
+            kCVReturnSuccess
+        );
+        let image_buffer =
+            unsafe { CFRetained::from_raw(ptr::NonNull::new(image_buffer).unwrap()) };
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            image_buffer,
+        });
+        scene.finish();
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
+            .unwrap();
+        assert_eq!(*image.get_pixel(8, 8), image::Rgba([0, 0, 0, 255]));
     }
 }

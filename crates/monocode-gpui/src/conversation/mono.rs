@@ -92,7 +92,7 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         if self.driven_by.is_some() {
-            return Err("This child thread is driven by its lead".into());
+            return Err("A subagent is driven by its lead".into());
         }
         if self.busy
             || self.stopping
@@ -1269,7 +1269,10 @@ mod tests {
         });
         cx.run_until_parked();
         chat.update(cx, |chat, _| {
-            let state = locked(&chat.store).unwrap().follow_ups(chat.summary.id).unwrap();
+            let state = locked(&chat.store)
+                .unwrap()
+                .follow_ups(chat.summary.id)
+                .unwrap();
             assert!(state.draft.is_none());
             assert_eq!(state.messages.len(), 1);
             assert_eq!(state.messages[0].id, id);
@@ -1281,7 +1284,9 @@ mod tests {
     #[gpui::test]
     fn a_draft_launch_opens_its_prompt_in_the_composer(cx: &mut TestAppContext) {
         let (chat, _) = launched(cx);
-        chat.update(cx, |chat, cx| chat.install_app_launch(chat.settings.clone(), false, cx));
+        chat.update(cx, |chat, cx| {
+            chat.install_app_launch(chat.settings.clone(), false, cx)
+        });
         cx.run_until_parked();
         chat.update(cx, |chat, cx| {
             assert_eq!(chat.input.read(cx).content.as_ref(), "Review this project");

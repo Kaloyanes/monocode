@@ -127,4 +127,20 @@ mod tests {
             Some("wait")
         );
     }
+
+    #[test]
+    fn thread_start_reads_its_result_after_the_input_refresh() {
+        // Claude refreshes agent input at tool_use, before the result exists.
+        let mut call = ToolCall::new("start", "mcp__monocode__thread_start");
+        call.input = json!({"title":"Drafts", "prompt":"Share drafts"}).to_string();
+        call.refresh_agent_input();
+        call.output = json!({"threadId":7,"harness":"claude","model":"opus"}).to_string();
+        call.state = ToolState::Completed;
+        let Some(Panel::Thread(run)) = call.panel() else {
+            panic!("missing thread panel")
+        };
+        assert_eq!(run.id, Some(7));
+        assert_eq!(run.harness.as_deref(), Some("claude"));
+        assert_eq!(run.model.as_deref(), Some("opus"));
+    }
 }

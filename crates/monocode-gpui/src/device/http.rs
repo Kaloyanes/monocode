@@ -37,8 +37,8 @@ pub(super) fn get(
     read_timeout: Duration,
 ) -> Result<(Body, Closer), String> {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
-        .map_err(|e| e.to_string())?;
+    let stream =
+        TcpStream::connect_timeout(&address, Duration::from_secs(5)).map_err(|e| e.to_string())?;
     stream.set_nodelay(true).ok();
     stream
         .set_read_timeout(Some(read_timeout))

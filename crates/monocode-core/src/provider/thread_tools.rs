@@ -69,6 +69,8 @@ mod tests {
         assert!(source.contains("before_agent_start"));
         assert!(!source.contains("/* THREAD_GUIDANCE */ \"\""));
         assert!(source.contains("Use thread_start instead of your built-in subagent"));
+        assert!(source.contains("\"name\":\"new_thread\""));
+        assert!(source.contains("\"threads.new\""));
         assert!(!source.contains("private-test-token"));
         request
             .settings

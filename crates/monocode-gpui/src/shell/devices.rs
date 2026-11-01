@@ -47,13 +47,39 @@ impl Shell {
         }
     }
 
+    /// The Device tab's screenshots and recordings go into the message being
+    /// written in the conversation on screen.
+    pub(super) fn attach_to_visible_message(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chat = self
+            .visible_session()
+            .and_then(|id| self.sessions.get(&id).cloned());
+        match chat {
+            Some(chat) => chat.update(cx, |chat, cx| chat.add_attachments(paths, cx)),
+            None => self.notification_state.file_error.update(cx, |notice, cx| {
+                notice.set_message(
+                    Some("Open a thread to attach the screenshot to.".into()),
+                    cx,
+                )
+            }),
+        }
+        cx.notify();
+    }
+
     fn authorize_device_call(&self, call: &Call, cx: &App) -> Result<(), String> {
         device::validate(&call.action, &call.input)?;
         if !cfg!(target_os = "macos") {
             return Err("Devices need the macOS app.".into());
         }
         if !device::agents_enabled() {
-            return Err("Agent access to devices is off. The user can turn it on in Settings › Devices.".into());
+            return Err(
+                "Agent access to devices is off. The user can turn it on in Settings › Devices."
+                    .into(),
+            );
         }
         let caller = self
             .sessions
@@ -67,7 +93,9 @@ impl Shell {
             || caller.settings.plan
             || caller.settings.access == monocode_core::agent::AccessMode::ReadOnly;
         if read_only && !matches!(call.action.as_str(), "devices.list" | "devices.screenshot") {
-            return Err("This thread's access policy allows only device_list and device_screenshot.".into());
+            return Err(
+                "This thread's access policy allows only device_list and device_screenshot.".into(),
+            );
         }
         Ok(())
     }
@@ -95,18 +123,25 @@ impl Shell {
             .and_then(|panel| panel.read(cx).device.read(cx).selected().cloned());
         let session = call.session;
         let action = call.action.clone();
+        let setting = call.input["setting"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let value = call.input["value"].as_str().unwrap_or_default().to_owned();
         let work = cx.background_executor().spawn(async move {
             let find = |query: &str| -> Result<Device, String> {
                 let list = hub::list()?;
-                device::resolve(&list, query, platform).cloned().ok_or_else(|| {
-                    let names: Vec<String> = list
-                        .devices
-                        .iter()
-                        .filter(|d| d.supported)
-                        .map(|d| format!("{} ({})", d.name, d.id))
-                        .collect();
-                    format!("No device matches {query:?}. Devices: {}", names.join(", "))
-                })
+                device::resolve(&list, query, platform)
+                    .cloned()
+                    .ok_or_else(|| {
+                        let names: Vec<String> = list
+                            .devices
+                            .iter()
+                            .filter(|d| d.supported)
+                            .map(|d| format!("{} ({})", d.name, d.id))
+                            .collect();
+                        format!("No device matches {query:?}. Devices: {}", names.join(", "))
+                    })
             };
             match action.as_str() {
                 "devices.list" => {
@@ -129,16 +164,53 @@ impl Shell {
                         (Some(query), _) => find(query)?,
                         (None, Some(device)) => device,
                         (None, None) => {
-                            return Err("No device is open. Call device_open first, or name one.".into());
+                            return Err(
+                                "No device is open. Call device_open first, or name one.".into()
+                            );
                         }
                     };
                     if !device.booted {
-                        return Err(format!("{} is not running. Call device_open first.", device.name));
+                        return Err(format!(
+                            "{} is not running. Call device_open first.",
+                            device.name
+                        ));
                     }
                     let png = hub::screenshot(device.platform, &device.id)?;
                     let path = save_screenshot(session, &png)?;
+                    Ok((json!({"device": device, "path": path}), None))
+                }
+                "devices.set" => {
+                    let device = match (query.as_deref(), shown) {
+                        (Some(query), _) => find(query)?,
+                        (None, Some(device)) => device,
+                        (None, None) => {
+                            return Err(
+                                "No device is open. Call device_open first, or name one.".into()
+                            );
+                        }
+                    };
+                    if device.platform != Platform::Ios {
+                        return Err("device_set changes iOS Simulators only.".into());
+                    }
+                    if !device.booted {
+                        return Err(format!(
+                            "{} is not running. Call device_open first.",
+                            device.name
+                        ));
+                    }
+                    let applied = match agent_change(&setting, &value)? {
+                        AgentChange::Setting(setting, value) => {
+                            crate::device::sim::set(&device.id, setting, value)?;
+                            value.to_owned()
+                        }
+                        AgentChange::Place(at) => {
+                            crate::device::sim::set_location(&*hub::ensure()?, &device.id, at)?;
+                            at.map(|(lat, lng)| format!("{lat},{lng}"))
+                                .unwrap_or_else(|| "clear".into())
+                        }
+                    };
                     Ok((
-                        json!({"device": device, "path": path}),
+                        json!({"device": device.id, "setting": setting, "value": applied}),
                         None,
                     ))
                 }
@@ -164,11 +236,41 @@ impl Shell {
                         });
                     }
                 }
+                if call.action == "devices.set"
+                    && let Ok((value, _)) = &result
+                    && let Some(panel) = this.right_panel.clone()
+                    && let Ok(change) = agent_change(
+                        value["setting"].as_str().unwrap_or_default(),
+                        value["value"].as_str().unwrap_or_default(),
+                    )
+                {
+                    let id = value["device"].as_str().unwrap_or_default().to_owned();
+                    panel.update(cx, |panel, cx| {
+                        panel.device.update(cx, |d, cx| {
+                            if d.selected().is_some_and(|shown| shown.id == id) {
+                                match change {
+                                    AgentChange::Setting(setting, value) => {
+                                        d.agent_set(Some((setting, value)), None, cx)
+                                    }
+                                    AgentChange::Place(at) => d.agent_set(
+                                        None,
+                                        Some(at.map(|(lat, lng)| {
+                                            (format!("{lat:.3}, {lng:.3}").into(), lat, lng)
+                                        })),
+                                        cx,
+                                    ),
+                                }
+                            }
+                        })
+                    });
+                }
                 if call.action == "devices.close"
                     && result.is_ok()
                     && let Some(panel) = this.right_panel.clone()
                 {
-                    panel.update(cx, |panel, cx| panel.device.update(cx, |d, cx| d.refresh(cx)));
+                    panel.update(cx, |panel, cx| {
+                        panel.device.update(cx, |d, cx| d.refresh(cx))
+                    });
                 }
                 let _ = call.reply.send(result.map(|(value, _)| value));
             });
@@ -177,13 +279,31 @@ impl Shell {
     }
 }
 
+/// What an agent's `device_set` asks for.
+enum AgentChange {
+    Setting(crate::device::sim::Setting, &'static str),
+    Place(Option<(f64, f64)>),
+}
+
+fn agent_change(setting: &str, value: &str) -> Result<AgentChange, String> {
+    use crate::device::sim;
+    if setting == "location" {
+        return if matches!(value.trim(), "clear" | "off" | "none") {
+            Ok(AgentChange::Place(None))
+        } else {
+            sim::parse_coordinates(value)
+                .map(|at| AgentChange::Place(Some(at)))
+                .ok_or_else(|| "location takes \"latitude,longitude\" or clear".to_string())
+        };
+    }
+    let setting = sim::Setting::from_key(setting).ok_or("Unknown setting")?;
+    Ok(AgentChange::Setting(setting, setting.accept(value)?))
+}
+
 fn save_screenshot(session: i64, png: &[u8]) -> Result<String, String> {
     let dir = toolchain::root().join("screenshots");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!(
-        "{session}-{}.png",
-        monocode_core::time::now_ms()
-    ));
+    let path = dir.join(format!("{session}-{}.png", monocode_core::time::now_ms()));
     std::fs::write(&path, png).map_err(|e| e.to_string())?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let mut files: Vec<_> = entries

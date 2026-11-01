@@ -193,6 +193,9 @@ pub struct TurnInfo {
     pub started_at: Option<u64>,
     pub completed_at: Option<u64>,
     pub metrics: Option<TurnMetrics>,
+    /// The thread that sent this turn's prompt, when another thread did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender: Option<i64>,
 }
 impl TurnInfo {
     pub fn has_duration(&self) -> bool {

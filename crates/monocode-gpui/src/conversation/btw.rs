@@ -1689,7 +1689,8 @@ impl Render for Btw {
             .role(Role::Dialog)
             .aria_label("By-the-way conversations")
             .when(open, |d| {
-                d.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                d.occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             })
             .child(body_in(self.header(cx)))
             .child(body_in(div().flex_1().min_h_0()).child(

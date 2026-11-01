@@ -1,5 +1,9 @@
 //! Lifecycle rules from the desktop adapters. An idle stream is not a failed turn.
 use super::*;
+/// How long a finished Claude result waits for the echo of this turn's prompt
+/// before it is taken as the turn's own. The echo follows Claude's internal
+/// turns by a second or two.
+const CLAUDE_ECHO_GRACE: Duration = Duration::from_secs(10);
 static CONTROL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Protocol {
@@ -146,11 +150,23 @@ impl Protocol {
         } else {
             self.request.prompt.clone()
         };
-        write_json(
-            stdin,
-            json!({"type":"user","session_id":"","parent_tool_use_id":null,
-                "message":{"role":"user","content":self.request.claude_content(&prompt)?}}),
-        )?;
+        // Slash commands and one-shot operations may finish without Claude ever
+        // echoing them, so only an ordinary resumed turn waits for the echo.
+        let gated = self.request.provider_id.is_some()
+            && !self.compact
+            && !self.probe
+            && !self.command_probe
+            && !self.request.settings.text_only
+            && !self.request.prompt.trim_start().starts_with('/');
+        let mut message = json!({"type":"user","session_id":"","parent_tool_use_id":null,
+            "message":{"role":"user","content":self.request.claude_content(&prompt)?}});
+        if gated {
+            let uuid = uuid::Uuid::new_v4().to_string();
+            message["uuid"] = uuid.clone().into();
+            self.claude_prompt_uuid = Some(uuid);
+        }
+        write_json(stdin, message)?;
+        self.claude_prompt_pending = gated;
         self.claude_prompt_sent = true;
         self.follow_up_ready = true;
         Ok(())
@@ -171,6 +187,18 @@ impl Protocol {
             // CLIs never acknowledge the initialize control request.
             if !self.claude_prompt_sent && started.elapsed() >= Duration::from_secs(8) {
                 self.claude_prompt(stdin)?;
+            }
+            // A Claude that never echoes the prompt must not hold the turn open.
+            if self.claude_prompt_pending
+                && self
+                    .claude_deferred_result
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() >= CLAUDE_ECHO_GRACE)
+            {
+                self.claude_prompt_pending = false;
+                if let Some((result, _)) = self.claude_deferred_result.take() {
+                    events.extend(self.frame(result, stdin)?);
+                }
             }
             self.sync_background(&mut events);
             events.extend(self.expire_claude_steers());
