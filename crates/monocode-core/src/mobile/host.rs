@@ -56,6 +56,7 @@ const APP_METHODS: &[&str] = &[
     "session.rename",
     "session.delete",
     "session.archive",
+    "session.unarchive",
     "orchestration.read",
     "orchestration.action",
     "draft.read",
@@ -971,6 +972,12 @@ mod tests {
         }
         result.unwrap();
         assert!(!listening, "listener started after shutdown={shutdown}");
+    }
+
+    #[test]
+    fn session_unarchive_is_an_app_method() {
+        assert!(APP_METHODS.contains(&"session.unarchive"));
+        assert!(APP_METHODS.contains(&"session.archive"));
     }
 
     #[test]
