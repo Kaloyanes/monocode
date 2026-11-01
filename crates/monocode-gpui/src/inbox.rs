@@ -505,6 +505,11 @@ impl Inbox {
         self.item()
     }
 
+    /// Whether the Inbox is the view on screen.
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+
     pub(crate) fn phone_view(&self) -> PhoneView<'_> {
         PhoneView {
             items: &self.snapshot.items,
