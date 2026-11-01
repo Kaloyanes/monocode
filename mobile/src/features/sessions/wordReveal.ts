@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 // Streaming prose, as the desktop's wordFade.tsx: each burst goes on screen as
 // it arrives, a word still being written waits until it is whole, and new
@@ -12,6 +12,8 @@ const CADENCE_FADE_MAX_MS = 400;
 const CADENCE_SEED_MS = 160;
 /** A stall longer than this counts as this long, so one pause can't drag every fade out. */
 const CADENCE_GAP_CAP_MS = 1000;
+/** Fading words re-render at most this often (about 30 per second), enough for a fade a few tenths of a second long. */
+const FADE_FRAME_MS = 30;
 /** How long a word still being written is held back before it shows as is. */
 const REVEAL_HOLD_MS = 150;
 
@@ -159,6 +161,8 @@ export function useWordFade(count: number, animate: boolean) {
   const [clock] = useState(() => new WordClock());
   const [cadence] = useState(() => new Cadence());
   const [frame, setFrame] = useState({ now: 0, fadeMs: cadence.fadeMs, active: false });
+  const frameFadeMs = useRef(frame.fadeMs);
+  frameFadeMs.current = frame.fadeMs;
   // Before paint, so a new word never shows at full strength first.
   useLayoutEffect(() => {
     const now = performance.now();
@@ -170,9 +174,16 @@ export function useWordFade(count: number, animate: boolean) {
   }, [count, clock, cadence]);
   useEffect(() => {
     if (!frame.active) return;
+    let last = performance.now();
     let id = requestAnimationFrame(function tick() {
       const now = performance.now();
-      setFrame((current) => ({ ...current, now, active: clock.fading(now, current.fadeMs) }));
+      // The screen runs at 60 or 120 Hz; a fade this short needs only about
+      // 30 steps a second, so the other frames cost no render. The last step,
+      // when the newest word has settled, is never skipped.
+      if (now - last >= FADE_FRAME_MS || !clock.fading(now, frameFadeMs.current)) {
+        last = now;
+        setFrame((current) => ({ ...current, now, active: clock.fading(now, current.fadeMs) }));
+      }
       id = requestAnimationFrame(tick);
     });
     return () => cancelAnimationFrame(id);
