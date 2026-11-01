@@ -126,7 +126,8 @@ const MAX_PLAN_STEPS: usize = 24;
 const MAX_STEP_CHARS: usize = 160;
 
 /// Loaded through visual_docs or the CLI only when authoring a visual. Keep the
-/// SDK out of ordinary prompts, server instructions and tool descriptions.
+/// SDK out of ordinary prompts, server instructions and tool descriptions; only
+/// the short USAGE trigger is part of the system prompt.
 const DOCUMENTATION: &str = r#"Native session visuals
 Use visual_check to validate a visual, then visual_show to publish it into this
 conversation. They accept {source}; visual_show also accepts {title?,id?}.
@@ -195,6 +196,42 @@ scripts compact. Check validates execution, the initial component tree, and repr
 it does not capture a screenshot. Fix errors before publishing. Set a concise
 title for the published visual. Never expose capability environment variables.
 "#;
+
+/// The system-prompt rule for when to reach for a visual. Only the trigger
+/// lives here; the SDK stays behind visual_docs.
+const USAGE: &str = "### Native visuals\n\nAnswer data with a trend, comparison or breakdown with an inline visual, and show any chart, diagram or visualizer the user asks for the same way: read `visual_docs` once, then `visual_check` and `visual_show`. Never start a server, open a browser or write an HTML file to show it. Ordinary coding answers need no visual.";
+
+/// Usage guidance for a provider that received the visual MCP server. Claude
+/// Code may defer MCP tools behind ToolSearch, so it is told how to load them.
+pub fn instructions(environment: &HashMap<String, String>, deferred: bool) -> Option<String> {
+    configured(environment).then(|| {
+        if deferred {
+            format!("{USAGE} The monocode_visual tools may be deferred: load them with ToolSearch before you call them.")
+        } else {
+            USAGE.to_owned()
+        }
+    })
+}
+
+/// The explicit composer command requires a publication even when the ordinary
+/// automatic trigger would leave the answer in prose. Keep the SDK on demand.
+pub fn requested_prompt(request: &str) -> String {
+    let request = if request.trim().is_empty() {
+        "Visualize the current topic using the conversation so far."
+    } else {
+        request
+    };
+    format!(
+        "Create and publish at least one native inline visual in this conversation during this turn. The user invoked the visualization command, so a visual is required even if you would normally answer only in prose.\n\n\
+         Read `visual_docs`, build the visual, run `visual_check`, fix any errors, and call `visual_show` before finishing. The monocode_visual MCP tools may be deferred; load them with ToolSearch if needed. If these tools are unavailable, use the executable in MONOCODE_VISUAL_EXECUTABLE: run `\"$MONOCODE_VISUAL_EXECUTABLE\" visual docs`, write the JavaScript source to a file, then run `\"$MONOCODE_VISUAL_EXECUTABLE\" visual check --input FILE` and `\"$MONOCODE_VISUAL_EXECUTABLE\" visual show --input FILE --title TITLE`.\n\n\
+         Use the native visual SDK, never a server, browser or HTML file. Include the embed line returned by visual_show in your reply, alongside concise supporting prose. If publication fails, explain the failure; do not claim a visual was shown. Never print capability environment variables.\n\n\
+         User request:\n{request}"
+    )
+}
+
+/// Claude permission rule that pre-approves every visual tool. Publishing
+/// only affects this conversation, so read-only and plan turns may use it.
+pub const CLAUDE_ALLOWED_TOOLS: &str = "mcp__monocode_visual";
 
 #[derive(Serialize, Deserialize)]
 struct Wire {
@@ -1713,6 +1750,43 @@ mod tests {
 
     fn input() -> Value {
         json!({"source":"return () => visual.text('Hello');","title":"Hello","requestId":"test-request","id":"hello"})
+    }
+
+    #[test]
+    fn visualize_prompt_uses_native_tools_without_invoking_a_same_named_skill() {
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join(".agents/skills/visualize");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: visualize\n---\nUse a different visualization system.",
+        )
+        .unwrap();
+        let cwd = root.path().to_str().unwrap();
+        for request in ["", "Compare the two approaches"] {
+            let prompt = requested_prompt(request);
+            assert!(prompt.contains("a visual is required"));
+            assert!(prompt.contains("visual_docs"));
+            assert!(prompt.contains("visual_check"));
+            assert!(prompt.contains("visual_show"));
+            assert!(prompt.contains("MONOCODE_VISUAL_EXECUTABLE"));
+            assert!(prompt.ends_with(if request.is_empty() {
+                "Visualize the current topic using the conversation so far."
+            } else {
+                request
+            }));
+            for kind in [
+                crate::provider::Kind::Codex,
+                crate::provider::Kind::Omp,
+                crate::provider::Kind::Devin,
+            ] {
+                assert_eq!(
+                    crate::provider::prepare_prompt(kind, &prompt, cwd, &[]).unwrap(),
+                    prompt,
+                    "The local command must not expand a same-named skill or reach a provider as a raw slash command"
+                );
+            }
+        }
     }
 
     #[test]

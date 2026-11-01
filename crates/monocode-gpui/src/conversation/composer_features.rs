@@ -619,7 +619,7 @@ impl Conversation {
         &self.status
     }
     pub(crate) fn turn_generation(&self) -> u64 {
-        self.submission_generation as u64
+        self.submission_generation
     }
     pub(crate) fn current_model(&self) -> Option<String> {
         self.model.clone()

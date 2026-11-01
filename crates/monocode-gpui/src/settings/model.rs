@@ -586,10 +586,10 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "unified editor review changes working tree",
     ),
     (
-        "empty-session-games",
+        "empty-session",
         Section::Chat,
-        "Empty session games",
-        "pacman snake arcade grid fun",
+        "Empty session",
+        "ink dither trails ripple games pacman snake arcade fun",
     ),
     (
         "agent-clis",
@@ -602,6 +602,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::Providers,
         "New chats start with",
         "default model last used remember previous pinned new conversation session",
+    ),
+    (
+        "background-model",
+        Section::Providers,
+        "Background model",
+        "title generation commit message branch worktree name pull request haiku fast small",
     ),
     (
         "provider-accounts",
@@ -632,6 +638,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::Providers,
         "Subagents only through MonoCode",
         "agent task explore delegate spawn threads multi-agent codex claude built-in",
+    ),
+    (
+        "claude-entrypoint",
+        Section::Providers,
+        "Identify as Monocode to Claude",
+        "entrypoint sdk-cli label usage limit 5-hour window rate experimental",
     ),
     (
         "idle-agents",

@@ -6,7 +6,7 @@ pub mod protocol;
 pub mod toolchain;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set in a provider's environment when device tools are offered to it.
@@ -345,30 +345,24 @@ mod tests {
 
     #[test]
     fn device_settings_name_a_known_setting_and_a_value() {
-        assert!(
-            validate(
-                "devices.set",
-                &json!({"setting":"appearance","value":"dark"})
-            )
-            .is_ok()
-        );
-        assert!(
-            validate(
-                "devices.set",
-                &json!({"device":"B","setting":"location","value":"35.6,139.6"})
-            )
-            .is_ok()
-        );
+        assert!(validate(
+            "devices.set",
+            &json!({"setting":"appearance","value":"dark"})
+        )
+        .is_ok());
+        assert!(validate(
+            "devices.set",
+            &json!({"device":"B","setting":"location","value":"35.6,139.6"})
+        )
+        .is_ok());
         assert!(validate("devices.set", &json!({"setting":"volume","value":"1"})).is_err());
         assert!(validate("devices.set", &json!({"setting":"appearance"})).is_err());
         assert!(validate("devices.set", &json!({"setting":"appearance","value":" "})).is_err());
-        assert!(
-            validate(
-                "devices.set",
-                &json!({"setting":"appearance","value":"dark","x":1})
-            )
-            .is_err()
-        );
+        assert!(validate(
+            "devices.set",
+            &json!({"setting":"appearance","value":"dark","x":1})
+        )
+        .is_err());
     }
 
     #[test]

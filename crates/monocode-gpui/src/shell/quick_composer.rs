@@ -115,6 +115,7 @@ impl Shell {
                         this.quick.last = Some(crate::quick_composer::Launch {
                             prompt: String::new(),
                             attachments: Vec::new(),
+                            staged_attachments: Vec::new(),
                             ..launch.clone()
                         });
                         let _ = handle.update(cx, |view, window, cx| view.dismiss(window, cx));
@@ -159,6 +160,7 @@ impl Shell {
                 summary.id,
                 &crate::quick_composer::paste_staging_dir(),
                 attachments,
+                &choice.staged_attachments,
             )?;
             Ok::<_, String>((summary, settings, attachments))
         });

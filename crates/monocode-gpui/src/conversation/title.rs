@@ -1,8 +1,57 @@
 //! Background session names never join or rewrite the user's provider history.
 use super::*;
-use monocode_core::session_title::display_title;
+use monocode_core::session_title::{TextModel, display_title};
 
 impl Conversation {
+    /// The model chosen for one chore, else the general background model.
+    pub(super) fn task_text_model(
+        &self,
+        task: crate::settings::TextTask,
+        cx: &gpui::App,
+    ) -> TextModel {
+        let kind = Kind::from_id(&self.summary.provider);
+        match cx
+            .try_global::<crate::settings::Preferences>()
+            .and_then(|p| p.text_model_for(task))
+        {
+            Some(choice) => {
+                let chosen = Kind::from_id(&choice.provider);
+                TextModel {
+                    account: if chosen == kind {
+                        self.settings.account.clone()
+                    } else {
+                        Default::default()
+                    },
+                    kind: chosen,
+                    model: choice.model.clone(),
+                }
+            }
+            None => self.background_text_model(cx),
+        }
+    }
+    /// The background model picked in Settings, else this session's harness.
+    /// Only the session's own provider reuses the session's account.
+    pub(super) fn background_text_model(&self, cx: &gpui::App) -> TextModel {
+        let kind = Kind::from_id(&self.summary.provider);
+        let account = self.settings.account.clone();
+        let chosen = cx
+            .try_global::<crate::settings::Preferences>()
+            .and_then(|p| p.background_text_model());
+        match chosen {
+            Some((chosen, model)) => TextModel {
+                account: if chosen == kind {
+                    account
+                } else {
+                    crate::accounts::get(cx)
+                        .map(|center| center.read(cx).selected(chosen, &self.summary.cwd))
+                        .unwrap_or_default()
+                },
+                kind: chosen,
+                model,
+            },
+            None => TextModel::automatic(kind, account),
+        }
+    }
     /// Tauri's sessionDisplayTitle: the harness prefix belongs to persistence,
     /// while every conversation headline shows only the user's title.
     pub(crate) fn display_title(&self) -> String {
@@ -45,20 +94,7 @@ impl Conversation {
         self.summary.title = seed.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         self.title_cancel = Some(cancel.clone());
-        let mut kind = Kind::from_id(&self.summary.provider);
-        let mut model = None;
-        let mut account = self.settings.account.clone();
-        if let Some(choice) = cx
-            .try_global::<crate::settings::Preferences>()
-            .and_then(|p| p.text_model_for(crate::settings::TextTask::Title))
-        {
-            let chosen = Kind::from_id(&choice.provider);
-            if chosen != kind {
-                account = Default::default();
-            }
-            kind = chosen;
-            model = choice.model.clone();
-        }
+        let text = self.task_text_model(crate::settings::TextTask::Title, cx);
         let cwd = self
             .settings
             .worktree_cwd
@@ -80,14 +116,7 @@ impl Conversation {
             let generated = if !titled || cfg!(test) {
                 None
             } else {
-                monocode_core::session_title::generate_for(
-                    kind,
-                    model,
-                    Path::new(&cwd),
-                    &message,
-                    account,
-                    flag,
-                )
+                monocode_core::session_title::generate_for(text, Path::new(&cwd), &message, flag)
             };
             // Tauri's resolveLinkedWorkItem: a pasted issue or PR links the
             // session even when a manual name kept the title. Tests never shell

@@ -312,6 +312,7 @@ impl Conversation {
         });
         self.launch_prompt(prompt, cx);
     }
+    #[cfg(test)]
     pub(super) fn remote_save_draft(&mut self, cx: &mut Context<Self>) {
         if self.remote_send_guard(true, cx) {
             return;

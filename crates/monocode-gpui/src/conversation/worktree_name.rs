@@ -14,21 +14,7 @@ impl Conversation {
         if self.is_remote() || self.settings.mono.is_some() {
             return;
         }
-        let mut kind = Kind::from_id(&self.summary.provider);
-        let mut model = None;
-        let mut account = self.settings.account.clone();
-        // Its own preference: never the general text or title model.
-        if let Some(choice) = cx
-            .try_global::<crate::settings::Preferences>()
-            .and_then(|p| p.text_model_for(crate::settings::TextTask::Branch))
-        {
-            let chosen = Kind::from_id(&choice.provider);
-            if chosen != kind {
-                account = Default::default();
-            }
-            kind = chosen;
-            model = choice.model.clone();
-        }
+        let text = self.task_text_model(crate::settings::TextTask::Branch, cx);
         let project = self.summary.cwd.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let work = cx.background_executor().spawn(async move {
@@ -37,9 +23,7 @@ impl Conversation {
             if !expected.starts_with(naming::PREFIX) || cfg!(test) {
                 return None;
             }
-            let wanted =
-                naming::generate_for(kind, model, Path::new(&path), &message, account, cancel)?
-                    .branch();
+            let wanted = naming::generate_for(text, Path::new(&path), &message, cancel)?.branch();
             match git::rename_worktree_branch(
                 Path::new(&project),
                 Path::new(&path),

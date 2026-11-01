@@ -14,7 +14,7 @@ fn home_shots() {
     let dir = std::env::var("HOME_SHOTS").unwrap_or_else(|_| "/tmp/home-shots".into());
     std::fs::create_dir_all(&dir).unwrap();
     let home = monocode_core::files::home_project().unwrap();
-    let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let store = Store::open(std::path::Path::new(":memory:")).unwrap();
     let mut sessions = Vec::new();
     for (cwd, title, started) in [
         (home.as_str(), "", false),
@@ -49,7 +49,7 @@ fn home_shots() {
             )))
         },
     );
-    cx.update(|cx| crate::popover::bind(cx));
+    cx.update(crate::popover::bind);
     let window = cx
         .open_window(size(px(1280.), px(760.)), |_, cx| {
             cx.new(|cx| {

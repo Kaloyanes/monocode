@@ -365,15 +365,14 @@ fn threads_new_opens_a_top_level_thread_the_lead_does_not_own(cx: &mut TestAppCo
     let id = value["sessionId"].as_i64().unwrap();
     window
         .update(cx, |shell, _, cx| {
-            assert!(shell.thread_parents.get(&id).is_none());
+            assert!(!shell.thread_parents.contains_key(&id));
             assert!(!shell.sessions[&id].read(cx).managed);
             assert!(
-                locked(&shell.store)
+                !locked(&shell.store)
                     .unwrap()
                     .thread_parents()
                     .unwrap()
-                    .get(&id)
-                    .is_none()
+                    .contains_key(&id)
             );
             assert!(
                 shell

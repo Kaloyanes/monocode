@@ -2,6 +2,7 @@
 mod app_access;
 mod composer_draft;
 pub use composer_draft::{sent_from as composer_sent_from, ComposerText, ComposerWrite};
+mod contributions;
 mod managed_sessions;
 mod monocode_import;
 mod monos;

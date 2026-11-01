@@ -144,7 +144,7 @@ for line in sys.stdin:
             settings.environment.insert(key.into(), value.into());
         }
         let fakes = [(Kind::Claude, claude), (Kind::Codex, codex)];
-        for (kind, binary) in &fakes {
+        for (_, binary) in &fakes {
             std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         for ((kind, binary), only) in fakes.iter().flat_map(|fake| [(fake, false), (fake, true)]) {

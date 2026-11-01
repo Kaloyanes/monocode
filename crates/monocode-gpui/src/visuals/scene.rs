@@ -372,13 +372,12 @@ mod tests {
         let a = project(&[cube()], &camera(), Orbit::default(), 600., 400.);
         assert_eq!(a.faces.len(), 6);
         assert!(a.faces.windows(2).all(|p| p[0].depth >= p[1].depth));
-        assert!(
-            a.faces
-                .iter()
-                .flat_map(|f| &f.points)
-                .flatten()
-                .all(|n| n.is_finite())
-        );
+        assert!(a
+            .faces
+            .iter()
+            .flat_map(|f| &f.points)
+            .flatten()
+            .all(|n| n.is_finite()));
         let b = project(
             &[cube()],
             &camera(),
@@ -406,11 +405,9 @@ mod tests {
         let points = lens.clip(&[[-1., 0., -1.], [1., 0., -1.], [0., 1., 1.]]);
         assert_eq!(points.len(), 4);
         assert!(points.iter().all(|p| lens.depth(*p) >= 0.0099));
-        assert!(
-            points
-                .into_iter()
-                .flat_map(|p| lens.project(p))
-                .all(|n| n.is_finite())
-        );
+        assert!(points
+            .into_iter()
+            .flat_map(|p| lens.project(p))
+            .all(|n| n.is_finite()));
     }
 }

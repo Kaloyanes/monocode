@@ -5,6 +5,7 @@ use monocode_core::follow_up::Message as Draft;
 impl TranscriptView {
     /// Saving a new draft is a user submission, even though no provider starts.
     /// Cold restores and persistence updates use set_saved_draft without replay.
+    #[cfg(test)]
     pub(crate) fn introduce_saved_draft(&mut self, draft: Draft, cx: &mut Context<Self>) {
         if !self.mono {
             self.follow = Follow::default();

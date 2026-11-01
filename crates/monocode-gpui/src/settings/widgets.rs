@@ -282,6 +282,7 @@ impl SettingsView {
                     | "mask-emails"
                     | "claude-hooks"
                     | "monocode-subagents-only"
+                    | "claude-entrypoint"
                     | "monos-enabled"
                     | "rail-monos-pinned"
                     | "mono-menu-bar-icon"

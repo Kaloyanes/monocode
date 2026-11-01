@@ -188,14 +188,11 @@ fn button(
         .child(label)
 }
 
-/// The card's buttons as (element id, label, primary, disabled, action), and
-/// why the main one is unavailable.
-pub(crate) fn actions(
-    phase: &Phase,
-) -> (
-    Vec<(&'static str, &'static str, bool, bool, Action)>,
-    Option<String>,
-) {
+/// One button on the card: element id, label, primary, disabled, action.
+type CardButton = (&'static str, &'static str, bool, bool, Action);
+type CardHandler = Box<dyn Fn(&mut TranscriptView, &mut Context<TranscriptView>)>;
+/// The card's buttons, and why the main one is unavailable.
+pub(crate) fn actions(phase: &Phase) -> (Vec<CardButton>, Option<String>) {
     match phase {
         Phase::Review { blocked } => (
             vec![
@@ -324,18 +321,17 @@ pub(super) fn render(
             RunView::review(plan.clone(), Phase::Inactive, &view.provider, "", None)
         });
     let key = call.id.clone();
-    let action =
-        move |action: Action| -> Box<dyn Fn(&mut TranscriptView, &mut Context<TranscriptView>)> {
-            let call = key.clone();
-            Box::new(
-                move |_: &mut TranscriptView, cx: &mut Context<TranscriptView>| {
-                    cx.emit(OrchestrationAction {
-                        call: call.clone(),
-                        action: action.clone(),
-                    })
-                },
-            )
-        };
+    let action = move |action: Action| -> CardHandler {
+        let call = key.clone();
+        Box::new(
+            move |_: &mut TranscriptView, cx: &mut Context<TranscriptView>| {
+                cx.emit(OrchestrationAction {
+                    call: call.clone(),
+                    action: action.clone(),
+                })
+            },
+        )
+    };
     let (actions, reason) = actions(&run.phase);
     let buttons: Vec<AnyElement> = actions
         .into_iter()

@@ -11,6 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+pub(crate) mod contributions;
 #[cfg(all(test, unix))]
 mod follow_up_tests;
 mod handoff;
@@ -79,6 +80,8 @@ pub(crate) struct Update {
     pub(crate) model: Option<String>,
     pub(crate) config_model: Option<String>,
     pub(crate) config_settings: Option<std::collections::HashMap<String, String>>,
+    /// A title the host changed since the last update; never written back.
+    pub(crate) title: Option<String>,
     pub(crate) context: Option<monocode_core::context::Usage>,
     pub(crate) metrics: Option<monocode_core::agent::TurnMetrics>,
     pub(crate) usage_limit: Option<monocode_core::usage::Limit>,
@@ -308,6 +311,7 @@ fn run_turn_using(
                 model: None,
                 config_model: None,
                 config_settings: None,
+                title: None,
                 context: None,
                 metrics: None,
                 usage_limit: None,
@@ -364,6 +368,7 @@ fn run_turn_using(
                     model: None,
                     config_model: None,
                     config_settings: None,
+                    title: None,
                     context: None,
                     metrics: None,
                     usage_limit: None,
@@ -412,6 +417,7 @@ fn run_turn_using(
                     model: None,
                     config_model: None,
                     config_settings: None,
+                    title: None,
                     context: None,
                     metrics: None,
                     usage_limit: None,
@@ -472,6 +478,7 @@ fn run_turn_using(
                     model: None,
                     config_model: None,
                     config_settings: None,
+                    title: None,
                     context: None,
                     metrics: None,
                     usage_limit: None,
@@ -535,7 +542,9 @@ fn run_turn_using(
             } else {
                 prompt
             };
-            format!("{intro}\n\n{brief}\n\n{prompt}")
+            // Outside the hashed context, so the clock never resends it.
+            let now = chrono::Local::now().format("%A %-d %B %Y, %H:%M");
+            format!("{intro}\n\n{brief}\n\n<local_time>{now}</local_time>\n{prompt}")
         } else if let Some(handoff) = &settings.handoff {
             monocode_core::response::wrap_handoff_prompt(&handoff.from, &handoff.brief, &prompt)
         } else if provider_id.is_none() && shell_start > 0 {
@@ -806,6 +815,7 @@ fn run_turn_using(
                                 serde_json::to_string(&tool).map_err(|e| e.to_string())?;
                             start = start.min(ix);
                             pending.changed(ix);
+                            contributions::record(&store, summary.id, &summary.cwd, &tool);
                         }
                         Event::SessionId(id) => {
                             if provider_id.as_ref() != Some(&id) {
@@ -1042,6 +1052,7 @@ fn run_turn_using(
                             model,
                             config_model,
                             config_settings,
+                            title: None,
                             context: context_changed.then_some(context),
                             metrics,
                             usage_limit: None,
@@ -1262,6 +1273,7 @@ fn run_turn_using(
         model: None,
         config_model: None,
         config_settings: None,
+        title: None,
         context: None,
         metrics: None,
         usage_limit: if cancelled { None } else { usage_limit },

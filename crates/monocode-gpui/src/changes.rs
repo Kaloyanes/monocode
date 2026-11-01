@@ -703,26 +703,23 @@ impl Changes {
             }
         }
     }
-    /// The model chosen for `task`, else pickTextHarness: the conversation's
-    /// provider when installed, then Claude Code, then Codex.
-    fn text_harness(
-        &self,
-        task: crate::settings::TextTask,
-        cx: &App,
-    ) -> Option<(Kind, PathBuf, Option<String>)> {
+    /// pickTextHarness: the model chosen for `task`, else the background model
+    /// picked in Settings, else the conversation's provider when installed,
+    /// else Claude Code, then Codex.
+    fn text_harness(&self, task: crate::settings::TextTask, cx: &App) -> Option<TextHarness> {
         let prefs = cx.try_global::<crate::settings::Preferences>();
-        commit_harness(
-            self.text_provider,
-            prefs.and_then(|p| p.text_model_for(task)),
-        )
+        let chosen = prefs
+            .and_then(|p| p.text_model_for(task))
+            .map(|choice| (Kind::from_id(&choice.provider), choice.model.clone()))
+            .or_else(|| prefs.and_then(|p| p.background_text_model()));
+        pick_text_harness(self.text_provider, chosen)
     }
     fn generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let has_files = self.index(cx).is_some_and(|i| !i.files.is_empty());
         if !has_files || self.busy.is_some() || self.generate_cancel.is_some() {
             return;
         }
-        let Some((kind, binary, model)) = self.text_harness(crate::settings::TextTask::Commit, cx)
-        else {
+        let Some(harness) = self.text_harness(crate::settings::TextTask::Commit, cx) else {
             Self::fail(
                 "No provider CLI is installed to write a commit message.".into(),
                 window,
@@ -738,7 +735,7 @@ impl Changes {
         let flag = cancel.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { generate_commit_message(kind, binary, cwd, model, flag) });
+            .spawn(async move { generate_commit_message(harness, cwd, flag) });
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -872,7 +869,7 @@ impl Changes {
     /// generatePrContent, `gh pr create`, then the browser.
     fn open_created_pr(
         &mut self,
-        harness: Option<(Kind, PathBuf, Option<String>)>,
+        harness: Option<TextHarness>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1152,7 +1149,7 @@ impl Changes {
         // `bg-content` buttons with `text-background-base`, 40% when unavailable.
         let solid: Hsla = content(1.);
         let face = if can_commit { solid } else { content(0.4) };
-        let ink: Hsla = rgb(BACKGROUND_BASE).into();
+        let ink = crate::theme::background_base();
         let generate_label = if generating {
             "Cancel commit message generation"
         } else {
@@ -1278,7 +1275,7 @@ impl Changes {
                             .justify_center()
                             .rounded_r_md()
                             .border_l_1()
-                            .border_color(rgb(BACKGROUND_BASE).opacity(0.1))
+                            .border_color(ink.opacity(0.1))
                             .bg(if menu_open { solid } else { face })
                             .when(can_open_menu && !menu_open, |d| {
                                 d.hover(move |s| {
@@ -1883,40 +1880,37 @@ impl Changes {
     }
 }
 
-/// pickTextHarness: `preferred` when installed, else Claude Code, then Codex.
-pub(crate) fn pick_text_harness(preferred: Kind) -> Option<(Kind, PathBuf)> {
-    [preferred, Kind::Claude, Kind::Codex]
-        .into_iter()
-        .find_map(|kind| provider::resolve(kind).map(|binary| (kind, binary)))
-}
+/// A provider CLI and model for one-off text, `None` for its default model.
+pub(crate) type TextHarness = (Kind, PathBuf, Option<String>);
 
-/// The harness and model that write commit text: the chosen commit model when
-/// its CLI is installed, else `pick_text_harness` with the CLI's own default.
-pub(crate) fn commit_harness(
+/// pickTextHarness: `chosen` (the background model picked in Settings) when
+/// installed, else `preferred`, then Claude Code, then Codex on their default
+/// models.
+pub(crate) fn pick_text_harness(
     preferred: Kind,
-    choice: Option<&crate::settings::ModelChoice>,
-) -> Option<(Kind, PathBuf, Option<String>)> {
-    choice
-        .and_then(|c| {
-            let kind = Kind::from_id(&c.provider);
-            provider::resolve(kind).map(|binary| (kind, binary, c.model.clone()))
+    chosen: Option<(Kind, Option<String>)>,
+) -> Option<TextHarness> {
+    chosen
+        .and_then(|(kind, model)| provider::resolve(kind).map(|binary| (kind, binary, model)))
+        .or_else(|| {
+            [preferred, Kind::Claude, Kind::Codex]
+                .into_iter()
+                .find_map(|kind| provider::resolve(kind).map(|binary| (kind, binary, None)))
         })
-        .or_else(|| pick_text_harness(preferred).map(|(kind, binary)| (kind, binary, None)))
 }
 
 /// generateCommitMessage: a message for the staged changes, written by a
 /// read-only turn of `kind`. Blocking.
 pub(crate) fn generate_commit_message(
-    kind: Kind,
-    binary: PathBuf,
+    harness: TextHarness,
     cwd: PathBuf,
-    model: Option<String>,
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
+    let kind = harness.0;
     let context = scm::staged_context(&cwd)?;
     let prompt =
         scm::commit_message_prompt(context.branch.as_deref(), &context.summary, &context.patch);
-    let output = text_prompt(kind, binary, cwd, prompt, model, cancel)?;
+    let output = text_prompt(harness, cwd, prompt, cancel)?;
     scm::parse_commit_message(&output).ok_or_else(|| {
         let snippet: String = output
             .split_whitespace()
@@ -1939,17 +1933,15 @@ pub(crate) fn generate_commit_message(
 /// generatePrContent, falling back to the commits, then `gh pr create`; the
 /// new pull request's URL. Blocking.
 pub(crate) fn create_pr_blocking(
-    harness: Option<(Kind, PathBuf, Option<String>)>,
+    harness: Option<TextHarness>,
     cwd: &std::path::Path,
 ) -> Result<String, String> {
     let range = scm::range_context(cwd)?;
-    let parsed = harness.and_then(|(kind, binary, model)| {
+    let parsed = harness.and_then(|harness| {
         let output = text_prompt(
-            kind,
-            binary,
+            harness,
             cwd.to_path_buf(),
             scm::pr_content_prompt(&range),
-            model,
             Arc::new(AtomicBool::new(false)),
         )
         .ok()?;
@@ -1972,11 +1964,9 @@ pub(crate) fn create_pr_blocking(
 /// A read-only one-shot turn, as the React text harness runs: the final
 /// assistant message's text.
 fn text_prompt(
-    kind: Kind,
-    binary: PathBuf,
+    (kind, binary, model): TextHarness,
     cwd: PathBuf,
     prompt: String,
-    model: Option<String>,
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
     let request = Request {

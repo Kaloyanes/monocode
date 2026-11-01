@@ -67,7 +67,7 @@ fn chromium_card_shots() {
             )))
         },
     );
-    cx.update(|cx| crate::popover::bind(cx));
+    cx.update(crate::popover::bind);
     let html = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/native/examples/draft-spike.html"),

@@ -1569,8 +1569,11 @@ fn run_operation(
                     "--mcp-config",
                     "{\"mcpServers\":{}}",
                 ]);
-            } else if settings.access == AccessMode::ReadOnly {
-                command.args(["--tools", "Read,Glob,Grep,Bash", "--allowedTools", "Read,Glob,Grep,Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(pwd),Bash(ls *),Bash(rg *)"]);
+            }
+            let mut allowed: Vec<&str> = Vec::new();
+            if !settings.text_only && settings.access == AccessMode::ReadOnly {
+                command.args(["--tools", "Read,Glob,Grep,Bash"]);
+                allowed.push("Read,Glob,Grep,Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(pwd),Bash(ls *),Bash(rg *)");
             }
             if !settings.text_only {
                 if let Some(server) = crate::visual_bridge::mcp_server(&settings.environment) {
@@ -1590,6 +1593,9 @@ fn run_operation(
                 {
                     command.args(["--disallowedTools", "Agent"]);
                 }
+            }
+            if !allowed.is_empty() {
+                command.args(["--allowedTools", &allowed.join(",")]);
             }
             if mode == "bypassPermissions" {
                 command.arg("--allow-dangerously-skip-permissions");
@@ -2012,7 +2018,8 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        let sent: Value = serde_json::from_slice(out.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        let sent: Value =
+            serde_json::from_slice(out.split(|b| *b == b'\n').next().unwrap()).unwrap();
         let uuid = sent["uuid"].as_str().unwrap_or_default().to_owned();
         (p, uuid)
     }
@@ -2035,7 +2042,10 @@ mod tests {
         p.frame(result_frame(), &mut Vec::new()).unwrap();
         assert!(!p.done);
         assert!(!p.claude_result_seen);
-        assert!(p.holds_steers(), "an unacknowledged prompt must not be parked");
+        assert!(
+            p.holds_steers(),
+            "an unacknowledged prompt must not be parked"
+        );
         // Claude takes the prompt and answers it.
         p.frame(echo(&uuid), &mut Vec::new()).unwrap();
         assert!(!p.claude_prompt_pending);

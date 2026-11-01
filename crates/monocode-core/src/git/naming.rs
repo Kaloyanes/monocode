@@ -2,7 +2,7 @@
 //! A deterministic slug names the worktree the moment it exists; a text model
 //! may later refine only the branch to `mc/<type>/<slug>`.
 use crate::{
-    provider::{self, Kind, Request},
+    provider::{self, Request},
     session_title,
 };
 use std::sync::{atomic::AtomicBool, Arc};
@@ -151,27 +151,25 @@ pub fn parse(raw: &str) -> Option<Suggestion> {
 
 /// Runs on a worker, apart from the user's provider thread and transcript.
 pub fn generate_for(
-    kind: Kind,
-    model: Option<String>,
+    text: session_title::TextModel,
     cwd: &std::path::Path,
     message: &str,
-    account: crate::accounts::Profile,
     cancel: Arc<AtomicBool>,
 ) -> Option<Suggestion> {
-    if !session_title::supports(kind) {
+    if !session_title::supports(text.kind) {
         return None;
     }
-    let binary = provider::resolve(kind)?;
+    let binary = provider::resolve(text.kind)?;
     let output = provider::run_text(
         Request {
-            kind,
+            kind: text.kind,
             binary,
             cwd: cwd.into(),
             prompt: prompt(message),
             provider_id: None,
-            model: model.or_else(|| session_title::cheap_model(kind)),
+            model: text.model,
             settings: crate::agent::Settings {
-                account,
+                account: text.account,
                 ..Default::default()
             },
         },
@@ -184,6 +182,7 @@ pub fn generate_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Kind;
 
     #[test]
     fn slugs_name_the_subject_and_drop_filler() {
@@ -269,11 +268,9 @@ mod tests {
             for prompt in prompts {
                 let started = std::time::Instant::now();
                 let found = generate_for(
-                    kind,
-                    None,
+                    session_title::TextModel::automatic(kind, Default::default()),
                     std::env::temp_dir().as_path(),
                     prompt,
-                    Default::default(),
                     Arc::new(AtomicBool::new(false)),
                 );
                 println!(
@@ -324,11 +321,9 @@ mod tests {
         let tree = crate::git::create_worktree(&cwd, "main", 1, Some(message)).unwrap();
         let provisional = crate::git::worktree_branch(&tree).unwrap();
         let wanted = generate_for(
-            Kind::Claude,
-            None,
+            session_title::TextModel::automatic(Kind::Claude, Default::default()),
             &tree,
             message,
-            Default::default(),
             Arc::new(AtomicBool::new(false)),
         )
         .expect("claude names the branch")

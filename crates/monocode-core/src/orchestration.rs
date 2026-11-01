@@ -3,7 +3,7 @@
 //! have no explicit dependency. The model only proposes the plan: dispatch,
 //! dependencies, reports and the hand-back are all decided here.
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     path::{Component, Path},
@@ -323,7 +323,7 @@ pub fn validate(plan: &Plan) -> Result<(), String> {
                 return Err(format!("Invalid file scope: {file}"));
             }
         }
-        if task.depends_on.iter().any(|id| *id == task.id) {
+        if task.depends_on.contains(&task.id) {
             return Err(format!("Assignment {} depends on itself.", task.id));
         }
     }
@@ -1075,9 +1075,7 @@ mod tests {
         let pick = |team: Team, d: u8| team.model(Some(d), 0);
         assert_eq!(
             [1, 4, 5, 6, 7, 8, 10].map(|d| pick(Team::Cheap, d)),
-            [
-                "haiku", "haiku", "haiku", "haiku", "haiku", "sonnet", "sonnet"
-            ]
+            ["haiku", "haiku", "haiku", "haiku", "haiku", "sonnet", "sonnet"]
         );
         assert_eq!(
             [1, 4, 5, 10].map(|d| pick(Team::Balanced, d)),

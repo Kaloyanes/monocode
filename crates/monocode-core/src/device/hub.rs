@@ -7,14 +7,14 @@
 //! with the app, and stops after it has gone unused for a while. It requires a
 //! token: serve-sim can run shell commands, so nothing else on this machine
 //! gets to drive it.
-use super::{Device, DeviceList, Platform, toolchain};
-use serde_json::{Value, json};
+use super::{toolchain, Device, DeviceList, Platform};
+use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader, Read},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };

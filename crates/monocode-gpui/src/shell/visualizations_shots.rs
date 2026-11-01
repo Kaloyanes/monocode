@@ -13,7 +13,7 @@ fn visualizations_shots() {
     let dir = std::env::var("VISUALIZATIONS_SHOTS")
         .unwrap_or_else(|_| "/tmp/visualizations-shots".into());
     std::fs::create_dir_all(&dir).unwrap();
-    let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let store = Store::open(std::path::Path::new(":memory:")).unwrap();
     let session = store.create("claude", PROJECT).unwrap();
     let id = session.id;
     let mut state = Workspace::default();
@@ -29,7 +29,7 @@ fn visualizations_shots() {
             )))
         },
     );
-    cx.update(|cx| crate::popover::bind(cx));
+    cx.update(crate::popover::bind);
     let (width, height) = (1100u32, 720u32);
     let window = cx
         .open_window(size(px(width as f32), px(height as f32)), |_, cx| {

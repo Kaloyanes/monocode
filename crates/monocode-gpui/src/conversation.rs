@@ -70,6 +70,7 @@ use std::{
 // Keep empty and docked composers aligned with the transcript column. Below
 // this width the empty session drops its title.
 const COMPOSER_COLUMN: f32 = COLUMN;
+const COMPOSER_RADIUS: f32 = 12.;
 // RUNTIME_MODE_LABEL and RUNTIME_MODE_HINT from the React session model,
 // with AccessPicker's icons; Full access is amber.
 const ACCESS_MODES: &[(&str, &str, &str, &str)] = &[
@@ -274,9 +275,11 @@ pub(crate) struct Conversation {
     // pane rest the composer where it docks.
     beside_pane: bool,
     arcade: Option<Entity<crate::arcade::Arcade>>,
+    ink: Option<Entity<crate::ink_field::InkField>>,
     runner: Option<Entity<crate::composer_runner::Runner>>,
     cancel: Arc<AtomicBool>,
     title_cancel: Option<Arc<AtomicBool>>,
+    worktree_name_cancel: Option<Arc<AtomicBool>>,
     _submission: Subscription,
     _alternate_submission: Subscription,
     _shell_submission: Subscription,
@@ -287,6 +290,9 @@ pub(crate) struct Conversation {
 }
 impl Drop for Conversation {
     fn drop(&mut self) {
+        if let Some(cancel) = self.worktree_name_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         if !self.summary.cwd.starts_with("remote://") {
             self.cancel.store(true, Ordering::Relaxed);
         }
@@ -740,9 +746,11 @@ impl Conversation {
             narrow: false,
             beside_pane: false,
             arcade: None,
+            ink: None,
             runner: None,
             cancel: Arc::new(AtomicBool::new(false)),
             title_cancel: None,
+            worktree_name_cancel: None,
             _submission: submission,
             _alternate_submission: alternate_submission,
             _shell_submission: shell_submission,
@@ -1360,6 +1368,13 @@ impl Conversation {
                                 if let Some(message) = naming_message.take() {
                                     this.refine_worktree_branch(cwd, message, cx);
                                 }
+                            }
+                            // The host renamed the conversation; it is not sent back.
+                            if let Some(title) = update.title
+                                && this.summary.title != title
+                            {
+                                this.summary.title = title;
+                                cx.emit(SessionChanged);
                             }
                             if let Some(commands) = update.commands.filter(|_| source_selected) {
                                 this.completion.update(cx, |completion, cx| {
@@ -3783,7 +3798,7 @@ impl Conversation {
             },
             enabled,
         )
-        .on_click(cx.listener(move |this, _, _, cx| {
+        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
             if !enabled {
                 return;
             }
@@ -3794,7 +3809,13 @@ impl Conversation {
             } else if this.input.read(cx).shell_mode() {
                 this.submit_shell(cx);
             } else {
-                this.send(cx);
+                let modifiers = event.modifiers();
+                let alternate = if cfg!(target_os = "macos") {
+                    modifiers.platform
+                } else {
+                    modifiers.control
+                };
+                this.send_follow_up(alternate, cx);
             }
         }))
     }
@@ -3802,20 +3823,30 @@ impl Conversation {
     // where it will dock once a neighbouring pane squeezes it narrower than
     // the column. A narrow window alone keeps it centred.
     fn empty(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let games = cx
+        // A chat background replaces the canvas; the ink only lives in motion.
+        let fill = cx
             .try_global::<crate::settings::Preferences>()
-            .is_none_or(|p| p.empty_session_games)
-            && cx
-                .try_global::<crate::settings::Preferences>()
-                .is_none_or(|p| p.chat_background.is_none());
-        let arcade = if games {
-            Some(
+            .map_or("ink", |p| {
+                if p.chat_background.is_some() {
+                    "none"
+                } else {
+                    p.empty_session.as_str()
+                }
+            });
+        let canvas_fill: Option<AnyElement> = match fill {
+            "games" => Some(
                 self.arcade
                     .get_or_insert_with(|| cx.new(crate::arcade::Arcade::new))
-                    .clone(),
-            )
-        } else {
-            None
+                    .clone()
+                    .into_any_element(),
+            ),
+            "ink" if !cx.reduce_motion() => Some(
+                self.ink
+                    .get_or_insert_with(|| cx.new(crate::ink_field::InkField::new))
+                    .clone()
+                    .into_any_element(),
+            ),
+            _ => None,
         };
         let this = cx.entity().downgrade();
         let narrow = self.narrow;
@@ -3825,7 +3856,7 @@ impl Conversation {
             .size_full()
             .flex()
             .justify_center()
-            .children(arcade)
+            .children(canvas_fill)
             .child(
                 canvas(
                     move |bounds, _, cx| {
@@ -4053,12 +4084,12 @@ mod composer_motion_tests {
                                             <= 2.
                                 })
                                 .expect("the composer paints React's content-3% surface");
-                            #[cfg(target_os = "macos")]
+                            #[cfg(any(target_os = "macos", target_os = "windows"))]
                             assert_eq!(
                                 surface.border_color,
-                                gpui_apple::metal_renderer::backdrop_blur_marker(24. * scale)
+                                gpui::backdrop_blur_marker(24. * scale)
                             );
-                            #[cfg(not(target_os = "macos"))]
+                            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                             let _ = surface;
                             assert!(window.painted_quads().iter().any(|quad| {
                                 quad.border_color == content(0.2)
@@ -4341,15 +4372,13 @@ fn composer_surface(radius: f32) -> impl IntoElement {
         |_, _, _| {},
         move |bounds, _, window, _| {
             let surface = gpui::fill(bounds, fill).corner_radii(px(radius - 1.));
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             let surface = if blur > 0. {
-                surface.border_color(gpui_apple::metal_renderer::backdrop_blur_marker(
-                    blur * window.scale_factor(),
-                ))
+                surface.border_color(gpui::backdrop_blur_marker(blur * window.scale_factor()))
             } else {
                 surface
             };
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let _ = blur;
             window.paint_quad(surface);
         },
@@ -4369,8 +4398,14 @@ fn send_button(
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
     let accent = primary_action(enabled);
+    // Without an accent the button is the inverse of the surface: white with
+    // black ink on dark, black with white ink on light.
+    let light = crate::theme::is_light();
+    let solid: fn(f32) -> gpui::Hsla = if light { black } else { white };
+    let ink: fn(f32) -> gpui::Hsla = if light { white } else { black };
     div()
         .id(id)
+        .debug_selector(|| id.into())
         .role(Role::Button)
         .aria_label(label)
         .tip(label)
@@ -4386,11 +4421,11 @@ fn send_button(
                 .bg(fill)
                 .when(enabled, |d| d.hover(|s| s.bg(fill.blend(content(0.12))))),
             None => d
-                .bg(white(if enabled { 1. } else { 0.3 }))
-                .when(enabled, |d| d.hover(|s| s.bg(white(0.9)))),
+                .bg(solid(if enabled { 1. } else { 0.3 }))
+                .when(enabled, |d| d.hover(|s| s.bg(solid(0.9)))),
         })
         .map(|d| {
-            let ink = accent.map_or(black(if enabled { 1. } else { 0.4 }), |(_, ink)| ink);
+            let ink = accent.map_or(ink(if enabled { 1. } else { 0.4 }), |(_, ink)| ink);
             if busy {
                 d.child(div().size(px(10.)).rounded(px(2.)).bg(ink))
             } else {

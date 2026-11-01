@@ -108,8 +108,10 @@ mod tests {
     use super::*;
 
     fn protocol(kind: Kind, goal: Option<&str>) -> Protocol {
-        let mut settings = crate::agent::Settings::default();
-        settings.goal = goal.map(Into::into);
+        let settings = crate::agent::Settings {
+            goal: goal.map(Into::into),
+            ..Default::default()
+        };
         Protocol::new(Request {
             kind,
             binary: "unused".into(),

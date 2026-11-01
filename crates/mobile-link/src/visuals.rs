@@ -90,9 +90,10 @@ enum Job {
 }
 
 type Reply = mpsc::Sender<Value>;
+type Queue = mpsc::Sender<(Job, Option<Reply>)>;
 
-fn worker() -> &'static Mutex<mpsc::Sender<(Job, Option<Reply>)>> {
-    static WORKER: OnceLock<Mutex<mpsc::Sender<(Job, Option<Reply>)>>> = OnceLock::new();
+fn worker() -> &'static Mutex<Queue> {
+    static WORKER: OnceLock<Mutex<Queue>> = OnceLock::new();
     WORKER.get_or_init(|| {
         let (send, receive) = mpsc::channel::<(Job, Option<Reply>)>();
         std::thread::Builder::new()
@@ -169,7 +170,9 @@ struct Live {
 impl Live {
     fn run(&mut self, job: Job) -> Value {
         match job {
-            Job::Render { key, source } => self.with(&key, &source, false, |runtime| runtime.render()),
+            Job::Render { key, source } => {
+                self.with(&key, &source, false, |runtime| runtime.render())
+            }
             Job::Dispatch {
                 key,
                 source,
@@ -187,9 +190,12 @@ impl Live {
                     }
                 })
             }
-            Job::Reset { key, source } => self.with(&key, &source, true, |runtime| runtime.render()),
+            Job::Reset { key, source } => {
+                self.with(&key, &source, true, |runtime| runtime.render())
+            }
             Job::Drop { prefix } => {
-                self.runtimes.retain(|(key, _, _)| !key.starts_with(&prefix));
+                self.runtimes
+                    .retain(|(key, _, _)| !key.starts_with(&prefix));
                 Value::Null
             }
         }
@@ -206,9 +212,7 @@ impl Live {
         key: &str,
         source: &str,
         restart: bool,
-        call: impl FnOnce(
-            &mut shared::visual::VisualRuntime,
-        ) -> Result<shared::visual::Node, String>,
+        call: impl FnOnce(&mut shared::visual::VisualRuntime) -> Result<shared::visual::Node, String>,
     ) -> Value {
         let found = self
             .runtimes

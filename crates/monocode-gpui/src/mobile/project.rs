@@ -394,6 +394,8 @@ pub(crate) fn git(root: &Path) -> Result<Value, String> {
 pub(crate) struct TextModels {
     pub commit: Option<ModelChoice>,
     pub pr: Option<ModelChoice>,
+    /// The general background model, for a chore with no model of its own.
+    pub background: Option<(Kind, Option<String>)>,
 }
 
 impl TextModels {
@@ -402,6 +404,7 @@ impl TextModels {
         Self {
             commit: pick(TextTask::Commit),
             pr: pick(TextTask::PullRequest),
+            background: prefs.and_then(|p| p.background_text_model()),
         }
     }
 }
@@ -420,8 +423,13 @@ pub(crate) fn git_action(
         .as_str()
         .and_then(Kind::parse)
         .unwrap_or(Kind::Claude);
-    let harness =
-        |choice: &Option<ModelChoice>| crate::changes::commit_harness(preferred, choice.as_ref());
+    let harness = |choice: &Option<ModelChoice>| {
+        let chosen = choice
+            .as_ref()
+            .map(|c| (Kind::from_id(&c.provider), c.model.clone()))
+            .or_else(|| models.background.clone());
+        crate::changes::pick_text_harness(preferred, chosen)
+    };
     let paths = params["paths"]
         .as_array()
         .map(|paths| paths.iter().filter_map(Value::as_str).collect::<Vec<_>>())
@@ -444,13 +452,11 @@ pub(crate) fn git_action(
         "stageAll" => scm::stage_all(root).map(|()| json!({})),
         "unstageAll" => scm::unstage_all(root).map(|()| json!({})),
         "generate" => {
-            let (kind, binary, model) = harness(&models.commit)
+            let harness = harness(&models.commit)
                 .ok_or("No provider CLI is installed to write a commit message.")?;
             let message = crate::changes::generate_commit_message(
-                kind,
-                binary,
+                harness,
                 root.to_path_buf(),
-                model,
                 Arc::new(AtomicBool::new(false)),
             )?;
             Ok(json!({ "message": message }))
@@ -484,7 +490,7 @@ pub(crate) fn git_action(
 /// commits, when no provider can write them), then `gh pr create`.
 fn create_pr_url(
     root: &Path,
-    harness: Option<(Kind, PathBuf, Option<String>)>,
+    harness: Option<crate::changes::TextHarness>,
 ) -> Result<String, String> {
     crate::changes::create_pr_blocking(harness, root).map(|url| url.trim().to_string())
 }
