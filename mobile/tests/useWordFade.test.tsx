@@ -10,8 +10,11 @@ import { useWordFade } from "@/features/sessions/wordReveal";
 
 let renders = 0;
 const nows: number[] = [];
+let fadeMs = 0;
 function Reply({ count }: { count: number }) {
-  const { now } = useWordFade(count, true);
+  const fade = useWordFade(count, true);
+  const { now } = fade;
+  fadeMs = fade.fadeMs;
   renders++;
   nows.push(now);
   return null;
@@ -33,16 +36,17 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-it("renders fading words about 30 times a second, not once per 60 Hz frame, and settles", async () => {
+it("steps the fade on every frame, as it always did, and settles", async () => {
   await act(async () => root.render(<Reply count={1} />));
   await act(async () => root.render(<Reply count={5} />));
   renders = 0;
-  // A fade lasts 480 ms at most; two seconds covers it and then some.
+  nows.length = 0;
+  // A fade lasts a few hundred ms; two seconds covers it and then some.
   await frames(2000);
-  const fadeMs = 480;
-  // At 60 Hz that fade was about 30 renders; throttled it is about half.
-  expect(renders).toBeGreaterThan(5);
-  expect(renders).toBeLessThanOrEqual(Math.ceil(fadeMs / 32) + 3);
+  // One step per 16 ms frame while it fades: the full frame rate, unthrottled.
+  expect(renders).toBeGreaterThanOrEqual(Math.floor(fadeMs / 16) - 1);
+  const gaps = nows.slice(1).map((now, i) => now - nows[i]);
+  expect(Math.max(...gaps.slice(0, Math.floor(fadeMs / 16) - 2))).toBeLessThanOrEqual(17);
   // Nothing renders once the newest word has settled.
   const settled = renders;
   await frames(2000);
