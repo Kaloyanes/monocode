@@ -78,6 +78,21 @@ Design language: the page's `html`/`body` are forced transparent (`page.rs`),
      `a_retry_with_the_same_title_revises_the_draft_instead_of_adding_a_twin`).
    - Not done: `draft_keep` upgrading the existing card instead of adding a
      second one; rendering the live page once per id when two rows share it.
+   - Done (2026-11-01): `draft_keep` upgrades the existing card. The transcript
+     pairs a kept picture with its card through the `draft_keep` call's `draft`
+     id (`visual_bridge::kept_upgrades`) and draws the live page, else the kept
+     picture, else the closed note, at the card's own place; the picture has no
+     row of its own. Tests in `transcript/pages.rs` and `visual_bridge.rs`.
+   - Done: a thread draws a draft id once (`TranscriptView::shows_draft`); a
+     later row naming the same draft is dropped on rebuild.
+   - Done: a same-title retry after the person closed the draft starts a new
+     draft instead of failing (`DRAFT_GONE`, test
+     `a_retry_after_the_person_closed_the_draft_starts_a_new_one`).
+   - Not done: the phone still shows a kept picture as its own card; it cannot
+     tell whether the desktop's page is live.
+   - Measured: a card follows its list item at a constant offset once a frame
+     settles; the first paint after a scroll reports the previous position
+     (test `a_live_card_sits_at_its_place_in_the_turn_and_scrolls_with_it`).
 2. Performance (not started; needs a GPUI build).
    - Cache everything except the draft row instead of bypassing the cache.
    - Make the layout passes opt-in or run them on an offscreen clone.

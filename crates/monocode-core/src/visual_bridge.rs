@@ -323,7 +323,6 @@ pub fn kept_upgrades(rows: &[crate::transcript::Row]) -> Vec<(usize, usize)> {
         claimed[keep] = true;
         let card = cards
             .iter()
-            .rev()
             .find(|(card, draft)| *card < picture && *draft == keeps[keep].1);
         if let Some((card, _)) = card {
             pairs.push((*card, picture));
