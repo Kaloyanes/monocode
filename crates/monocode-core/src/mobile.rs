@@ -9,6 +9,7 @@ mod router;
 pub mod watch;
 
 pub use host::{
-    Device, Event, Invite, MobileHost, Push, PushRegistration, Request, Status, WatchStart,
+    Device, Event, Invite, MobileHost, Push, PushRegistration, Request, Status, TerminalStart,
+    WatchStart,
 };
 pub use monocode_mobile_link::Address;

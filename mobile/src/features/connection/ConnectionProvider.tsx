@@ -53,6 +53,8 @@ export type Catalog = {
   /** The desktop answers `session.unarchive`, so an archive can be undone;
    *  the desktop app today only archives, and the phone then offers no Undo. */
   sessionUnarchive?: boolean;
+  /** Whether the desktop lets this phone open a terminal; missing on older desktops. */
+  terminal?: boolean;
 };
 const EMPTY: Catalog = { projects: [], monos: [], sessions: [] };
 const PAIRING = "monocode.mobile.pairing";

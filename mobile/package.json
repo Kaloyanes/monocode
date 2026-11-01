@@ -63,6 +63,7 @@
     "build:ios": "npx eas-cli@latest build --platform ios --profile production",
     "submit:ios": "npx eas-cli@latest submit --platform ios --profile production",
     "update:beta": "npx eas-cli@latest update --platform ios --channel beta --environment production",
+    "terminal:page": "node scripts/generate-terminal-page.mjs",
     "native:ios": "node scripts/build-native-link.mjs ios",
     "native:android": "node scripts/build-native-link.mjs android"
   },

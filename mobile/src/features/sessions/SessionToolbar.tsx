@@ -18,6 +18,7 @@ import type { SessionSummary } from "@/features/workspace/types";
 import { useWorkspace } from "@/features/workspace/WorkspaceProvider";
 import { LiquidView } from "@/ui/LiquidView";
 import { ChoiceMenu } from "@/ui/ChoiceMenu";
+import { ACTION_SYMBOLS, useTerminalActions } from "@/features/terminal/terminalActions";
 import { themedStyles, useColors } from "@/ui/theme";
 
 import { confirmArchive } from "./archiveActions";
@@ -31,6 +32,10 @@ const failed = (title: string) => (reason: unknown) =>
  *  its button and takes none. Too little left for them and iOS drops a
  *  button rather than squeeze them. */
 const HEADER_ITEMS = 210;
+/** What the terminal button adds to it, when the desktop offers one: its own
+ *  width and the gap beside it. Less and iOS folds the changes button and the
+ *  session menu into an overflow menu behind the terminal button. */
+const TERMINAL_ITEM = 60;
 
 /**
  * A session's title on the left of the stack's header, beside the back button
@@ -41,11 +46,14 @@ export function SessionTitle({
   title,
   subtitle,
   onClose,
+  terminal,
 }: {
   title: string;
   subtitle: string;
   /** Presented as a sheet: a close button before the title, in place of back. */
   onClose?: () => void;
+  /** Whether the toolbar has a terminal button, which the title leaves room for. */
+  terminal?: boolean;
 }) {
   const styles = useStyles();
   const { width } = useWindowDimensions();
@@ -71,7 +79,15 @@ export function SessionTitle({
       ) : null}
       <Stack.Toolbar.View hidesSharedBackground>
         <View
-          style={[styles.title, { width: Math.max(width - HEADER_ITEMS, 80) }]}
+          style={[
+            styles.title,
+            {
+              width: Math.max(
+                width - HEADER_ITEMS - (terminal ? TERMINAL_ITEM : 0),
+                80,
+              ),
+            },
+          ]}
         >
           <Text style={styles.name} numberOfLines={1}>
             {title}
@@ -97,6 +113,9 @@ export function SessionToolbar({
   worktreePath,
   harness,
   changed,
+  terminal,
+  onTerminal,
+  onEditActions,
   onSettings,
 }: {
   projectId: string;
@@ -108,6 +127,12 @@ export function SessionToolbar({
   harness?: string;
   /** Files changed in the session's working copy. */
   changed: number;
+  /** Whether the desktop lets this phone open a terminal. */
+  terminal?: boolean;
+  /** Opens the terminal sheet, typing and running `run` if given. */
+  onTerminal?: (run?: string) => void;
+  /** Opens the sheet that edits the terminal's saved actions. */
+  onEditActions?: () => void;
   onSettings: () => void;
 }) {
   const { archiveSession, deleteSession, renameSession } = useWorkspace();
@@ -126,6 +151,10 @@ export function SessionToolbar({
         ...(harness ? { harness } : {}),
       },
     });
+
+  const [actions] = useTerminalActions(projectId);
+  const openTerminal = (run?: string) => onTerminal?.(run);
+  const editActions = () => onEditActions?.();
 
   const copyId = async () => {
     await Clipboard.setStringAsync(sessionId);
@@ -160,6 +189,32 @@ export function SessionToolbar({
     return (
       <View style={styles.androidToolbar}>
         <LiquidView borderRadius={24} innerStyle={styles.androidActions}>
+          {terminal ? (
+            <ChoiceMenu
+              label="Terminal"
+              actions={[
+                { label: "Open Terminal", onPress: () => openTerminal() },
+                ...actions.map((action) => ({
+                  label: action.name,
+                  onPress: () => openTerminal(action.command),
+                })),
+                { label: "Edit Actions…", onPress: editActions },
+              ]}
+            >
+              <View style={styles.androidButton}>
+                <Svg width={24} height={24} viewBox="0 0 24 24">
+                  <Path
+                    d="M5 8l4.5 4L5 16M12.5 17H19"
+                    stroke={colors.content}
+                    strokeWidth={1.8}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    fill="none"
+                  />
+                </Svg>
+              </View>
+            </ChoiceMenu>
+          ) : null}
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={`Changes, ${changed} ${changed === 1 ? "file" : "files"}`}
@@ -274,6 +329,35 @@ export function SessionToolbar({
 
   return (
     <Stack.Toolbar placement="right">
+      {terminal ? (
+        <Stack.Toolbar.Menu icon="apple.terminal" accessibilityLabel="Terminal">
+          <Stack.Toolbar.MenuAction
+            icon="apple.terminal"
+            onPress={() => openTerminal()}
+          >
+            Open Terminal
+          </Stack.Toolbar.MenuAction>
+          <Stack.Toolbar.Menu inline>
+            {actions.map((action) => (
+              <Stack.Toolbar.MenuAction
+                key={action.id ?? action.name}
+                icon={(ACTION_SYMBOLS[action.icon] ?? "play") as "play"}
+                onPress={() => openTerminal(action.command)}
+              >
+                {action.name}
+              </Stack.Toolbar.MenuAction>
+            ))}
+          </Stack.Toolbar.Menu>
+          <Stack.Toolbar.Menu inline>
+            <Stack.Toolbar.MenuAction
+              icon="slider.horizontal.3"
+              onPress={editActions}
+            >
+              Edit Actions…
+            </Stack.Toolbar.MenuAction>
+          </Stack.Toolbar.Menu>
+        </Stack.Toolbar.Menu>
+      ) : null}
       <Stack.Toolbar.Button
         icon="plus.forwardslash.minus"
         accessibilityLabel={`Changes, ${changed} ${changed === 1 ? "file" : "files"}`}

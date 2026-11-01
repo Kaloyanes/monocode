@@ -4,6 +4,7 @@ import {
   ReconnectingStatus,
   useOffline,
 } from "@/features/connection/ConnectionNotice";
+import { useConnection } from "@/features/connection/ConnectionProvider";
 import { hasNativeTranscript } from "@/features/connection/nativeLink";
 import { useProjectChanges } from "@/features/connection/useProjectChanges";
 import { useProjectWorktrees } from "@/features/connection/useProjectWorktrees";
@@ -48,6 +49,8 @@ import {
 } from "@/features/sessions/activityStore";
 import { SessionContent, SessionScreen } from "@/features/sessions/SessionScreen";
 import { SessionsPage } from "@/features/sessions/SessionsPage";
+import { TerminalActionsSheet } from "@/features/terminal/TerminalActionsSheet";
+import { TerminalSheet } from "@/features/terminal/TerminalSheet";
 import {
   SessionTitle,
   SessionToolbar,
@@ -105,6 +108,10 @@ export function ProjectScreen({
   title?: string;
 }) {
   const { startSession, sendMessage, stop, sessions } = useWorkspace();
+  // Whether the desktop lets this phone open a terminal.
+  const terminal = useConnection().catalog.terminal === true;
+  const [terminalSheet, setTerminalSheet] = useState<{ run?: string; opened: number } | null>(null);
+  const [actionsSheet, setActionsSheet] = useState(false);
   const [openAfterStarting] = useOpenSessionAfterStarting();
   const createMono = useCreateMono(project.id);
   const colors = useColors();
@@ -313,6 +320,7 @@ export function ProjectScreen({
       title={session?.title ?? title ?? "Session"}
       subtitle={[project.name, branch].filter(Boolean).join(" · ")}
       onClose={sheet ? () => router.back() : undefined}
+      terminal={terminal}
     />
   ) : null;
   // A lead's agents, or a worker's way back to its lead.
@@ -331,6 +339,9 @@ export function ProjectScreen({
       worktreePath={worktreePath}
       harness={harness}
       changed={changes.length}
+      terminal={terminal}
+      onTerminal={(run) => setTerminalSheet({ run, opened: Date.now() })}
+      onEditActions={() => setActionsSheet(true)}
       onSettings={openSettings}
     />
   ) : null;
@@ -538,6 +549,24 @@ export function ProjectScreen({
       {/* After the content: iOS blurs under the header the scroll view it
           finds first, down each view's first child. */}
       <ConnectionNotice error={conversation.error} />
+      {sessionId && terminal ? (
+        <>
+          <TerminalSheet
+            project={project}
+            worktreePath={worktreePath}
+            run={terminalSheet?.run}
+            opened={terminalSheet?.opened ?? 0}
+            isPresented={terminalSheet !== null}
+            onDismiss={() => setTerminalSheet(null)}
+          />
+          <TerminalActionsSheet
+            projectId={project.id}
+            projectName={project.name}
+            isPresented={actionsSheet}
+            onDismiss={() => setActionsSheet(false)}
+          />
+        </>
+      ) : null}
     </SessionScreen>
   );
 }

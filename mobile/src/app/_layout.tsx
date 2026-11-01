@@ -183,6 +183,7 @@ function LinkedWorkspace() {
             <Stack.Screen name="inbox" options={screens.modal} />
             <Stack.Screen name="draft" options={screens.modal} />
             <Stack.Screen name="changes" options={screens.changes} />
+            <Stack.Screen name="terminal" options={screens.changes} />
           </Stack>
         </SessionFrame>
         </Timed>
