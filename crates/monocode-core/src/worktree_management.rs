@@ -62,6 +62,9 @@ pub fn remove(cwd: &Path, path: &Path) -> Result<(), String> {
     crate::git::git(cwd, &["worktree", "remove", "--force", "--", &tree.path]).map(|_| ())
 }
 
+/// How many worktrees [`sweep`] inspects at once.
+const INSPECT_PARALLELISM: usize = 8;
+
 /// Merges are judged against this branch when the repository has it.
 pub const PREFERRED_BASE: &str = "feat/gpui";
 
@@ -240,10 +243,23 @@ pub fn sweep(cwd: &Path, base: Option<&str>) -> Result<(Option<String>, Vec<Tree
     let base = base
         .map(str::to_owned)
         .or_else(|| detect_base(Path::new(&main.path)));
-    let list = trees
-        .into_iter()
-        .map(|tree| inspect(cwd, tree, base.as_deref()))
-        .collect();
+    // Each worktree costs several Git processes, so inspect them side by side.
+    let base_ref = base.as_deref();
+    let mut list = Vec::with_capacity(trees.len());
+    let mut rest = trees.into_iter().peekable();
+    while rest.peek().is_some() {
+        let batch: Vec<_> = rest.by_ref().take(INSPECT_PARALLELISM).collect();
+        list.extend(std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .into_iter()
+                .map(|tree| scope.spawn(move || inspect(cwd, tree, base_ref)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worktree inspection panicked"))
+                .collect::<Vec<_>>()
+        }));
+    }
     Ok((base, list))
 }
 /// "3d ago", "Oct 12" or "just now" for a commit time in unix seconds.
@@ -255,6 +271,20 @@ pub fn age_label(unix: i64, now_ms: u64) -> String {
         r if r.ends_with(|c: char| c == 'm' || c == 'h' || c == 'd') => format!("{r} ago"),
         r => r.into(),
     }
+}
+/// Removes a worktree the user picked, but only while it is still clean. Its
+/// branch and commits are kept, so unlike [`remove_if_safe`] it does not need
+/// them merged or pushed. Git is not forced, so it refuses if files changed
+/// after the check.
+pub fn remove_if_clean(cwd: &Path, path: &Path) -> Result<(), String> {
+    let tree = check(cwd, path)?;
+    match status(cwd, &tree).1 {
+        Some(false) => {}
+        Some(true) => return Err(Blocker::Dirty.message().into()),
+        None => return Err(Blocker::Unknown.message().into()),
+    }
+    crate::provider::discard_worktree(Path::new(&tree.path));
+    crate::git::git(cwd, &["worktree", "remove", "--", &tree.path]).map(|_| ())
 }
 /// Removes a worktree only if it is still clean and merged or pushed right now.
 /// Unlike [`remove`], this never passes `--force`, so Git itself also refuses

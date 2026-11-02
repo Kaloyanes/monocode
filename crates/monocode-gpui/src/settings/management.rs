@@ -10,6 +10,8 @@ pub(super) enum Target {
     Skill,
     Worktree,
     DeleteTree(data::Tree),
+    /// Worktrees ticked on the list, all clean when they were ticked.
+    DeleteTrees(Vec<data::Tree>),
     /// Cleanup: worktrees that are clean and merged or pushed.
     Sweep(Vec<monocode_core::worktree_management::TreeStatus>),
     ResetMono(super::MonoSetting),
@@ -81,7 +83,11 @@ impl SettingsView {
         let previous = window.focused(cx);
         if matches!(
             target,
-            Target::Cli(_) | Target::DeleteTree(_) | Target::Sweep(_) | Target::ResetMono(_)
+            Target::Cli(_)
+                | Target::DeleteTree(_)
+                | Target::DeleteTrees(_)
+                | Target::Sweep(_)
+                | Target::ResetMono(_)
         ) {
             window.focus(&self.focus, cx);
         } else {
@@ -193,21 +199,36 @@ impl SettingsView {
                     let removed = match &editor.target {
                         Target::DeleteTree(tree) => vec![tree.tree.path.clone()],
                         Target::Sweep(list) => list.iter().map(|t| t.tree.path.clone()).collect(),
+                        Target::DeleteTrees(list) => {
+                            list.iter().map(|t| t.tree.path.clone()).collect()
+                        }
                         _ => Vec::new(),
                     };
+                    let worktrees_only = matches!(
+                        editor.target,
+                        Target::Worktree
+                            | Target::DeleteTree(_)
+                            | Target::DeleteTrees(_)
+                            | Target::Sweep(_)
+                    );
+                    self.management = None;
+                    self.selected_trees.clear();
                     if removed.iter().any(|path| {
                         monocode_core::files::is_equal_or_inside(&self.selected_project, path)
                     }) {
-                        self.selected_project = self.discovery.worktrees.main.clone();
+                        let main = self.discovery.worktrees.main.clone();
+                        self.select_project_path(main, cx);
+                    } else if worktrees_only {
+                        self.refresh_worktrees(cx);
+                    } else {
+                        self.refresh(cx);
                     }
-                    self.management = None;
-                    self.refresh(cx);
                 }
                 Err(e) => {
                     editor.error = Some(e);
                     // Some of a cleanup may have been removed before one was skipped.
-                    if matches!(editor.target, Target::Sweep(_)) {
-                        self.refresh(cx);
+                    if matches!(editor.target, Target::Sweep(_) | Target::DeleteTrees(_)) {
+                        self.refresh_worktrees(cx);
                     }
                 }
             }
@@ -247,6 +268,16 @@ impl SettingsView {
             cx.emit(SettingsEvent::RemoveWorktrees {
                 cwd,
                 paths: list.into_iter().map(|t| t.tree.path).collect(),
+                merged_only: true,
+            });
+            cx.notify();
+            return;
+        }
+        if let Target::DeleteTrees(list) = target {
+            cx.emit(SettingsEvent::RemoveWorktrees {
+                cwd,
+                paths: list.into_iter().map(|t| t.tree.path).collect(),
+                merged_only: false,
             });
             cx.notify();
             return;
@@ -578,6 +609,7 @@ impl SettingsView {
                 )));
             }
             Target::Sweep(list) => rows.extend(self.sweep_confirmation(&list)),
+            Target::DeleteTrees(list) => rows.extend(self.delete_trees_confirmation(&list)),
             Target::DeleteTree(tree) => {
                 let count = self
                     .ctx
@@ -733,10 +765,12 @@ impl SettingsView {
         let sweep_label = match &target {
             Target::Sweep(list) if list.len() == 1 => Some("Remove worktree".to_owned()),
             Target::Sweep(list) => Some(format!("Remove {} worktrees", list.len())),
+            Target::DeleteTrees(list) if list.len() == 1 => Some("Delete worktree".to_owned()),
+            Target::DeleteTrees(list) => Some(format!("Delete {} worktrees", list.len())),
             _ => None,
         };
         let label = match target {
-            Target::Sweep(_) => sweep_label.as_deref().unwrap_or_default(),
+            Target::Sweep(_) | Target::DeleteTrees(_) => sweep_label.as_deref().unwrap_or_default(),
             Target::Cli(_) => "Save path",
             Target::Mcp => {
                 if busy {
@@ -780,7 +814,10 @@ impl SettingsView {
                 crate::modal::disabled(
                     if matches!(
                         target,
-                        Target::DeleteTree(_) | Target::Sweep(_) | Target::ResetMono(_)
+                        Target::DeleteTree(_)
+                            | Target::DeleteTrees(_)
+                            | Target::Sweep(_)
+                            | Target::ResetMono(_)
                     ) {
                         crate::modal::danger_button("submit-management", label)
                     } else {
@@ -812,6 +849,11 @@ impl SettingsView {
             Target::Mcp => "Add MCP server".into(),
             Target::Worktree => "Create worktree".into(),
             Target::DeleteTree(_) => "Delete worktree?".into(),
+            Target::DeleteTrees(ref list) => format!(
+                "Delete {} {}?",
+                list.len(),
+                if list.len() == 1 { "worktree" } else { "worktrees" }
+            ),
             Target::Sweep(ref list) => format!(
                 "Remove {} {}?",
                 list.len(),

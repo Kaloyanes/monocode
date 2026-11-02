@@ -1,5 +1,6 @@
-//! Settings → Worktrees → Cleanup: removes several worktrees one after another.
-//! Each is checked again by `remove_if_safe` right before it is removed, so a
+//! Settings → Worktrees: removes several worktrees one after another, for
+//! Cleanup and for rows ticked on the list. Each is checked again by
+//! `remove_if_safe` (or `remove_if_clean`) right before it is removed, so a
 //! worktree that gained changes since the list was drawn is skipped, not deleted.
 //! Sessions in a removed worktree are kept and detached, as for a single delete.
 use super::*;
@@ -35,6 +36,7 @@ impl Shell {
         &mut self,
         cwd: String,
         paths: Vec<String>,
+        merged_only: bool,
         cx: &mut Context<Self>,
     ) {
         let mut skipped = Vec::new();
@@ -77,10 +79,18 @@ impl Shell {
                     .ok_or("No main working copy found")?;
                 for path in paths {
                     let main_path = Path::new(&main.path);
-                    if let Err(e) = monocode_core::worktree_management::remove_if_safe(
-                        main_path,
-                        Path::new(&path),
-                    ) {
+                    let removal = if merged_only {
+                        monocode_core::worktree_management::remove_if_safe(
+                            main_path,
+                            Path::new(&path),
+                        )
+                    } else {
+                        monocode_core::worktree_management::remove_if_clean(
+                            main_path,
+                            Path::new(&path),
+                        )
+                    };
+                    if let Err(e) = removal {
                         out.skipped.push(format!("{}: {e}", folder(&path)));
                         continue;
                     }

@@ -197,6 +197,32 @@ impl Shell {
         self.persist(cx);
         cx.notify();
     }
+    /// Settings → Worktrees: leave Settings and start a fresh session in this
+    /// worktree, selecting the worktree (and its project) first.
+    pub(super) fn new_session_in_worktree(
+        &mut self,
+        project: String,
+        focus: WorktreeFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_settings(window, cx);
+        if self.workspace.project != project {
+            self.select_project(project.clone(), window, cx);
+        }
+        if path_key(&focus.path) == path_key(&project) {
+            self.worktree_focus.remove(&project);
+        } else {
+            self.worktree_focus.insert(project, focus);
+        }
+        self.navigation_revision += 1;
+        self.leave_app_views(cx);
+        self.close_preview(cx);
+        if let Some(monos) = self.monos.clone() {
+            monos.update(cx, |m, cx| m.close(cx));
+        }
+        self.create_session(self.default_kind(), false, cx);
+    }
     pub(super) fn seed_worktree(
         &mut self,
         id: i64,

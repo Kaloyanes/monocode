@@ -86,39 +86,60 @@ pub(super) fn discover(cwd: &str) -> Discovery {
         }
         Err(e) => data.mcp_error = Some(e),
     }
-    if !cwd.is_empty() {
-        match git::snapshot(Path::new(cwd)) {
-            Ok(s) => {
-                if let Some(main) = s.worktrees.first() {
-                    data.worktrees.main = main.path.clone();
-                    data.worktrees.default_root =
-                        monocode_core::worktree_management::default_root(Path::new(&main.path));
-                }
-                data.worktrees.branches = s.branches;
-                data.worktrees.trees = s
-                    .worktrees
-                    .into_iter()
-                    .filter(|t| !t.main)
-                    .map(|tree| {
-                        let status =
-                            monocode_core::worktree_management::status(Path::new(cwd), &tree);
-                        Tree {
-                            tree,
-                            locked: status.0,
-                            dirty: status.1,
-                            unpushed: status.2,
-                        }
-                    })
-                    .collect();
-                if let Ok((base, sweep)) =
-                    monocode_core::worktree_management::sweep(Path::new(cwd), None)
-                {
-                    data.worktrees.base = base;
-                    data.worktrees.sweep = sweep;
-                }
-            }
-            Err(e) => data.worktrees.error = Some(e),
+    data
+}
+
+/// The worktrees of the project at `cwd`. Git runs here, on a worker, apart
+/// from `discover` so the Worktrees page never waits on skills or MCP.
+pub(super) fn discover_worktrees(cwd: &str) -> ResultTrees {
+    let mut out = ResultTrees::default();
+    if cwd.is_empty() {
+        return out;
+    }
+    let snapshot = match git::snapshot(Path::new(cwd)) {
+        Ok(s) => s,
+        Err(e) => {
+            out.error = Some(e);
+            return out;
+        }
+    };
+    if let Some(main) = snapshot.worktrees.first() {
+        out.main = main.path.clone();
+        out.default_root = monocode_core::worktree_management::default_root(Path::new(&main.path));
+    }
+    out.branches = snapshot.branches;
+    match monocode_core::worktree_management::sweep(Path::new(cwd), None) {
+        // One inspection per worktree feeds both the list and Cleanup.
+        Ok((base, sweep)) => {
+            out.trees = sweep
+                .iter()
+                .filter(|s| !s.tree.main)
+                .map(|s| Tree {
+                    tree: s.tree.clone(),
+                    locked: s.locked,
+                    dirty: s.dirty,
+                    unpushed: s.unpushed.unwrap_or(0),
+                })
+                .collect();
+            out.base = base;
+            out.sweep = sweep;
+        }
+        Err(_) => {
+            out.trees = snapshot
+                .worktrees
+                .into_iter()
+                .filter(|t| !t.main)
+                .map(|tree| {
+                    let status = monocode_core::worktree_management::status(Path::new(cwd), &tree);
+                    Tree {
+                        tree,
+                        locked: status.0,
+                        dirty: status.1,
+                        unpushed: status.2,
+                    }
+                })
+                .collect();
         }
     }
-    data
+    out
 }

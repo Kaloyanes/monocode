@@ -230,9 +230,21 @@ impl Shell {
                     window,
                     cx,
                 ),
-                SettingsEvent::RemoveWorktrees { cwd, paths } => {
-                    this.remove_swept_worktrees(cwd.clone(), paths.clone(), cx)
-                }
+                SettingsEvent::NewSessionInWorktree { cwd, path, branch } => this
+                    .new_session_in_worktree(
+                        cwd.clone(),
+                        crate::worktree_switcher::WorktreeFocus {
+                            path: path.clone(),
+                            branch: branch.clone(),
+                        },
+                        window,
+                        cx,
+                    ),
+                SettingsEvent::RemoveWorktrees {
+                    cwd,
+                    paths,
+                    merged_only,
+                } => this.remove_swept_worktrees(cwd.clone(), paths.clone(), *merged_only, cx),
                 SettingsEvent::ChooseBackground => this.choose_chat_background(cx),
                 SettingsEvent::ResetMono(id) => {
                     if let Some(m) = this.monos.clone() {

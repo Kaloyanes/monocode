@@ -291,4 +291,66 @@ impl SettingsView {
         ));
         rows
     }
+
+    /// What the confirmation lists for worktrees ticked on the Worktrees page.
+    pub(in crate::settings) fn delete_trees_confirmation(
+        &self,
+        list: &[super::super::data::Tree],
+    ) -> Vec<AnyElement> {
+        let sessions = list
+            .iter()
+            .map(|s| {
+                self.ctx
+                    .sessions
+                    .iter()
+                    .filter(|(_, p, _)| monocode_core::files::is_equal_or_inside(p, &s.tree.path))
+                    .count()
+            })
+            .sum::<usize>();
+        let mut rows = vec![note(
+            "These folders are deleted from disk, including ignored files such as build output. Each branch and its commits are kept.",
+        )];
+        rows.push(
+            div()
+                .rounded_lg()
+                .border_1()
+                .border_color(content(0.1))
+                .bg(content(0.05))
+                .p_3()
+                .text_size(px(12.))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(list.iter().map(|s| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().font_weight(gpui::FontWeight::MEDIUM).child(format!(
+                            "{} · {}",
+                            folder(&s.tree.path),
+                            s.tree.branch.as_deref().unwrap_or("detached")
+                        )))
+                        .child(div().text_color(content(0.45)).child(s.tree.path.clone()))
+                        .when(s.unpushed > 0, |d| {
+                            d.child(div().text_color(content(0.55)).child(format!(
+                                "{} unpublished {} stay on the branch.",
+                                s.unpushed,
+                                if s.unpushed == 1 { "commit" } else { "commits" }
+                            )))
+                        })
+                }))
+                .into_any_element(),
+        );
+        if sessions > 0 {
+            rows.push(note(format!(
+                "{sessions} {} using these worktrees {} kept. Select a branch or worktree to continue them.",
+                if sessions == 1 { "session" } else { "sessions" },
+                if sessions == 1 { "is" } else { "are" },
+            )));
+        }
+        rows.push(note(
+            "Each worktree is checked again just before it is deleted; one that has changes by then is skipped.",
+        ));
+        rows
+    }
 }

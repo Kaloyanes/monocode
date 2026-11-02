@@ -1,6 +1,6 @@
 //! SettingsView.tsx's building blocks: PageHeader, Group, Row, Toggle,
 //! Segmented, Slider, Select and SecondaryButton, at their Tailwind metrics.
-use super::{SettingsView, SliderKind};
+use super::{Section, SettingsView, SliderKind};
 use crate::tooltip::Tip;
 use crate::{
     popover::{Align, Anchor, AnchorSlot, Side, popover},
@@ -873,8 +873,7 @@ impl SettingsView {
             None,
             cx,
             |this, value, cx| {
-                this.selected_project = value;
-                this.refresh(cx);
+                this.select_project_path(value, cx);
             },
         )
     }
@@ -884,11 +883,22 @@ impl SettingsView {
         label: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        secondary_button(id, label, false, self.discovery_loading)
+        let loading = if self.section == Section::Worktrees {
+            self.worktrees_loading
+        } else {
+            self.discovery_loading
+        };
+        secondary_button(id, label, false, loading)
             .child(icon("refresh-cw", 14.))
             .child(label)
-            .when(!self.discovery_loading, |d| {
-                d.on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
+            .when(!loading, |d| {
+                d.on_click(cx.listener(|this, _, _, cx| {
+                    if this.section == Section::Worktrees {
+                        this.refresh_worktrees(cx);
+                    } else {
+                        this.refresh(cx);
+                    }
+                }))
             })
             .into_any_element()
     }

@@ -24,6 +24,8 @@ fn window(section: Section, cx: &mut TestAppContext) -> WindowHandle<SettingsVie
                     );
                     view.discovery_task = None;
                     view.discovery_loading = false;
+                    view.worktrees_task = None;
+                    view.worktrees_loading = false;
                     view
                 })
             },

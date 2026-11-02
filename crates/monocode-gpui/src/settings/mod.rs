@@ -133,10 +133,19 @@ pub(crate) enum SettingsEvent {
         path: String,
         delete_sessions: bool,
     },
+    /// Start a new session whose working copy is this worktree.
+    NewSessionInWorktree {
+        cwd: String,
+        path: String,
+        branch: Option<String>,
+    },
     /// Cleanup: remove these worktrees, each only if it is still safe to.
     RemoveWorktrees {
         cwd: String,
         paths: Vec<String>,
+        /// Cleanup only removes what is merged or pushed; a hand-picked list
+        /// removes any worktree that is still clean.
+        merged_only: bool,
     },
     ResetMono(String),
     MonoSidebar(String, bool, bool),
@@ -267,6 +276,12 @@ pub(crate) struct SettingsView {
     discovery: data::Discovery,
     discovery_loading: bool,
     discovery_task: Option<Task<()>>,
+    /// Git runs apart from the rest of discovery, so the Worktrees page
+    /// neither waits on skills and MCP nor loses its list while Git runs.
+    worktrees_loading: bool,
+    worktrees_task: Option<Task<()>>,
+    /// Folders ticked on the Worktrees page for deleting together.
+    selected_trees: std::collections::BTreeSet<String>,
     selected_project: String,
     provider_scope: String,
     mcp_filter: String,
@@ -437,6 +452,9 @@ impl SettingsView {
             discovery: data::Discovery::default(),
             discovery_loading: false,
             discovery_task: None,
+            worktrees_loading: false,
+            worktrees_task: None,
+            selected_trees: Default::default(),
             selected_project,
             provider_scope: "global".into(),
             mcp_filter: "all".into(),
@@ -469,6 +487,7 @@ impl SettingsView {
         }
         this.notification_deadline(cx);
         this.refresh(cx);
+        this.refresh_worktrees(cx);
         this
     }
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -483,17 +502,23 @@ impl SettingsView {
         }
         let cwd = self.selected_project.clone();
         self.discovery_loading = true;
-        let work = cx.background_executor().spawn(async move {
-            (
-                data::discover(&cwd),
-                monocode_core::permissions::Store::default().list(),
-            )
+        let work = cx.background_executor().spawn({
+            let cwd = cwd.clone();
+            async move {
+                (
+                    data::discover(&cwd),
+                    monocode_core::permissions::Store::default().list(),
+                )
+            }
         });
         self.discovery_task = Some(cx.spawn(async move |this, cx| {
             let (data, grants) = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.skill_documents.clear();
+                // Worktrees load on their own; keep what they have.
+                let worktrees = std::mem::take(&mut this.discovery.worktrees);
                 this.discovery = data;
+                this.discovery.worktrees = worktrees;
                 this.discovery_loading = false;
                 match grants {
                     Ok(grants) => {
@@ -513,6 +538,38 @@ impl SettingsView {
             });
         }));
         cx.notify();
+    }
+    /// Read the selected project's worktrees again. The list on screen stays
+    /// until the answer arrives; a newer request replaces an older one.
+    pub(super) fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.selected_project.clone();
+        self.worktrees_loading = true;
+        let work = cx.background_executor().spawn({
+            let cwd = cwd.clone();
+            async move { data::discover_worktrees(&cwd) }
+        });
+        self.worktrees_task = Some(cx.spawn(async move |this, cx| {
+            let trees = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selected_project != cwd {
+                    return;
+                }
+                this.selected_trees
+                    .retain(|path| trees.trees.iter().any(|t| &t.tree.path == path));
+                this.discovery.worktrees = trees;
+                this.worktrees_loading = false;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+    /// The project changed: the old project's worktrees are not shown for the new one.
+    pub(super) fn select_project_path(&mut self, path: String, cx: &mut Context<Self>) {
+        self.selected_project = path;
+        self.discovery.worktrees = Default::default();
+        self.selected_trees.clear();
+        self.refresh(cx);
+        self.refresh_worktrees(cx);
     }
     /// Ask each installed CLI for its models, as the model picker does.
     fn discover_catalogs(&mut self, cx: &mut Context<Self>) {
@@ -584,6 +641,10 @@ impl SettingsView {
             self.watch_connections(cx);
             if section == Section::Mcp {
                 self.refresh_mcp_health(cx);
+            }
+            if section == Section::Worktrees {
+                // Show what is known now; Git may have moved on since.
+                self.refresh_worktrees(cx);
             }
             self.select_open = None;
             self.text_model_menu = None;
