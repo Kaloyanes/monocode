@@ -53,6 +53,7 @@ mod pane_layout;
 mod pane_motion;
 mod particle_text;
 mod pickers;
+mod plan_rail;
 mod popover;
 mod project_background;
 mod project_search;
@@ -222,6 +223,7 @@ fn main() {
     let mut fixture = false;
     let mut chat_fixture = false;
     let mut visual_fixture = false;
+    let mut plan_fixture = false;
     // Development stays separate; release builds use the installed app's data.
     let mut use_monocode = bundle_uses_monocode_data().unwrap_or(!cfg!(debug_assertions));
     let mut monocode_db = monocode_core::store::monocode_database();
@@ -233,6 +235,7 @@ fn main() {
             "--fixture" => fixture = true,
             "--chat-fixture" => chat_fixture = true,
             "--visual-fixture" => visual_fixture = true,
+            "--plan-fixture" => plan_fixture = true,
             "--dev-data" => use_monocode = false,
             "--monocode-data" => use_monocode = true,
             "--monocode-db" => {
@@ -246,7 +249,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "monocode-gpui [--cwd PATH] [--dev-data | --monocode-data | --monocode-db PATH]\nDevelopment builds use a separate database; release builds use the installed MonoCode database.\n--dev-data opens an isolated development database using Monocode's existing schema.\n--monocode-data opens the existing desktop monocode.db directly.\n--monocode-db PATH opens a specific desktop database.\n--fixture, --chat-fixture and --visual-fixture add local samples to isolated development data only.\nvisual docs prints the native visual SDK reference.\nvisual check/show --input FILE validates or publishes native session visuals.\nvisual-mcp runs the session visual tool server over standard input/output.\n--check-data validates and lists the selected store read-only, then exits."
+                    "monocode-gpui [--cwd PATH] [--dev-data | --monocode-data | --monocode-db PATH]\nDevelopment builds use a separate database; release builds use the installed MonoCode database.\n--dev-data opens an isolated development database using Monocode's existing schema.\n--monocode-data opens the existing desktop monocode.db directly.\n--monocode-db PATH opens a specific desktop database.\n--fixture, --chat-fixture, --visual-fixture and --plan-fixture add local samples to isolated development data only.\nvisual docs prints the native visual SDK reference.\nvisual check/show --input FILE validates or publishes native session visuals.\nvisual-mcp runs the session visual tool server over standard input/output.\n--check-data validates and lists the selected store read-only, then exits."
                 );
                 return;
             }
@@ -256,7 +259,7 @@ fn main() {
             }
         }
     }
-    if use_monocode && (fixture || chat_fixture || visual_fixture) {
+    if use_monocode && (fixture || chat_fixture || visual_fixture || plan_fixture) {
         eprintln!(
             "Fixtures require --dev-data; they cannot be written into your Monocode database."
         );
@@ -376,6 +379,13 @@ fn main() {
         db.title(s.id, "Native visuals · Controls, charts and 3D")
             .unwrap();
         db.write_rows(s.id, 0, &fixtures::visuals().rows).unwrap();
+    }
+    if plan_fixture {
+        for (provider, title, transcript) in fixtures::plans() {
+            let s = db.create(provider, &cwd).expect("create plan fixture");
+            db.title(s.id, title).unwrap();
+            db.write_rows(s.id, 0, &transcript.rows).unwrap();
+        }
     }
     let mut sessions = db.sessions().expect("read native sessions");
     if sessions.is_empty() {

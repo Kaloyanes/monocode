@@ -117,6 +117,23 @@ impl Conversation {
         self.follow_ups.state.messages.push(message);
         self.save_follow_ups(cx);
     }
+    /// The plan rail's request to reorder, skip or write the plan. It leaves
+    /// the composer and its attachments alone, and steers wherever the
+    /// provider can take a message mid-turn.
+    pub(crate) fn send_plan_steer(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.is_remote() || !self.responding() {
+            return;
+        }
+        let mut message = self.message(prompt, Vec::new(), None, cx);
+        message.steer = Kind::from_id(&self.summary.provider).can_steer() && message.can_steer();
+        self.follow_ups.motion.insert(
+            &message.id,
+            self.follow_ups.state.messages.is_empty(),
+            !cx.reduce_motion(),
+        );
+        self.follow_ups.state.messages.push(message);
+        self.save_follow_ups(cx);
+    }
     pub(super) fn save_message_draft(&mut self, cx: &mut Context<Self>) {
         if self.is_remote() {
             self.remote_save_draft(cx);

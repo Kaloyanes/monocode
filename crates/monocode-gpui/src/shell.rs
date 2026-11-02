@@ -2,6 +2,7 @@ mod accounts;
 mod actions;
 mod app_commands;
 mod app_views;
+mod archive_motion;
 mod automation_runs;
 mod classic_sidebar;
 #[cfg(test)]
@@ -18,12 +19,13 @@ pub(crate) mod monos;
 mod notifications;
 mod orchestration;
 mod picker_preferences;
+#[cfg(all(test, target_os = "macos"))]
+mod plan_rail_shots;
 mod project_rail;
 mod project_removal;
 mod project_settings;
 mod quick_composer;
 mod quick_open;
-mod archive_motion;
 mod rails;
 mod remote_projects;
 mod remote_sessions;
@@ -571,6 +573,7 @@ pub(crate) struct Shell {
     /// title bar takes their room back.
     fullscreen: bool,
     tabs_frame: Entity<Chrome>,
+    plan_rail: Entity<crate::plan_rail::PlanRail>,
     store: Database,
     remote: Arc<monocode_core::remote::Connections>,
     remote_project_picker: Option<remote_projects::Open>,
@@ -929,6 +932,7 @@ impl Shell {
             peek_toggle_bounds: AnchorSlot::default(),
             fullscreen: false,
             tabs_frame,
+            plan_rail: cx.new(|_| crate::plan_rail::PlanRail::new()),
             store,
             remote,
             remote_project_picker: None,
@@ -7167,8 +7171,41 @@ impl Shell {
         };
         (window.viewport_size().width.as_f32() - lead - trailing).max(0.)
     }
+    /// The title strip as the active session's plan rail, in place of tabs.
+    fn plan_strip(&mut self, viewport: f32, cx: &mut Context<Self>) -> AnyElement {
+        let session = self.workspace.active.and_then(|id| {
+            let id = self.workspace.session_for_pane(id);
+            self.sessions.get(&id).map(|view| (id, view.clone()))
+        });
+        let session = session.filter(|_| !self.app_view_open());
+        self.plan_rail
+            .update(cx, |rail, cx| rail.follow(session, cx));
+        div()
+            .id("title-plan-strip")
+            .debug_selector(|| "title-plan-strip".into())
+            .w(px(viewport))
+            .min_w_0()
+            .h(px(TITLE_BAR_HEIGHT))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .pl(px(STRIP_LEAD))
+            .child(
+                div()
+                    .flex_shrink(1.)
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .child(self.plan_rail.clone()),
+            )
+            .child(titlebar_drag_area().flex_1().min_w(px(24.)))
+            .into_any()
+    }
     fn tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let viewport = self.tabs_width(window, cx);
+        if self.workspace.preferences.title_plan {
+            return self.plan_strip(viewport, cx);
+        }
         let tabs = self.visible_tabs(cx);
         let count = tabs.len();
         let insert = self.pane_drag.as_ref().and_then(|d| d.insert);

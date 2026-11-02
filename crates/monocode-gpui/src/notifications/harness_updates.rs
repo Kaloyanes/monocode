@@ -38,6 +38,11 @@ impl HarnessUpdates {
         }
         this
     }
+    #[cfg(test)]
+    pub(crate) fn clear(&mut self, cx: &mut Context<Self>) {
+        self.updates.clear();
+        cx.notify();
+    }
     pub(crate) fn is_visible(&self) -> bool {
         !self.updates.is_empty()
     }
