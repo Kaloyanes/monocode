@@ -45,8 +45,6 @@ impl Conversation {
         self.install_transfer(settings, None, cx);
         if send {
             self.apply_draft_action(true, cx);
-        } else {
-            self.adopt_saved_draft(cx);
         }
         cx.emit(SessionChanged);
     }
@@ -92,7 +90,7 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         if self.driven_by.is_some() {
-            return Err("A subagent is driven by its lead".into());
+            return Err("This child thread is driven by its lead".into());
         }
         if self.busy
             || self.stopping

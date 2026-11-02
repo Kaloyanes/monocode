@@ -73,6 +73,10 @@ impl Conversation {
         if self.driven_by.is_some() {
             return;
         }
+        if !self.history_ready() {
+            self.defer_history_action(|this, cx| this.compact_context(cx), cx);
+            return;
+        }
         self.compact_context_then(None, cx);
     }
 

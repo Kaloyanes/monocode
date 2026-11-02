@@ -12,14 +12,6 @@ pub struct ThreadRun {
 }
 
 impl ToolCall {
-    /// A call to one of the draft tools. The draft's card in the thread shows
-    /// the result, so the calls themselves stay out of it.
-    pub fn is_draft_tool(&self) -> bool {
-        ["draft_preview", "draft_keep", "draft_wait"]
-            .iter()
-            .any(|tool| self.name.ends_with(tool))
-    }
-
     /// The tool's name without the MonoCode MCP server's prefix.
     fn monocode_tool(&self) -> &str {
         self.name

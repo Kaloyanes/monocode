@@ -640,6 +640,8 @@ pub(crate) struct Shell {
     thread_waiters: HashMap<i64, Vec<monocode_core::mono::bridge::Call>>,
     agent_summary_writes: HashMap<i64, gpui::Task<()>>,
     /// The sidebar rails under orchestrators and /operator threads.
+    rails: rails::Rails,
+    /// The sidebar rails under orchestrators and /operator threads.
     usage_footer: Entity<UsageFooter>,
     /// The footer's high-usage chip and its running-work dialog.
     resources: Entity<ResourceMonitor>,
@@ -1077,6 +1079,7 @@ impl Shell {
             thread_parents: sidebar_metadata.thread_parents,
             thread_waiters: HashMap::new(),
             agent_summary_writes: HashMap::new(),
+            rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
             keep_awake,
@@ -1497,14 +1500,6 @@ impl Shell {
             // the indexed working directory so those events cannot erase it.
             view.restore_worktree(worktree, None, cx);
             view.draft_hint = self.draft_sessions.contains(&id);
-            if self.composer_draft_sessions.contains(&id)
-                && let Some(draft) = locked(&self.store)
-                    .and_then(|s| s.composer_draft(id))
-                    .ok()
-                    .flatten()
-            {
-                view.restore_composer_draft(draft, cx);
-            }
             view.driven_by = self.subagent_lead(id);
             view.managed |= view.driven_by.is_some();
             view.thread_lead_title = view
@@ -1522,7 +1517,6 @@ impl Shell {
                 t.subagent = subagent;
             });
             view.set_subagents(self.subagent_strip(id, cx), cx);
-            view.settings.usage_limit = self.usage_limits.get(&id).cloned();
             if let Some(bridge) = &self.app_bridge {
                 view.set_app_environment(bridge.environment(id));
             }
@@ -1753,9 +1747,6 @@ impl Shell {
                             {
                                 this.toggle_archive(sub, cx);
                             }
-                        }
-                        if archived {
-                            this.start_archive_exit(id, window, cx);
                         }
                         if archived && this.workspace.tab_of(id).is_some() {
                             this.close_pane(id, window, cx);
@@ -6595,7 +6586,6 @@ impl Shell {
                 .items_center()
                 .gap_1()
                 .flex_shrink_0()
-                .children(origin)
                 .children(work_item)
                 .when(
                     self.automation_state.session_automations.contains_key(&id),
@@ -6636,7 +6626,6 @@ impl Shell {
                         .items_center()
                         .gap(px(gap))
                         .child(mark)
-                        .children(mono_tile)
                         .child(title)
                         .when(has_badges, |d| d.child(badges))
                         .child(suffix),
@@ -6764,17 +6753,12 @@ impl Shell {
             .flex()
             .items_center()
             .when(active, |d| d.bg(content(0.1)))
-            .hover(|s| {
-                let s = s.bg(content(if active { 0.1 } else { 0.05 }));
-                if archived { s.opacity(0.9) } else { s }
-            })
+            .hover(|s| s.bg(content(if active { 0.1 } else { 0.05 })))
             .when(
                 self.sidebar_drop == Some(session_groups::ListDrop::Session(id)),
                 |d| d.bg(content(0.14)),
             )
             .when(self.deleting.contains(&id), |d| d.opacity(0.5))
-            // Archived threads recede, and come back to full strength on hover.
-            .when(session.summary.archived, |d| d.opacity(0.55))
             .child(
                 div()
                     .w_full()
@@ -6784,7 +6768,6 @@ impl Shell {
                     .child(body)
                     .children(tree),
             )
-            .children(self.sidebar_drop_mark(id))
             .child(anchor.probe())
             .relative()
             .on_hover(cx.listener(move |this, hovered, window, cx| {
@@ -7048,9 +7031,7 @@ impl Shell {
                 .as_ref()
                 .is_some_and(|m| m.read(cx).hidden_session(id))
                 && s.summary.cwd == self.workspace.project
-                && (s.summary.has_messages
-                    || s.has_composer_draft()
-                    || self.is_fresh_session(id, cx))
+                && s.summary.has_messages
                 && self.subagent_lead(id).is_none()
                 && self.in_sidebar_worktree_scope(id, cx)
         };

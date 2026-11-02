@@ -109,11 +109,7 @@ export function ProjectScreen({
   /** Its title until the session is in the catalog, which may leave it out. */
   title?: string;
 }) {
-  const { startSession, sendMessage, stop } = useWorkspace();
-  // Whether the desktop lets this phone open a terminal.
-  const terminal = useConnection().catalog.terminal === true;
-  const [terminalSheet, setTerminalSheet] = useState<{ run?: string; opened: number } | null>(null);
-  const [actionsSheet, setActionsSheet] = useState(false);
+  const { startSession, sendMessage, stop, sessions } = useWorkspace();
   const [openAfterStarting] = useOpenSessionAfterStarting();
   const createMono = useCreateMono(project.id);
   const colors = useColors();

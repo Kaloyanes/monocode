@@ -519,15 +519,7 @@ impl Shell {
             let Entry::Session(id) = entry else {
                 continue;
             };
-            if fresh.contains(id) {
-                continue;
-            }
-            let summary = self.session_metadata(*id, cx).summary;
-            let label = if archived_listed && summary.archived {
-                "Archived"
-            } else {
-                age_label(summary.updated_at, now)
-            };
+            let label = age_label(self.session_metadata(*id, cx).summary.updated_at, now);
             if previous != Some(label) {
                 rows.push(Row::Heading { label, first });
                 previous = Some(label);
@@ -633,8 +625,7 @@ impl Shell {
                 | Row::GroupedSession { id, .. }
                 | Row::ClassicGroupMember { id, .. },
             ) = self.sidebar_list.rows.get(ix)
-                && (self.orchestration_summaries.contains_key(id)
-                    || self.archive_exits.exiting(*id))
+                && self.orchestration_summaries.contains_key(id)
             {
                 self.sidebar_list.state.remeasure_items(ix..ix + 1);
             }

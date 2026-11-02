@@ -164,14 +164,6 @@ fn thread_ui_shots() {
             cx.update_window(window.into(), |_, w, _| w.refresh())
                 .unwrap();
         }
-        window
-            .update(cx, |shell, _, cx| {
-                shell
-                    .notification_state
-                    .harness
-                    .update(cx, |h, cx| h.clear(cx))
-            })
-            .unwrap();
         cx.run_until_parked();
         cx.update_window(window.into(), |_, w, _| w.refresh())
             .unwrap();

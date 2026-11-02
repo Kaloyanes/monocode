@@ -5524,15 +5524,6 @@ impl TranscriptView {
                     && (!first
                         || self.clamped_prompts.contains(&message_start)
                         || self.prompt_lines(&text, window) > 4);
-                let prose = (user && link.is_none())
-                    .then(|| self.user_prose_rows(message_start, &text))
-                    .flatten();
-                let prose = prose.map(|rows| {
-                    rows.iter()
-                        .map(|md| self.user_prose_row(md, ix, cx))
-                        .collect::<Vec<_>>()
-                });
-                let has_prose = prose.is_some();
                 let from_thread = user && self.prompt_sender(message_start).is_some();
                 let bubble = div()
                     .when(photo_body.is_none(), |d| d.w_full())

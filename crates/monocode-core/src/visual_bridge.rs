@@ -125,6 +125,42 @@ const NEW_THREAD: &str = "new_thread";
 const MAX_PLAN_STEPS: usize = 24;
 const MAX_STEP_CHARS: usize = 160;
 
+/// The MCP server's name, so its tools reach the model as `mcp__monocode__*`.
+pub const SERVER_NAME: &str = "monocode";
+/// What the MCP server needs from the provider process: the visual capability
+/// and, in a chat that can start threads, its app capability.
+const SERVER_ENV: [&str; 9] = [
+    ENV_ENDPOINT,
+    ENV_TOKEN,
+    ENV_SESSION,
+    ENV_EXECUTABLE,
+    "MONOCODE_APP_ENDPOINT",
+    "MONOCODE_APP_TOKEN",
+    "MONOCODE_APP_SESSION",
+    "MONOCODE_THREADS",
+    crate::orchestration::ENV,
+];
+/// Harnesses ship their own subagent tools, which run out of the user's sight
+/// and only on that harness. Claude Code also defers MCP tools to a name until
+/// searched, so the server instructions and each harness's own system prompt
+/// (see [`instructions`]) are where an agent learns that MonoCode starts
+/// subagents, and how that differs from opening a new thread for the user.
+pub(crate) const THREAD_INSTRUCTIONS: &str = "MonoCode runs your subagents. Whenever you would hand work to a subagent or another agent, and whenever the user asks for one on another harness or model (Codex, Claude, Haiku and so on), start it with thread_start and collect its reply with thread_wait. Each runs as its own chat the user can watch in MonoCode. Use thread_start instead of your built-in subagent or task tool, and do not run agent CLIs from the shell. A subagent works for you and reports back. When the user asks for a new thread or chat instead, open it with new_thread: it is theirs, so you don't send to it or wait on it. If you can't tell which they mean, ask.";
+fn threads_enabled(environment: &HashMap<String, String>) -> bool {
+    environment
+        .get("MONOCODE_THREADS")
+        .is_some_and(|v| v == "1")
+}
+/// The chat the user talks to, which can start MonoCode threads.
+pub fn lead_chat(environment: &HashMap<String, String>) -> bool {
+    configured(environment) && threads_enabled(environment)
+}
+/// Claude Code shows these in full rather than as a name behind tool search,
+/// so in a lead chat they compete on equal terms with its own subagent tool.
+const ALWAYS_LOADED: [&str; 3] = ["thread_start", "thread_wait", NEW_THREAD];
+/// Opens a top-level thread the user owns, unlike thread_start's children.
+const NEW_THREAD: &str = "new_thread";
+
 /// Loaded through visual_docs or the CLI only when authoring a visual. Keep the
 /// SDK out of ordinary prompts, server instructions and tool descriptions; only
 /// the short USAGE trigger is part of the system prompt.
@@ -203,12 +239,18 @@ const USAGE: &str = "### Native visuals\n\nAnswer data with a trend, comparison 
 
 /// Usage guidance for a provider that received the visual MCP server. Claude
 /// Code may defer MCP tools behind ToolSearch, so it is told how to load them.
+/// A lead chat is also told to start its subagents through MonoCode.
 pub fn instructions(environment: &HashMap<String, String>, deferred: bool) -> Option<String> {
     configured(environment).then(|| {
-        if deferred {
-            format!("{USAGE} The monocode_visual tools may be deferred: load them with ToolSearch before you call them.")
+        let usage = if deferred {
+            format!("{USAGE} The monocode tools may be deferred: load them with ToolSearch before you call them.")
         } else {
             USAGE.to_owned()
+        };
+        if lead_chat(environment) {
+            format!("{usage}\n\n{THREAD_INSTRUCTIONS}")
+        } else {
+            usage
         }
     })
 }
@@ -223,7 +265,7 @@ pub fn requested_prompt(request: &str) -> String {
     };
     format!(
         "Create and publish at least one native inline visual in this conversation during this turn. The user invoked the visualization command, so a visual is required even if you would normally answer only in prose.\n\n\
-         Read `visual_docs`, build the visual, run `visual_check`, fix any errors, and call `visual_show` before finishing. The monocode_visual MCP tools may be deferred; load them with ToolSearch if needed. If these tools are unavailable, use the executable in MONOCODE_VISUAL_EXECUTABLE: run `\"$MONOCODE_VISUAL_EXECUTABLE\" visual docs`, write the JavaScript source to a file, then run `\"$MONOCODE_VISUAL_EXECUTABLE\" visual check --input FILE` and `\"$MONOCODE_VISUAL_EXECUTABLE\" visual show --input FILE --title TITLE`.\n\n\
+         Read `visual_docs`, build the visual, run `visual_check`, fix any errors, and call `visual_show` before finishing. The monocode MCP tools may be deferred; load them with ToolSearch if needed. If these tools are unavailable, use the executable in MONOCODE_VISUAL_EXECUTABLE: run `\"$MONOCODE_VISUAL_EXECUTABLE\" visual docs`, write the JavaScript source to a file, then run `\"$MONOCODE_VISUAL_EXECUTABLE\" visual check --input FILE` and `\"$MONOCODE_VISUAL_EXECUTABLE\" visual show --input FILE --title TITLE`.\n\n\
          Use the native visual SDK, never a server, browser or HTML file. Include the embed line returned by visual_show in your reply, alongside concise supporting prose. If publication fails, explain the failure; do not claim a visual was shown. Never print capability environment variables.\n\n\
          User request:\n{request}"
     )
@@ -231,7 +273,8 @@ pub fn requested_prompt(request: &str) -> String {
 
 /// Claude permission rule that pre-approves every visual tool. Publishing
 /// only affects this conversation, so read-only and plan turns may use it.
-pub const CLAUDE_ALLOWED_TOOLS: &str = "mcp__monocode_visual";
+pub const CLAUDE_ALLOWED_TOOLS: &str =
+    "mcp__monocode__visual_docs,mcp__monocode__visual_check,mcp__monocode__visual_show";
 
 #[derive(Serialize, Deserialize)]
 struct Wire {
@@ -1488,6 +1531,7 @@ pub fn configure_codex(command: &mut std::process::Command, environment: &HashMa
     for (key, value) in [
         ("command", json!(environment[ENV_EXECUTABLE])),
         ("args", json!(["visual-mcp"])),
+        // thread_wait holds a call for up to 50 seconds.
         ("tool_timeout_sec", json!(90)),
         ("env_vars", json!(SERVER_ENV)),
     ] {
@@ -1584,58 +1628,6 @@ fn new_thread_definition() -> Value {
     json!({"name":NEW_THREAD,"description":"Open a new thread for the user: a top-level chat in this project's sidebar that the user owns and continues. Use it when the user asks for a new thread, chat or conversation. It is not a subagent: you don't send to it, wait on it or get its reply. Tell the user it is open.","inputSchema":{"type":"object","properties":properties,"required":["prompt"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}})
 }
 
-fn device_tool_definitions() -> Vec<Value> {
-    let device = json!({"type":"string","description":"A device id from device_list, or its name such as \"iPhone 17 Pro\" or \"Pixel 9\""});
-    let tool = |name: &str,
-                description: &str,
-                properties: Value,
-                required: Vec<&str>,
-                read_only: bool| {
-        json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read_only,"destructiveHint":false,"openWorldHint":false}})
-    };
-    vec![
-        tool("device_list", "List the iOS Simulators and Android Emulators on this Mac, and Android phones connected over USB (physical: true), booted first.", json!({}), vec![], true),
-        tool("device_open", "Boot a simulator or emulator if needed and show it in the user's Device panel. Returns the agent-device command and the exact arguments that drive this device (tap, type, swipe, snapshot of the accessibility tree); run it from your shell.", json!({"device":device,"platform":{"enum":["ios","android"]}}), vec!["device"], false),
-        tool("device_screenshot", "Take a screenshot of a device, by default the one in the Device panel.", json!({"device":device}), vec![], true),
-        tool("device_close", "Shut a simulator or emulator down. Phones connected over USB can't be shut down.", json!({"device":device}), vec!["device"], false),
-        tool("device_set", "Change an iOS Simulator's setting or simulated location, by default on the one in the Device panel. The user sees the change listed under the phone, marked as yours, and can put it back; it lasts until reset, so set it back when you are done unless the user wants to keep it. Values: appearance light|dark; text-size extra-small … accessibility-extra-extra-extra-large, or XS, S, M, L (the default), XL, XXL, XXXL, AX1 … AX5; color-filter none|grayscale|red-green|green-red|blue-yellow; liquid-glass clear|tinted; reduce-motion, increase-contrast, reduce-transparency, voiceover and show-borders on|off; location \"latitude,longitude\" or clear.", json!({"device":device,"setting":{"enum":crate::device::SETTINGS},"value":{"type":"string"}}), vec!["setting", "value"], false),
-    ]
-}
-
-fn call_device_tool(
-    name: &str,
-    input: Value,
-    environment: &HashMap<String, String>,
-) -> Result<Value, String> {
-    if !devices_enabled(environment) {
-        return Err("Device tools are turned off in Settings › Devices".into());
-    }
-    let action = format!(
-        "devices.{}",
-        name.strip_prefix("device_").ok_or("Unknown device tool")?
-    );
-    crate::device::validate(&action, &input)?;
-    let response = crate::mono::bridge::call(&action, input, &crate::mono::new_id(), environment)?;
-    if response["ok"] != true {
-        return Err(response["error"]
-            .as_str()
-            .unwrap_or("Device request failed")
-            .to_owned());
-    }
-    let mut value = response["result"].clone();
-    if action == "devices.screenshot" {
-        // The app saves the picture; it comes back here as an image block
-        // rather than megabytes of base64 across the bridge.
-        let path = value["path"].as_str().ok_or("The app sent no screenshot")?;
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        use base64::Engine as _;
-        value["png"] = base64::engine::general_purpose::STANDARD
-            .encode(bytes)
-            .into();
-    }
-    Ok(value)
-}
-
 fn call_thread_tool(
     action: &str,
     mut input: Value,
@@ -1668,16 +1660,7 @@ pub fn read_only_tool(name: &str) -> bool {
         name.strip_prefix("mcp__monocode__")
             .or_else(|| name.strip_prefix("monocode:"))
             .or_else(|| name.strip_prefix("monocode_")),
-        Some(
-            "update_plan"
-                | "thread_wait"
-                | "thread_read"
-                | "thread_list"
-                | "draft_wait"
-                | "device_list"
-                | "device_screenshot"
-                | crate::orchestration::TOOL
-        )
+        Some("thread_wait" | "thread_read" | "thread_list" | crate::orchestration::TOOL)
     )
 }
 
@@ -1687,8 +1670,8 @@ fn planning_orchestration(environment: &HashMap<String, String>) -> bool {
         .is_some_and(|v| v == "1")
 }
 
-/// Like update_plan, the plan lives in the tool call's input, where the app
-/// reads it when the turn ends. This only refuses a plan it could not start.
+/// The plan lives in the tool call's input, where the app reads it when the
+/// turn ends. This only refuses a plan it could not start.
 fn check_orchestration_plan(
     input: &Value,
     environment: &HashMap<String, String>,
@@ -1705,57 +1688,31 @@ fn check_orchestration_plan(
     }))
 }
 
-/// The plan itself lives in the tool call's input; this only refuses a list
-/// the rail could not show honestly.
-fn check_plan(input: &Value) -> Result<Value, String> {
-    let steps = input["plan"]
-        .as_array()
-        .ok_or("plan must be a list of steps")?;
-    if steps.is_empty() || steps.len() > MAX_PLAN_STEPS {
-        return Err(format!("plan needs 1 to {MAX_PLAN_STEPS} steps"));
-    }
-    let mut current = 0;
-    for step in steps {
-        let text = step["step"].as_str().map(str::trim).unwrap_or("");
-        if text.is_empty() || text.chars().count() > MAX_STEP_CHARS {
-            return Err(format!("each step needs 1 to {MAX_STEP_CHARS} characters"));
-        }
-        match step["status"].as_str() {
-            Some("pending" | "completed" | "cancelled") => {}
-            Some("in_progress") => current += 1,
-            _ => return Err("status must be pending, in_progress, completed or cancelled".into()),
-        }
-    }
-    if current > 1 {
-        return Err("only one step can be in_progress".into());
-    }
-    Ok(json!({"ok": true, "steps": steps.len()}))
-}
-
 fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option<Value> {
     let id = request.get("id")?.clone();
     let result = match request["method"].as_str().unwrap_or("") {
         "initialize" => Ok(
-            json!({"protocolVersion":request["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION")},"instructions":server_instructions(environment)}),
-        ),
+            json!({"protocolVersion":request["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION")}}),
+        )
+        .map(|mut result: Value| {
+            if threads_enabled(environment) {
+                result["instructions"] = THREAD_INSTRUCTIONS.into();
+            }
+            result
+        }),
         "ping" => Ok(json!({})),
         "tools/list" => {
             let mut tools = tool_definitions();
             if threads_enabled(environment) {
                 tools.extend(thread_tool_definitions());
-            }
-            if planning_orchestration(environment) {
-                tools.push(crate::orchestration::tool_definition());
-            }
-            if devices_enabled(environment) {
-                tools.extend(device_tool_definitions());
-            }
-            if threads_enabled(environment) {
                 for tool in &mut tools {
                     if ALWAYS_LOADED.contains(&tool["name"].as_str().unwrap_or_default()) {
                         tool["_meta"]["anthropic/alwaysLoad"] = true.into();
                     }
                 }
+            }
+            if planning_orchestration(environment) {
+                tools.push(crate::orchestration::tool_definition());
             }
             Ok(json!({"tools":tools}))
         }
@@ -1765,17 +1722,11 @@ fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option
                 "visual_docs" => documentation_for(&input),
                 "visual_check" => check_input(&input),
                 "visual_show" => publish_with_environment(input, environment),
-                "image_show" => publish_image_with_environment(input, environment),
-                "draft_preview" => draft_with_environment(&input, environment),
-                "draft_keep" => keep_draft(&input, environment),
-                "draft_wait" => wait_for_draft(&input, environment),
-                PLAN_TOOL => check_plan(&input),
                 crate::orchestration::TOOL => check_orchestration_plan(&input, environment),
                 NEW_THREAD => call_thread_tool("new", input, environment),
                 name if name.starts_with("thread_") => {
                     call_thread_tool(&name["thread_".len()..], input, environment)
                 }
-                name if name.starts_with("device_") => call_device_tool(name, input, environment),
                 _ => Err("Unknown native visual tool".into()),
             };
             let is_draft = matches!(
@@ -2503,6 +2454,57 @@ mod tests {
     }
 
     #[test]
+    fn only_a_lead_chat_lists_thread_tools_and_only_a_planning_turn_the_plan_tool() {
+        let names = |environment: &HashMap<String, String>| -> Vec<String> {
+            let catalog = mcp_response(json!({"id":1,"method":"tools/list"}), environment).unwrap();
+            catalog["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let plain = names(&HashMap::new());
+        assert!(!plain.iter().any(|name| name.starts_with("thread_")));
+        assert!(!plain.contains(&crate::orchestration::TOOL.to_owned()));
+        let lead = HashMap::from([("MONOCODE_THREADS".to_string(), "1".to_string())]);
+        let tools = names(&lead);
+        for name in ["thread_start", "thread_wait", "thread_close", NEW_THREAD] {
+            assert!(tools.contains(&name.to_owned()), "{name}");
+        }
+        let initialization =
+            mcp_response(json!({"id":2,"method":"initialize","params":{}}), &lead).unwrap();
+        assert_eq!(
+            initialization["result"]["instructions"], THREAD_INSTRUCTIONS,
+            "the lead learns that MonoCode starts its subagents"
+        );
+        let catalog = mcp_response(json!({"id":3,"method":"tools/list"}), &lead).unwrap();
+        let start = catalog["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "thread_start")
+            .unwrap();
+        assert_eq!(start["_meta"]["anthropic/alwaysLoad"], true);
+        let planning = HashMap::from([(crate::orchestration::ENV.to_string(), "1".to_string())]);
+        assert!(names(&planning).contains(&crate::orchestration::TOOL.to_owned()));
+        let refused = mcp_response(
+            json!({"id":4,"method":"tools/call","params":{"name":"thread_list","arguments":{}}}),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(refused["result"]["isError"], true);
+        assert!(read_only_tool("mcp__monocode__thread_wait"));
+        assert!(!read_only_tool("mcp__monocode__thread_start"));
+        assert!(!read_only_tool("mcp__other__thread_wait"));
+        // Visual tools keep working under the server's new name.
+        assert_eq!(
+            crate::tool::visual_tool("mcp__monocode__visual_show"),
+            Some(crate::tool::VisualStep::Show)
+        );
+    }
+
+    #[test]
     fn stable_session_configuration_rejects_old_in_flight_requests() {
         let server = Server::start(83).unwrap();
         let environment = server.environment(std::path::Path::new("/test/app"));
@@ -2554,7 +2556,7 @@ mod tests {
         assert_eq!(plain.get_args().count(), 0);
         let acp = acp_servers(&environment);
         assert_eq!(acp[0]["name"], SERVER_NAME);
-        assert_eq!(acp[0]["env"].as_array().unwrap().len(), 8);
+        assert_eq!(acp[0]["env"].as_array().unwrap().len(), 4);
         assert_eq!(mcp_server(&environment).unwrap()["command"], "/test/app");
     }
 

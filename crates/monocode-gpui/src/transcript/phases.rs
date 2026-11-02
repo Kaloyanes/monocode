@@ -78,12 +78,10 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
         } else if role == "tool"
             && let Ok(mut call) = serde_json::from_str::<ToolCall>(&rows[at].text)
         {
-            if call.is_draft_tool()
-                || matches!(
-                    call.thread_action(),
-                    Some("wait" | "send" | "stop" | "close")
-                )
-            {
+            if matches!(
+                call.thread_action(),
+                Some("wait" | "send" | "stop" | "close")
+            ) {
                 result.hidden.insert(at);
                 at = end;
                 continue;
@@ -206,27 +204,6 @@ mod tests {
             suffix.hidden.contains(&4),
             "incremental rebuilds keep child identity"
         );
-    }
-    #[test]
-    fn draft_tool_calls_stay_out_of_the_thread_and_leave_other_steps_alone() {
-        let draft = |name: &str| {
-            let mut call = ToolCall::new(name, name);
-            call.state = ToolState::Completed;
-            row("tool", &serde_json::to_string(&call).unwrap())
-        };
-        let phases = build(&[
-            row("user", "Mock it"),
-            draft("mcp__monocode__draft_preview"),
-            tool(),
-            draft("monocode:draft_wait"),
-            draft("mcp__monocode__draft_keep"),
-            row("assistant", "Done"),
-        ]);
-        for at in [1, 3, 4] {
-            assert!(phases.hidden.contains(&at), "{at}");
-        }
-        assert!(!phases.hidden.contains(&2));
-        assert_eq!(phases.at(2).unwrap().calls.len(), 1);
     }
     #[test]
     fn empty_thoughts_are_invisible_and_do_not_split_calls() {

@@ -27,7 +27,6 @@ import { selectedWorkspace } from "@/features/connection/selection";
 import type { ModelCatalog, ModelChoice } from "@/features/models/types";
 import { toWire, type Attachment } from "@/features/sessions/attachments";
 import type {
-  ComposerMode,
   DisplayedQuestionPrompt,
   Message,
   Mono,
@@ -700,21 +699,27 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     (conversationId: string) => removeSession("session.archive", conversationId),
     [removeSession],
   );
-  const unarchiveSession = useCallback(
-    async (conversationId: string) => {
-      setDeleted((previous) => {
-        const next = new Set(previous);
-        next.delete(conversationId);
-        return next;
+  const readOrchestration = useCallback(
+    async (conversationId: string) =>
+      (await command<{ runs: OrchestrationRun[] }>("orchestration.read", { conversationId })).runs,
+    [command],
+  );
+  const orchestrationAction = useCallback(
+    async (
+      conversationId: string,
+      run: OrchestrationRun,
+      action: OrchestrationActionName,
+      task?: OrchestrationTask,
+    ) => {
+      const result = await mutate<{ runs: OrchestrationRun[] }>("orchestration.action", {
+        conversationId,
+        call: run.call,
+        action,
+        ...(task ? { taskId: task.id, index: task.index } : {}),
       });
-      try {
-        await mutate("session.unarchive", { conversationId });
-      } catch (reason) {
-        // Still archived there, so still off the lists.
-        setDeleted((previous) => new Set(previous).add(conversationId));
-        throw reason;
-      }
+      // The lead's row and strip follow on the next catalog.
       void refresh();
+      return result.runs;
     },
     [mutate, refresh],
   );

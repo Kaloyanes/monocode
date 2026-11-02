@@ -1,10 +1,8 @@
 import * as Haptics from "expo-haptics";
-import { router, useIsFocused } from "expo-router";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Alert, Pressable, Text, View } from "react-native";
+import { router } from "expo-router";
+import { useCallback, useEffect, useState } from "react";
+import { ActivityIndicator, Alert, AppState, Pressable, Text, View } from "react-native";
 
-import { backoff, pause, waitForActive } from "@/features/connection/appActivity";
-import { deepEqual } from "@/features/connection/deepEqual";
 import { SettingsPage } from "@/features/settings/SettingsUI";
 import { ProviderLogo } from "@/features/sessions/ProviderLogo";
 import type {
@@ -47,42 +45,28 @@ export function AgentsSheet({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  /** What was last read, so a read of the same data renders nothing. */
-  const held = useRef<OrchestrationRun[] | null>(null);
-  // Whether the read found something new, and if it failed.
   const load = useCallback(async () => {
     try {
-      const next = await readOrchestration(sessionId);
-      const same = !!held.current && deepEqual(held.current, next);
-      if (!same) {
-        held.current = next;
-        setRuns(next);
-      }
+      setRuns(await readOrchestration(sessionId));
       setError(null);
-      return same ? "same" : "changed";
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
-      return "failed";
     }
   }, [readOrchestration, sessionId]);
-  // Read at once, then follow the run while the sheet is open, in view and the
-  // app in the foreground; slower only after failures.
-  const focused = useIsFocused();
+  // Read at once, then follow the run while the sheet is open and in view.
   useEffect(() => {
-    if (!focused) return;
-    const stop = new AbortController();
-    void (async () => {
-      let failures = 0;
-      while (!stop.signal.aborted) {
-        await waitForActive(stop.signal);
-        if (stop.signal.aborted) return;
-        const result = await load();
-        failures = result === "failed" ? failures + 1 : 0;
-        await pause(failures > 0 ? backoff(POLL_MS, failures, 30000) : POLL_MS, stop.signal);
-      }
-    })();
-    return () => stop.abort();
-  }, [load, focused]);
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      if (AppState.currentState === "active") await load();
+      if (!disposed) timer = setTimeout(poll, POLL_MS);
+    };
+    void poll();
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+    };
+  }, [load]);
 
   const press = (
     run: OrchestrationRun,
@@ -93,10 +77,7 @@ export function AgentsSheet({
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       setBusy(true);
       orchestrationAction(sessionId, run, action, task)
-        .then((next) => {
-          held.current = next;
-          setRuns(next);
-        }, failed)
+        .then(setRuns, failed)
         .finally(() => setBusy(false));
     };
     const ask = (title: string, message: string, label: string) =>

@@ -106,16 +106,6 @@ impl Conversation {
             "MONOCODE_THREADS".into(),
             if enabled { "1" } else { "0" }.into(),
         );
-        // Lists the device tools when the user lets agents drive devices.
-        environment.insert(
-            monocode_core::device::ENV.into(),
-            if monocode_core::device::agents_enabled() && !self.is_remote() {
-                "1"
-            } else {
-                "0"
-            }
-            .into(),
-        );
         // Lists the plan tool on the MonoCode MCP server for this turn only.
         environment.insert(
             monocode_core::orchestration::ENV.into(),
@@ -196,9 +186,8 @@ mod tests {
                 let before = v.transcript.read(cx).source_rows().to_vec();
                 v.send(cx);
                 v.quick_submit("Quick submit".into(), Settings::default(), cx);
-                let _ = v.mobile_submit("Mobile submit".into(), None, Vec::new(), cx);
+                v.mobile_submit("Mobile submit".into(), Vec::new(), cx);
                 v.save_app_draft("Operator draft".into(), cx);
-                v.submit_shell(cx);
                 let settings = v.settings.clone();
                 assert!(!v.apply_model_pick(&ModelPicked(Kind::Claude, Some("other".into())), cx));
                 v.mobile_configure(
@@ -337,7 +326,6 @@ mod tests {
                     title: "Allow inspection?".into(),
                     detail: String::new(),
                     can_remember: false,
-                    remember_scope: None,
                 });
                 assert_eq!(v.mobile_waiting(cx), Some(mobile::Waiting::Approval));
                 assert!(v.decide_notification_request("approval", Decision::Allow, cx));

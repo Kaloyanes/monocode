@@ -1575,18 +1575,21 @@ fn run_operation(
                 command.args(["--tools", "Read,Glob,Grep,Bash"]);
                 allowed.push("Read,Glob,Grep,Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(pwd),Bash(ls *),Bash(rg *)");
             }
-            if !settings.text_only {
-                if let Some(server) = crate::visual_bridge::mcp_server(&settings.environment) {
-                    command.args([
-                        "--mcp-config",
-                        &json!({"mcpServers":{(crate::visual_bridge::SERVER_NAME):server}})
-                            .to_string(),
-                    ]);
-                }
-                if let Some(guidance) =
-                    crate::visual_bridge::harness_instructions(&settings.environment)
+            if let Some(server) = visual_server {
+                command.args([
+                    "--mcp-config",
+                    &json!({"mcpServers":{(crate::visual_bridge::SERVER_NAME):server}}).to_string(),
+                ]);
+                allowed.push(crate::visual_bridge::CLAUDE_ALLOWED_TOOLS);
+                if let Some(instructions) =
+                    crate::visual_bridge::instructions(&settings.environment, true)
                 {
                     command.args(["--append-system-prompt", &guidance]);
+                }
+                if settings.monocode_subagents_only
+                    && crate::visual_bridge::lead_chat(&settings.environment)
+                {
+                    command.args(["--disallowedTools", "Agent"]);
                 }
                 if settings.monocode_subagents_only
                     && crate::visual_bridge::lead_chat(&settings.environment)
@@ -2325,17 +2328,6 @@ mod tests {
                 "{name}"
             );
         }
-    }
-    #[test]
-    fn the_plan_note_is_allowed_without_asking_even_in_plan_mode() {
-        let mut claude = protocol(Kind::Claude);
-        claude.request.settings.plan = true;
-        let mut out = Vec::new();
-        let input = json!({"plan":[{"step":"Read","status":"in_progress"}]});
-        let events = claude.frame(json!({"type":"control_request","request_id":"plan-1","request":{"subtype":"can_use_tool","tool_name":"mcp__monocode__update_plan","input":input}}), &mut out).unwrap();
-        assert!(events.is_empty());
-        let response: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(response["response"]["response"]["behavior"], "allow");
     }
     #[test]
     fn selected_model_effort_and_access_reach_the_codex_turn() {

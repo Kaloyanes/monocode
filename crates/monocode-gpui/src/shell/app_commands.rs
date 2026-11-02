@@ -224,10 +224,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if call.action.starts_with("devices.") {
-            self.handle_device_call(call, window, cx);
-            return;
-        }
         if let Err(error) = self.authorize_app_call(&call, cx) {
             let _ = call.reply.send(Err(error));
             return;

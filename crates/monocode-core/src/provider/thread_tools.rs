@@ -22,7 +22,7 @@ pub(super) fn pi_extension(request: &Request) -> Result<Option<tempfile::NamedTe
     let definitions = serde_json::to_string(&crate::visual_bridge::thread_tool_definitions())
         .map_err(|e| e.to_string())?;
     let environment = &request.settings.environment;
-    let guidance = crate::visual_bridge::harness_instructions(environment)
+    let guidance = crate::visual_bridge::instructions(environment, false)
         .unwrap_or_else(|| crate::visual_bridge::THREAD_INSTRUCTIONS.into());
     let json = |text: &str| serde_json::to_string(text).map_err(|e| e.to_string());
     let source = include_str!("thread_tools.mjs")
@@ -78,12 +78,12 @@ mod tests {
             .insert("MONOCODE_THREADS".into(), "0".into());
         assert!(pi_extension(&request).unwrap().is_none());
     }
-    /// A fake Claude and Codex fail the turn unless MonoCode's plan, draft and
-    /// subagent guidance reaches their own system prompt, and unless their own
+    /// A fake Claude and Codex fail the turn unless MonoCode's subagent
+    /// guidance reaches their own system prompt, and unless their own
     /// subagent tool is off exactly when the setting asks.
     #[cfg(unix)]
     #[test]
-    fn claude_and_codex_system_prompts_carry_plan_draft_and_subagent_guidance() {
+    fn claude_and_codex_system_prompts_carry_subagent_guidance() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let claude = directory.path().join("claude");
@@ -94,8 +94,7 @@ import json,os,sys
 only=os.environ['MONOCODE_TEST_SUBAGENTS_ONLY']=='1'
 assert (['--disallowedTools','Agent'] in [sys.argv[i:i+2] for i in range(len(sys.argv))])==only, sys.argv
 prompt=sys.argv[sys.argv.index('--append-system-prompt')+1]
-assert 'thread_start' in prompt and 'built-in subagent' in prompt and 'draft_preview' in prompt, prompt
-assert 'plan rail' in prompt and 'TodoWrite' in prompt, prompt
+assert 'thread_start' in prompt and 'built-in subagent' in prompt, prompt
 def send(value):
     print(json.dumps(value),flush=True)
 for line in sys.stdin:
@@ -124,8 +123,7 @@ for line in sys.stdin:
     elif method=='thread/start':
         instructions=frame['params']['developerInstructions']
         assert instructions.startswith('You are the coding agent in Monocode.'), instructions
-        assert 'thread_start' in instructions and 'draft_preview' in instructions, instructions
-        assert 'plan rail' in instructions, instructions
+        assert 'thread_start' in instructions and 'built-in subagent' in instructions, instructions
         send({'id':frame['id'],'result':{'thread':{'id':'thread'}}})
     elif method=='turn/start':
         send({'id':frame['id'],'result':{'turn':{'id':'turn'}}})

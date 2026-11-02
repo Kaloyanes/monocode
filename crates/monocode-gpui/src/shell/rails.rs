@@ -435,8 +435,6 @@ impl Shell {
             return row;
         }
         let work_item = self.work_item_badge(id, false, cx);
-        let origin = self.archived_origin_badge(id, cx);
-        let mono_tile = self.origin_tile(id, 16., cx);
         let session = self.session_metadata(id, cx);
         let archived = session.summary.archived;
         let selected = self.selected_sessions.contains(&id);
@@ -652,13 +650,7 @@ impl Shell {
                     }))
             })
             .when(!selected && !approval && !active, |d| {
-                d.hover(|s| {
-                    let s = s.bg(content(0.05));
-                    if archived { s.opacity(0.9) } else { s }
-                })
-            })
-            .when(archived && (selected || approval || active), |d| {
-                d.hover(|s| s.opacity(0.9))
+                d.hover(|s| s.bg(content(0.05)))
             })
             .when(
                 self.sidebar_drop == Some(session_groups::ListDrop::Session(id)),
@@ -673,7 +665,6 @@ impl Shell {
             .when(archived, |d| d.opacity(0.55))
             .child(body)
             .children(self.rail_tree(id, rail, 6., cx))
-            .children(self.sidebar_drop_mark(id))
             .child(anchor.probe())
             .on_hover(cx.listener(move |this, hovered, window, cx| {
                 // Original cards carry their details inline, so hovering only

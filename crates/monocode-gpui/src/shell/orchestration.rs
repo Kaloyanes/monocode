@@ -96,8 +96,6 @@ fn worker_settings(lead: &Conversation) -> Settings {
     settings.mono = None;
     settings.mono_message_id = None;
     settings.internal_message = false;
-    settings.goal = None;
-    settings.restart_continuation = false;
     settings.turns.clear();
     settings.environment.clear();
     settings.attachments.clear();

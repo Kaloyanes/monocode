@@ -151,8 +151,10 @@ export type SessionSummary = {
   busy?: boolean;
   /** What it waits on the user for; absent from an older desktop. */
   waiting?: "approval" | "question";
-  /** What it waits on: the first approval (or question), and how many. */
-  request?: { id: string; label: string; count: number };
+  /** An Orchestrator worker's lead; workers open from its Agents sheet, not lists. */
+  leadId?: string;
+  /** A lead's newest Orchestrator plan or run. */
+  orchestration?: OrchestrationSummary;
 };
 
 // The desktop's Orchestrator card (crates/monocode-gpui/src/mobile/orchestration.rs).

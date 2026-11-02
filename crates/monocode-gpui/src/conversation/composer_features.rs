@@ -1,10 +1,6 @@
 use super::*;
-use crate::tooltip::Tip;
 use crate::transcript::orchestration::{OrchestrationAction, RunView};
 use std::path::PathBuf;
-
-/// What a bare `/operator` asks.
-pub(super) const OPERATOR_INTRO: &str = "Explain what you can do in MonoCode with the app CLI.";
 
 /// The one-shot composer modes a turn was submitted with. A turn that starts
 /// later, after compaction or history loading, must still run in them.

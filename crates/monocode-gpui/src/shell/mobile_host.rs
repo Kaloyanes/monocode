@@ -467,7 +467,9 @@ impl Shell {
                             Some(crate::conversation::MobileWaiting::Question) => Some("question"),
                             None => None,
                         },
-                        request: view.mobile_request(cx),
+                        orchestration: mobile_orchestration::current(view.orchestration_views())
+                            .last()
+                            .map(|(_, run)| mobile_orchestration::summary(run)),
                     }
                 });
                 Some(CatalogEntry {
@@ -621,8 +623,8 @@ impl Shell {
                     mobile_catalog::checkout_branch(metadata.worktree_cwd.as_deref().unwrap_or(&entry.summary.cwd), &mut branches)
                 } else { String::new() };
                 let mut session = mobile_catalog::session(&entry.summary, id, &entry.project, &metadata, entry.live.as_ref(), &branch);
-                if let Some(mono) = origins.get(&entry.id) {
-                    session["monoId"] = json!(mono);
+                if let Some(lead) = lead {
+                    session["leadId"] = json!(lead);
                 }
                 sessions.push(session);
             }
@@ -800,7 +802,10 @@ impl Shell {
                 request.reply(Ok(project::file_highlight(&job, from)));
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
-            method if method.starts_with("terminal.") => self.mobile_terminal_request(request, cx),
+            "orchestration.read" => {
+                let result = self.mobile_orchestration(&request.params, cx);
+                request.reply(result);
+            }
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }
@@ -1638,8 +1643,6 @@ impl Shell {
             ("orchestration.action", Target::Mono(_)) => {
                 Err("A Mono's conversation has no orchestration".into())
             }
-            ("draft.action", _) => self.mobile_draft_action(params, window, cx),
-            ("composer.write", _) => self.mobile_composer_write(params, cx),
             ("session.answerQuestion" | "session.keepQuestionOpen", target) => {
                 let view = match target {
                     Target::Session(id) => self.sessions.get(id).cloned(),
@@ -1737,10 +1740,7 @@ impl Shell {
                         if view.read(cx).driven_by.is_some() {
                             return Err("A subagent is driven by its lead".into());
                         }
-                        view.update(cx, |v, cx| {
-                            v.clear_composer_text_sent_from_phone(&text, draft_rev, cx);
-                            v.mobile_submit(text, mode, attachments, cx)
-                        })?;
+                        view.update(cx, |v, cx| v.mobile_submit(text, attachments, cx));
                         this.mobile.started.insert(*id);
                         Ok(())
                     }

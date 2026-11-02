@@ -28,16 +28,9 @@ impl Conversation {
         mode: Option<&'static str>,
         attachments: Vec<std::path::PathBuf>,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
+    ) {
         if self.driven_by.is_some() {
-            return Ok(());
-        }
-        let (mode, prompt) = match mode {
-            Some(mode) => (Some(mode), prompt),
-            None => split_mode_command(prompt),
-        };
-        if self.is_remote() && matches!(mode, Some("operator" | "orchestrator")) {
-            return Err("This mode is not available on remote projects.".into());
+            return;
         }
         if !self.history_ready() {
             self.defer_history_action(
