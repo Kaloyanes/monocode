@@ -243,6 +243,9 @@ struct IndexedFile {
     relative: Vec<(usize, char, char)>,
 }
 impl FilenameIndex {
+    pub fn find(&self, path: &str) -> Option<&ProjectFile> {
+        self.files.iter().map(|f| &f.file).find(|f| f.path == path)
+    }
     pub fn new(files: Vec<ProjectFile>) -> Self {
         Self {
             files: files

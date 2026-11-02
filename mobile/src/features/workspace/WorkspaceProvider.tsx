@@ -30,6 +30,7 @@ import type {
   DisplayedQuestionPrompt,
   Message,
   Mono,
+  MonoSubsessions,
   OrchestrationActionName,
   OrchestrationRun,
   OrchestrationTask,
@@ -60,8 +61,10 @@ export type MonoChange = {
   color?: string;
   addProject?: string;
   removeProject?: string;
+  /** Null goes back to its own model and effort. */
+  subsessions?: MonoSubsessions | null;
 };
-type MonoField = "name" | "mascot" | "color" | "projectIds";
+type MonoField = "name" | "mascot" | "color" | "projectIds" | "subsessions";
 /** A field changed here, with what the desktop had then: it shows only while
  *  the catalog still has that, so the desktop's own copy takes over. */
 type MonoEdits = Record<string, Partial<Record<MonoField, { value: unknown; from: unknown }>>>;
@@ -646,6 +649,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       if (change.name !== undefined) next.name = change.name.trim();
       if (change.mascot !== undefined) next.mascot = change.mascot;
       if (change.color !== undefined) next.color = change.color;
+      if (change.subsessions !== undefined) next.subsessions = change.subsessions;
       if (change.addProject || change.removeProject)
         next.projectIds = [
           ...mono.projectIds.filter((id) => id !== change.removeProject),

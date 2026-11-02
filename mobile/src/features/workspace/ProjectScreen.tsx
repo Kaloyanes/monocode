@@ -303,7 +303,7 @@ export function ProjectScreen({
       onPress={drawer.open}
     >
       {/* The drawer's button, as on every screen it opens from. */}
-      <Icon name="menu" size={22} color={colors.content} />
+      <Icon name="sidebar" size={22} color={colors.content} />
       {unread ? <UnreadDot /> : null}
     </ProjectHeaderButton>
   );
@@ -392,6 +392,7 @@ export function ProjectScreen({
             key={sessionId ?? project.id}
             // A worker's thread is driven by its lead and has no draft of its own.
             conversationId={session?.leadId ? undefined : sessionId}
+            active={focused && (sessionId != null || pages.view === "chat")}
             notice={sessionNotice}
             context={project.name}
             branch={sessionId ? (session?.branch ?? project.branch) : branch}

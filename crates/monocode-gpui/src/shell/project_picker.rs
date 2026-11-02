@@ -142,7 +142,7 @@ impl Shell {
                 return;
             }
         }
-        self.create(self.default_kind(), cx);
+        self.create(self.default_choice().kind, cx);
     }
     fn is_blank_session(&self, pane: i64, cx: &App) -> bool {
         let id = self.workspace.session_for_pane(pane);

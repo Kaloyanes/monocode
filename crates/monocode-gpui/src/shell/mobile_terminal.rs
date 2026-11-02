@@ -463,7 +463,8 @@ fn spawn(cwd: &str, device: String, cols: u16, rows: u16) -> Result<Spawned, Str
         .openpty(size(cols, rows))
         .map_err(|error| format!("Could not open a terminal: {error}"))?;
     let workdir = crate::terminal::working_dir(cwd);
-    let (program, args) = crate::terminal::default_shell();
+    let (program, args) =
+        crate::terminal::default_shell(&monocode_core::scm::terminal_search_path());
     let mut command = CommandBuilder::new(&program);
     command.args(&args);
     command.cwd(&workdir);

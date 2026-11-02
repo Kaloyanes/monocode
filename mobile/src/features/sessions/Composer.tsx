@@ -1,6 +1,7 @@
 import { ChoiceMenu } from "@/ui/ChoiceMenu";
 import { GlassMenuButton } from "@/ui/GlassMenuButton";
 import { Button } from "@expo/ui/swift-ui";
+import { useNavigation } from "expo-router";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Alert, Platform, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import Animated, {
@@ -35,6 +36,7 @@ import {
 import { DictationBar } from "./DictationBar";
 import { cachedText } from "./composerDraft";
 import { canDictate, insertDictation } from "./dictation";
+import { TypingPostureFocus } from "./TypingPostureFocus";
 import { ProviderLogo } from "./ProviderLogo";
 import { COMPOSER_INPUT_ID } from "./SessionScreen";
 import { useComposerDraft } from "./useComposerDraft";
@@ -137,12 +139,15 @@ export function Composer({
   modes = false,
   onNewMono,
   slash,
+  active = true,
   compact = false,
   reply,
   onClearReply,
 }: {
   /** The thread whose composer text this shares with the desktop. */
   conversationId?: string;
+  /** Only the visible route may focus its composer in response to folding. */
+  active?: boolean;
   /** Where this runs: the project, or the mono. */
   context: string;
   branch: string;
@@ -239,6 +244,28 @@ export function Composer({
   useEffect(() => {
     if (reply) input.current?.focus();
   }, [reply]);
+
+  // Lets go of the keyboard as the screen starts to leave, or as another
+  // covers it. A popped screen is unmounted without ever losing focus, and
+  // the native back button pops before JS hears of it, so this goes on the
+  // transition's start, while the field is still on screen. Left focused, the
+  // keyboard outlives the chat: the list behind rides it up, and the next
+  // chat's field can't take focus until it is left and entered again.
+  const navigation = useNavigation();
+  useEffect(() => {
+    const letGo = () => input.current?.blur();
+    const offStart = navigation.addListener(
+      "transitionStart" as never,
+      (event: { data?: { closing?: boolean } }) => {
+        if (event.data?.closing) letGo();
+      },
+    );
+    const offBlur = navigation.addListener("blur", letGo);
+    return () => {
+      offStart();
+      offBlur();
+    };
+  }, [navigation]);
 
   // Lets go of the keyboard as the field gives way.
   useEffect(() => {
@@ -425,6 +452,10 @@ export function Composer({
 
   return (
     <Animated.View style={containerStyle}>
+      <TypingPostureFocus
+        enabled={active && !blocked && !dictating && !sending}
+        onEnterTypingPosture={() => input.current?.focus()}
+      />
       <LiquidView fill row={false} borderRadius={RADIUS} style={StyleSheet.absoluteFill}>
         <View />
       </LiquidView>
@@ -686,8 +717,8 @@ function AddMenu({
   const label = onMode ? "Add files or pick a mode" : "Add photos or files";
   if (Platform.OS === "android") return (
     <ChoiceMenu label={label} actions={[
-      { label: "Photo Library", onPress: onPhotos },
-      { label: "Files", onPress: onFiles },
+      { label: "Photo Library", icon: "image", onPress: onPhotos },
+      { label: "Files", icon: "folder", onPress: onFiles },
       ...(onSkills ? [{ label: "Skills and commands", onPress: onSkills }] : []),
       ...(onMode
         ? MODES.map((entry) => ({

@@ -2,10 +2,11 @@ import { Label, Picker } from "@expo/ui/swift-ui";
 import { pickerStyle, tag } from "@expo/ui/swift-ui/modifiers";
 import { router, useGlobalSearchParams, usePathname } from "expo-router";
 import { memo, useState } from "react";
-import { Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Image, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import Animated from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { plainText } from "@/features/sessions/markdownParser";
 import { ProjectMascot } from "@/features/mascots/ProjectMascot";
 import { HEADER_GAP, HEADER_HEIGHT, useKeyboardLift } from "@/features/sessions/SessionScreen";
 import { MONOCODE_MARK } from "@/ui/brand";
@@ -14,6 +15,7 @@ import { useWarmDitherLoading } from "@/ui/DitherLoading";
 import { GradualBlur } from "@/ui/GradualBlur";
 import { Icon } from "@/ui/Icon";
 import { GlassMenuButton } from "@/ui/GlassMenuButton";
+import { ChoiceMenu } from "@/ui/ChoiceMenu";
 import { LiquidView } from "@/ui/LiquidView";
 import { isModalRoute } from "@/ui/SceneFade";
 import { AnimationsPaused } from "@/ui/AnimationsPaused";
@@ -183,6 +185,25 @@ function FilterMenu({
   filter: Filter;
   onFilter: (value: Filter) => void;
 }) {
+  const colors = useColors();
+  // The SwiftUI menu has no Android view, so Android lists the choices in a sheet.
+  if (Platform.OS === "android")
+    return (
+      <ChoiceMenu
+        label={filter !== "all" ? "Filter, on" : "Filter"}
+        title="Filter"
+        actions={FILTERS.map((option) => ({
+          label: option.label,
+          icon: option.value === "all" ? "inbox" : "automation",
+          selected: filter === option.value,
+          onPress: () => onFilter(option.value),
+        }))}
+      >
+        <LiquidView borderRadius={HEADER_HEIGHT / 2} innerStyle={filterStyles.round}>
+          <Icon name="filter" size={20} color={filter !== "all" ? colors.accent : colors.content} />
+        </LiquidView>
+      </ChoiceMenu>
+    );
   return (
     <GlassMenuButton
       icon="filter"
@@ -340,3 +361,33 @@ const useStyles = themedStyles((colors) => ({
     fontSize: 17,
   },
 }));
+
+const filterStyles = StyleSheet.create({
+  round: {
+    width: HEADER_HEIGHT,
+    height: HEADER_HEIGHT,
+  },
+});
+
+/** When a Mono was last active, as a chat list dates its rows: the time
+ *  today, Yesterday, else the day. */
+export function when(at: number) {
+  const date = new Date(at);
+  const today = new Date();
+  if (date.toDateString() === today.toDateString())
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+/** The start of a message as one plain line: its markdown read for its
+ *  words, so **bold** shows as bold rather than its asterisks. Only as much
+ *  as one line can show is read. */
+export function oneLine(text: string) {
+  // A reply that is only a reaction, as the chat shows it, by its emoji.
+  const reaction = text.trim().match(/^<reaction>\s*(.{1,16}?)\s*<\/reaction>$/su);
+  if (reaction) return `Reacted ${reaction[1]}`;
+  return plainText(text.slice(0, 600));
+}

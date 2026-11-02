@@ -36,13 +36,15 @@ import GitBranchIcon from "@hugeicons/core-free-icons/GitBranchIcon";
 import Image01Icon from "@hugeicons/core-free-icons/Image01Icon";
 import InboxIcon from "@hugeicons/core-free-icons/InboxIcon";
 import KeyboardOffIcon from "@hugeicons/core-free-icons/KeyboardOffIcon";
+import InformationCircleIcon from "@hugeicons/core-free-icons/InformationCircleIcon";
+import Layers01Icon from "@hugeicons/core-free-icons/Layers01Icon";
+import LayoutAlignRightIcon from "@hugeicons/core-free-icons/LayoutAlignRightIcon";
 import LockIcon from "@hugeicons/core-free-icons/LockIcon";
 import ArrowLeft01Icon from "@hugeicons/core-free-icons/ArrowLeft01Icon";
 import LeftToRightListBulletIcon from "@hugeicons/core-free-icons/LeftToRightListBulletIcon";
 import Moon02Icon from "@hugeicons/core-free-icons/Moon02Icon";
 import MinusSignIcon from "@hugeicons/core-free-icons/MinusSignIcon";
 import MoreHorizontalIcon from "@hugeicons/core-free-icons/MoreHorizontalIcon";
-import Menu01Icon from "@hugeicons/core-free-icons/Menu01Icon";
 import Mic01Icon from "@hugeicons/core-free-icons/Mic01Icon";
 import Note01Icon from "@hugeicons/core-free-icons/Note01Icon";
 import Notification01Icon from "@hugeicons/core-free-icons/Notification01Icon";
@@ -60,6 +62,7 @@ import SourceCodeIcon from "@hugeicons/core-free-icons/SourceCodeIcon";
 import SparklesIcon from "@hugeicons/core-free-icons/SparklesIcon";
 import TextWrapIcon from "@hugeicons/core-free-icons/TextWrapIcon";
 import Tick02Icon from "@hugeicons/core-free-icons/Tick02Icon";
+import UserGroupIcon from "@hugeicons/core-free-icons/UserGroupIcon";
 import UnfoldMoreIcon from "@hugeicons/core-free-icons/UnfoldMoreIcon";
 import ViewIcon from "@hugeicons/core-free-icons/ViewIcon";
 import Wrench01Icon from "@hugeicons/core-free-icons/Wrench01Icon";
@@ -71,7 +74,8 @@ import { useColors } from "./theme";
 // Hugeicons, the same set as the desktop chrome (src/shared/ui/icons.tsx).
 // Deep imports keep the full catalog out of the bundle.
 const icons = {
-  menu: Menu01Icon,
+  // The desktop title bar's sidebar toggle (PanelLeft in src/shared/ui/icons.tsx).
+  sidebar: LayoutAlignRightIcon,
   more: MoreHorizontalIcon,
   search: Search01Icon,
   close: Cancel01Icon,
@@ -136,6 +140,10 @@ const icons = {
   alert: Alert01Icon,
   passing: CheckmarkCircle01Icon,
   failing: CancelCircleIcon,
+  info: InformationCircleIcon,
+  people: UserGroupIcon,
+  layers: Layers01Icon,
+  circle: CircleIcon,
 };
 
 export type IconName = keyof typeof icons;
