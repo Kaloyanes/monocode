@@ -25,7 +25,6 @@ mod list_cascade;
 mod live_agents;
 mod mobile_host;
 pub(crate) mod mobile_terminal;
-mod mono_origin;
 mod mono_panes;
 pub(crate) mod monos;
 mod notifications;

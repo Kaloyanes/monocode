@@ -16,9 +16,7 @@ use crate::{
 use gpui::{EntityId, Task};
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
-    mobile::{
-        Event, Invite, MobileHost, Push, Request, Status, TerminalStart, WatchStart, notify, watch,
-    },
+    mobile::{Event, Invite, MobileHost, Push, Request, Status, TerminalStart, WatchStart, watch},
     transcript::Row,
 };
 use serde_json::{Value, json};
@@ -805,9 +803,7 @@ impl Shell {
                 request.reply(Ok(project::file_highlight(&job, from)));
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
-            method if method.starts_with("inbox.") && method != "inbox.start" => {
-                self.mobile_inbox(request, window, cx)
-            }
+            method if method.starts_with("terminal.") => self.mobile_terminal_request(request, cx),
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }

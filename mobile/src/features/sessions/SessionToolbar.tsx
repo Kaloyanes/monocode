@@ -45,13 +45,10 @@ const TERMINAL_ITEM = 60;
 export function SessionTitle({
   title,
   subtitle,
-  onClose,
   terminal,
 }: {
   title: string;
   subtitle: string;
-  /** Presented as a sheet: a close button before the title, in place of back. */
-  onClose?: () => void;
   /** Whether the toolbar has a terminal button, which the title leaves room for. */
   terminal?: boolean;
 }) {

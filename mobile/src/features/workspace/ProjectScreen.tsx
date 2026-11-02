@@ -109,7 +109,7 @@ export function ProjectScreen({
   /** Its title until the session is in the catalog, which may leave it out. */
   title?: string;
 }) {
-  const { startSession, sendMessage, stop, sessions } = useWorkspace();
+  const { startSession, sendMessage, stop } = useWorkspace();
   // Whether the desktop lets this phone open a terminal.
   const terminal = useConnection().catalog.terminal === true;
   const [terminalSheet, setTerminalSheet] = useState<{ run?: string; opened: number } | null>(null);
@@ -316,7 +316,6 @@ export function ProjectScreen({
     <SessionTitle
       title={session?.title ?? title ?? "Session"}
       subtitle={[project.name, branch].filter(Boolean).join(" · ")}
-      onClose={sheet ? () => router.back() : undefined}
       terminal={terminal}
     />
   ) : null;
@@ -335,7 +334,10 @@ export function ProjectScreen({
       session={session}
       worktreePath={worktreePath}
       harness={harness}
-      changed={changes.files}
+      changed={changes.length}
+      terminal={terminal}
+      onTerminal={(run) => setTerminalSheet({ run, opened: Date.now() })}
+      onEditActions={() => setActionsSheet(true)}
       onSettings={openSettings}
     />
   ) : null;
@@ -542,7 +544,24 @@ export function ProjectScreen({
       {/* After the content: iOS blurs under the header the scroll view it
           finds first, down each view's first child. */}
       <ConnectionNotice error={conversation.error} />
-
+      {sessionId && terminal ? (
+        <>
+          <TerminalSheet
+            project={project}
+            worktreePath={worktreePath}
+            run={terminalSheet?.run}
+            opened={terminalSheet?.opened ?? 0}
+            isPresented={terminalSheet !== null}
+            onDismiss={() => setTerminalSheet(null)}
+          />
+          <TerminalActionsSheet
+            projectId={project.id}
+            projectName={project.name}
+            isPresented={actionsSheet}
+            onDismiss={() => setActionsSheet(false)}
+          />
+        </>
+      ) : null}
     </SessionScreen>
   );
 }
