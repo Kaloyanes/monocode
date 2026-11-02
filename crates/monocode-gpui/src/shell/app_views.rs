@@ -250,14 +250,18 @@ impl Shell {
         self.show_app_view(AppView::Inbox, window, cx);
     }
 
-    /// A link to a work item: shown in the Inbox when it can show it, otherwise
-    /// in the browser.
+    /// A link to a work item: shown in the right panel beside the thread it
+    /// was followed from, else in the Inbox when it can show it, otherwise in
+    /// the browser.
     pub(super) fn open_work_link(
         &mut self,
         url: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.open_work_item_panel(url, window, cx) {
+            return;
+        }
         self.ensure_background_inbox(window, cx);
         let Some(inbox) = self
             .inbox

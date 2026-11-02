@@ -63,6 +63,7 @@ mod visualizations_shots;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
 mod worktree_sweep;
+mod work_item_panel;
 mod worktrees;
 
 use crate::settings::TitleBarMode;
@@ -744,6 +745,10 @@ pub(crate) struct Shell {
     _session_clock: gpui::Task<()>,
     notes: Option<Entity<Notes>>,
     inbox: Option<Entity<crate::inbox::Inbox>>,
+    /// The list-less Inbox behind the right panel's Issue tab, and the tab
+    /// it replaced.
+    work_item_panel: Option<Entity<crate::inbox::Inbox>>,
+    work_item_return: Option<crate::right_panel::RightTab>,
     automations: Option<Entity<crate::automations::Automations>>,
     active_app_view: Option<app_views::AppView>,
     app_view_events: Vec<Subscription>,
@@ -1162,6 +1167,8 @@ impl Shell {
             _session_clock: session_clock,
             notes: None,
             inbox: None,
+            work_item_panel: None,
+            work_item_return: None,
             automations: None,
             active_app_view: None,
             app_view_events: Vec::new(),
@@ -1904,7 +1911,9 @@ impl Shell {
                 || self.right_panel.as_ref().is_some_and(|panel| {
                     matches!(
                         panel.read(cx).tab(),
-                        crate::right_panel::RightTab::Plan | crate::right_panel::RightTab::Device
+                        crate::right_panel::RightTab::Plan
+                            | crate::right_panel::RightTab::Device
+                            | crate::right_panel::RightTab::Issue
                     )
                 }))
             && !self.app_view_open()
@@ -1987,6 +1996,14 @@ impl Shell {
         }
     }
     fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Reopening the panel does not bring a closed work item back.
+        if !self.workspace.right_panel_open
+            && let Some(panel) = &self.right_panel
+            && panel.read(cx).tab() == crate::right_panel::RightTab::Issue
+        {
+            let tab = self.workspace.right_panel_tab;
+            panel.update(cx, |panel, cx| panel.select(tab, cx));
+        }
         self.set_right_panel_open(!self.workspace.right_panel_open, window, cx);
     }
     fn open_plan_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2133,7 +2150,10 @@ impl Shell {
             .push(cx.subscribe(&panel, |this, _, event: &PanelEvent, cx| {
                 match event {
                     PanelEvent::Tab(tab) => {
-                        this.workspace.right_panel_tab = *tab;
+                        // A work item is not restored on the next launch.
+                        if *tab != crate::right_panel::RightTab::Issue {
+                            this.workspace.right_panel_tab = *tab;
+                        }
                         if *tab == crate::right_panel::RightTab::Terminal {
                             this.ensure_panel_terminal(cx);
                         }
@@ -5106,6 +5126,8 @@ impl Shell {
                     }))
                     .child(self.plan_sidebar.clone())
                     .into_any_element()
+            } else if panel.read(cx).tab() == crate::right_panel::RightTab::Issue {
+                self.work_item_panel_body(cx)
             } else if self.terminal_in_panel(cx)
                 && panel.read(cx).tab() == crate::right_panel::RightTab::Terminal
             {

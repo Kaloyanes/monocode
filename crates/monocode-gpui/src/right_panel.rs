@@ -70,6 +70,9 @@ pub(crate) enum RightTab {
     /// Simulators and emulators, when Devices are on. Last, and never part
     /// of the saved order.
     Device,
+    /// A work item followed from a thread; the shell paints it. Never part
+    /// of the strip or the saved order.
+    Issue,
 }
 impl RightTab {
     fn label(self) -> &'static str {
@@ -80,6 +83,7 @@ impl RightTab {
             Self::Graph => "History",
             Self::Terminal => "Terminal",
             Self::Device => "Device",
+            Self::Issue => "Issue",
         }
     }
     /// loadRightPanelTabOrder: unique known tabs, the missing ones appended.
@@ -89,7 +93,7 @@ impl RightTab {
         for tab in order.iter().chain(&[Self::Files, Self::Graph]) {
             if !matches!(
                 tab,
-                Self::Terminal | Self::Changes | Self::Plan | Self::Device
+                Self::Terminal | Self::Changes | Self::Plan | Self::Device | Self::Issue
             ) && !out.contains(tab)
             {
                 out.push(*tab);
@@ -553,6 +557,7 @@ impl RightPanel {
                     RightTab::Graph => ("right-panel-tab-History", "clock"),
                     RightTab::Terminal => ("right-panel-tab-Terminal", "terminal"),
                     RightTab::Device => ("right-panel-tab-Device", "smart-phone"),
+                    RightTab::Issue => ("right-panel-tab-Issue", "external-link"),
                 };
                 let unfolded = match progress {
                     Some((_, p)) if active => p,
@@ -658,7 +663,7 @@ impl Render for RightPanel {
                 .child(self.device.clone())
                 .into_any_element(),
             // The shell paints the terminal over this pane.
-            RightTab::Terminal | RightTab::Plan => div().into_any_element(),
+            RightTab::Terminal | RightTab::Plan | RightTab::Issue => div().into_any_element(),
         };
         div()
             .id("right-panel")
