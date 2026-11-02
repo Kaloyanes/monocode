@@ -885,7 +885,12 @@ impl Changes {
                 this.mutated(cx);
                 this.load_pr(cx);
                 match result {
-                    Ok(url) => cx.open_url(url.trim()),
+                    Ok(url) => {
+                        let url = url.trim();
+                        if !crate::inbox::open_in_inbox(url, window, cx) {
+                            cx.open_url(url);
+                        }
+                    }
                     Err(error) => Self::fail(error, window, cx),
                 }
                 cx.notify();

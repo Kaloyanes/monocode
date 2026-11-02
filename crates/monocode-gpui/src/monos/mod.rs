@@ -21,6 +21,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 mod work;
+mod work_item;
 use crate::{
     conversation::{Conversation, MonoSubmitted, SessionChanged},
     input::{self, Input},
@@ -50,6 +51,8 @@ use std::{
     time::Duration,
 };
 pub(crate) struct Changed;
+/// Asks the shell to choose a project for a copy of this Mono.
+pub(crate) struct DuplicateRequested(pub String);
 pub(crate) struct TabOpened(pub String);
 pub(crate) struct ShowDetails(pub String);
 pub(crate) use notifications::{NotificationChanged, NotificationFinished};
@@ -121,6 +124,7 @@ pub(crate) struct Monos {
     html_documents: HashMap<String, Entity<html::Html>>,
     project_changes: changes::ProjectChanges,
     review: Option<Entity<crate::review::ReviewPane>>,
+    work_item: Option<work_item::Page>,
     activity: Option<(String, Entity<crate::transcript::TranscriptView>)>,
     activity_turn: Option<usize>,
     rail_ids: Vec<String>,
@@ -151,6 +155,39 @@ pub(crate) struct Monos {
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
 impl EventEmitter<ShowDetails> for Monos {}
+impl EventEmitter<DuplicateRequested> for Monos {}
+fn home() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into())
+}
+/// A new Mono's chat: the preferred provider with full access.
+fn default_chat(prefs: &crate::settings::Preferences) -> (Kind, Settings) {
+    let provider = prefs
+        .default_provider
+        .as_deref()
+        .and_then(Kind::parse)
+        .unwrap_or(Kind::Codex);
+    let settings = Settings {
+        access: AccessMode::Auto,
+        model: prefs.stable_model(provider.id(), &home()),
+        ..Default::default()
+    };
+    (provider, settings)
+}
+/// Mono chats run from home; their projects come from the Mono context.
+fn start_chat(
+    db: &monocode_core::store::Store,
+    mono: &Mono,
+    provider: &str,
+    settings: &Settings,
+) -> Result<Session, String> {
+    let mut summary = db.create(provider, &home())?;
+    summary.title = mono.label();
+    db.title(summary.id, &summary.title)?;
+    db.configure_agent(summary.id, provider, settings)?;
+    Ok(summary)
+}
 impl Monos {
     pub(crate) fn resource_sessions(
         &self,
@@ -350,6 +387,7 @@ impl Monos {
             html_documents: HashMap::new(),
             project_changes: Default::default(),
             review: None,
+            work_item: None,
             activity: None,
             activity_turn: None,
             rail_ids: Vec::new(),
@@ -671,23 +709,8 @@ impl Monos {
                     .collect::<Vec<_>>();
                 return Ok::<_, String>((summary, None, delivered));
             }
-            let home = std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .unwrap_or_else(|_| ".".into());
-            let provider = prefs
-                .default_provider
-                .as_deref()
-                .and_then(Kind::parse)
-                .unwrap_or(Kind::Codex);
-            let mut summary = db.create(provider.id(), &home)?;
-            summary.title = mono.label();
-            db.title(summary.id, &summary.title)?;
-            let settings = Settings {
-                access: AccessMode::Auto,
-                model: prefs.stable_model(provider.id(), &home),
-                ..Default::default()
-            };
-            db.configure_agent(summary.id, provider.id(), &settings)?;
+            let (provider, settings) = default_chat(&prefs);
+            let summary = start_chat(&db, &mono, provider.id(), &settings)?;
             Ok((summary, Some(settings), Vec::new()))
         });
         cx.spawn(async move |this, cx| {
@@ -1575,6 +1598,13 @@ impl gpui::Render for Monos {
                     cx.notify();
                 }
             }))
+            .on_action(
+                cx.listener(|this, link: &crate::inbox::OpenWorkLink, _, cx| {
+                    if !this.open_work_item(&link.0, cx) {
+                        cx.propagate();
+                    }
+                }),
+            )
             .capture_any_mouse_down(|_, window, _| {
                 #[cfg(target_os = "macos")]
                 crate::traffic_lights::focus_content(window);

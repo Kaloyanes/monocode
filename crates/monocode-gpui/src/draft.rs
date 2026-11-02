@@ -15,12 +15,12 @@ mod web;
 
 use crate::{right_panel::icon_action, theme::*};
 use gpui::{
-    App, Context, Entity, EventEmitter, FontWeight, Global, SharedString, WeakEntity, Window, div,
-    prelude::*, px,
+    App, Context, Entity, EventEmitter, Global, SharedString, WeakEntity, Window, div, prelude::*,
+    px,
 };
 use monocode_core::visual_bridge::{
     DRAFT_DEFAULT_HEIGHT, DRAFT_DEFAULT_WIDTH, DraftAction, DraftContent, DraftDiagnostics,
-    DraftElement, DraftFeedback, DraftLog, DraftReply, DraftRequest, DraftSnapshot,
+    DraftElement, DraftFeedback, DraftLayout, DraftLog, DraftReply, DraftRequest, DraftSnapshot,
 };
 use page::Palette;
 use std::sync::{
@@ -41,11 +41,28 @@ const AFTER_ACTION: std::time::Duration = std::time::Duration::from_millis(300);
 #[cfg(target_os = "macos")]
 const MAX_PICTURE_WIDTH: u32 = 1000;
 
-/// The tallest and shortest a draft's card gets when it follows its page.
+/// The shortest a draft's card gets, and the tallest it follows its page to:
+/// a page taller than that scrolls inside its card.
 #[cfg(target_os = "macos")]
 const MIN_HEIGHT: u32 = 120;
 #[cfg(target_os = "macos")]
-const MAX_HEIGHT: u32 = 1600;
+const MAX_HEIGHT: u32 = 12_000;
+
+/// Consecutive fits that each add the same height: the page is sized by its
+/// own viewport (`min-height:100vh` plus padding), so following it never ends.
+#[cfg(target_os = "macos")]
+const RUNAWAY_STEPS: u8 = 8;
+
+/// How the card has been following its page: the last step up, how many in a
+/// row repeated it, the height before they began, and whether it gave up.
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Growth {
+    step: u32,
+    repeats: u8,
+    base: u32,
+    frozen: bool,
+}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -140,12 +157,19 @@ pub(crate) enum DraftEvent {
     Send,
 }
 
+/// What the person and the page sent that the agent has not read.
+pub(crate) struct Outbox {
+    pub notes: Vec<DraftFeedback>,
+    pub messages: Vec<String>,
+    pub actions: Vec<String>,
+}
+
 pub(crate) struct Draft {
     id: String,
     /// What the card is called; the agent's title for a new draft.
     title: Option<SharedString>,
-    /// The height follows the page until the agent picks one.
-    auto_height: bool,
+    /// How the card's height has been following the page lately.
+    growth: Growth,
     content: DraftContent,
     /// Bumps whenever the page itself is replaced.
     generation: u64,
@@ -166,9 +190,12 @@ pub(crate) struct Draft {
     pending: Vec<DraftFeedback>,
     /// Notes the person sent that the agent has not read.
     outbox: Vec<DraftFeedback>,
+    /// What the page sent with `mc.send` that the agent has not read.
+    messages: Vec<String>,
     /// What the person did in the page by hand since the agent last looked.
     trail: Vec<String>,
-    /// Why the agent's wait should end: the person sent notes or handed back.
+    /// Why the agent's wait should end: the person sent notes, the page sent a
+    /// message, or the person handed back.
     signal: Option<&'static str>,
     /// The agent is waiting for the person.
     waiting: bool,
@@ -176,9 +203,75 @@ pub(crate) struct Draft {
     host: web::Host,
     #[cfg(target_os = "macos")]
     appearance: Option<bool>,
+    /// The version of the page the person can see. Until it matches
+    /// `generation`, the page stays clear over the card's placeholder.
+    shown: u64,
+    /// When `shown` last changed, for the fade.
+    revealed: Option<std::time::Instant>,
+    /// The page's shape as it last reported it, at its own width, drawn as the
+    /// skeleton while the next version loads.
+    outline: Vec<OutlineBox>,
+    /// The version being replaced, shown until the next one is ready.
+    still: Option<Arc<gpui::RenderImage>>,
+    /// The agent sent this version: lay it out at other widths for them.
+    measure: bool,
+    layouts: Vec<DraftLayout>,
+    /// The agent chose the page's width; without one, the full view reflows
+    /// the page to fill it.
+    explicit_width: bool,
+    /// The person opened the page over the whole window.
+    expanded: bool,
+    /// The full view's viewport, as last laid out.
+    expanded_viewport: (u32, u32),
+    focus: gpui::FocusHandle,
+    _reveal: Option<gpui::Task<()>>,
+    _refit: Option<gpui::Task<()>>,
     _watch: Option<gpui::Task<()>>,
 }
 impl EventEmitter<DraftEvent> for Draft {}
+
+/// One part of a page's outline, in page pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OutlineBox {
+    /// `t` text, `m` media, `g` table, `b` a filled or bordered box.
+    kind: char,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    lines: u32,
+}
+
+impl OutlineBox {
+    fn parse(value: &serde_json::Value) -> Vec<Self> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(64)
+            .filter_map(|entry| {
+                let kind = entry[0].as_str()?.chars().next()?;
+                let number = |i: usize| entry[i].as_f64().map(|v| v as f32);
+                Some(Self {
+                    kind,
+                    x: number(1)?,
+                    y: number(2)?,
+                    width: number(3)?,
+                    height: number(4)?,
+                    lines: entry[5].as_u64().unwrap_or(1).clamp(1, 99) as u32,
+                })
+            })
+            .filter(|b| b.width > 0. && b.height > 0.)
+            .collect()
+    }
+}
+
+/// How long a ready page takes to fade in; the placeholder stays under it.
+const FADE: std::time::Duration = std::time::Duration::from_millis(180);
+/// The full view's margins from the window edges, and its header.
+const EXPANDED_INSET: f32 = 32.;
+const EXPANDED_TOP: f32 = 44.;
+const EXPANDED_HEADER: f32 = 40.;
 
 impl Draft {
     pub(crate) fn new(
@@ -198,7 +291,7 @@ impl Draft {
                 )
             }),
             title: title.map(Into::into),
-            auto_height: height.is_none(),
+            growth: Growth::default(),
             content,
             generation: 1,
             width: width.unwrap_or(DRAFT_DEFAULT_WIDTH),
@@ -213,6 +306,7 @@ impl Draft {
             commenting: false,
             pending: Vec::new(),
             outbox: Vec::new(),
+            messages: Vec::new(),
             trail: Vec::new(),
             signal: None,
             waiting: false,
@@ -220,10 +314,50 @@ impl Draft {
             host: web::Host::default(),
             #[cfg(target_os = "macos")]
             appearance: None,
+            shown: 0,
+            revealed: None,
+            outline: Vec::new(),
+            still: None,
+            measure: false,
+            layouts: Vec::new(),
+            explicit_width: width.is_some(),
+            expanded: false,
+            expanded_viewport: (0, 0),
+            focus: cx.focus_handle(),
+            _reveal: None,
+            _refit: None,
             _watch: None,
         };
         this._watch = this.watch(cx);
+        this.reveal(cx);
         this
+    }
+
+    /// The viewport the page is laid out at: the full view's while it is open.
+    fn viewport(&self) -> (u32, u32) {
+        if self.expanded {
+            self.expanded_viewport
+        } else {
+            (self.width, self.height)
+        }
+    }
+
+    /// Opens the page over the whole window, or puts it back in the thread.
+    fn set_expanded(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.expanded == on {
+            return;
+        }
+        self.expanded = on;
+        #[cfg(target_os = "macos")]
+        self.host.set_scrolls(on);
+        if on {
+            window.focus(&self.focus, cx);
+        } else {
+            self.refit(cx);
+        }
+        cx.notify();
+        let app: &mut App = cx;
+        changed(app);
     }
 
     pub(crate) fn id(&self) -> &str {
@@ -234,13 +368,15 @@ impl Draft {
         self.waiting
     }
 
-    /// The notes and hand-done actions the agent has not seen, handed over.
-    pub(crate) fn take_outbox(&mut self) -> (Vec<DraftFeedback>, Vec<String>) {
+    /// The notes, page messages and hand-done actions the agent has not seen,
+    /// handed over.
+    pub(crate) fn take_outbox(&mut self) -> Outbox {
         self.signal = None;
-        (
-            std::mem::take(&mut self.outbox),
-            std::mem::take(&mut self.trail),
-        )
+        Outbox {
+            notes: std::mem::take(&mut self.outbox),
+            messages: std::mem::take(&mut self.messages),
+            actions: std::mem::take(&mut self.trail),
+        }
     }
 
     /// Sends the pinned notes to the agent.
@@ -319,17 +455,30 @@ impl Draft {
 
     /// Applies what a request changes before it acts.
     pub(crate) fn apply(&mut self, request: &DraftRequest, cx: &mut Context<Self>) {
+        if request.width.is_some() || request.height.is_some() {
+            // The agent is choosing a size: show it the size it chose.
+            self.expanded = false;
+        }
         if let Some(content) = &request.content {
             self.content = content.clone();
             self.generation += 1;
             self.markup = None;
             self.elements.clear();
             self.control = false;
+            self.measure = matches!(content, DraftContent::Html(_));
+            self.layouts.clear();
+            self.reveal(cx);
+        }
+        if request.width.is_some() {
+            self.explicit_width = true;
         }
         self.width = request.width.unwrap_or(self.width);
+        // A height is only where the card starts: the page decides the rest.
         if let Some(height) = request.height {
             self.height = height;
-            self.auto_height = false;
+        }
+        if request.content.is_some() || request.width.is_some() {
+            self.growth = Growth::default();
         }
         if let Some(light) = request.light {
             self.light = Some(light);
@@ -363,8 +512,10 @@ impl Draft {
     fn watch(&self, cx: &mut Context<Self>) -> Option<gpui::Task<()>> {
         Some(cx.spawn(async move |this, cx| {
             loop {
+                // Quick enough that the wheel follows the pointer onto a scroller
+                // in the page, and that Escape closes the full view promptly.
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(400))
+                    .timer(std::time::Duration::from_millis(120))
                     .await;
                 let Ok(web) = this.read_with(cx, |this, _| {
                     this.host.web().filter(|_| this.host.visible())
@@ -384,11 +535,12 @@ impl Draft {
                         .and_then(|state| state[key].as_array())
                         .is_some_and(|items| !items.is_empty())
                 };
-                // Take the page's notes and trail in one step so none is lost.
-                let notes = if has("feedback") || has("trail") {
+                // Take the page's notes, messages and trail in one step so none
+                // is lost.
+                let notes = if has("feedback") || has("trail") || has("messages") {
                     evaluate(
                         &web,
-                        "JSON.stringify({f:window.__mc.feedback.splice(0),t:window.__mc.trail.splice(0)})",
+                        "JSON.stringify({f:window.__mc.feedback.splice(0),n:window.__mc.messages.splice(0),t:window.__mc.trail.splice(0)})",
                         cx,
                     )
                     .await
@@ -396,7 +548,39 @@ impl Draft {
                 } else {
                     None
                 };
+                let content = reading.as_ref().and_then(|state| state["h"].as_u64());
+                let escape = reading.as_ref().is_some_and(|state| state["escape"] == true);
+                if escape {
+                    evaluate(&web, "window.__mc.escape=false;'ok'", cx).await;
+                }
                 let changed = this.update(cx, |this, cx| {
+                    // A page with no height of its own keeps fitting its
+                    // content as it grows or shrinks after loading.
+                    if let Some(content) = content
+                        && !this.expanded
+                        && this.shown == this.generation
+                        && !this.host.measuring()
+                        && this.fit_content(content)
+                    {
+                        cx.notify();
+                        let app: &mut App = cx;
+                        changed(app);
+                    }
+                    // A page that fits its card leaves the wheel to the thread.
+                    if let Some(content) = content {
+                        let over_scroller = reading.as_ref().is_some_and(|r| r["wheel"] == true);
+                        this.host.set_scrolls(
+                            this.expanded || over_scroller || content > u64::from(this.height) + 1,
+                        );
+                    }
+                    if escape && this.expanded {
+                        this.expanded = false;
+                        this.host.set_scrolls(false);
+                        this.refit(cx);
+                        cx.notify();
+                        let app: &mut App = cx;
+                        changed(app);
+                    }
                     if this.control != control {
                         this.control = control;
                         cx.notify();
@@ -406,9 +590,19 @@ impl Draft {
                             serde_json::from_value(notes["f"].clone()).unwrap_or_default();
                         let acts: Vec<String> =
                             serde_json::from_value(notes["t"].clone()).unwrap_or_default();
+                        let sent: Vec<String> =
+                            serde_json::from_value(notes["n"].clone()).unwrap_or_default();
                         this.pending.extend(found);
                         this.trail.extend(acts);
                         this.trail.truncate(40);
+                        // A page message goes to the agent at once, the way
+                        // pressing Send does for notes.
+                        if !sent.is_empty() {
+                            this.messages.extend(sent);
+                            this.messages.truncate(20);
+                            this.signal = Some("message");
+                            cx.emit(DraftEvent::Send);
+                        }
                         cx.notify();
                     }
                 });
@@ -450,35 +644,103 @@ impl Render for Draft {
             self.markup = None;
             self.retheme = Some(page::retheme_script(now));
         }
-        let header = div()
-            .id("draft-header")
-            .h(px(32.))
-            .px_3()
+        #[cfg(target_os = "macos")]
+        self.follow_column(cx);
+        let header = self.header(false, cx);
+        let ratio = self.width as f32 / self.height.max(1) as f32;
+        let body = if self.expanded {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.))
+                .text_color(content(0.5))
+                .child("Open in full view")
+                .into_any_element()
+        } else {
+            self.surface(window, cx)
+        };
+        let loading =
+            self.shown != self.generation || self.revealed.is_some_and(|at| at.elapsed() < FADE);
+        div()
+            .py_2()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .group("draft")
+                    .w_full()
+                    // A page the agent sized keeps that width; any other is
+                    // as wide as the conversation.
+                    .when(self.explicit_width, |card| {
+                        card.max_w(px(self.width as f32 + 2.))
+                    })
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(header)
+                    .child(
+                        div()
+                            .id("draft-card")
+                            .debug_selector(|| "draft-card".into())
+                            .w_full()
+                            .rounded_xl()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .aspect_ratio(ratio)
+                                    .when(loading || self.expanded, |card| {
+                                        card.child(self.placeholder(!self.expanded))
+                                    })
+                                    .child(body),
+                            ),
+                    ),
+            )
+            .when(self.expanded, |root| root.child(self.full_view(window, cx)))
+    }
+}
+
+impl Draft {
+    /// The row above the page: the person's tools for the draft. In the full
+    /// view it always shows, with the title, and closing it returns the page
+    /// to the thread.
+    fn header(&mut self, full: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let id = |name: &str| -> SharedString {
+            if full {
+                format!("{name}-full").into()
+            } else {
+                name.to_owned().into()
+            }
+        };
+        let active =
+            full || self.waiting || self.commenting || self.control || !self.pending.is_empty();
+        div()
+            .id(id("draft-header"))
+            // Out of the way until the person reaches for the draft, unless
+            // there is something to act on.
+            .when(!active, |header| {
+                header
+                    .opacity(0.)
+                    .group_hover("draft", |style| style.opacity(1.))
+            })
+            .h(px(28.))
+            .px_1()
             .flex()
             .flex_shrink_0()
             .items_center()
-            .gap_2()
-            .border_b_1()
-            .border_color(content(0.08))
+            .gap_1()
             .text_size(px(12.))
-            .child(icon("app-window", 14.).text_color(content(0.55)))
-            .child(
-                div()
-                    .min_w_0()
+            .child(div().flex_1().min_w_0().when(full, |d| {
+                d.pl_1()
                     .truncate()
-                    .font_weight(FontWeight::MEDIUM)
+                    .text_size(px(13.))
                     .text_color(content(0.8))
-                    .child(self.title()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(11.))
-                    .text_color(content(0.45))
-                    .child(format!("{} × {}", self.width, self.height)),
-            )
+                    .child(self.title())
+            }))
             .when(self.waiting, |header| {
                 header.child(
                     div()
@@ -503,8 +765,11 @@ impl Render for Draft {
             })
             .child(
                 div()
-                    .id("draft-comment")
-                    .debug_selector(|| "draft-comment".into())
+                    .id(id("draft-comment"))
+                    .debug_selector({
+                        let name = id("draft-comment");
+                        move || name.to_string()
+                    })
                     .role(gpui::Role::Button)
                     .aria_label("Leave a note on the page")
                     .flex_shrink_0()
@@ -513,9 +778,10 @@ impl Render for Draft {
                     .flex()
                     .items_center()
                     .rounded(px(6.))
-                    .border_1()
-                    .border_color(content(0.12))
-                    .when(self.commenting, |d| d.bg(content(0.1)))
+                    .text_color(content(0.6))
+                    .when(self.commenting, |d| {
+                        d.bg(content(0.1)).text_color(content(0.9))
+                    })
                     .hover(|s| s.bg(content(0.06)))
                     .cursor(gpui::CursorStyle::PointingHand)
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -527,8 +793,11 @@ impl Render for Draft {
             .when(!self.pending.is_empty(), |header| {
                 header.child(
                     div()
-                        .id("draft-send")
-                        .debug_selector(|| "draft-send".into())
+                        .id(id("draft-send"))
+                        .debug_selector({
+                            let name = id("draft-send");
+                            move || name.to_string()
+                        })
                         .role(gpui::Role::Button)
                         .aria_label("Send your notes to the agent")
                         .flex_shrink_0()
@@ -555,8 +824,11 @@ impl Render for Draft {
             .when(self.control || self.waiting, |header| {
                 header.child(
                     div()
-                        .id("draft-resume")
-                        .debug_selector(|| "draft-resume".into())
+                        .id(id("draft-resume"))
+                        .debug_selector({
+                            let name = id("draft-resume");
+                            move || name.to_string()
+                        })
                         .role(gpui::Role::Button)
                         .aria_label("Hand the draft back to the agent")
                         .flex_shrink_0()
@@ -565,35 +837,198 @@ impl Render for Draft {
                         .flex()
                         .items_center()
                         .rounded(px(6.))
-                        .border_1()
-                        .border_color(content(0.12))
+                        .text_color(content(0.6))
                         .hover(|s| s.bg(content(0.06)))
                         .cursor(gpui::CursorStyle::PointingHand)
                         .on_click(cx.listener(|this, _, _, cx| this.hand_back(cx)))
                         .child("Hand back"),
                 )
             })
-            .child(
-                icon_action("draft-close", "Close draft", "close", true)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DraftEvent::Closed))),
-            );
-        let ratio = self.width as f32 / self.height.max(1) as f32;
-        let body = self.surface(window, cx);
-        div().py_3().w_full().min_w_0().child(
+            .child(if full {
+                icon_action(
+                    "draft-collapse",
+                    "Back to the thread",
+                    "minimize-screen",
+                    true,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.set_expanded(false, window, cx)))
+            } else {
+                icon_action("draft-expand", "Open in full view", "maximize-screen", true)
+                    .debug_selector(|| "draft-expand".into())
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.set_expanded(true, window, cx)),
+                    )
+            })
+            .when(!full, |header| {
+                header.child(
+                    icon_action("draft-close", "Close draft", "close", true)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DraftEvent::Closed))),
+                )
+            })
+    }
+
+    /// What the card shows where the page is not: a picture of the version
+    /// being replaced, the page's outline, or a plain skeleton.
+    fn placeholder(&self, pulse: bool) -> gpui::AnyElement {
+        if let Some(still) = &self.still {
+            let size = still.size(0);
+            let ratio = size.width.0 as f32 / size.height.0.max(1) as f32;
+            return div()
+                .absolute()
+                .inset_0()
+                .overflow_hidden()
+                .child(gpui::img(still.clone()).w_full().aspect_ratio(ratio))
+                .into_any_element();
+        }
+        let (width, height) = (self.width.max(1) as f32, self.height.max(1) as f32);
+        let bar = content(0.1);
+        let shape = if self.outline.is_empty() {
+            // Nothing is known about the page yet: a heading, a line and a block.
             div()
-                .id("draft-card")
-                .debug_selector(|| "draft-card".into())
-                .w_full()
-                .max_w(px(self.width as f32 + 2.))
+                .absolute()
+                .inset_0()
                 .flex()
                 .flex_col()
-                .rounded_xl()
-                .overflow_hidden()
-                .border_1()
-                .border_color(content(0.08))
-                .bg(content(0.03))
-                .child(header)
-                .child(div().relative().w_full().aspect_ratio(ratio).child(body)),
+                .gap_2()
+                .pt_1()
+                .child(
+                    div()
+                        .h(px(14.))
+                        .w(gpui::relative(0.4))
+                        .rounded(px(4.))
+                        .bg(bar),
+                )
+                .child(
+                    div()
+                        .h(px(10.))
+                        .w(gpui::relative(0.6))
+                        .rounded(px(4.))
+                        .bg(bar),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .flex_1()
+                        .max_h(px(220.))
+                        .w_full()
+                        .rounded(px(12.))
+                        .bg(bar),
+                )
+        } else {
+            div()
+                .absolute()
+                .inset_0()
+                .children(self.outline.iter().map(|part| {
+                    let place = div()
+                        .absolute()
+                        .left(gpui::relative(part.x / width))
+                        .top(gpui::relative(part.y / height))
+                        .w(gpui::relative(part.width / width))
+                        .h(gpui::relative(part.height / height));
+                    match part.kind {
+                        't' | 'g' => {
+                            place
+                                .flex()
+                                .flex_col()
+                                .children((0..part.lines).map(|line| {
+                                    let last = line + 1 == part.lines && part.lines > 1;
+                                    div().flex_1().flex().items_center().child(
+                                        div()
+                                            .h(gpui::relative(0.55))
+                                            .max_h(px(12.))
+                                            .w(gpui::relative(if last { 0.6 } else { 1. }))
+                                            .rounded(px(3.))
+                                            .bg(bar),
+                                    )
+                                }))
+                        }
+                        'm' => place.rounded(px(8.)).bg(bar),
+                        _ => place.rounded(px(8.)).bg(content(0.05)),
+                    }
+                }))
+        };
+        if !pulse {
+            return shape.into_any_element();
+        }
+        crate::pulse::looping(
+            "draft-skeleton",
+            std::time::Duration::from_millis(1600),
+            crate::pulse::Rate::Half,
+            move |phase| {
+                let wave = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+                shape.opacity(0.55 + 0.45 * wave)
+            },
+        )
+        .into_any_element()
+    }
+
+    /// The page over the whole window, with the draft's tools above it.
+    fn full_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        let body = (
+            (f32::from(viewport.width) - 2. * EXPANDED_INSET).max(240.),
+            (f32::from(viewport.height) - EXPANDED_TOP - EXPANDED_INSET - EXPANDED_HEADER)
+                .max(120.),
+        );
+        // A page the agent sized keeps its width, at up to life size; any
+        // other page reflows to fill the view.
+        self.expanded_viewport = if self.explicit_width {
+            let scale = (body.0 / self.width.max(1) as f32).min(1.);
+            (self.width, (body.1 / scale) as u32)
+        } else {
+            (body.0 as u32, body.1 as u32)
+        };
+        let header = self.header(true, cx);
+        let page = self.surface(window, cx);
+        let panel = div()
+            .absolute()
+            .top(px(EXPANDED_TOP))
+            .left(px(EXPANDED_INSET))
+            .right(px(EXPANDED_INSET))
+            .bottom(px(EXPANDED_INSET))
+            .flex()
+            .flex_col()
+            .rounded(px(12.))
+            .overflow_hidden()
+            .border_1()
+            .border_color(content(0.1))
+            .bg(pane_surface())
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(24.), black(0.3))
+                    .blur_radius(px(48.))
+                    .spread_radius(px(-12.)),
+            ])
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .h(px(EXPANDED_HEADER))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .child(header.w_full()),
+            )
+            .child(div().relative().flex_1().min_h_0().child(page));
+        crate::modal::window_overlay(
+            window,
+            div()
+                .id("draft-full-view")
+                .debug_selector(|| "draft-full-view".into())
+                .absolute()
+                .inset_0()
+                .occlude()
+                .track_focus(&self.focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.set_expanded(false, window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.set_expanded(false, window, cx)),
+                )
+                .child(crate::modal::scrim("draft-full-scrim"))
+                .child(panel),
         )
     }
 }
@@ -601,12 +1036,14 @@ impl Render for Draft {
 #[cfg(target_os = "macos")]
 impl Draft {
     fn surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (width, height) = self.viewport();
         let placement = web::Placement {
             load: self.load(),
             generation: self.generation,
-            width: self.width,
-            height: self.height,
+            width,
+            height,
             retheme: self.retheme.take().filter(|_| self.is_html()),
+            revealed: self.revealed.filter(|_| self.shown == self.generation),
             app: cx.to_async(),
         };
         // Dev servers follow the window's appearance for prefers-color-scheme.
@@ -620,6 +1057,8 @@ impl Draft {
 }
 #[cfg(not(target_os = "macos"))]
 impl Draft {
+    fn reveal(&mut self, _: &mut Context<Self>) {}
+    fn refit(&mut self, _: &mut Context<Self>) {}
     fn surface(&mut self, _: &mut Window, _: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .p_4()
@@ -628,6 +1067,23 @@ impl Draft {
             .child("Drafts need the macOS app.")
             .into_any_element()
     }
+}
+
+/// A PNG with see-through parts laid on `color`.
+#[cfg(target_os = "macos")]
+fn flatten(png: &[u8], color: [u8; 3]) -> Option<Vec<u8>> {
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .ok()?
+        .into_rgba8();
+    let [r, g, b] = color;
+    let mut flat =
+        image::RgbaImage::from_pixel(image.width(), image.height(), image::Rgba([r, g, b, 255]));
+    image::imageops::overlay(&mut flat, &image, 0, 0);
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(flat)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .ok()?;
+    Some(out.into_inner())
 }
 
 /// The wrapper's state as JSON.
@@ -661,7 +1117,7 @@ impl Draft {
         let gone = |_| "The draft was closed".to_string();
         let acts = matches!(
             request.action,
-            DraftAction::Click { .. } | DraftAction::Type { .. }
+            DraftAction::Click { .. } | DraftAction::Type { .. } | DraftAction::Set { .. }
         );
         let changes = acts
             || request.content.is_some()
@@ -684,6 +1140,25 @@ impl Draft {
                 .map_err(gone)?;
             }
             _ => {}
+        }
+        if request.content.is_some() {
+            // The card keeps showing this version until the next is ready.
+            let current = this
+                .read_with(cx, |this, _| {
+                    (this.shown == this.generation && this.host.visible())
+                        .then(|| this.host.web())
+                        .flatten()
+                })
+                .map_err(gone)?;
+            if let Some(web) = current {
+                let still = web::picture(&web).await;
+                this.update(cx, |this, cx| {
+                    if let Some(old) = std::mem::replace(&mut this.still, still) {
+                        cx.drop_image(old, None);
+                    }
+                })
+                .map_err(gone)?;
+            }
         }
         this.update(cx, |this, cx| this.apply(request, cx))
             .map_err(gone)?;
@@ -728,6 +1203,9 @@ impl Draft {
                 )
                 .await?;
             }
+            DraftAction::Set { values } => {
+                act(&web, serde_json::json!({"kind":"set","values":values}), cx).await?;
+            }
             _ => {}
         }
         let event = match &request.action {
@@ -739,15 +1217,30 @@ impl Draft {
         } else {
             SETTLE
         };
-        let mut snapshot = Self::capture(this, &web, settle, cx).await?;
+        let mut snapshot = Self::capture(this, &web, settle, cx)
+            .await
+            .map_err(|error| {
+                // The click or typing already reached the page.
+                if acts {
+                    format!("Your action was applied, but the picture could not be taken: {error}")
+                } else {
+                    error
+                }
+            })?;
         if let DraftAction::Keep { title } = &request.action {
             return Self::keep(this, snapshot.png, title, cx);
         }
-        let (feedback, actions) = this
+        let outbox = this
             .update(cx, |this, _| this.take_outbox())
             .map_err(gone)?;
-        snapshot.feedback = feedback;
-        snapshot.user_actions = actions;
+        snapshot.feedback = outbox.notes;
+        snapshot.messages = outbox.messages;
+        snapshot.user_actions = outbox.actions;
+        if request.content.is_some() {
+            snapshot.layouts = this
+                .read_with(cx, |this, _| this.layouts.clone())
+                .map_err(gone)?;
+        }
         snapshot.event = event.map(str::to_owned);
         Ok(DraftReply::Snapshot(Box::new(snapshot)))
     }
@@ -785,6 +1278,29 @@ impl Draft {
                     .read_with(cx, |this, _| this.pending.len())
                     .map_err(gone)?;
                 Ok(serde_json::json!({"pending": pending}))
+            }
+            "expand" | "collapse" => {
+                let on = what == "expand";
+                this.update(cx, |this, cx| {
+                    this.expanded = on;
+                    this.host.set_scrolls(on);
+                    if !on {
+                        this.refit(cx);
+                    }
+                    cx.notify();
+                    let app: &mut App = cx;
+                    changed(app);
+                })
+                .map_err(gone)?;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(600))
+                    .await;
+                Ok(serde_json::json!({ "expanded": on }))
+            }
+            "message" => {
+                let web = Self::ready(this, cx).await?;
+                evaluate(&web, "window.__mc.messages.push('Use this one');'ok'", cx).await;
+                Ok(serde_json::json!({"message": "queued"}))
             }
             "send" => {
                 this.update(cx, |this, cx| this.send(cx)).map_err(gone)?;
@@ -844,23 +1360,253 @@ impl Draft {
         Ok(event)
     }
 
+    /// Keeps the version just given to the page clear until it has loaded,
+    /// growing the card to its height and drawing its outline meanwhile; lays
+    /// it out at other widths when the agent asked for it; then fades it in.
+    fn reveal(&mut self, cx: &mut Context<Self>) {
+        let generation = self.generation;
+        self._reveal = Some(cx.spawn(async move |this, cx| {
+            let current = |this: &Self| this.generation == generation;
+            // Painting the card is what hands the page to the web view.
+            let web = loop {
+                let Ok(found) = this.read_with(cx, |this, _| {
+                    (current(this) && this.host.has_loaded(generation))
+                        .then(|| this.host.web())
+                        .flatten()
+                }) else {
+                    return;
+                };
+                if let Some(web) = found {
+                    break web;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(80))
+                    .await;
+            };
+            let started = std::time::Instant::now();
+            loop {
+                let reading = state(&web, cx).await;
+                let ready = reading
+                    .as_ref()
+                    .is_some_and(|s| s["loaded"] == true && s["fontsReady"] == true);
+                let alive = this.update(cx, |this, cx| {
+                    if !current(this) {
+                        return false;
+                    }
+                    if let Some(reading) = &reading {
+                        let outline = OutlineBox::parse(&reading["outline"]);
+                        if !outline.is_empty() && outline != this.outline {
+                            this.outline = outline;
+                            cx.notify();
+                        }
+                        // Grow the card to the page now, so it does not jump
+                        // when the page appears.
+                        if let Some(content) = reading["h"].as_u64().filter(|h| *h > 0)
+                            && !this.expanded
+                            && this.fit_content(content)
+                        {
+                            cx.notify();
+                            let app: &mut App = cx;
+                            changed(app);
+                        }
+                    }
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    return;
+                }
+                if ready || started.elapsed() > LOAD_TIMEOUT {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+            }
+            let measure = this
+                .update(cx, |this, _| {
+                    std::mem::take(&mut this.measure) && this.is_html() && !this.expanded
+                })
+                .unwrap_or(false);
+            if measure {
+                let layouts = Self::measure_layouts(&this, &web, cx).await;
+                let _ = this.update(cx, |this, _| {
+                    if current(this) {
+                        this.layouts = layouts;
+                    }
+                });
+            }
+            Self::fit_height(&this, &web, cx).await;
+            let _ = this.update(cx, |this, cx| {
+                if !current(this) {
+                    return;
+                }
+                this.shown = generation;
+                this.revealed = Some(std::time::Instant::now());
+                cx.notify();
+                let app: &mut App = cx;
+                changed(app);
+            });
+            // The placeholder stays under the page until the fade is done.
+            cx.background_executor().timer(FADE).await;
+            let _ = this.update(cx, |this, cx| {
+                if current(this)
+                    && let Some(still) = this.still.take()
+                {
+                    cx.drop_image(still, None);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Makes the card as tall as the page's content, up to `MAX_HEIGHT`.
+    /// Returns whether the height changed. A page whose height depends on its
+    /// own viewport would grow without end, so the same step repeated is
+    /// taken as that: the card goes back to where it was and the page scrolls.
+    fn fit_content(&mut self, content: u64) -> bool {
+        if self.growth.frozen {
+            return false;
+        }
+        let height = (content.min(u64::from(MAX_HEIGHT)) as u32).max(MIN_HEIGHT);
+        if height.abs_diff(self.height) <= 1 {
+            return false;
+        }
+        let growth = &mut self.growth;
+        if height > self.height {
+            let step = height - self.height;
+            if step == growth.step {
+                growth.repeats += 1;
+            } else {
+                *growth = Growth {
+                    step,
+                    repeats: 1,
+                    base: self.height,
+                    frozen: false,
+                };
+            }
+            if growth.repeats >= RUNAWAY_STEPS {
+                growth.frozen = true;
+                self.height = growth.base;
+                return true;
+            }
+        } else {
+            *growth = Growth::default();
+        }
+        self.height = height;
+        true
+    }
+
+    /// The page's height at its own width again, after the full view closes
+    /// or the conversation changes width.
+    fn refit(&mut self, cx: &mut Context<Self>) {
+        let own = (self.width, self.height);
+        self._refit = Some(cx.spawn(async move |this, cx| {
+            let Ok(Some(web)) = this.read_with(cx, |this, _| this.host.web()) else {
+                return;
+            };
+            Self::lay_out(&this, &web, None, own, cx).await;
+            Self::fit_height(&this, &web, cx).await;
+        }));
+    }
+
+    /// A page the agent gave no width lays out at the conversation's width,
+    /// as the thread around it does.
+    fn follow_column(&mut self, cx: &mut Context<Self>) {
+        if self.explicit_width || self.expanded {
+            return;
+        }
+        let Some(column) = self.host.column() else {
+            return;
+        };
+        let width = (column.round() as u32).clamp(240, 1600);
+        if width != self.width {
+            self.width = width;
+            self.growth = Growth::default();
+            self.refit(cx);
+        }
+    }
+
+    /// Lays the hidden page out at the common widths and back at its own.
+    async fn measure_layouts(
+        this: &gpui::WeakEntity<Self>,
+        web: &objc2::rc::Retained<objc2_web_kit::WKWebView>,
+        cx: &mut gpui::AsyncApp,
+    ) -> Vec<DraftLayout> {
+        let Ok(own) = this.read_with(cx, |this, _| (this.width, this.height)) else {
+            return Vec::new();
+        };
+        let mut layouts = Vec::new();
+        for width in monocode_core::visual_bridge::DRAFT_LAYOUT_WIDTHS {
+            if let Some(layout) = Self::lay_out(this, web, Some((width, own.1)), own, cx).await {
+                layouts.push(layout);
+            }
+        }
+        Self::lay_out(this, web, None, own, cx).await;
+        layouts
+    }
+
+    /// Sets the page's viewport (its own with `None`), waits for the page to
+    /// report the new layout, and returns it.
+    async fn lay_out(
+        this: &gpui::WeakEntity<Self>,
+        web: &objc2::rc::Retained<objc2_web_kit::WKWebView>,
+        viewport: Option<(u32, u32)>,
+        own: (u32, u32),
+        cx: &mut gpui::AsyncApp,
+    ) -> Option<DraftLayout> {
+        let width = viewport.map_or(own.0, |viewport| viewport.0);
+        evaluate(web, "window.__mc.vw=0;window.__mc.h=0;'ok'", cx).await?;
+        this.update(cx, |this, cx| {
+            this.host.measure_at(viewport, own);
+            cx.notify();
+        })
+        .ok()?;
+        let started = std::time::Instant::now();
+        loop {
+            let reading = state(web, cx).await?;
+            let laid_out = reading["vw"]
+                .as_u64()
+                .is_some_and(|vw| vw.abs_diff(u64::from(width)) <= 1);
+            if laid_out && reading["h"].as_u64().is_some_and(|h| h > 0) {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_millis(900) {
+                return None;
+            }
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(30))
+                .await;
+        }
+        // The page's own resize handlers run on the next frames.
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(80))
+            .await;
+        let reading = state(web, cx).await?;
+        let number = |key: &str| reading[key].as_u64().unwrap_or(0) as u32;
+        Some(DraftLayout {
+            width,
+            height: number("h"),
+            horizontal_overflow: number("w").saturating_sub(number("vw")),
+        })
+    }
+
     /// A page the agent gave no height to is as tall as its content.
     async fn fit_height(
         this: &gpui::WeakEntity<Self>,
         web: &objc2::rc::Retained<objc2_web_kit::WKWebView>,
         cx: &mut gpui::AsyncApp,
     ) {
-        let Ok(auto) = this.read_with(cx, |this, _| this.auto_height) else {
+        let Ok(open) = this.read_with(cx, |this, _| this.expanded) else {
             return;
         };
-        if !auto {
+        if open {
             return;
         }
         let Some(content) = state(web, cx).await.and_then(|state| state["h"].as_u64()) else {
             return;
         };
         let _ = this.update(cx, |this, cx| {
-            this.height = (content as u32).clamp(MIN_HEIGHT, MAX_HEIGHT);
+            this.fit_content(content);
             cx.notify();
             let app: &mut App = cx;
             changed(app);
@@ -894,9 +1640,13 @@ impl Draft {
         };
         let started = std::time::Instant::now();
         loop {
-            let ready = state(&web, cx)
-                .await
-                .is_some_and(|s| s["loaded"] == true && s["fontsReady"] == true);
+            let shown = this
+                .read_with(cx, |this, _| this.shown == this.generation)
+                .map_err(|_| "The draft was closed".to_string())?;
+            let ready = shown
+                && state(&web, cx)
+                    .await
+                    .is_some_and(|s| s["loaded"] == true && s["fontsReady"] == true);
             if ready || started.elapsed() > LOAD_TIMEOUT {
                 // A page that never finishes usually has a blocked script or a
                 // stuck request; report what there is.
@@ -931,11 +1681,12 @@ impl Draft {
         }
         let (width, height, id, inspection) = this
             .update(cx, |this, _| {
-                this.host.resize(this.width, this.height);
+                let (width, height) = this.viewport();
+                this.host.resize(width, height);
                 this.inspections += 1;
                 (
-                    this.width,
-                    this.height,
+                    width,
+                    height,
                     this.id.clone(),
                     format!("{}-{}", this.generation, this.inspections),
                 )
@@ -946,6 +1697,16 @@ impl Draft {
             .timer(std::time::Duration::from_millis(150))
             .await;
         let (png, size) = web::png(web, f64::from(width.min(MAX_PICTURE_WIDTH)), cx).await?;
+        // The page is clear over the thread; give the agent's picture the
+        // thread's color under it.
+        let (html, palette) = this
+            .read_with(cx, |this, _| (this.is_html(), this.palette))
+            .map_err(|_| "The draft was closed".to_string())?;
+        let png = if html {
+            flatten(&png, page::backdrop(palette)).unwrap_or(png)
+        } else {
+            png
+        };
         let message = serde_json::json!({ "__mcInspect": inspection });
         evaluate(web, &format!("window.__mcSend({message});'sent'"), cx)
             .await
@@ -1005,6 +1766,7 @@ impl Draft {
             url: url_mode.then(|| summary["url"].as_str().unwrap_or_default().into()),
             title: url_mode.then(|| summary["title"].as_str().unwrap_or_default().into()),
             feedback: Vec::new(),
+            messages: Vec::new(),
             user_actions: Vec::new(),
             event: None,
             issues: summary["issues"]
@@ -1014,6 +1776,7 @@ impl Draft {
                 .filter_map(|issue| issue.as_str().map(str::to_owned))
                 .collect(),
             state: summary.get("state").filter(|v| v.is_object()).cloned(),
+            layouts: Vec::new(),
         })
     }
 
@@ -1145,17 +1908,97 @@ mod tests {
             assert_eq!(draft.signal, None);
             draft.send(cx);
             assert_eq!(draft.signal, Some("feedback"));
-            let (notes, actions) = draft.take_outbox();
-            assert_eq!(notes.len(), 1);
-            assert_eq!(actions, ["clicked \"Go\""]);
+            let outbox = draft.take_outbox();
+            assert_eq!(outbox.notes.len(), 1);
+            assert_eq!(outbox.actions, ["clicked \"Go\""]);
             // Handed over once.
             assert_eq!(draft.signal, None);
-            assert!(draft.take_outbox().0.is_empty());
+            assert!(draft.take_outbox().notes.is_empty());
         });
         assert_eq!(sent.get(), 1);
         draft.update(cx, |draft, cx| {
             draft.hand_back(cx);
             assert_eq!(draft.signal, Some("handed back"));
         });
+    }
+
+    /// Renders the card's own parts (the page is a native view and is not in
+    /// these pictures): the skeleton before anything is known, the page's
+    /// outline, and the full view.
+    /// `DRAFT_SHOTS=/tmp/shots cargo test --bins draft_shots -- --ignored`
+    #[test]
+    #[ignore = "Requires a Metal device; writes screenshots"]
+    fn draft_shots() {
+        use gpui::{HeadlessAppContext, size};
+        let dir = std::env::var("DRAFT_SHOTS").unwrap_or_else(|_| "/tmp/draft-shots".into());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cx = HeadlessAppContext::with_platform(
+            Arc::new(gpui_apple::AppleTextSystem::new()),
+            Arc::new(crate::assets::Assets),
+            || {
+                Ok(Some(Box::new(
+                    gpui_apple::metal_renderer::MetalHeadlessRenderer::new(),
+                )))
+            },
+        );
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            crate::popover::bind(cx);
+        });
+        let window = cx
+            .open_window(size(px(900.), px(640.)), |_, cx| {
+                cx.new(|cx| {
+                    Draft::new(
+                        None,
+                        1,
+                        DraftContent::Html("<p>Hi</p>".into()),
+                        (Some(640), Some(300)),
+                        None,
+                        Some("Pricing".into()),
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+        let shot = |cx: &mut HeadlessAppContext, name: &str| {
+            for _ in 0..4 {
+                cx.run_until_parked();
+                cx.advance_clock(std::time::Duration::from_millis(300));
+                cx.update_window(window.into(), |_, w, _| w.refresh())
+                    .unwrap();
+            }
+            cx.run_until_parked();
+            let image = cx.capture_screenshot(window.into()).unwrap();
+            let mut flat = image::RgbaImage::from_pixel(
+                image.width(),
+                image.height(),
+                image::Rgba([20, 20, 20, 255]),
+            );
+            image::imageops::overlay(&mut flat, &image, 0, 0);
+            flat.save(format!("{dir}/{name}.png")).unwrap();
+        };
+        shot(&mut cx, "skeleton");
+        window
+            .update(&mut cx, |draft, _, cx| {
+                draft.outline = OutlineBox::parse(&serde_json::json!([
+                    ["t", 0, 4, 220, 30, 1],
+                    ["t", 0, 46, 600, 44, 2],
+                    ["b", 0, 106, 196, 120, 1],
+                    ["t", 12, 118, 80, 20, 1],
+                    ["b", 212, 106, 196, 120, 1],
+                    ["m", 424, 106, 196, 120, 1],
+                    ["t", 0, 242, 420, 22, 1]
+                ]));
+                cx.notify();
+            })
+            .unwrap();
+        shot(&mut cx, "outline");
+        window
+            .update(&mut cx, |draft, _, cx| {
+                draft.expanded = true;
+                cx.notify();
+            })
+            .unwrap();
+        shot(&mut cx, "expanded");
     }
 }

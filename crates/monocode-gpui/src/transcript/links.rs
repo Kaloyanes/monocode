@@ -50,10 +50,15 @@ impl Target {
     }
     fn items(&self) -> Vec<MenuItem> {
         match self {
-            Self::Web(_) => vec![
-                MenuAction::new("open-web", "Open Link").into(),
-                MenuAction::new("copy-link", "Copy Link Address").into(),
-            ],
+            Self::Web(url) => {
+                let mut items = Vec::new();
+                if monocode_core::inbox::link_target(url).is_some() {
+                    items.push(MenuAction::new("open-inbox", "Open in MonoCode").into());
+                }
+                items.push(MenuAction::new("open-web", "Open Link").into());
+                items.push(MenuAction::new("copy-link", "Copy Link Address").into());
+                items
+            }
             Self::File { base, .. } => {
                 let reveal = if cfg!(target_os = "macos") {
                     "Reveal in Finder"
@@ -128,6 +133,11 @@ impl TranscriptView {
         cx: &mut Context<Self>,
     ) {
         match (action, target) {
+            ("open-inbox", Target::Web(url)) => {
+                if !crate::inbox::open_in_inbox(url, window, cx) {
+                    cx.open_url(url);
+                }
+            }
             ("open-web", Target::Web(url)) => cx.open_url(url),
             ("copy-link", Target::Web(url)) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))

@@ -26,6 +26,7 @@ mod compaction;
 pub(crate) mod devin;
 mod discovery;
 mod follow_up;
+mod goals;
 mod kind;
 mod lifecycle;
 mod limits;
@@ -107,7 +108,7 @@ pub enum Event {
     Image(ImageOutput),
     Status(String),
     /// What the turn still waits on after the provider yielded; empty clears it.
-    Background(Vec<BackgroundTask>),
+    Background(Waiting),
     UsageLimited(crate::usage::Limit),
     Interjection {
         text: String,
@@ -118,6 +119,8 @@ pub enum Event {
         model: Option<String>,
         model_settings: HashMap<String, String>,
     },
+    /// A `/goal` changed; the text is its objective or what is still missing.
+    Goal(crate::transcript::GoalChange, String),
     Done,
 }
 
@@ -126,6 +129,15 @@ pub struct ImageOutput {
     pub data: String,
     pub mime_type: String,
     pub title: String,
+}
+
+/// What a yielded turn still waits on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Waiting {
+    pub tasks: Vec<BackgroundTask>,
+    /// A subagent just reported back and the provider may pick the thread up
+    /// on its own, so the turn is not idle even if no agent is left running.
+    pub waking: bool,
 }
 
 /// A command or subagent left running after the provider yielded its answer.
@@ -274,6 +286,10 @@ struct Protocol {
     claude_result_seen: bool,
     claude_usage_limit: Option<crate::usage::Limit>,
     claude_resume_at: Option<Instant>,
+    /// When a finished Claude turn stops waiting for its steers to start the next.
+    claude_steer_deadline: Option<Instant>,
+    /// Claude may still run a steer this process was handed.
+    claude_stale: bool,
     follow_up_ready: bool,
     steering: HashMap<String, (crate::follow_up::Message, Instant)>,
     request: Request,
@@ -295,6 +311,10 @@ struct Protocol {
     pi: pi::State,
     probe: bool,
     catalog_result: Option<Value>,
+    /// The goal in force and its last reported status.
+    goal: Option<(String, String)>,
+    /// Claude answered this turn itself, not only with local command output.
+    claude_model_turn: bool,
     questions: HashMap<String, (Value, String, Value, crate::agent::Question)>,
     question_order: std::collections::VecDeque<String>,
     visible_question: Option<String>,
@@ -304,6 +324,12 @@ struct Protocol {
 impl Protocol {
     fn new(request: Request) -> Self {
         Self {
+            goal: request
+                .settings
+                .goal
+                .clone()
+                .map(|objective| (objective, "active".into())),
+            claude_model_turn: false,
             request,
             initialized: false,
             compact: false,
@@ -316,6 +342,8 @@ impl Protocol {
             claude_result_seen: false,
             claude_usage_limit: None,
             claude_resume_at: None,
+            claude_steer_deadline: None,
+            claude_stale: false,
             follow_up_ready: false,
             steering: HashMap::new(),
             emitted: HashMap::new(),
@@ -430,7 +458,13 @@ impl Protocol {
             if starts_message && self.claude_result_seen {
                 self.claude_result_seen = false;
                 self.claude_resume_at = None;
+                self.claude_steer_deadline = None;
                 self.text_key = None;
+            }
+            if v["type"] == "user" && v["isReplay"] == true {
+                if let Some(events) = self.claude_replay(&v) {
+                    return Ok(events);
+                }
             }
         }
         let mut activity_events = Vec::new();
@@ -675,6 +709,9 @@ impl Protocol {
                     "item/started" | "item/completed" => {
                         self.codex_tool(&p["item"], v["method"] == "item/completed", &mut events)
                     }
+                    method @ ("thread/goal/updated" | "thread/goal/cleared") => {
+                        self.codex_goal(method, p, &mut events)
+                    }
                     "thread/compacted" if self.active_compaction.is_some() => {
                         self.compaction(None, ToolState::Completed, &mut events);
                     }
@@ -836,6 +873,8 @@ impl Protocol {
                             );
                         }
                     }
+                    "assistant"
+                        if v["error"].is_null() && self.claude_goal_frame(&v, &mut events) => {}
                     "assistant" => {
                         if let Some(error) = v["error"].as_str() {
                             return Err(self.claude_error(error, &v));
@@ -871,6 +910,7 @@ impl Protocol {
                         self.text(&self.claude_message.to_string(), &text, true, &mut events);
                     }
                     "user" => {
+                        self.claude_goal_check(&v, &mut events);
                         for block in v["message"]["content"].as_array().into_iter().flatten() {
                             if block["type"] == "tool_result" {
                                 // A background Agent's launch receipt is not its final report.
@@ -963,7 +1003,9 @@ impl Protocol {
                             return Err(self.claude_error(&error, &v));
                         }
                         // Some versions omit partial/assistant frames in simple turns.
-                        if !self.begun {
+                        if !self.begun
+                            && !Self::claude_goal_result(v["result"].as_str().unwrap_or(""))
+                        {
                             self.text(
                                 &self.claude_message.to_string(),
                                 v["result"].as_str().unwrap_or(""),
@@ -972,7 +1014,13 @@ impl Protocol {
                             );
                         }
                         self.claude_result_seen = true;
-                        if self.activities.claude_background.is_empty()
+                        self.claude_goal_end(&mut events);
+                        if !self.steering.is_empty() {
+                            // Claude starts another turn for steers it has not
+                            // taken yet; this one is not the end.
+                            self.claude_steer_deadline =
+                                Some(Instant::now() + Duration::from_secs(30));
+                        } else if self.activities.claude_background.is_empty()
                             && self.activities.claude_pending.is_empty()
                             && self.claude_resume_at.is_none()
                         {
@@ -1456,6 +1504,9 @@ fn run_operation(
                 "--output-format",
                 "stream-json",
                 "--include-partial-messages",
+                // Echoes each message when Claude takes it, which is when a
+                // steer counts as delivered.
+                "--replay-user-messages",
                 "--permission-prompt-tool",
                 "stdio",
             ]);
@@ -1856,6 +1907,9 @@ fn run_operation(
     if !pending.is_empty() {
         let _ = emit(std::mem::take(&mut pending));
     }
+    // A Claude process still holding a steer would run it on the next turn's
+    // pipe, so it is shut down instead.
+    let eligible = eligible && !protocol.holds_steers();
     if eligible
         && cancel.load(Ordering::Relaxed)
         && !protocol.done

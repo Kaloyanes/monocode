@@ -13,8 +13,14 @@ pub(super) struct FollowUps {
     pub continuations: std::collections::VecDeque<String>,
     pub resuming: bool,
     pub ready: bool,
-    pub draft_selected: bool,
     pub edit: Option<QueueEdit>,
+}
+/// The last composer draft written to the store, and the save waiting on a
+/// pause in typing.
+#[derive(Default)]
+pub(super) struct ComposerDraft {
+    pub saved: Option<Message>,
+    pub pending: Option<gpui::Task<()>>,
 }
 pub(super) struct QueueEdit {
     id: String,
@@ -23,11 +29,6 @@ pub(super) struct QueueEdit {
 }
 
 impl Conversation {
-    pub(super) fn draft_active(&self, cx: &gpui::App) -> bool {
-        self.follow_ups.draft_selected
-            || monocode_core::composer::consume_command(&self.input.read(cx).content, "draft")
-                .is_some()
-    }
     pub(super) fn message(
         &mut self,
         text: String,
@@ -107,10 +108,9 @@ impl Conversation {
         let prefers_steer = cx
             .try_global::<crate::settings::Preferences>()
             .is_none_or(|prefs| prefs.follow_up == "steer");
-        // Once the agent has answered and only background work is left, which
-        // may never end (a dev server), queuing would park the message behind
-        // it, so hand it to the agent now.
-        (prefers_steer != invert || !self.background.tasks.is_empty())
+        // Queued messages wait for subagents the agent will come back to, but
+        // not for commands alone, which may never end (a dev server).
+        (prefers_steer != invert || self.background.idle())
             && Kind::from_id(&self.summary.provider).can_steer()
     }
     /// `invert` flips the follow-up preference for this message (Cmd+Enter).
@@ -139,7 +139,6 @@ impl Conversation {
         if self.is_remote() || !self.responding() {
             return;
         }
-        self.plan_asked = true;
         let mut message = self.message(prompt, Vec::new(), None, cx);
         message.steer = Kind::from_id(&self.summary.provider).can_steer() && message.can_steer();
         self.follow_ups.motion.insert(
@@ -170,10 +169,9 @@ impl Conversation {
         self.follow_ups.state.messages.push(message);
         self.save_follow_ups(cx);
     }
-    /// Whether a plan request reaches the agent mid-turn. Where it would only
-    /// queue for after the turn, asking for a plan is pointless.
-    pub(crate) fn can_steer_plan(&self) -> bool {
-        !self.is_remote() && Kind::from_id(&self.summary.provider).can_steer()
+    #[cfg(test)]
+    pub(crate) fn queued_follow_ups(&self) -> usize {
+        self.follow_ups.state.messages.len()
     }
     /// The plan rail's Build: leave Plan mode and build the proposal the
     /// agent just wrote, starting from its todo list so the rail can follow.
@@ -193,6 +191,92 @@ impl Conversation {
         let attachments = std::mem::take(&mut self.attachments);
         self.launch_prompt(BUILD_PROPOSED_PLAN.into(), cx);
         self.attachments = attachments;
+    }
+    /// The composer's unsent text and files: the thread's draft once it is left.
+    fn composer_draft(&self, cx: &gpui::App) -> Option<Message> {
+        let input = self.input.read(cx);
+        (input.has_message_text() || !self.attachments.is_empty()).then(|| Message {
+            text: input.content.to_string(),
+            attachments: self.attachments.clone(),
+            ..Default::default()
+        })
+    }
+    pub(crate) fn composer_has_draft(&self) -> bool {
+        self.draft_has_value || !self.attachments.is_empty()
+    }
+    /// Saved drafts, from an Operator draft launch or from before drafts lived
+    /// in the composer, open in the composer so a thread has one kind of draft.
+    /// A launch waiting to send its draft keeps it.
+    pub(super) fn adopt_saved_draft(&mut self, cx: &mut Context<Self>) {
+        if self.is_remote()
+            || self.driven_by.is_some()
+            || !self.history_actions.is_empty()
+            || !self.input.read(cx).content.is_empty()
+            || !self.attachments.is_empty()
+        {
+            return;
+        }
+        let Some(draft) = self.follow_ups.state.draft.take() else {
+            return;
+        };
+        self.attachments = draft.attachments;
+        self.input
+            .update(cx, |input, cx| input.set_text(draft.text, cx));
+        // The composer's copy is written first, so a crash between the two
+        // writes cannot lose the draft.
+        self.save_composer_draft(cx);
+        self.transcript
+            .update(cx, |view, cx| view.set_saved_draft(None, cx));
+        self.save_follow_ups(cx);
+    }
+    /// Reopens the thread with what was left in its composer. Files that are
+    /// gone, such as pasted images cleared from the temp folder, are dropped.
+    pub(crate) fn restore_composer_draft(&mut self, mut draft: Message, cx: &mut Context<Self>) {
+        self.composer_draft.saved = Some(draft.clone());
+        if !self.input.read(cx).content.is_empty() || !self.attachments.is_empty() {
+            return;
+        }
+        draft.attachments.retain(|path| path.exists());
+        self.attachments = draft.attachments;
+        self.input.update(cx, |input, cx| input.set_text(draft.text, cx));
+    }
+    /// Typing saves the draft once it pauses. Leaving the composer and quitting
+    /// save it at once, so only a crash mid-word can lose the last keystrokes.
+    pub(super) fn queue_composer_draft(&mut self, cx: &mut Context<Self>) {
+        // The input also notifies for caret and focus changes.
+        if self.composer_draft.pending.is_none()
+            && self.composer_draft(cx) == self.composer_draft.saved
+        {
+            return;
+        }
+        self.composer_draft.pending = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| this.save_composer_draft(cx));
+        }));
+    }
+    /// Writes a save still waiting on the typing pause.
+    pub(crate) fn flush_composer_draft(&mut self, cx: &mut Context<Self>) {
+        if self.composer_draft.pending.is_some() {
+            self.save_composer_draft(cx);
+        }
+    }
+    /// One small row, written in place so saves can never land out of order.
+    pub(super) fn save_composer_draft(&mut self, cx: &mut Context<Self>) {
+        self.composer_draft.pending = None;
+        let draft = self.composer_draft(cx);
+        if draft != self.composer_draft.saved
+            && locked(&self.store)
+                .and_then(|s| s.save_composer_draft(self.summary.id, draft.as_ref()))
+                .is_ok()
+        {
+            self.composer_draft.saved = draft;
+        }
+    }
+    /// A saved draft or unsent composer text that an Operator must not overwrite.
+    pub(crate) fn has_unsent_draft(&self) -> bool {
+        self.has_saved_draft() || self.composer_has_draft()
     }
     pub(super) fn save_message_draft(&mut self, cx: &mut Context<Self>) {
         if self.driven_by.is_some() {
@@ -214,10 +298,7 @@ impl Conversation {
         {
             return;
         }
-        let raw = self.input.read(cx).content.to_string();
-        let text = monocode_core::composer::consume_command(&raw, "draft")
-            .unwrap_or(&raw)
-            .to_owned();
+        let text = self.input.read(cx).content.to_string();
         if text.trim().is_empty() && self.attachments.is_empty() {
             return;
         }
@@ -249,7 +330,6 @@ impl Conversation {
             self.composer_motion.capture(self.composer_anchor.get());
         }
         self.summary.has_messages = true;
-        self.follow_ups.draft_selected = false;
         self.settings.plan = false;
         self.settings.operator = false;
         self.settings.orchestrator = false;
@@ -323,6 +403,31 @@ impl Conversation {
             .messages
             .retain(|message| message.id != id);
         if before != self.follow_ups.state.messages.len() {
+            self.unpause_empty_queue();
+            self.save_follow_ups(cx);
+        }
+    }
+    /// Nothing is left to hold back, so the next message must not inherit a
+    /// pause from messages that are gone.
+    fn unpause_empty_queue(&mut self) {
+        if self.follow_ups.state.messages.is_empty() {
+            self.follow_ups.state.paused = false;
+        }
+    }
+    /// A message the provider never took when its turn ended stays where it
+    /// is, unflagged, and goes out as the next turn.
+    pub(super) fn return_follow_up(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.follow_ups.sending.as_deref() == Some(id) {
+            self.follow_ups.sending = None;
+        }
+        if let Some(message) = self
+            .follow_ups
+            .state
+            .messages
+            .iter_mut()
+            .find(|m| m.id == id && m.error.is_some())
+        {
+            message.error = None;
             self.save_follow_ups(cx);
         }
     }
@@ -413,7 +518,10 @@ impl Conversation {
                 }
                 return;
             }
-            if !message.steer
+            // A queued message goes out once the agent has answered and only
+            // commands are left running, rather than waiting on them forever.
+            let steer = message.steer || self.background.idle();
+            if !steer
                 || !Kind::from_id(&self.summary.provider).can_steer()
                 || !message.can_steer()
                 || !self.follow_ups.ready
@@ -470,9 +578,6 @@ impl Conversation {
         self.settings.plan = message.mode.as_deref() == Some("plan");
         self.settings.operator = message.mode.as_deref() == Some("operator");
         self.settings.orchestrator = message.mode.as_deref() == Some("orchestrator");
-        self.planning_orchestration = self.settings.orchestrator;
-        self.orchestration_plan = None;
-        self.orchestration_error = None;
         let composer_attachments = std::mem::take(&mut self.attachments);
         self.settings.attachments = message.attachments;
         let previous_prepared = self.settings.prepared_prompt.take();
@@ -487,6 +592,27 @@ impl Conversation {
             self.settings.orchestrator,
         ) = previous;
     }
+    /// What queued messages are waiting for while subagents are still out.
+    fn queue_waits_on(&self) -> Option<String> {
+        let queued = self.follow_ups.state.messages.iter().any(|m| !m.steer);
+        if !self.busy
+            || self.follow_ups.state.paused
+            || !queued
+            || !self.background.waiting_on_agents()
+        {
+            return None;
+        }
+        Some(
+            match self.background.tasks.iter().filter(|task| task.agent).count() {
+                0 => format!(
+                    "Sends after {} picks the thread back up",
+                    Kind::from_id(&self.summary.provider).label()
+                ),
+                1 => "Sends when the subagent finishes".into(),
+                agents => format!("Sends when {agents} subagents finish"),
+            },
+        )
+    }
     fn resume_queue(&mut self, cx: &mut Context<Self>) {
         if self.driven_by.is_some() {
             return;
@@ -495,7 +621,20 @@ impl Conversation {
             self.defer_history_action(|this, cx| this.resume_queue(cx), cx);
             return;
         }
-        if self.busy || !self.follow_ups.state.paused || self.follow_ups.state.messages.is_empty() {
+        if !self.follow_ups.state.paused || self.follow_ups.state.messages.is_empty() {
+            return;
+        }
+        // A message that could not be sent is retried as it is; nothing was
+        // interrupted, so there is no turn to continue first.
+        if self.follow_ups.state.messages.iter().any(|m| m.error.is_some()) {
+            self.follow_ups.state.paused = false;
+            for message in &mut self.follow_ups.state.messages {
+                message.error = None;
+            }
+            self.save_follow_ups(cx);
+            return;
+        }
+        if self.busy {
             return;
         }
         // Resume the interrupted provider turn before releasing its outbox,
@@ -600,6 +739,11 @@ impl Conversation {
                     .child(div().flex_1().min_w_0().truncate().child(if failed { "A message couldn't be sent" } else { "Queue paused because you interrupted" }))
                     .child(queue_button("queue-resume", if failed { "Retry queue" } else { "Resume queue" }, "queue-play").w_auto().px(px(6.)).gap(px(6.)).child(if failed { "Retry" } else { "Resume" }).on_click(cx.listener(|this, _, _, cx| this.resume_queue(cx))))
             ))
+            .when_some(self.queue_waits_on(), |d, note| d.child(
+                div().id("queue-waiting").debug_selector(|| "queue-waiting".into()).role(Role::Status).h(px(28.)).flex().items_center().gap_2().border_b_1().border_color(content(0.1)).text_color(content(0.5))
+                    .child(icon("bot", 14.))
+                    .child(div().flex_1().min_w_0().truncate().child(note))
+            ))
             .children(self.follow_ups.state.messages.iter().enumerate().map(|(index, message)| {
                 let id = message.id.clone();
                 let editing = self.follow_ups.edit.as_ref().filter(|edit| edit.id == id);
@@ -612,7 +756,7 @@ impl Conversation {
                             .child(queue_button("queue-cancel", "Cancel queued message edit", "close").on_click(cx.listener(|this, _, window, cx| this.finish_queue_edit(false, window, cx))))
                     } else {
                         let (steer, edit, remove) = (id.clone(), id.clone(), id);
-                        row.children(queued_attachments(&message.id, &message.attachments)).child(div().flex_1().min_w_0().py_1().child(div().id("queued-message-text").role(Role::Label).aria_label(message.label()).truncate().text_color(content(0.75)).child(message.label())).when_some(message.error.clone(), |d, error| d.child(div().id("queue-error").role(Role::Alert).text_color(gpui::rgb(0xf87171)).child(error))))
+                        row.children(queued_attachments(&message.id, &message.attachments)).child(div().flex_1().min_w_0().py_1().child(div().id("queued-message-text").role(Role::Label).aria_label(message.label()).truncate().text_color(content(0.75)).child(message.label())).when(sending, |d| d.child(div().id("queue-taking").debug_selector(|| "queue-taking".into()).role(Role::Status).truncate().text_size(px(11.)).text_color(content(0.4)).child(format!("Sent · {} takes it after its current step", Kind::from_id(&self.summary.provider).label())))).when_some(message.error.clone(), |d, error| d.child(div().id("queue-error").role(Role::Alert).text_color(gpui::rgb(0xf87171)).child(error))))
                             .when(Kind::from_id(&self.summary.provider).can_steer(), |d| d.child(queue_button("queue-steer", "Steer queued message", "queue-steer").w_auto().px_2().gap(px(6.)).opacity(if sending { 0.4 } else { 1. }).child("Steer").on_click(cx.listener(move |this, _, _, cx| {
                                 if !sending && let Some(message) = this.follow_ups.state.messages.iter_mut().find(|m| m.id == steer) {
                                     if !message.can_steer() && this.busy { return; }
@@ -628,6 +772,7 @@ impl Conversation {
                                     this.follow_ups.state.messages.retain(|m| m.id != remove);
                                     this.follow_ups.continuations.retain(|id| id != &remove);
                                     if this.follow_ups.requested.as_ref() == Some(&remove) { this.follow_ups.requested = this.follow_ups.continuations.front().cloned(); }
+                                    this.unpause_empty_queue();
                                     this.save_follow_ups(cx);
                                 }
                             })))
@@ -707,7 +852,7 @@ fn queued_attachments(id: &str, attachments: &[std::path::PathBuf]) -> Option<An
     )
 }
 
-fn queue_button(
+pub(super) fn queue_button(
     id: &'static str,
     label: &'static str,
     glyph: &'static str,
@@ -758,6 +903,68 @@ mod tests {
             })
             .unwrap()
         })
+    }
+
+    #[gpui::test]
+    fn text_left_in_the_composer_becomes_the_threads_draft(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let window = conversation(cx);
+        let saved = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |view, _, _| {
+                    locked(&view.store)
+                        .unwrap()
+                        .composer_draft(view.summary.id)
+                        .unwrap()
+                })
+                .unwrap()
+        };
+        let type_text = |cx: &mut TestAppContext, text: &str| {
+            window
+                .update(cx, |view, _, cx| {
+                    view.input
+                        .update(cx, |input, cx| input.set_text(text.into(), cx))
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        type_text(cx, "half a thought");
+        assert_eq!(saved(cx), None, "it waits for a pause in typing");
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert_eq!(saved(cx).unwrap().text, "half a thought");
+
+        let (store, summary) = window
+            .update(cx, |view, _, _| (view.store.clone(), view.summary.clone()))
+            .unwrap();
+        let reopened = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| Conversation::new(summary, store, cx))
+            })
+            .unwrap()
+        });
+        reopened
+            .update(cx, |view, _, cx| {
+                let draft = locked(&view.store)
+                    .unwrap()
+                    .composer_draft(view.summary.id)
+                    .unwrap()
+                    .unwrap();
+                view.restore_composer_draft(draft, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        reopened
+            .update(cx, |view, _, cx| {
+                assert_eq!(view.input.read(cx).content.as_ref(), "half a thought");
+                assert!(view.composer_has_draft());
+            })
+            .unwrap();
+
+        type_text(cx, "");
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert_eq!(saved(cx), None, "an emptied composer clears the draft");
     }
 
     #[gpui::test]
@@ -1012,6 +1219,87 @@ mod tests {
     }
 
     #[gpui::test]
+    fn an_emptied_queue_does_not_hold_the_next_message(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        let (controls, received) = std::sync::mpsc::channel();
+        window
+            .update(cx, |view, _, cx| {
+                view.busy = true;
+                view.controls = Some(controls);
+                view.follow_ups.ready = true;
+                view.enqueue_follow_up("interrupted".into(), None, cx);
+                view.follow_ups.state.paused = true;
+                let id = view.follow_ups.state.messages[0].id.clone();
+                view.follow_up_delivered(&id, cx);
+                assert!(!view.follow_ups.state.paused);
+                view.enqueue_follow_up_inverted("next".into(), None, true, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let Decision::Steer(message) = received.try_recv().unwrap().decision else {
+            panic!("expected steering");
+        };
+        assert_eq!(message.text, "next");
+    }
+
+    #[gpui::test]
+    fn retry_resends_a_failed_message_mid_turn_without_continuing(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        let (controls, received) = std::sync::mpsc::channel();
+        window
+            .update(cx, |view, _, cx| {
+                view.busy = true;
+                view.controls = Some(controls);
+                view.follow_ups.ready = true;
+                view.enqueue_follow_up_inverted("try again".into(), None, true, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let first = received.try_recv().unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.fail_follow_up(&first.id, "Timed out".into(), cx);
+                assert!(view.follow_ups.state.paused);
+                view.resume_queue(cx);
+                assert!(!view.follow_ups.resuming, "nothing was interrupted");
+                assert!(!view.follow_ups.state.paused);
+                assert!(view.follow_ups.state.messages[0].error.is_none());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(received.try_recv().unwrap().id, first.id);
+    }
+
+    #[gpui::test]
+    fn a_message_untaken_when_the_turn_ends_waits_unflagged_for_the_next(
+        cx: &mut TestAppContext,
+    ) {
+        let window = conversation(cx);
+        let (controls, received) = std::sync::mpsc::channel();
+        window
+            .update(cx, |view, _, cx| {
+                view.busy = true;
+                view.controls = Some(controls);
+                view.follow_ups.ready = true;
+                view.enqueue_follow_up_inverted("just in time".into(), None, true, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let sent = received.try_recv().unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                assert_eq!(view.follow_ups.sending.as_deref(), Some(sent.id.as_str()));
+                view.return_follow_up(&sent.id, cx);
+                assert!(view.follow_ups.sending.is_none());
+                assert!(!view.follow_ups.state.paused);
+                let message = &view.follow_ups.state.messages[0];
+                assert_eq!(message.text, "just in time");
+                assert!(message.error.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn a_rejected_steer_keeps_its_text_for_retry(cx: &mut TestAppContext) {
         let window = conversation(cx);
         cx.update(|cx| {
@@ -1125,17 +1413,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn draft_commands_save_without_starting_an_agent_and_remove_restores_a_blank(
-        cx: &mut TestAppContext,
-    ) {
+    fn saved_drafts_do_not_start_an_agent_and_remove_restores_a_blank(cx: &mut TestAppContext) {
         let window = conversation(cx);
         window
             .update(cx, |view, _, cx| {
-                view.input.update(cx, |i, cx| {
-                    i.set_text(" /DRAFT Explore this later".into(), cx)
-                });
+                view.input
+                    .update(cx, |i, cx| i.set_text("Explore this later".into(), cx));
                 view.attachments.push("/tmp/note.txt".into());
-                view.send(cx);
+                view.save_message_draft(cx);
                 assert!(!view.busy);
                 assert!(view.summary.has_messages);
                 assert!(
@@ -1187,8 +1472,8 @@ mod tests {
         window
             .update(cx, |view, _, cx| {
                 view.input
-                    .update(cx, |i, cx| i.set_text("/draft send later".into(), cx));
-                view.send(cx);
+                    .update(cx, |i, cx| i.set_text("send later".into(), cx));
+                view.save_message_draft(cx);
                 view.busy = true;
                 view.follow_ups.ready = true;
                 view.controls = Some(controls);

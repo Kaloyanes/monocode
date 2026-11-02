@@ -604,6 +604,10 @@ impl Input {
             cx.notify();
         }
     }
+    /// Insert `text` at the caret, replacing any selection.
+    pub(crate) fn insert(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_text_in_range(None, text, window, cx);
+    }
     pub(crate) fn replace_completion(
         &mut self,
         range: Range<usize>,

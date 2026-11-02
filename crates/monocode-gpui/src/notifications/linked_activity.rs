@@ -10,7 +10,7 @@ pub(crate) enum LinkedActivityEvent {
     OpenUrl(String),
     OpenDiscussion(i64),
     /// The prompt, and its chip's label.
-    AddToChat(i64, String, String),
+    AddToChat(i64, String),
     Archive(i64),
     Delete(i64),
 }
@@ -98,7 +98,6 @@ impl Render for LinkedActivity {
             .map(|e| e.url.clone())
             .unwrap_or_else(|| item_url.clone());
         let prompt = card.prompt();
-        let summary = card.summary();
         let header = div()
             .flex()
             .items_center()
@@ -345,11 +344,7 @@ impl Render for LinkedActivity {
                         .hover(move |s| s.bg(content(0.85)).text_color(ink))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(LinkedActivityEvent::Acknowledge(session));
-                            cx.emit(LinkedActivityEvent::AddToChat(
-                                session,
-                                prompt.clone(),
-                                summary.clone(),
-                            ));
+                            cx.emit(LinkedActivityEvent::AddToChat(session, prompt.clone()));
                         }))
                         .child(agent_label),
                 )

@@ -50,7 +50,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         fixed: false,
     },
     Binding {
-        command: "App: New Window",
+        command: "App: New Conversation in Project",
         keys: "⌘⇧N",
         when: "Always",
         fixed: false,
@@ -226,6 +226,18 @@ pub(crate) const BINDINGS: &[Binding] = &[
     Binding {
         command: "Project: Next",
         keys: "⌘⇧→",
+        when: "!overlay && (!textFocus || emptyComposer)",
+        fixed: false,
+    },
+    Binding {
+        command: "Project: Move Back",
+        keys: "⌘⌥⇧←",
+        when: "!overlay && (!textFocus || emptyComposer)",
+        fixed: false,
+    },
+    Binding {
+        command: "Project: Move Forward",
+        keys: "⌘⌥⇧→",
         when: "!overlay && (!textFocus || emptyComposer)",
         fixed: false,
     },

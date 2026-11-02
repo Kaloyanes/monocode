@@ -258,7 +258,7 @@ impl Shell {
             || tasks
                 .iter()
                 .any(|t| matches!(t.status.as_str(), "running" | "blocked"))
-            || self.orchestrations.contains_key(&lead);
+            || self.orchestrations.active(lead);
         if let Some(previous) = self.orchestration_summaries.get(&lead) {
             tasks.extend(
                 previous

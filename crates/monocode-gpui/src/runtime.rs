@@ -83,7 +83,7 @@ pub(crate) struct Update {
     pub(crate) metrics: Option<monocode_core::agent::TurnMetrics>,
     pub(crate) usage_limit: Option<monocode_core::usage::Limit>,
     /// The tasks a yielded turn still waits on, when that changed.
-    pub(crate) background: Option<Vec<provider::BackgroundTask>>,
+    pub(crate) background: Option<provider::Waiting>,
     pub(crate) approvals: Vec<Approval>,
     pub(crate) approvals_resolved: Vec<String>,
     pub(crate) approvals_save_failed: Vec<(String, String)>,
@@ -642,6 +642,8 @@ fn run_turn_using(
                 prompt = discovery.prepend(prompt);
             }
         }
+        settings.goal = monocode_core::transcript::active_goal(&transcript.rows[..turn_start])
+            .map(|goal| goal.objective);
         let request = Request {
             kind,
             binary,
@@ -884,6 +886,15 @@ fn run_turn_using(
                             pending.changed(at);
                             boundary = true;
                         }
+                        Event::Goal(change, text) => {
+                            let note = monocode_core::transcript::Interjection::goal(change, text);
+                            let at = transcript.begin("interjection");
+                            transcript
+                                .append(&serde_json::to_string(&note).map_err(|e| e.to_string())?);
+                            start = start.min(at);
+                            pending.changed(at);
+                            boundary = true;
+                        }
                         Event::Metrics(mut reading) => {
                             let spent = turn_receipt
                                 .as_ref()
@@ -960,7 +971,7 @@ fn run_turn_using(
                             }
                         }
                         Event::Status(text) => status = text,
-                        Event::Background(tasks) => background = Some(tasks),
+                        Event::Background(waiting) => background = Some(waiting),
                         Event::UsageLimited(limit) => usage_limit = Some(limit),
                         Event::Done => {
                             status = "Ready".into();

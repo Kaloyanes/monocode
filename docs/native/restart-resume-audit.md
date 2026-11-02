@@ -160,7 +160,7 @@ Stagger launches (finding 11). Leave queued follow-ups paused.
 - A plan-mode or read-only turn resumes in plan or read-only mode.
 - Stop then quit: no resume. Finished turn then quit: no resume. Quit twice during resumed turns: one notice and one resume each time.
 - Codex chat killed before its thread exists: shows the notice and does not start an empty thread.
-- Usage-limited chats, Mono chats, automation runs, orchestration workers, remote projects, removed worktrees, and deleted accounts: none auto-resume, and each shows the correct state.
+- Usage-limited chats, Mono chats, automation runs, orchestration workers, remote projects, removed worktrees, and deleted accounts: none auto-resume, and each shows the correct state. An orchestration that was running comes back paused on its lead's card: interrupted workers show as Interrupted and Resume continues them.
 - Five chats running at quit resume one after another, active tab first, without freezing the UI.
 - Queued follow-ups remain paused after resume.
 - Undo/review after a resumed turn covers the edits from before and after the restart.

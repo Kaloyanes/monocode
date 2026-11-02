@@ -105,6 +105,9 @@ pub struct Settings {
     pub turn_model: Option<TurnInfo>,
     #[serde(skip)]
     pub disable_claude_hooks: bool,
+    /// The objective of the thread's unfinished `/goal`, from its transcript.
+    #[serde(skip)]
+    pub goal: Option<String>,
     #[serde(skip)]
     pub environment: std::collections::HashMap<String, String>,
     #[serde(skip)]

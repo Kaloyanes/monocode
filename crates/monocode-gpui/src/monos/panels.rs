@@ -28,6 +28,8 @@ pub(super) enum Route {
     Document(String),
     Habit(String),
     NewHabit,
+    /// A pull request or issue, shown by the Mono's own Inbox detail view.
+    WorkItem,
 }
 impl Route {
     pub(super) fn key(&self) -> String {
@@ -37,6 +39,7 @@ impl Route {
             Self::Document(id) => format!("document:{id}"),
             Self::Habit(id) => format!("habit:{id}"),
             Self::NewHabit => "new-habit".into(),
+            Self::WorkItem => "work-item".into(),
         }
     }
 }
@@ -1296,7 +1299,8 @@ impl Monos {
                         .html_documents
                         .entry(id.clone())
                         .or_insert_with(|| {
-                            cx.new(|_| super::html::Html::new(document.body.clone()))
+                            let monos = cx.weak_entity();
+                            cx.new(|_| super::html::Html::new(document.body.clone(), monos))
                         })
                         .clone();
                     html.update(cx, |html, _| html.set_interactive(interactive));
@@ -1334,6 +1338,7 @@ impl Monos {
             }
             Route::Habit(id) => self.habit_page(mono, Some(&id), window, cx),
             Route::NewHabit => self.habit_page(mono, None, window, cx),
+            Route::WorkItem => self.work_item_page(cx),
         }
     }
     fn activity_view(&mut self, mono: &Mono, cx: &mut Context<Self>) -> AnyElement {
@@ -1801,6 +1806,9 @@ impl Monos {
                     MenuAction::new("background", "Background image")
                         .icon("image-add")
                         .into(),
+                    MenuAction::new("duplicate", "Duplicate to project…")
+                        .icon("copy")
+                        .into(),
                     MenuAction::new("delete", "Delete mono…")
                         .icon("trash")
                         .danger()
@@ -1818,6 +1826,7 @@ impl Monos {
             if let MenuEvent::Picked(action, _) = event {
                 match action.as_ref() {
                     "background" => this.open_background(&target, w, cx),
+                    "duplicate" => cx.emit(DuplicateRequested(target.clone())),
                     "delete" => this.delete_mono(&target, w, cx),
                     _ => {}
                 }

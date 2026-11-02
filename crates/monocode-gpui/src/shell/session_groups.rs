@@ -998,6 +998,7 @@ impl Shell {
             self.session_preview = None;
             self.preview_close = None;
         }
+        self.forget_orchestration(id, cx);
         self.sessions.remove(&id);
         self.thread_parents.remove(&id);
         self.agent_summary_writes.remove(&id);

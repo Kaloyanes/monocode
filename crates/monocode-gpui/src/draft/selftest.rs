@@ -5,7 +5,8 @@
 //! `MONOCODE_DRAFT_ACTIONS` is a JSON array of further `draft_preview` inputs;
 //! `"$draft"` stands for the draft's id. `{"debug":"takeover"}` plays the part
 //! of the person clicking in the page; `{"debug":"note"}` pins a note as they
-//! would, `"send"` sends it and `"send_later"` sends it a second from now. A click's `reference` written as
+//! would, `{"debug":"message"}` queues a line as a page's mc.send would, `"expand"` and
+//! `"collapse"` open and close the full view, `"send"` sends it and `"send_later"` sends it a second from now. A click's `reference` written as
 //! `@Name` means the control with that name in the latest snapshot. `_WIDTH`, `_HEIGHT` and `_APPEARANCE`
 //! shape the first step, `_URL` opens a dev server instead of the file, and
 //! `_HOLD` keeps the window open that many seconds for a screen capture.

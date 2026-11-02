@@ -7,7 +7,8 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
-    NSBitmapFormat, NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSView, NSWindowOrderingMode,
+    NSApplication, NSBitmapFormat, NSBitmapImageFileType, NSBitmapImageRep, NSEventType, NSImage,
+    NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::{
     NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -25,13 +26,27 @@ define_class!(
     #[unsafe(super(NSView))]
     #[name = "MonocodeDraftClip"]
     #[thread_kind = MainThreadOnly]
-    #[ivars = ()]
+    #[ivars = std::cell::Cell<bool>]
     struct DraftClip;
     unsafe impl NSObjectProtocol for DraftClip {}
     impl DraftClip {
         #[unsafe(method(isFlipped))]
         fn flipped(&self) -> bool {
             true
+        }
+
+        /// A page that cannot scroll lets the wheel through to the thread
+        /// behind it; everything else still lands on the page.
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            let wheel = NSApplication::sharedApplication(self.mtm())
+                .currentEvent()
+                .is_some_and(|event| event.r#type() == NSEventType::ScrollWheel);
+            if wheel && !self.ivars().get() {
+                None
+            } else {
+                unsafe { msg_send![super(self), hitTest: point] }
+            }
         }
     }
 );
@@ -106,6 +121,8 @@ struct Hosted {
     loaded: Option<(u64, Load)>,
     /// Clip frame, web frame and zoom as last applied.
     placed: [f64; 9],
+    /// The page's opacity as last applied: 0 until it is ready to be seen.
+    alpha: f64,
 }
 
 /// While a popover covers the panel, a still of the page is painted in its
@@ -184,6 +201,9 @@ pub(super) struct Host {
     cover: Rc<RefCell<Cover>>,
     /// The panel area the draft was last painted in, and the window zoom.
     area: Rc<std::cell::Cell<Option<(f32, f32, f32)>>>,
+    /// A viewport the page is laid out at for a moment, out of sight, to
+    /// measure it at another width. Paints keep it until it is cleared.
+    measuring: Rc<std::cell::Cell<Option<(u32, u32)>>>,
 }
 
 impl Host {
@@ -204,6 +224,10 @@ impl Host {
                 f64::from(u8::from(view.clip.isHidden())),
             ]
         })
+    }
+    /// The width the thread gave the draft when it was last painted.
+    pub(super) fn column(&self) -> Option<f32> {
+        self.area.get().map(|(width, _, _)| width)
     }
     /// The page is on screen and not stepped aside for a popover.
     pub(super) fn visible(&self) -> bool {
@@ -227,7 +251,13 @@ impl Host {
         let Some(view) = view.as_mut() else {
             return;
         };
-        let scale = fit(width, (w, h)).scale;
+        // Measuring lays the page out at life size: scaled down, WebKit's
+        // smallest font size would make the text taller than it is.
+        let scale = if self.measuring.get().is_some() {
+            1.
+        } else {
+            fit(width, (w, h)).scale
+        };
         let size = NSSize::new(
             f64::from(width as f32 * scale * zoom),
             f64::from(height as f32 * scale * zoom),
@@ -238,6 +268,24 @@ impl Host {
         unsafe { view.web.setPageZoom(f64::from(scale * zoom)) };
         // The next paint places it again.
         view.placed = [f64::NAN; 9];
+    }
+    /// Lays the hidden page out at another viewport to measure it, or back at
+    /// its own with `None`.
+    pub(super) fn measure_at(&self, viewport: Option<(u32, u32)>, own: (u32, u32)) {
+        self.measuring.set(viewport);
+        let (width, height) = viewport.unwrap_or(own);
+        self.resize(width, height);
+    }
+    /// The page is laid out at another width for measuring, so its height is
+    /// not its own.
+    pub(super) fn measuring(&self) -> bool {
+        self.measuring.get().is_some()
+    }
+    /// Whether the page scrolls inside its card, and so keeps the wheel.
+    pub(super) fn set_scrolls(&self, scrolls: bool) {
+        if let Some(view) = self.view.borrow().as_ref() {
+            view.clip.ivars().set(scrolls);
+        }
     }
     pub(super) fn set_appearance(&self, light: Option<bool>) {
         if let Some(view) = self.view.borrow().as_ref() {
@@ -278,8 +326,14 @@ pub(super) struct Placement {
     /// A script that restyles the open page in place, when the theme changed
     /// but the content did not.
     pub retheme: Option<String>,
+    /// When the page was ready to be seen; until then it stays transparent
+    /// over the card's placeholder, then fades in.
+    pub revealed: Option<std::time::Instant>,
     pub app: gpui::AsyncApp,
 }
+
+/// How long a ready page takes to fade in over its placeholder.
+const FADE: Duration = Duration::from_millis(180);
 
 /// Paints the draft: places the web view where this canvas is and keeps a still
 /// of it for when a popover covers it. Returns the element and, via `Host`,
@@ -295,6 +349,7 @@ pub(super) fn surface<T: 'static>(
     let cover = host.cover.clone();
     let area = host.area.clone();
     let painted = host.painted.clone();
+    let measuring = host.measuring.clone();
     HOSTS.with(|hosts| {
         let mut hosts = hosts.borrow_mut();
         if !hosts
@@ -330,10 +385,17 @@ pub(super) fn surface<T: 'static>(
             let zoom = window.content_zoom();
             let available = (f32::from(bounds.size.width), f32::from(bounds.size.height));
             area.set(Some((available.0, available.1, zoom)));
-            let scale = fit(placement.width, available).scale;
+            let (width, height, scale) = match measuring.get() {
+                Some((width, height)) => (width, height, 1.),
+                None => (
+                    placement.width,
+                    placement.height,
+                    fit(placement.width, available).scale,
+                ),
+            };
             let shown = gpui::size(
-                gpui::px(placement.width as f32 * scale),
-                gpui::px(placement.height as f32 * scale),
+                gpui::px(width as f32 * scale),
+                gpui::px(height as f32 * scale),
             );
             let draft = gpui::Bounds::new(
                 gpui::point(
@@ -441,6 +503,17 @@ pub(super) fn surface<T: 'static>(
                 });
             }
             drop(state);
+            let alpha = placement.revealed.map_or(0., |at| {
+                let t = (at.elapsed().as_secs_f64() / FADE.as_secs_f64()).min(1.);
+                1. - (1. - t).powi(3)
+            });
+            if hosted.alpha != alpha {
+                hosted.clip.setAlphaValue(alpha);
+                hosted.alpha = alpha;
+            }
+            if alpha < 1. && placement.revealed.is_some() {
+                window.request_animation_frame();
+            }
             let hidden = covered && still;
             if hosted.clip.isHidden() != hidden {
                 hosted.clip.setHidden(hidden);
@@ -465,7 +538,9 @@ unsafe fn create(
     web_rect: NSRect,
     placement: &Placement,
 ) -> Hosted {
-    let clip = DraftClip::alloc(mtm).set_ivars(());
+    // A dev server's page may scroll itself; only the agent's own page is known.
+    let clip = DraftClip::alloc(mtm)
+        .set_ivars(std::cell::Cell::new(matches!(placement.load, Load::Url(_))));
     let clip: Retained<DraftClip> = unsafe { msg_send![super(clip), initWithFrame: rect] };
     clip.setWantsLayer(true);
     clip.setClipsToBounds(true);
@@ -499,6 +574,13 @@ unsafe fn create(
     };
     let web =
         unsafe { WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), web_rect, &config) };
+    // The agent's page sits on the thread's own background, so it reads as
+    // part of the conversation. A dev server paints its own.
+    if matches!(placement.load, Load::Html(_)) {
+        let _: () = unsafe {
+            msg_send![&web, setValue: &*NSNumber::new_bool(false), forKey: &*NSString::from_str("drawsBackground")]
+        };
+    }
     let guard = Navigation::alloc(mtm).set_ivars(policy);
     let guard: Retained<Navigation> = unsafe { msg_send![super(guard), init] };
     unsafe {
@@ -511,6 +593,7 @@ unsafe fn create(
         _guard: guard,
         loaded: None,
         placed: [f64::NAN; 9],
+        alpha: f64::NAN,
     }
 }
 
@@ -612,6 +695,18 @@ fn still_of(web: &WKWebView, cover: Rc<RefCell<Cover>>, done_notify: impl Fn() +
         done_notify();
     });
     unsafe { web.takeSnapshotWithConfiguration_completionHandler(None, &done) };
+}
+
+/// A picture of the page as it is now, for the card to show while the next
+/// version loads.
+pub(super) async fn picture(web: &WKWebView) -> Option<Arc<gpui::RenderImage>> {
+    let (send, receive) = async_channel::bounded(1);
+    let done = block2::RcBlock::new(move |image: *mut NSImage, _: *mut NSError| {
+        // SAFETY: WebKit passes a live image or null for the duration of the call.
+        let _ = send.try_send(unsafe { image.as_ref() }.and_then(pixels).map(Arc::new));
+    });
+    unsafe { web.takeSnapshotWithConfiguration_completionHandler(None, &done) };
+    receive.recv().await.ok().flatten()
 }
 
 /// Copies an 8-bit RGB(A) snapshot into the BGRA layout GPUI's sprites use.

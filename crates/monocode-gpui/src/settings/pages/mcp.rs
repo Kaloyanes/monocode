@@ -383,7 +383,7 @@ impl SettingsView {
     }
     fn saved_permissions(&self, cx: &mut Context<Self>) -> AnyElement {
         let project =
-            monocode_core::permissions::project(std::path::Path::new(&self.selected_project));
+            monocode_core::permissions::repository(std::path::Path::new(&self.selected_project));
         let grants = self.mcp_grants.iter().filter(|g| g.key.project == project);
         let mut section = div()
             .mt_6()
@@ -394,7 +394,7 @@ impl SettingsView {
                     .child("Saved permissions"),
             )
             .child(note(
-                "Exact MCP confirmations allowed for this project across chats and restarts.",
+                "Saved MCP permissions for this project across worktrees, chats and restarts.",
             ));
         if let Some(error) = &self.mcp_grants_error {
             section = section.child(

@@ -95,10 +95,16 @@ fn tokens(palette: Palette) -> String {
 /// The script that restyles an open page.
 pub(crate) fn retheme_script(palette: Palette) -> String {
     format!(
-        "window.__mcTheme&&__mcTheme({});document.querySelectorAll('html,body,iframe').forEach(e=>e.style.background='{}')",
+        "window.__mcTheme&&__mcTheme({})",
         serde_json::Value::String(tokens(palette)),
-        background(palette)
     )
+}
+
+/// The color a picture of the page is laid on for the agent: the page itself
+/// is clear, over the thread.
+pub(crate) fn backdrop(palette: Palette) -> [u8; 3] {
+    let value: gpui::Rgba = palette.surface.into();
+    [value.r, value.g, value.b].map(|c| (c * 255.).round() as u8)
 }
 
 /// MonoCode's component kit: `mc-*` classes and the `window.mc` helpers that
@@ -106,14 +112,17 @@ pub(crate) fn retheme_script(palette: Palette) -> String {
 const KIT_STYLE: &str = concat!(
     include_str!("../monos/kit.css"),
     include_str!("../monos/kit_viz.css"),
-    include_str!("../monos/kit_controls.css")
+    include_str!("../monos/kit_controls.css"),
+    include_str!("../monos/kit_motion.css")
 );
 const KIT_SCRIPT: &str = concat!(
     include_str!("../monos/kit.js"),
     "\n",
     include_str!("../monos/kit_viz.js"),
     "\n",
-    include_str!("../monos/kit_controls.js")
+    include_str!("../monos/kit_controls.js"),
+    "\n",
+    include_str!("../monos/kit_motion.js")
 );
 
 /// Runs first inside the page. It reports console output, errors, load and
@@ -131,10 +140,25 @@ document.fonts.ready.then(metrics);
 document.fonts.addEventListener('loadingdone',metrics);
 addEventListener('load',()=>{metrics();post({k:'l'})});
 post({k:'p',v:String(performance.timeOrigin)});
-let mode=false;
+let mode=false,touched=-1e9;
+// The real clock: the kit's slow motion scales performance.now later.
+const realNow=performance.now.bind(performance);
+// A page message reaches the agent only right after the person's own input,
+// so a page cannot talk to the agent by itself.
+window.__mcTell=t=>{if(realNow()-touched>2000)return false;post({k:'n',t:String(t).slice(0,2000)});return true};
 const label=el=>{try{return String(el.getAttribute('aria-label')||(el.innerText||'').trim().replace(/\s+/g,' ').slice(0,60)||el.alt||el.placeholder||el.tagName.toLowerCase())}catch(x){return ''}};
-addEventListener('pointerdown',e=>{if(e.isTrusted&&!mode){const t=e.target;post({k:'u',a:t&&t.closest?'clicked '+JSON.stringify(label(t.closest('button,a,input,select,textarea,summary,[role]')||t)):''})}},true);
-addEventListener('keydown',e=>{if(e.isTrusted&&!mode)post({k:'u'})},true);
+addEventListener('pointerdown',e=>{if(e.isTrusted&&!mode){touched=realNow();const t=e.target;post({k:'u',a:t&&t.closest?'clicked '+JSON.stringify(label(t.closest('button,a,input,select,textarea,summary,[role]')||t)):''})}},true);
+addEventListener('keydown',e=>{if(!e.isTrusted)return;const t=e.composedPath()[0];
+// Escape the page leaves alone, outside a text field, closes the app's full view.
+if(e.key==='Escape'&&!(t&&(t.isContentEditable||/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)))){setTimeout(()=>{if(!e.defaultPrevented)post({k:'x'})});return}
+if(!mode){touched=realNow();post({k:'u'})}},true);
+// The app lets the wheel through to the thread unless the pointer is over
+// something here that scrolls, so it is told where the pointer is.
+let wheelOwn=false;
+const scrollable=t=>{for(let n=t;n&&n.nodeType===1&&n!==document.documentElement&&n!==document.body;n=n.parentElement){const s=getComputedStyle(n);if(/(auto|scroll)/.test(s.overflowY+s.overflowX)&&(n.scrollHeight>n.clientHeight+1||n.scrollWidth>n.clientWidth+1))return true}return false};
+const wheelTo=v=>{if(v!==wheelOwn){wheelOwn=v;post({k:'w',v})}};
+addEventListener('mousemove',e=>{try{wheelTo(scrollable(e.target))}catch(x){}},{passive:true,capture:true});
+document.addEventListener('mouseleave',()=>wheelTo(false));
 const css=(el,o)=>Object.assign(el.style,o);
 const ui=(tag,o,text)=>{const el=document.createElement(tag);el.setAttribute('data-mc-ui','');css(el,o);if(text)el.textContent=text;return el};
 const ink='var(--foreground,#fff)',sheet='var(--popover,#222)',line='var(--border,rgba(255,255,255,.14))';
@@ -164,6 +188,7 @@ const lum=c=>{const f=v=>{v/=255;return v<=.03928?v/12.92:Math.pow((v+.055)/1.05
 const base=()=>{const v=getComputedStyle(document.documentElement).getPropertyValue('--background').trim(),m=/^#([0-9a-f]{6})$/i.exec(v);return m?{r:parseInt(m[1].slice(0,2),16),g:parseInt(m[1].slice(2,4),16),b:parseInt(m[1].slice(4,6),16)}:{r:255,g:255,b:255}};
 const under=el=>{let bg=base();const chain=[];for(let n=el;n;n=n.parentElement)chain.push(n);for(const n of chain.reverse()){const c=rgba(getComputedStyle(n).backgroundColor);if(c&&c.a>0){bg=c.a>=1?{r:c.r,g:c.g,b:c.b}:{r:c.r*c.a+bg.r*(1-c.a),g:c.g*c.a+bg.g*(1-c.a),b:c.b*c.a+bg.b*(1-c.a)}}}return bg};
 const audit=()=>{const out=[],say=t=>{if(out.length<12&&!out.includes(t))out.push(t)};
+if(stripped)say('The outermost element had a background in the app\'s own color; it was removed, because the page sits on the thread\'s background. Leave it off.');
 const doc=document.documentElement;let seen=0;
 for(const el of document.body?document.body.querySelectorAll('*'):[]){if(seen++>1500)break;if(el.closest('[data-mc-ui]'))continue;
 const r=el.getBoundingClientRect();if(r.width<=0||r.height<=0)continue;const st=getComputedStyle(el);if(st.visibility==='hidden'||st.display==='none'||+st.opacity===0)continue;
@@ -182,7 +207,7 @@ const click=el=>{el.scrollIntoView({block:'nearest',inline:'nearest'});
 const r=el.getBoundingClientRect(),i={button:0,buttons:1,pointerId:1,pointerType:'mouse',isPrimary:true,clientX:r.x+r.width/2,clientY:r.y+r.height/2};
 fire(el,'pointerover',PointerEvent,i);fire(el,'mouseover',MouseEvent,i);fire(el,'pointermove',PointerEvent,i);fire(el,'mousemove',MouseEvent,i);
 fire(el,'pointerdown',PointerEvent,i);const go=fire(el,'mousedown',MouseEvent,i);
-if(go&&el.focus)el.focus({preventScroll:true});
+if(go&&el.focus&&(el.isContentEditable||/^(TEXTAREA|SELECT)$/.test(el.tagName)||(el.tagName==='INPUT'&&!/^(checkbox|radio|button|submit|reset|range|color|file|image)$/.test(el.type))))el.focus({preventScroll:true});
 i.buttons=0;fire(el,'pointerup',PointerEvent,i);fire(el,'mouseup',MouseEvent,i);el.click()};
 const typing=(text,replace)=>{const el=document.activeElement;
 if(!el||el===document.body||el===document.documentElement)return 'Click an input before typing';
@@ -203,7 +228,7 @@ fire(el,'change',Event);return ''};
 addEventListener('message',e=>{const d=e.data;if(e.source!==parent||!d)return;
 if(typeof d.__mcComment==='boolean')setMode(d.__mcComment);
 if(typeof d.__mcTheme==='string'){const s=document.getElementById('mc-theme');if(s){const k=document.createElement('style');k.textContent='*,*::before,*::after{transition:none!important}';document.head.appendChild(k);s.textContent=d.__mcTheme;getComputedStyle(document.body).color;setTimeout(()=>k.remove(),80)}}
-if(d.__mcAct){const a=d.__mcAct;let err='';try{if(a.kind==='click'){const el=refs.get(a.ref);if(!el||!el.isConnected)err='Element reference expired; inspect the draft again';else click(el)}else if(a.kind==='type')err=typing(String(a.text),!!a.replace)}catch(x){err=String(x&&x.message||x)}
+if(d.__mcAct){const a=d.__mcAct;let err='';try{if(a.kind==='click'){const el=refs.get(a.ref);if(!el||!el.isConnected)err='Element reference expired; inspect the draft again';else click(el)}else if(a.kind==='type')err=typing(String(a.text),!!a.replace);else if(a.kind==='set')err=typeof window.__mcSet==='function'?window.__mcSet(a.values)||'':'The page has no mc.state to set'}catch(x){err=String(x&&x.message||x)}
 post({k:'r',id:a.id,err})}
 if(typeof d.__mcInspect==='string'){refs.clear();
 const elements=[];for(const el of document.querySelectorAll('button,input:not([type=hidden]),select,textarea,a[href],summary,[role=button],[role=switch],[role=tab],[role=checkbox],[role=menuitem],[contenteditable=""],[contenteditable=true],[tabindex]:not([tabindex="-1"])')){
@@ -212,26 +237,45 @@ const name=el.getAttribute('aria-label')||(el.labels&&Array.from(el.labels).map(
 const ref=d.__mcInspect+'-'+elements.length;refs.set(ref,el);
 elements.push({ref,name:String(name).trim().replace(/\s+/g,' ').slice(0,160),role:el.getAttribute('role')||el.tagName.toLowerCase(),x:r.x,y:r.y,width:r.width,height:r.height,value:el.getAttribute('aria-checked')??el.getAttribute('aria-selected')??(typeof el.value==='string'?el.value:null)});if(elements.length>=128)break}
 metrics();post({k:'s',id:d.__mcInspect,elements,issues:audit(),text:(document.body.innerText||'').slice(0,8000),url:location.href,title:document.title})}});
-const h=()=>{const r=document.documentElement;if(!r)return;post({k:'h',v:Math.ceil(r.scrollHeight>r.clientHeight?r.scrollHeight:r.getBoundingClientRect().height)});metrics()};
+const outline=()=>{const out=[],y0=-document.documentElement.getBoundingClientRect().top;let seen=0;
+const put=(k,b,n)=>out.push([k,Math.round(b.left),Math.round(b.top+y0),Math.round(b.width),Math.round(b.height),n]);
+const walk=el=>{if(out.length>=64||seen++>2000||el.hasAttribute('data-mc-ui'))return;const st=getComputedStyle(el);if(st.display==='none'||st.visibility==='hidden'||+st.opacity===0)return;
+const b=el.getBoundingClientRect(),tag=el.tagName.toUpperCase();
+if(b.width>=4&&b.height>=4){if(/^(IMG|SVG|CANVAS|VIDEO|PICTURE|IFRAME|OBJECT)$/.test(tag)){put('m',b,1);return}
+if(tag==='TABLE'){put('g',b,Math.max(1,el.rows?el.rows.length:1));return}
+if(Array.from(el.childNodes).some(n=>n.nodeType===3&&n.textContent.trim())){const lh=parseFloat(st.lineHeight)||parseFloat(st.fontSize)*1.4||18;put('t',b,Math.max(1,Math.min(99,Math.round(b.height/lh))));return}
+const c=rgba(st.backgroundColor);if((c&&c.a>.04)||parseFloat(st.borderTopWidth)>0)put('b',b,1)}
+for(const c of el.children)walk(c)};
+if(document.body)for(const c of document.body.children)walk(c);return out};
+// A full-bleed box painted in the app's own background would sit as a slab on
+// the thread; the page is clear, so such a fill is taken off and reported.
+let stripped=0;
+const clearFills=()=>{const d=document.documentElement,b=document.body;if(!b)return;const cs=getComputedStyle(d),tones=['--background','--popover'].map(k=>/^#([0-9a-f]{6})$/i.exec(cs.getPropertyValue(k).trim())).filter(Boolean).map(m=>({r:parseInt(m[1].slice(0,2),16),g:parseInt(m[1].slice(2,4),16),b:parseInt(m[1].slice(4,6),16)})),vw=d.clientWidth,vh=Math.max(b.getBoundingClientRect().height,1);
+for(const el of b.children){if(el.hasAttribute('data-mc-ui')||/^(SCRIPT|STYLE)$/.test(el.tagName))continue;const r=el.getBoundingClientRect();if(r.width<vw*.95||r.height<vh*.9)continue;const c=rgba(getComputedStyle(el).backgroundColor);if(c&&c.a>=.9&&tones.some(t=>Math.abs(t.r-c.r)<=2&&Math.abs(t.g-c.g)<=2&&Math.abs(t.b-c.b)<=2)){el.style.setProperty('background-color','transparent','important');stripped++}}};
+const h=()=>{const r=document.documentElement;if(!r)return;try{clearFills()}catch(e){}post({k:'h',v:Math.ceil(r.scrollHeight>r.clientHeight?r.scrollHeight:r.getBoundingClientRect().height)});metrics();try{post({k:'o',v:outline()})}catch(e){}};
 const o=new ResizeObserver(h);if(document.documentElement)o.observe(document.documentElement);
 addEventListener('DOMContentLoaded',()=>{if(document.documentElement)o.observe(document.documentElement);if(document.body)o.observe(document.body);h()});addEventListener('load',h);})();</script>"#;
 
 /// The wrapper keeps the probe's reports where the app can read them.
-const WRAPPER_SCRIPT: &str = r#"<script>window.__mc={log:[],loaded:false,h:0,w:0,vw:0,fontsReady:false,failedImages:0,userControl:false,feedback:[],trail:[],issues:[]};
+const WRAPPER_SCRIPT: &str = r#"<script>window.__mc={log:[],loaded:false,h:0,w:0,vw:0,fontsReady:false,failedImages:0,userControl:false,wheel:false,feedback:[],messages:[],trail:[],issues:[]};
 const __frame=()=>document.querySelector('iframe')&&document.querySelector('iframe').contentWindow;
 window.__mcTheme=t=>{const f=__frame();if(f)f.postMessage({__mcTheme:t},'*')};
 window.__mcSend=m=>{const f=__frame()||window;f.postMessage(m,'*')};
 addEventListener('message',e=>{const d=e.data,s=window.__mc;if(!d||d.__mc!==1)return;
 if(d.k==='c'){if(s.log.length<50)s.log.push({level:String(d.l).slice(0,8),text:String(d.t).slice(0,500)})}
 else if(d.k==='l')s.loaded=true;
+else if(d.k==='w')s.wheel=d.v===true;
 else if(d.k==='p')s.page=d.v;
 else if(d.k==='u'){s.userControl=true;if(d.a&&s.trail.length<40)s.trail.push(String(d.a).slice(0,100))}
 else if(d.k==='v'&&d.v&&typeof d.v==='object')s.state=d.v;
 else if(d.k==='f'){if(s.feedback.length<50&&d.f)s.feedback.push(d.f)}
+else if(d.k==='n'){if(s.messages.length<20&&typeof d.t==='string')s.messages.push(d.t.slice(0,2000))}
 else if(d.k==='r')s.result={id:d.id,err:d.err||''};
 else if(d.k==='s'){s.inspection=d.id;s.issues=d.issues||[];s.elements=d.elements;s.text=d.text;s.url=d.url;s.title=d.title}
 else if(d.k==='m'){s.w=d.w;s.vw=d.vw;s.fontsReady=d.fontsReady;s.failedImages=d.failedImages}
-else if(d.k==='h'&&Number.isFinite(d.v))s.h=Math.min(d.v,20000)});</script>"#;
+else if(d.k==='h'&&Number.isFinite(d.v))s.h=Math.min(d.v,20000);
+else if(d.k==='o'&&Array.isArray(d.v))s.outline=d.v.slice(0,64);
+else if(d.k==='x')s.escape=true});</script>"#;
 
 /// The probe and wrapper as one user script for a page the app does not
 /// author, such as a dev server: they share the top window.
@@ -253,11 +297,10 @@ pub(crate) fn browser_probe() -> String {
     )
 }
 
-/// The agent's page inside a sandboxed iframe on the app's surface color.
+/// The agent's page inside a sandboxed iframe, clear over the thread.
 /// Nothing in it can reach the app, the network or the filesystem.
 pub(crate) fn sandbox(body: &str, palette: Palette) -> String {
     let theme = tokens(palette);
-    let background = background(palette);
     let policy = format!(
         "script-src 'unsafe-inline' {}; style-src 'unsafe-inline' {}; img-src data: blob:; font-src data: {}; media-src data: blob:",
         csp_sources(&SCRIPT_HOSTS),
@@ -268,10 +311,10 @@ pub(crate) fn sandbox(body: &str, palette: Palette) -> String {
         "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; {policy}; worker-src blob:; connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'\"><meta name=viewport content=\"width=device-width,initial-scale=1\">"
     );
     let source = format!(
-        "<!doctype html>{csp}<style id=mc-theme>{theme}</style><style>*{{box-sizing:border-box}}html{{background:transparent}}body{{margin:0;font:var(--font-size)/1.5 var(--font-sans);color:var(--foreground);background:transparent;-webkit-font-smoothing:antialiased}}a{{color:var(--link)}}::selection{{background:var(--selection)}}{KIT_STYLE}</style>{PAGE_PROBE}<script>{KIT_SCRIPT}</script><body>{body}"
+        "<!doctype html>{csp}<style id=mc-theme>{theme}</style><style>*{{box-sizing:border-box}}html{{background:transparent!important;scrollbar-width:none}}html::-webkit-scrollbar{{display:none}}:where(:focus-visible){{outline:2px solid var(--ring);outline-offset:-2px}}body{{margin:0;font:var(--font-size)/1.5 var(--font-sans);color:var(--foreground);background:transparent!important;-webkit-font-smoothing:antialiased}}a{{color:var(--link)}}::selection{{background:var(--selection)}}{KIT_STYLE}</style>{PAGE_PROBE}<script>{KIT_SCRIPT}</script><body>{body}"
     );
     format!(
-        "<!doctype html><style>html,body,iframe{{margin:0;border:0;width:100%;height:100%;overflow:hidden;background:{background}}}</style>{WRAPPER_SCRIPT}<iframe sandbox=\"allow-scripts\" referrerpolicy=\"no-referrer\" srcdoc=\"{}\"></iframe>",
+        "<!doctype html><style>html,body,iframe{{margin:0;border:0;width:100%;height:100%;overflow:hidden;background:transparent}}</style>{WRAPPER_SCRIPT}<iframe sandbox=\"allow-scripts\" referrerpolicy=\"no-referrer\" srcdoc=\"{}\"></iframe>",
         escape(&source)
     )
 }
@@ -315,9 +358,9 @@ mod tests {
         let script = retheme_script(light);
         assert!(script.starts_with("window.__mcTheme&&__mcTheme(\""));
         assert!(script.contains("--background:#ffffff"));
-        // The iframe paints over the document, so it is recolored too.
-        assert!(script.contains("querySelectorAll('html,body,iframe')"));
-        assert!(script.contains("style.background='#ffffff'"));
+        // The page is clear over the thread in either theme.
+        assert!(page.contains("background:transparent!important;-webkit-font-smoothing"));
+        assert_eq!(backdrop(light), [255, 255, 255]);
     }
 
     #[test]
@@ -334,5 +377,10 @@ mod tests {
         assert!(KIT_STYLE.contains(".mc-ctl.rail"));
         // The wrapper keeps what the page reports for the agent's snapshot.
         assert!(WRAPPER_SCRIPT.contains("d.k==='v'"));
+        assert!(WRAPPER_SCRIPT.contains("d.k==='n'"));
+        // The agent sets state by name, and the page speaks only after input.
+        assert!(KIT_SCRIPT.contains("window.__mcSet="));
+        assert!(PAGE_PROBE.contains("a.kind==='set'"));
+        assert!(PAGE_PROBE.contains("realNow()-touched>2000"));
     }
 }

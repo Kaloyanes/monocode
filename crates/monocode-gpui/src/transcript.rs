@@ -13,6 +13,7 @@ mod links;
 mod live_phase;
 mod mascot;
 mod measurements;
+pub(crate) mod orchestration;
 mod outline;
 pub(crate) mod phases;
 mod provider_switch;
@@ -582,6 +583,10 @@ pub(crate) struct TranscriptView {
     agent_panels: tasks::AgentPanels,
     thread_states: HashMap<i64, serde_json::Value>,
     thread_expanded: HashSet<i64>,
+    /// Orchestration cards, by the tool call that submitted their plan.
+    orchestration: HashMap<String, orchestration::RunView>,
+    /// Assignments whose details are open, by plan call and index.
+    orchestration_open: HashSet<(String, usize)>,
     /// Finished child threads the user removed from the spawn tree.
     thread_dismissed: HashSet<i64>,
     pub(crate) thread_driver: Option<String>,
@@ -620,6 +625,8 @@ pub(crate) struct TranscriptView {
     fold_targets: HashMap<usize, Option<usize>>,
     step_queue: HashMap<usize, Instant>,
     seen_steps: HashSet<usize>,
+    /// The `/goal` still in force, for the composer's ledge.
+    goal: Option<monocode_core::transcript::ActiveGoal>,
     pub(crate) turns: HashMap<usize, monocode_core::agent::TurnInfo>,
     provider: String,
     model: String,
@@ -720,6 +727,9 @@ impl TranscriptView {
     /// Older pages above it are read-only and never part of a save.
     pub(crate) fn source_rows(&self) -> &[Row] {
         &self.source[self.base..]
+    }
+    pub(crate) fn goal(&self) -> Option<&monocode_core::transcript::ActiveGoal> {
+        self.goal.as_ref()
     }
     /// Every loaded row, older pages included, numbered as this view's turns
     /// and response actions are.
@@ -2405,6 +2415,8 @@ impl TranscriptView {
             agent_panels: Default::default(),
             thread_states: HashMap::new(),
             thread_expanded: HashSet::new(),
+            orchestration: HashMap::new(),
+            orchestration_open: HashSet::new(),
             thread_dismissed: HashSet::new(),
             thread_driver: None,
             expanded_prompts: HashSet::new(),
@@ -2437,6 +2449,7 @@ impl TranscriptView {
             fold_targets: HashMap::new(),
             step_queue: HashMap::new(),
             seen_steps: HashSet::new(),
+            goal: None,
             turns: HashMap::new(),
             provider: "codex".into(),
             model: "Codex".into(),
@@ -2953,6 +2966,7 @@ impl TranscriptView {
         {
             self.rebuild_passes += 1;
         }
+        self.goal = monocode_core::transcript::active_goal(&self.source);
         self.phase_layouts.clear();
         let now = Instant::now();
         let following = self.list.is_following_tail();
@@ -4726,6 +4740,11 @@ impl TranscriptView {
                     Some("concern") => rgb(0xfbbf24).into(),
                     _ => content(0.55),
                 };
+                let goal = note.goal_change();
+                let label_color = match goal {
+                    Some(monocode_core::transcript::GoalChange::Met) => rgb(0x4ade80).into(),
+                    _ => content(0.55),
+                };
                 div()
                     .w_full()
                     .min_w_0()
@@ -4744,8 +4763,14 @@ impl TranscriptView {
                                     .id(("interjection-label", message_start))
                                     .role(Role::Group)
                                     .aria_label(format!("Interjection: {}", note.label()))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
                                     .text_size(px(12.))
-                                    .text_color(content(0.55))
+                                    .text_color(label_color)
+                                    .when(goal.is_some(), |d| {
+                                        d.child(icon("goal", 12.).text_color(label_color))
+                                    })
                                     .child(note.label().to_owned()),
                             )
                             .when_some(severity, |d, severity| {
@@ -6100,6 +6125,48 @@ mod scroll_tests {
                 elapsed.as_secs_f64() * 1000.
             );
         }
+    }
+
+    #[gpui::test]
+    fn repro_pr_link_bubble_width(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(900.), px(1000.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| TranscriptView::new()),
+            )
+            .unwrap()
+        });
+        let text = "Address the new feedback and continue the work where needed.\n\nThe linked GitHub pull request has new activity:\n\n#1213 Native: Always allow for every provider's confirmations\nhttps://github.com/acme/monocode/pull/1213\n\n- review by @coderabbitai[bot]: COMMENTED: <!-- coderabbit-ai-generated:v1 --> **Actionable comments posted: 1**";
+        window
+            .update(cx, |view, _, cx| {
+                view.patch(0, vec![row("user", text)], cx);
+                settle(view, cx);
+            })
+            .unwrap();
+        for _ in 0..3 {
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        }
+        window
+            .update(cx, |view, window, _| {
+                eprintln!("rows {}", view.rows.len());
+                let bubble = window
+                    .painted_quads()
+                    .into_iter()
+                    .find(|quad| quad.background == user_bubble_fill().into())
+                    .unwrap();
+                eprintln!("bubble {:?}", bubble.bounds);
+                assert!(bubble.bounds.size.width.0 / window.scale_factor() > 300.);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

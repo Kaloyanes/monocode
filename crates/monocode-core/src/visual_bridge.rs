@@ -28,9 +28,10 @@ mod draft;
 pub use draft::{
     csp_sources, local_url, staging_dir as draft_staging_dir, Diagnostics as DraftDiagnostics,
     DraftAction, DraftContent, DraftReply, DraftRequest, Element as DraftElement,
-    Feedback as DraftFeedback, LogEntry as DraftLog, Snapshot as DraftSnapshot,
-    DEFAULT_HEIGHT as DRAFT_DEFAULT_HEIGHT, DEFAULT_WAIT_SECONDS as DRAFT_DEFAULT_WAIT_SECONDS,
-    DEFAULT_WIDTH as DRAFT_DEFAULT_WIDTH, FONT_HOSTS, SCRIPT_HOSTS, STYLE_HOSTS,
+    Feedback as DraftFeedback, Layout as DraftLayout, LogEntry as DraftLog,
+    Snapshot as DraftSnapshot, DEFAULT_HEIGHT as DRAFT_DEFAULT_HEIGHT,
+    DEFAULT_WAIT_SECONDS as DRAFT_DEFAULT_WAIT_SECONDS, DEFAULT_WIDTH as DRAFT_DEFAULT_WIDTH,
+    FONT_HOSTS, LAYOUT_WIDTHS as DRAFT_LAYOUT_WIDTHS, SCRIPT_HOSTS, STYLE_HOSTS,
 };
 
 type DraftHandler = Box<dyn Fn(DraftRequest) + Send + Sync>;
@@ -49,7 +50,7 @@ pub const SERVER_NAME: &str = "monocode";
 /// Records the agent's plan in the transcript, where the title bar's plan rail
 /// reads it. It changes nothing, so a provider's approval prompt skips it.
 pub const PLAN_TOOL: &str = "update_plan";
-const SERVER_ENV: [&str; 8] = [
+const SERVER_ENV: [&str; 9] = [
     ENV_ENDPOINT,
     ENV_TOKEN,
     ENV_SESSION,
@@ -58,9 +59,31 @@ const SERVER_ENV: [&str; 8] = [
     "MONOCODE_APP_TOKEN",
     "MONOCODE_APP_SESSION",
     "MONOCODE_THREADS",
+    crate::orchestration::ENV,
 ];
 
 const PLAN_INSTRUCTIONS: &str = "Keep the user's plan rail current with update_plan: call it when you start work that takes three or more steps, and again each time a step starts or finishes.";
+/// Says when to reach for a draft; how to build one stays in visual_docs.
+const DRAFT_INSTRUCTIONS: &str = "When seeing or trying something would help the person more than prose (a UI idea, an animation, a layout, a diagram, a small tool), build it with draft_preview: a live page in the conversation that they can use and mark up. Design it around what they want to judge, including whatever controls that needs, such as states to flip between, slow motion or values to tune. The page is part of your reply, so don't describe it again in text.";
+/// Harnesses ship their own subagent tools, which run out of the user's sight
+/// and only on that harness. Claude Code also defers MCP tools to a name until
+/// searched, so these instructions are the one place an agent reliably learns
+/// that MonoCode starts subagents.
+const THREAD_INSTRUCTIONS: &str = "When the user asks for subagents, other agents, or work on another harness or model (Codex, Claude, Haiku and so on), start each one with thread_start and collect its reply with thread_wait. Each runs as its own chat the user can watch in MonoCode. Do not use your built-in subagent or task tool for that, and do not run agent CLIs from the shell.";
+/// What the server tells every agent at startup.
+fn server_instructions(environment: &HashMap<String, String>) -> String {
+    let mut instructions = format!("{PLAN_INSTRUCTIONS}\n\n{DRAFT_INSTRUCTIONS}");
+    if threads_enabled(environment) {
+        instructions.push_str("\n\n");
+        instructions.push_str(THREAD_INSTRUCTIONS);
+    }
+    instructions
+}
+fn threads_enabled(environment: &HashMap<String, String>) -> bool {
+    environment
+        .get("MONOCODE_THREADS")
+        .is_some_and(|v| v == "1")
+}
 const MAX_PLAN_STEPS: usize = 24;
 const MAX_STEP_CHARS: usize = 160;
 
@@ -982,7 +1005,7 @@ pub fn client(args: &[String]) -> Result<Value, String> {
         let json = match &args[1..] {
             [flag, json] if flag == "--json" => json,
             _ => {
-                return Err("Usage: monocode-gpui visual draft --json '{\"html\":\"...\"}'".into())
+                return Err("Usage: monocode-gpui visual draft --json '{\"html\":\"...\"}'".into());
             }
         };
         let input = serde_json::from_str::<Value>(json).map_err(|e| e.to_string())?;
@@ -1164,8 +1187,8 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({"name":"visual_check","description":"Validate a native visual program and representative controls without publishing. Returns its component tree. Read visual_docs for the SDK reference.","inputSchema":{"type":"object","properties":properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
         json!({"name":"visual_show","description":"Publish a native visual into the conversation as its own card. Read visual_docs first; validate with visual_check.","inputSchema":{"type":"object","properties":show_properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
         json!({"name":PLAN_TOOL,"description":"Show the user your plan and what you are doing now. Send the whole list each time, one step in_progress. Call when multi-step work starts and on every step change.","inputSchema":{"type":"object","properties":{"explanation":{"type":"string"},"plan":{"type":"array","items":{"type":"object","properties":{"step":{"type":"string"},"status":{"enum":["pending","in_progress","completed","cancelled"]}},"required":["step","status"]}}},"required":["plan"]},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
-        json!({"name":"draft_preview","description":"Build and inspect a live page inside the conversation, as a card at this point in the thread. Pass {html} (inline CSS/JS) or a localhost {url} to open one, with a short {title}; pass {draft} to look again. Returns a screenshot, text, controls with refs, console output and diagnostics. Revise with {draft,html}; resize or retheme with width/height/appearance. Actions: click {reference}, type {text,replace?}, resume, close. If userControl is true the user took over: inspect, but resume only after they hand it back. Results carry feedback the person sent from the page and issues the page reveals; to wait for feedback use draft_wait. Read visual_docs {topic:draft} first. Keep a good result with draft_keep.","inputSchema":{"type":"object","properties":{"html":{"type":"string"},"title":{"type":"string","maxLength":160},"url":{"type":"string","description":"A dev server on localhost"},"draft":{"type":"string","maxLength":96},"action":{"type":"object","properties":{"kind":{"enum":["snapshot","click","type","resume","close"]},"reference":{"type":"string","maxLength":96},"text":{"type":"string","maxLength":4096},"replace":{"type":"boolean"}},"required":["kind"],"additionalProperties":false},"width":{"type":"integer","minimum":240,"maximum":1600},"height":{"type":"integer","minimum":120,"maximum":1600},"appearance":{"enum":["light","dark"]}},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":true}}),
-        json!({"name":"draft_wait","description":"Pause until the person has tried the draft and sends their feedback (pinned notes on the page) or hands it back, then look at the page again. Returns the usual screenshot and numbers plus feedback, userActions and event (feedback, handed back or timeout). Waits up to 30 seconds; call again to keep waiting. Use after asking the person to try it, not in place of draft_preview.","inputSchema":{"type":"object","properties":{"draft":{"type":"string","maxLength":96},"seconds":{"type":"integer","minimum":1,"maximum":30}},"required":["draft"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"draft_preview","description":"Build and inspect a live page inside the conversation, as a card at this point in the thread. Pass {html} (inline CSS/JS) or a localhost {url} to open one, with a short {title}; pass {draft} to look again. Returns a screenshot, text, controls with refs, console output and diagnostics; a new page also reports layouts, its height and overflow at phone, tablet and laptop widths. Revise with {draft,html}; resize or retheme with width/height/appearance. Actions: click {reference}, type {text,replace?}, set {values} (patches the page's mc.state by key, as its own controls would), resume, close. If userControl is true the user took over: inspect, but resume only after they hand it back. Results carry feedback the person sent from the page (pinned notes, and messages the page sent with mc.send), its state and issues the page reveals; to wait for feedback use draft_wait. Read visual_docs {topic:draft} first. Keep a good result with draft_keep.","inputSchema":{"type":"object","properties":{"html":{"type":"string"},"title":{"type":"string","maxLength":160},"url":{"type":"string","description":"A dev server on localhost"},"draft":{"type":"string","maxLength":96},"action":{"type":"object","properties":{"kind":{"enum":["snapshot","click","type","set","resume","close"]},"reference":{"type":"string","maxLength":96},"values":{"type":"object","description":"For set: state keys and their new values"},"text":{"type":"string","maxLength":4096},"replace":{"type":"boolean"}},"required":["kind"],"additionalProperties":false},"width":{"type":"integer","minimum":240,"maximum":1600},"height":{"type":"integer","minimum":120,"maximum":1600,"description":"Only where the card starts; it is as tall as the page"},"appearance":{"enum":["light","dark"]}},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":true}}),
+        json!({"name":"draft_wait","description":"Pause until the person has tried the draft and sends their feedback (pinned notes on the page) or hands it back, then look at the page again. Returns the usual screenshot and numbers plus feedback, messages, userActions and event (feedback, message, handed back or timeout). Waits up to 30 seconds; call again to keep waiting. Use after asking the person to try it, not in place of draft_preview.","inputSchema":{"type":"object","properties":{"draft":{"type":"string","maxLength":96},"seconds":{"type":"integer","minimum":1,"maximum":30}},"required":["draft"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
         json!({"name":"draft_keep","description":"Save the current HTML draft as a picture in the conversation that reopens the live page after the draft is gone. Use for a result worth keeping, not every iteration.","inputSchema":{"type":"object","properties":{"draft":{"type":"string","maxLength":96},"title":{"type":"string","maxLength":160},"requestId":{"type":"string","maxLength":128}},"required":["draft","title"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
         json!({"name":"image_show","description":"Show a PNG, JPEG, GIF or WebP file you made, such as a chart or screenshot, in the conversation. The app keeps its own copy.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"title":{"type":"string","maxLength":160},"requestId":{"type":"string","maxLength":128}},"required":["path"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
     ]
@@ -1177,7 +1200,10 @@ pub(crate) fn thread_tool_definitions() -> Vec<Value> {
         let required = match action {
             "start" => {
                 properties["prompt"] = json!({"type":"string","minLength":1,"maxLength":240000});
-                for key in ["harness", "model", "effort", "title"] { properties[key] = json!({"type":"string"}); }
+                for key in ["model", "effort", "title"] { properties[key] = json!({"type":"string"}); }
+                let harnesses: Vec<&str> = crate::provider::Kind::ALL.iter().map(|kind| kind.id()).collect();
+                properties["harness"] = json!({"type":"string","description":format!("One of {}. Defaults to yours.", harnesses.join(", "))});
+                properties["model"] = json!({"type":"string","description":"The harness's model id or alias, such as haiku for claude"});
                 properties["modelSettings"] = json!({"type":"object","additionalProperties":{"type":"string"}});
                 properties["workspaceMode"] = json!({"enum":["current","worktree"]});
                 vec!["prompt"]
@@ -1199,7 +1225,7 @@ pub(crate) fn thread_tool_definitions() -> Vec<Value> {
             }
         };
         let detail = match action {
-            "start" => "Start a child on the requested harness and model.",
+            "start" => "Start a subagent: a child chat on any harness and model, which the user can watch in MonoCode. Use it instead of a built-in subagent tool or an agent CLI.",
             "send" => "Send a follow-up to an idle child; fails while it is busy.",
             "wait" => "Wait up to 50 seconds. Returns idle with success and the final reply, working, or needsInput for a user approval or question. Tell the user when input is needed.",
             "read" => "Read recent prose exchanges with an owned child, using nextBefore for older turns.",
@@ -1215,7 +1241,7 @@ fn call_thread_tool(
     mut input: Value,
     environment: &HashMap<String, String>,
 ) -> Result<Value, String> {
-    if environment.get("MONOCODE_THREADS").is_none_or(|v| v != "1") {
+    if !threads_enabled(environment) {
         return Err("Thread tools are only available to top-level threads".into());
     }
     let request = crate::app_access::optional_text(&input, "requestId", 128)?
@@ -1245,8 +1271,39 @@ pub fn read_only_tool(name: &str) -> bool {
         name.strip_prefix("mcp__monocode__")
             .or_else(|| name.strip_prefix("monocode:"))
             .or_else(|| name.strip_prefix("monocode_")),
-        Some("update_plan" | "thread_wait" | "thread_read" | "thread_list" | "draft_wait")
+        Some(
+            "update_plan"
+                | "thread_wait"
+                | "thread_read"
+                | "thread_list"
+                | "draft_wait"
+                | crate::orchestration::TOOL
+        )
     )
+}
+
+fn planning_orchestration(environment: &HashMap<String, String>) -> bool {
+    environment
+        .get(crate::orchestration::ENV)
+        .is_some_and(|v| v == "1")
+}
+
+/// Like update_plan, the plan lives in the tool call's input, where the app
+/// reads it when the turn ends. This only refuses a plan it could not start.
+fn check_orchestration_plan(
+    input: &Value,
+    environment: &HashMap<String, String>,
+) -> Result<Value, String> {
+    if !planning_orchestration(environment) {
+        return Err("Orchestration plans can only be submitted in an Orchestrator turn".into());
+    }
+    let plan = crate::orchestration::from_input(input)?;
+    Ok(json!({
+        "ok": true,
+        "title": plan.title,
+        "assignments": plan.tasks.len(),
+        "next": "The user reviews and starts the plan in MonoCode. Reply with a short explanation of the approach; do not repeat the plan."
+    }))
 }
 
 /// The plan itself lives in the tool call's input; this only refuses a list
@@ -1280,16 +1337,16 @@ fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option
     let id = request.get("id")?.clone();
     let result = match request["method"].as_str().unwrap_or("") {
         "initialize" => Ok(
-            json!({"protocolVersion":request["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION")},"instructions":PLAN_INSTRUCTIONS}),
+            json!({"protocolVersion":request["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION")},"instructions":server_instructions(environment)}),
         ),
         "ping" => Ok(json!({})),
         "tools/list" => {
             let mut tools = tool_definitions();
-            if environment
-                .get("MONOCODE_THREADS")
-                .is_some_and(|v| v == "1")
-            {
+            if threads_enabled(environment) {
                 tools.extend(thread_tool_definitions());
+            }
+            if planning_orchestration(environment) {
+                tools.push(crate::orchestration::tool_definition());
             }
             Ok(json!({"tools":tools}))
         }
@@ -1304,6 +1361,7 @@ fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option
                 "draft_keep" => keep_draft(&input, environment),
                 "draft_wait" => wait_for_draft(&input, environment),
                 PLAN_TOOL => check_plan(&input),
+                crate::orchestration::TOOL => check_orchestration_plan(&input, environment),
                 name if name.starts_with("thread_") => call_thread_tool(name, input, environment),
                 _ => Err("Unknown native visual tool".into()),
             };
@@ -1504,10 +1562,16 @@ mod tests {
                             note: "Bigger".into(),
                             ..DraftFeedback::default()
                         }],
+                        messages: vec!["Use B".into()],
                         user_actions: Vec::new(),
                         event: Some("feedback".into()),
                         issues: vec!["Small target 16×16".into()],
                         state: Some(json!({"radius": 12})),
+                        layouts: vec![DraftLayout {
+                            width: 375,
+                            height: 900,
+                            horizontal_overflow: 40,
+                        }],
                     })),
                 };
                 let _ = request.reply.send(Ok(reply));
@@ -1543,6 +1607,8 @@ mod tests {
         assert_eq!(result["event"], "feedback");
         assert_eq!(result["issues"][0], "Small target 16×16");
         assert_eq!(result["state"]["radius"], 12);
+        assert_eq!(result["messages"][0], "Use B");
+        assert_eq!(result["layouts"][0]["horizontalOverflow"], 40);
             assert_eq!(result["width"], 500);
             assert_eq!(result["diagnostics"]["horizontalOverflow"], 12);
             assert_eq!(result["console"][0]["text"], "boom");
@@ -1656,8 +1722,32 @@ mod tests {
             &environment,
         )
         .unwrap();
-        // Only the plan habit rides along; the visual SDK stays on demand.
-        assert_eq!(initialization["result"]["instructions"], PLAN_INSTRUCTIONS);
+        // The plan habit and when to draft ride along; the SDK stays on demand.
+        let instructions = initialization["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.starts_with(PLAN_INSTRUCTIONS));
+        assert!(instructions.contains("draft_preview"));
+        assert!(instructions.len() < 1_000);
+        assert!(!instructions.contains("mc."));
+        assert!(!instructions.contains("thread_start"));
+        let threads = HashMap::from([("MONOCODE_THREADS".to_string(), "1".to_string())]);
+        let initialization =
+            mcp_response(json!({"id":1,"method":"initialize","params":{}}), &threads).unwrap();
+        // Subagent requests go to MonoCode, not the harness's own subagent tool.
+        let instructions = initialization["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.ends_with(THREAD_INSTRUCTIONS));
+        assert!(instructions.len() < 1_400);
+        let catalog = mcp_response(json!({"id":2,"method":"tools/list"}), &threads).unwrap();
+        let start = catalog["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "thread_start")
+            .unwrap();
+        assert!(start["description"].as_str().unwrap().contains("subagent"));
+        let harness = start["inputSchema"]["properties"]["harness"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(harness.contains("claude") && harness.contains("codex"));
         let catalog = mcp_response(json!({"id":2,"method":"tools/list"}), &environment).unwrap();
         let metadata = catalog["result"].to_string();
         assert!(
@@ -1768,6 +1858,44 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn the_orchestration_plan_tool_is_only_offered_to_planning_turns() {
+        let mut env = HashMap::new();
+        let listed = |env: &HashMap<String, String>| {
+            mcp_response(json!({"id":1,"method":"tools/list"}), env).unwrap()["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == crate::orchestration::TOOL)
+        };
+        let call = |env: &HashMap<String, String>, plan: Value| {
+            mcp_response(
+                json!({"id":2,"method":"tools/call","params":{"name":crate::orchestration::TOOL,"arguments":plan}}),
+                env,
+            )
+            .unwrap()["result"]
+                .clone()
+        };
+        let plan =
+            json!({"title":"T","tasks":[{"id":"a","title":"A","prompt":"Do","files":["src"]}]});
+        assert!(!listed(&env));
+        assert_eq!(call(&env, plan.clone())["isError"], true);
+        env.insert(crate::orchestration::ENV.into(), "1".into());
+        assert!(listed(&env));
+        assert_eq!(call(&env, plan)["isError"], false);
+        // An invalid plan comes back to the model to fix in the same turn.
+        let escape = call(
+            &env,
+            json!({"title":"T","tasks":[{"id":"a","title":"A","prompt":"Do","files":["../x"]}]}),
+        );
+        assert_eq!(escape["isError"], true);
+        assert!(escape["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid file scope"));
+        assert!(read_only_tool("mcp__monocode__orchestration_plan"));
     }
 
     #[test]

@@ -25,8 +25,9 @@ const RAIL_HEIGHT: f32 = 10.;
 /// it gives way to the readout and drag area in a small window.
 const RAIL_WIDTH: f32 = 440.;
 const RAIL_MIN_WIDTH: f32 = 160.;
-/// Ask for a plan once a turn has done some real work without one. A small
-/// list is still worth having, so this is only a few calls in.
+/// Offer to ask for a plan once a turn has done some real work without one.
+/// The agent's instructions already ask for a list, so the rail never sends
+/// this on its own.
 const ASK_AFTER_CALLS: usize = 3;
 const ASK_FOR_PLAN: &str = "Before you continue, lay out the remaining work as a short \
                             todo list with your todo tool, then keep it updated as you go.";
@@ -169,24 +170,6 @@ impl PlanRail {
                 self.open = false;
             }
             cx.notify();
-        }
-        self.ask_unprompted(&conversation, cx);
-    }
-
-    /// A turn that has worked a few calls with no list gets asked, once, to
-    /// write one. The agent keeps it from there; nothing is asked of the user.
-    fn ask_unprompted(&mut self, conversation: &Entity<Conversation>, cx: &mut Context<Self>) {
-        let c = conversation.read(cx);
-        let due = self.busy
-            && !self.planning
-            && self.asked.is_none()
-            && !c.plan_asked
-            && self.snapshot.plan.is_none()
-            && self.snapshot.proposal.is_none()
-            && self.snapshot.turn_calls >= ASK_AFTER_CALLS
-            && c.can_steer_plan();
-        if due {
-            self.steer("a plan".into(), ASK_FOR_PLAN.into(), cx);
         }
     }
 

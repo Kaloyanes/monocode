@@ -444,7 +444,7 @@ impl Shell {
         self.focus_active(window, cx);
     }
 
-    fn start_inbox_session(
+    pub(super) fn start_inbox_session(
         &mut self,
         item: monocode_core::inbox::Item,
         prompt: String,

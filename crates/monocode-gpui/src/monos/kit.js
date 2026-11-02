@@ -27,15 +27,37 @@ svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('class','mc-icon'+(attr
 if(attrs&&attrs.size){svg.style.width=svg.style.height=attrs.size+'px'}
 const p=document.createElementNS('http://www.w3.org/2000/svg','path');p.setAttribute('d',ICONS[name]||ICONS.info);svg.append(p);return svg};
 const root=t=>typeof t==='string'?document.querySelector(t):(t||document.body);
-let speed=1;
-const pace=()=>{for(const a of document.getAnimations())if(a.playbackRate!==speed)a.playbackRate=speed};
+// One clock for the page. Speed and pause slow CSS and Web Animations, and the
+// time scripts read (performance.now, Date.now, requestAnimationFrame
+// timestamps) and the delay of their timers follow it, so script-driven motion
+// slows with the rest.
+const real=performance.now.bind(performance),realDate=Date.now,rAF=window.requestAnimationFrame.bind(window),rawTimeout=window.setTimeout,rawInterval=window.setInterval;
+let speed=1,paused=false,virtual=real(),mark=virtual;const watchers=new Set();
+const rate=()=>paused?0:speed;
+const tick=()=>{const t=real();virtual+=(t-mark)*rate();mark=t;return virtual};
+const pace=()=>{const r=rate();for(const a of document.getAnimations())if(a.playbackRate!==r)a.playbackRate=r};
 addEventListener('animationstart',pace,true);addEventListener('transitionrun',pace,true);
 const animate=Element.prototype.animate;
-Element.prototype.animate=function(...args){const a=animate.apply(this,args);a.playbackRate=speed;return a};
-const setSpeed=v=>{speed=Math.max(.05,Number(v)||1);document.documentElement.style.setProperty('--mc-speed',String(speed));pace()};
-// Wall-clock time scaled by playback speed, for requestAnimationFrame loops.
-let clock=0,last=performance.now();
-const now=()=>{const t=performance.now();clock+=(t-last)*speed;last=t;return clock};
+Element.prototype.animate=function(...args){const a=animate.apply(this,args);a.playbackRate=rate();return a};
+performance.now=()=>tick();
+Date.now=()=>realDate()+(tick()-real());
+window.requestAnimationFrame=f=>rAF(()=>f(tick()));
+window.setTimeout=(f,d,...a)=>rawTimeout(f,typeof f==='function'?(Number(d)||0)/Math.max(speed,.05):d,...a);
+window.setInterval=(f,d,...a)=>rawInterval(f,typeof f==='function'?(Number(d)||0)/Math.max(speed,.05):d,...a);
+const sync=()=>{document.documentElement.style.setProperty('--mc-speed',String(rate()));pace();watchers.forEach(f=>{try{f({speed,paused})}catch(e){console.error(e)}})};
+const setSpeed=v=>{tick();speed=Math.max(.05,Number(v)||1);sync()};
+const pause=on=>{tick();paused=on!==false;sync()};
+const now=()=>tick();
+const clock={get speed(){return speed},get paused(){return paused},setSpeed,pause,resume:()=>pause(false),now,
+// Calls f now and whenever speed or pause changes; returns a stop function.
+on(f){watchers.add(f);f({speed,paused});return()=>watchers.delete(f)}};
+// Named states shared by anything that listens, for a trigger that flips a page
+// between them: states(['expanded','collapsed']).
+const states=(names,o={})=>{let i=Math.max(0,names.indexOf(o.initial));const subs=new Set();
+const go=n=>{const j=typeof n==='number'?(n+names.length)%names.length:names.indexOf(n);if(j<0||j===i)return s;i=j;subs.forEach(f=>{try{f(names[i],i)}catch(e){console.error(e)}});return s};
+const s={names,get name(){return names[i]},get index(){return i},go,next:()=>go(i+1),
+// Calls f now and on every change; returns a stop function.
+on(f){subs.add(f);try{f(names[i],i)}catch(e){console.error(e)}return()=>subs.delete(f)}};return s};
 const slider=(label,o={})=>{const fmt=o.format||(v=>String(v)+(o.unit||''));
 const input=h('input',{class:'mc-range',type:'range',min:o.min??0,max:o.max??100,step:o.step??1,value:o.value??0,'aria-label':label});
 const out=h('output',null,fmt(Number(input.value)));
@@ -49,8 +71,19 @@ const select=i=>{[...bar.children].forEach((b,j)=>b.setAttribute('aria-selected'
 labels.forEach((l,i)=>bar.append(h('button',{class:'mc-tab',role:'tab','aria-selected':String(i===selected),onclick:()=>select(i)},l)));
 bar.select=i=>{[...bar.children].forEach((b,j)=>b.setAttribute('aria-selected',String(i===j)))};return bar};
 const stagger=(els,start=0)=>{[...els].forEach((el,i)=>el.style.setProperty('--i',String(start+i)));return els};
+// Variants side by side in one row, all alive at once, so one shared trigger
+// (o.states, a transport) drives them together and they can be compared live.
+const side=(target,list,o)=>{const cols=list.map((v,index)=>{const stage=h('div',{class:'mc-stage'+(o.stage?' '+o.stage:'')});
+if(o.stageHeight)stage.style.minHeight=o.stageHeight+'px';
+return{v,index,stage,cleanup:null,el:h('div',{class:'mc-side-col'},h('div',{class:'mc-side-title'},v.name),v.note?h('p',{class:'mc-side-note'},v.note):null,stage)}});
+const draw=c=>{if(typeof c.cleanup==='function'){try{c.cleanup()}catch(e){console.error(e)}}c.cleanup=null;c.stage.replaceChildren();
+try{c.cleanup=c.v.render(c.stage,{index:c.index,name:c.v.name,replay:()=>draw(c),speed:()=>speed,now,states:o.states,clock})}catch(e){console.error(e);c.stage.append(h('div',{class:'mc-muted'},String(e)))}};
+const demo=h('div',{class:'mc-side'},cols.map(c=>c.el));
+const mount=()=>{root(target).append(demo);cols.forEach(draw);requestAnimationFrame(pace)};
+if(document.body)mount();else addEventListener('DOMContentLoaded',mount);
+return{show:()=>cols.forEach(draw),replay:()=>cols.forEach(draw),stages:cols.map(c=>c.stage),demo}};
 // A variant carousel: a stage with tabs, and optional replay and playback speed.
-const variants=(target,list,o={})=>{let index=Math.min(o.initial||0,list.length-1),cleanup=null;
+const variants=(target,list,o={})=>{if(o.layout==='side')return side(target,list,o);let index=Math.min(o.initial||0,list.length-1),cleanup=null;
 const stage=h('div',{class:'mc-stage'+(o.stage?' '+o.stage:'')});
 if(o.stageHeight)stage.style.minHeight=o.stageHeight+'px';
 // The stage keeps the tallest height its content reached, so a replay or tab
@@ -63,7 +96,7 @@ if(r.height>(parseFloat(stage.style.minHeight)||0))stage.style.minHeight=r.heigh
 const note=h('span',{class:'mc-note'});
 const show=i=>{index=(i+list.length)%list.length;bar.select(index);if(typeof cleanup==='function'){try{cleanup()}catch(e){console.error(e)}}
 cleanup=null;stage.replaceChildren();const v=list[index];note.textContent=v.note||'';
-try{cleanup=v.render(stage,{index,name:v.name,replay:()=>show(index),speed:()=>speed,now})}catch(e){console.error(e);stage.append(h('div',{class:'mc-muted'},String(e)))}
+try{cleanup=v.render(stage,{index,name:v.name,replay:()=>show(index),speed:()=>speed,now,states:o.states,clock})}catch(e){console.error(e);stage.append(h('div',{class:'mc-muted'},String(e)))}
 requestAnimationFrame(pace)};
 const bar=tabs(list.map(v=>v.name),index,show);
 // Chrome is opt-in: tabs only for several variants, Replay when there is
@@ -79,6 +112,6 @@ const mount=()=>{root(target).append(demo);show(index)};
 if(document.body)mount();else addEventListener('DOMContentLoaded',mount);
 if(o.autoplay){setInterval(()=>show(index),Math.max(800,o.autoplay))}
 return{show,stage,demo,get index(){return index}}};
-window.mc={h,icon,icons:Object.keys(ICONS),slider,toggle,tabs,stagger,variants,setSpeed,now,get speed(){return speed},
+window.mc={h,icon,icons:Object.keys(ICONS),slider,toggle,tabs,stagger,variants,setSpeed,now,clock,states,get speed(){return speed},
 series:i=>getComputedStyle(document.documentElement).getPropertyValue('--chart-'+((i%6)+1)).trim()};
 })();

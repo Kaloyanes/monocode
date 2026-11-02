@@ -170,19 +170,20 @@ impl Shell {
         draft::register(&id, draft, cx);
     }
 
-    /// The person sent their notes. An agent that is waiting gets them as the
+    /// The person sent their notes, or used a page control that sends a
+    /// message. An agent that is waiting gets them as the
     /// result of its wait; otherwise they go to the conversation as a message,
     /// steering a running turn where the provider can take it.
     fn deliver_draft_notes(&mut self, session: i64, draft: &Entity<Draft>, cx: &mut Context<Self>) {
         if draft.read(cx).waiting() {
             return;
         }
-        let (notes, actions) = draft.update(cx, |draft, _| draft.take_outbox());
-        if notes.is_empty() {
+        let outbox = draft.update(cx, |draft, _| draft.take_outbox());
+        if outbox.notes.is_empty() && outbox.messages.is_empty() {
             return;
         }
         let title = draft.read(cx).title();
-        let text = DraftFeedback::message(&title, &notes, &actions);
+        let text = DraftFeedback::message(&title, &outbox.notes, &outbox.messages, &outbox.actions);
         if let Some(view) = self.sessions.get(&session).cloned() {
             view.update(cx, |view, cx| view.send_draft_feedback(text, cx));
         }

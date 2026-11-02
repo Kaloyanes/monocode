@@ -923,7 +923,10 @@ impl Render for UsageFooter {
                                 .child(
                                     div()
                                         .h_full()
-                                        .w(gpui::relative(percent as f32 / 100.))
+                                        .w(gpui::relative(
+                                            self.display_percent(percent.clamp(0., 100.)) as f32
+                                                / 100.,
+                                        ))
                                         .rounded_full()
                                         .bg(usage_color(percent)),
                                 ),

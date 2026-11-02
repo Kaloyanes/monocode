@@ -21,7 +21,17 @@ reset(){return s.patch(init)},
 // Calls f now and after every change; returns a function that stops it.
 on(f){subs.add(f);try{f({...cur})}catch(e){console.error(e)}return()=>subs.delete(f)},
 get values(){return{...cur}}};
+// The agent's {kind:'set'} action patches the newest store, by its own keys.
+window.__mcSet=o=>{if(!o||typeof o!=='object'||Array.isArray(o))return 'values must be an object';
+const bad=Object.keys(o).filter(k=>!(k in cur));if(bad.length)return 'Unknown state '+bad.join(', ')+'; this page has '+(Object.keys(cur).join(', ')||'none');
+s.patch(o);return ''};
 return s};
+
+// Sends a line to the agent, as from the person: for a control the page
+// offers, such as "Use this one". Works only straight after the person's own
+// click or key press; returns whether it went.
+const send=text=>{const ok=!!(window.__mcTell&&window.__mcTell(String(text)));
+if(!ok)console.warn('mc.send works only from the person\'s own click or key press');return ok};
 
 const label=c=>c.label||c.key[0].toUpperCase()+c.key.slice(1);
 
@@ -91,4 +101,5 @@ mount(target,el);
 el.state=s;el.destroy=()=>{off.forEach(f=>f());el.remove()};return el};
 
 Object.assign(mc,{state,controls});
+Object.assign(mc,{send});
 })();

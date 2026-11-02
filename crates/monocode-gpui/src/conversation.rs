@@ -8,6 +8,7 @@ pub(crate) mod composer_features;
 mod composer_shelf;
 mod edit_last_turn;
 mod follow_up;
+mod goal;
 #[cfg(test)]
 pub(crate) use follow_up::BUILD_PROPOSED_PLAN;
 pub(crate) mod git_actions;
@@ -152,6 +153,7 @@ pub(crate) struct Conversation {
     _draft_observation: Subscription,
     _input_focus: Option<[Subscription; 2]>,
     draft_has_value: bool,
+    composer_draft: follow_up::ComposerDraft,
     folder_selected: bool,
     follow_ups: follow_up::FollowUps,
     background: background_tasks::BackgroundTasks,
@@ -169,12 +171,16 @@ pub(crate) struct Conversation {
     pub(crate) app_read_only: bool,
     /// The newest turn ran in Plan mode, so its answer is a plan to review.
     pub(crate) plan_turn: bool,
-    /// The rail already asked the running turn for a todo list.
-    pub(crate) plan_asked: bool,
+    /// The running turn prepares an orchestration plan.
     planning_orchestration: bool,
-    pub(crate) orchestration_plan: Option<monocode_core::orchestration::Plan>,
+    /// The plan under review, with the tool call that submitted it (none for
+    /// the tagged fallback).
+    pub(crate) orchestration_plan: Option<(Option<String>, monocode_core::orchestration::Plan)>,
     orchestration_error: Option<String>,
-    pub(crate) orchestration_progress: Option<String>,
+    /// The shell's cards for this lead's plans and runs.
+    orchestration_views: Vec<(Option<String>, crate::transcript::orchestration::RunView)>,
+    /// One of this lead's runs is not finished.
+    pub(crate) orchestration_active: bool,
     status: String,
     loaded: bool,
     history_unloaded: bool,
@@ -536,6 +542,7 @@ impl Conversation {
                 this.draft_has_value = has_value;
                 cx.notify();
             }
+            this.queue_composer_draft(cx);
             this.open_typed_btw(cx);
         });
         input.update(cx, |input, _| input.set_alternate_submit(true));
@@ -621,6 +628,7 @@ impl Conversation {
             _draft_observation: draft_observation,
             _input_focus: None,
             draft_has_value: false,
+            composer_draft: Default::default(),
             folder_selected: false,
             follow_ups: Default::default(),
             background: Default::default(),
@@ -633,11 +641,11 @@ impl Conversation {
             app_environment: Default::default(),
             app_read_only: false,
             plan_turn: false,
-            plan_asked: false,
             planning_orchestration: false,
             orchestration_plan: None,
             orchestration_error: None,
-            orchestration_progress: None,
+            orchestration_views: Vec::new(),
+            orchestration_active: false,
             status: "Loading conversation…".into(),
             loaded: false,
             history_unloaded: false,
@@ -788,10 +796,11 @@ impl Conversation {
                     Ok(state) => {
                         this.follow_ups.persisted = state.revision;
                         this.follow_ups.state = state;
-                        let draft = this.follow_ups.state.draft.clone();
-                        if draft.is_some() {
+                        if this.follow_ups.state.draft.is_some() {
                             this.summary.has_messages = true;
                         }
+                        this.adopt_saved_draft(cx);
+                        let draft = this.follow_ups.state.draft.clone();
                         this.transcript
                             .update(cx, |view, cx| view.set_saved_draft(draft, cx));
                     }
@@ -913,7 +922,7 @@ impl Conversation {
         if self.driven_by.is_some() {
             return;
         }
-        if self.is_remote() && self.remote_send_guard(cx) {
+        if self.is_remote() && self.remote_send_guard(false, cx) {
             return;
         }
         if self.needs_history_restore() {
@@ -947,10 +956,6 @@ impl Conversation {
             return;
         }
         if !self.loaded || (self.preparing_worktree && !self.busy && !self.stopping) {
-            return;
-        }
-        if self.draft_active(cx) {
-            self.save_message_draft(cx);
             return;
         }
         if !self.folder_selected
@@ -1027,9 +1032,6 @@ impl Conversation {
             }
             return;
         }
-        self.planning_orchestration = self.settings.orchestrator;
-        self.orchestration_plan = None;
-        self.orchestration_error = None;
         self.launch_prompt(prompt, cx);
         if self.busy && mode.is_some() {
             self.clear_submitted_mode(cx);
@@ -1123,7 +1125,11 @@ impl Conversation {
             return;
         }
         if !self.history_ready() {
-            self.defer_history_action(move |this, cx| this.launch_prompt(prompt, cx), cx);
+            let modes = self.turn_modes();
+            self.defer_history_action(
+                move |this, cx| this.with_modes(modes, |this| this.launch_prompt(prompt, cx)),
+                cx,
+            );
             return;
         }
         if self.account_switching {
@@ -1146,6 +1152,13 @@ impl Conversation {
         self.sync_tool_paths(cx);
         self.transcript
             .update(cx, |v, _| v.identity(&self.summary.provider, &model_label));
+        // Set here, where the turn really starts, so a deferred or failed
+        // launch cannot leave a later turn parsed as a plan.
+        self.planning_orchestration = self.settings.orchestrator;
+        if self.planning_orchestration {
+            self.orchestration_plan = None;
+            self.orchestration_error = None;
+        }
         self.begin_turn(cx);
         let generation = self.submission_generation;
         let source_provider = self.summary.provider.clone();
@@ -1167,7 +1180,6 @@ impl Conversation {
             || self.settings.orchestrator
             || self.settings.access == AccessMode::ReadOnly;
         self.plan_turn = self.settings.plan && !self.settings.orchestrator;
-        self.plan_asked = false;
         let mut settings = self.settings.clone();
         settings.resume_after_restart = !self.managed;
         // One-shot: only the launch that continues an interrupted turn.
@@ -1436,6 +1448,10 @@ impl Conversation {
                             for (id, error) in update.follow_up_errors {
                                 if this.settings.mono.is_some() {
                                     this.mono_message_failed(id, error);
+                                } else if finished {
+                                    // Rejected because the turn was ending: the
+                                    // message starts the next turn instead.
+                                    this.return_follow_up(&id, cx);
                                 } else {
                                     this.fail_follow_up(&id, error, cx);
                                 }
@@ -1450,8 +1466,8 @@ impl Conversation {
                             if !stopping || finished {
                                 this.status = update.status;
                             }
-                            if let Some(tasks) = update.background.filter(|_| !stopping) {
-                                this.set_background(tasks, cx);
+                            if let Some(waiting) = update.background.filter(|_| !stopping) {
+                                this.set_background(waiting, cx);
                             }
                             if !stopping {
                                 this.approvals.extend(update.approvals);
@@ -1571,11 +1587,7 @@ impl Conversation {
                                     }
                                 }
                                 if let Some(id) = this.follow_ups.sending.clone() {
-                                    this.fail_follow_up(
-                                        &id,
-                                        "The turn ended before this message was accepted".into(),
-                                        cx,
-                                    );
+                                    this.return_follow_up(&id, cx);
                                 }
                                 if this.status != "Ready"
                                     && !this.follow_ups.state.messages.is_empty()
@@ -1599,7 +1611,6 @@ impl Conversation {
                                 });
                                 if stopping {
                                     this.planning_orchestration = false;
-                                    this.orchestration_progress = None;
                                 } else {
                                     this.finish_orchestration_plan(cx);
                                 }
@@ -1657,8 +1668,7 @@ impl EventEmitter<ChooseFolder> for Conversation {}
 impl EventEmitter<OpenSessionChanges> for Conversation {}
 impl EventEmitter<OpenThread> for Conversation {}
 impl EventEmitter<Transfer> for Conversation {}
-impl EventEmitter<composer_features::StartOrchestration> for Conversation {}
-impl EventEmitter<composer_features::StopOrchestration> for Conversation {}
+impl EventEmitter<crate::transcript::orchestration::OrchestrationAction> for Conversation {}
 
 impl Conversation {
     pub(crate) fn install_transfer(
@@ -2198,7 +2208,7 @@ impl Conversation {
                 "thinking" => {
                     self.settings.thinking = Some(!self.settings.thinking.unwrap_or(false))
                 }
-                "plan" | "operator" | "orchestrator" | "draft" => {
+                "plan" | "operator" | "orchestrator" => {
                     self.toggle_mode(id, cx);
                     return;
                 }
@@ -2665,16 +2675,11 @@ impl Conversation {
                             .icon_color(tint(FUCHSIA_300, 0.65))
                             .badge("v1")
                             .description("Plan and coordinate agent work"),
-                        MenuAction::new("draft", "Draft")
-                            .icon("circle-dashed-hi")
-                            .description("Save this message without starting the agent")
-                            .disabled(self.busy || self.follow_ups.state.draft.is_some()),
                     ]
                     .into_iter()
                     .map(|action| {
                         let checked = match action.id.as_ref() {
                             "plan" => self.settings.plan,
-                            "draft" => self.draft_active(cx),
                             "operator" => self.settings.operator,
                             "orchestrator" => self.settings.orchestrator,
                             _ => false,
@@ -2772,6 +2777,33 @@ impl Conversation {
     pub(crate) fn toggle_recent_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mono_ui.models = None;
         self.toggle_menu(ComposerMenu::Recent, window, cx);
+    }
+    /// `App: Change Effort` (Cmd+/): toggles the effort pill's menu, or the
+    /// provider's effort control when the model has no efforts of its own.
+    pub(crate) fn toggle_effort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(model) = self.model_info() else {
+            return;
+        };
+        let ix = if !model.efforts.is_empty() {
+            0
+        } else if let Some(ix) = model
+            .controls
+            .iter()
+            .position(|control| !model_control_toggle(control) && is_effort_key(&control.id))
+        {
+            ix + 1
+        } else {
+            return;
+        };
+        let beside = cx
+            .try_global::<crate::settings::Preferences>()
+            .is_some_and(|p| p.model_controls == "beside");
+        // Without the pills their anchors are stale, so open at the model trigger.
+        if self.settings.mono.is_none() && !beside {
+            self.mono_ui.setting_anchors.clear();
+        }
+        self.mono_ui.models = None;
+        self.toggle_menu(ComposerMenu::Setting(ix), window, cx);
     }
     /// Right-clicking the model trigger opens the recent models over any menu.
     fn open_recent_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2897,9 +2929,7 @@ impl Conversation {
             return self.thread_composer(cx);
         }
         let radius = 12.;
-        let command = if self.follow_ups.draft_selected {
-            Some(input::Command::Draft)
-        } else if self.settings.orchestrator {
+        let command = if self.settings.orchestrator {
             Some(input::Command::Orchestrator)
         } else if self.settings.plan {
             Some(input::Command::Plan)
@@ -2971,6 +3001,7 @@ impl Conversation {
             .children(self.model_list_popover(cx))
             .children(self.orchestration_card(cx))
             .children(if self.is_remote() { None } else { self.usage_notice(false, cx) })
+            .children(self.goal_shelf(cx))
             .child(self.background_shelf(window, cx))
             .children(self.shell_queue(cx))
             .child(self.message_queue(window, cx))
@@ -3657,20 +3688,18 @@ impl Conversation {
     // ComposerAction: a solid submit, dimmed while empty; Stop while busy.
     fn action(&self, has_value: bool, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = (self.responding() || self.shell_running()) && !has_value;
-        let draft = self.draft_active(cx);
         let modifiers = window.modifiers();
         let alternate = if cfg!(target_os = "macos") {
             modifiers.platform
         } else {
             modifiers.control
         };
-        let follow_up = (has_value && !draft)
+        let follow_up = has_value
             .then(|| self.follow_up_action(alternate, cx))
             .flatten();
         let enabled = !self.attaching
             && (!self.preparing_worktree || self.busy || self.stopping)
-            && (busy || (has_value && self.loaded))
-            && (busy || !draft || (!self.busy && self.follow_ups.state.draft.is_none()));
+            && (busy || (has_value && self.loaded));
         let shell = !busy && self.input.read(cx).shell_mode();
         send_button(
             "send-or-stop",
@@ -3678,8 +3707,6 @@ impl Conversation {
                 "Stop"
             } else if shell {
                 "Run command"
-            } else if draft {
-                "Save draft"
             } else {
                 follow_up.map_or("Send", |(label, _)| label)
             },
@@ -4098,7 +4125,10 @@ impl Render for Conversation {
             let focus = self.input.focus_handle(cx);
             self._input_focus = Some([
                 cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
-                cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+                cx.on_blur(&focus, window, |this, _, cx| {
+                    this.flush_composer_draft(cx);
+                    cx.notify()
+                }),
             ]);
         }
         if self.response_events.is_none() {
@@ -4457,6 +4487,23 @@ mod menu_tests {
                     "beside mode paints its effort control"
                 );
             })
+            .unwrap();
+        // App: Change Effort toggles the effort menu, and picking sets it.
+        window
+            .update(visual, |c, w, cx| c.toggle_effort_menu(w, cx))
+            .unwrap();
+        window
+            .update(visual, |c, _, cx| {
+                assert!(c.menu_is(ComposerMenu::Setting(0)));
+                c.menu_choice("effort:high", cx);
+                assert_eq!(c.selected_effort(), Some("high"));
+            })
+            .unwrap();
+        window
+            .update(visual, |c, w, cx| c.toggle_effort_menu(w, cx))
+            .unwrap();
+        window
+            .update(visual, |c, _, _| assert!(c.menu.is_none()))
             .unwrap();
     }
 
