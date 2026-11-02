@@ -718,30 +718,6 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     },
     [mutate, refresh],
   );
-  const readOrchestration = useCallback(
-    async (conversationId: string) =>
-      (await command<{ runs: OrchestrationRun[] }>("orchestration.read", { conversationId })).runs,
-    [command],
-  );
-  const orchestrationAction = useCallback(
-    async (
-      conversationId: string,
-      run: OrchestrationRun,
-      action: OrchestrationActionName,
-      task?: OrchestrationTask,
-    ) => {
-      const result = await mutate<{ runs: OrchestrationRun[] }>("orchestration.action", {
-        conversationId,
-        call: run.call,
-        action,
-        ...(task ? { taskId: task.id, index: task.index } : {}),
-      });
-      // The lead's row and strip follow on the next catalog.
-      void refresh();
-      return result.runs;
-    },
-    [mutate, refresh],
-  );
   const listSessions = useCallback(
     (projectId: string, query: string, offset: number, filters?: SessionListFilters) =>
       command<SessionPage>("sessions.list", {

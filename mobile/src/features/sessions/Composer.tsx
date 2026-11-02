@@ -1,7 +1,7 @@
 import { ChoiceMenu } from "@/ui/ChoiceMenu";
-import { Button, Divider, Host, HStack, Menu, Spacer } from "@expo/ui/swift-ui";
-import { accessibilityLabel, contentShape, frame, shapes } from "@expo/ui/swift-ui/modifiers";
-import { useCallback, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { GlassMenuButton } from "@/ui/GlassMenuButton";
+import { Button } from "@expo/ui/swift-ui";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Alert, Platform, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import Animated, {
   Easing,
@@ -530,6 +530,9 @@ export function Composer({
           placeholder={busy ? BUSY_PLACEHOLDER : COMPOSER_PLACEHOLDER}
           placeholderTextColor={colors.muted}
           multiline
+          // The pill's field is a point shorter than its one line, so it would
+          // bounce; only a draft taller than the card scrolls.
+          scrollEnabled={inputHeight >= INPUT_MAX}
           keyboardAppearance={scheme}
           cursorColor={colors.accent}
           selectionColor={colors.accent}
@@ -660,11 +663,8 @@ export function Composer({
 }
 
 /**
- * The add button: a native menu to attach photos or files, with `onSkills`
- * to list skills and commands, with `onMode` to pick a mode and with
- * `onNewMono` to make a Mono. The menu
- * lies over the button, its label an invisible box of the button's size, as
- * in SessionFilterMenu.
+ * The add button: a native menu to attach photos or files. The menu grows
+ * out of the button (see GlassMenuButton).
  */
 function AddMenu({
   onPhotos,
@@ -702,46 +702,10 @@ function AddMenu({
     </ChoiceMenu>
   );
   return (
-    <View>
-      <View style={styles.round}>
-        <Icon name="add" size={18} color={colors.content} />
-      </View>
-      <Host style={StyleSheet.absoluteFill}>
-        <Menu
-          modifiers={[accessibilityLabel(label)]}
-          label={
-            <HStack
-              modifiers={[
-                frame({ width: BUTTON, height: BUTTON }),
-                contentShape(shapes.circle()),
-              ]}
-            >
-              <Spacer />
-            </HStack>
-          }
-        >
-          <Button label="Photo Library" systemImage="photo.on.rectangle" onPress={onPhotos} />
-          <Button label="Files" systemImage="folder" onPress={onFiles} />
-          {onSkills ? (
-            <Button label="Skills and commands" systemImage="sparkles" onPress={onSkills} />
-          ) : null}
-          {onMode ? <Divider /> : null}
-          {onMode
-            ? MODES.map((entry) => (
-                <Button
-                  key={entry.id}
-                  label={entry.label}
-                  // A tick marks the mode that's on, as a menu's checked item.
-                  systemImage={entry.id === mode ? "checkmark" : entry.systemImage}
-                  onPress={() => onMode(entry.id)}
-                />
-              ))
-            : null}
-          {onNewMono ? <Divider /> : null}
-          {onNewMono ? <Button label="New Mono" systemImage="plus" onPress={onNewMono} /> : null}
-        </Menu>
-      </Host>
-    </View>
+    <GlassMenuButton icon="add" symbol="plus" label="Add photos or files" size={BUTTON}>
+      <Button label="Photo Library" systemImage="photo.on.rectangle" onPress={onPhotos} />
+      <Button label="Files" systemImage="folder" onPress={onFiles} />
+    </GlassMenuButton>
   );
 }
 

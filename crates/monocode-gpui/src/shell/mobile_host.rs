@@ -626,9 +626,6 @@ impl Shell {
                     mobile_catalog::checkout_branch(metadata.worktree_cwd.as_deref().unwrap_or(&entry.summary.cwd), &mut branches)
                 } else { String::new() };
                 let mut session = mobile_catalog::session(&entry.summary, id, &entry.project, &metadata, entry.live.as_ref(), &branch);
-                if let Some(lead) = lead {
-                    session["leadId"] = json!(lead);
-                }
                 if let Some(mono) = origins.get(&entry.id) {
                     session["monoId"] = json!(mono);
                 }
@@ -675,7 +672,7 @@ impl Shell {
                 // Expo, so they no longer post their own alerts. `monoFiles`:
                 // it reads and saves a Mono's soul and memory for the phone.
                 // `inbox`: it answers the phone's `inbox.*` requests.
-                json!({"projects": projects, "monos": monos, "sessions": sessions, "monoTools": true, "push": true, "monoFiles": true, "inbox": true}),
+                json!({"projects": projects, "monos": monos, "sessions": sessions, "monoTools": true, "push": true, "monoFiles": true, "inbox": true, "sessionUnarchive": true}),
                 ids,
                 previews,
             ))

@@ -9,11 +9,12 @@ import { PixelMascot } from "@/features/mascots/PixelMascot";
 import { useMonoModel } from "@/features/models/useMonoModel";
 import { useDrawerActions, useDrawerSwipe } from "@/ui/ScenePager";
 import { Timed } from "@/ui/Timed";
-import { useMonoTools, useConnectionActions, usePairing } from "@/features/connection/ConnectionProvider";
+import { useConnection, useMonoTools } from "@/features/connection/ConnectionProvider";
 import { markMonoSeen, markMonoUnread } from "@/features/workspace/monoSeen";
 import { Composer } from "@/features/sessions/Composer";
 import { MonoChoose, MonoMessageActions } from "@/features/sessions/MonoCards";
 import { MonoMenu } from "@/features/sessions/MonoMenu";
+import { homeProjectId, readLastPlace } from "@/features/workspace/lastPlace";
 import { useMonoAccent } from "@/features/workspace/monoAccent";
 import { AccentOverride, ACCENTS, useScheme } from "@/ui/theme";
 import { QuestionCard } from "@/features/sessions/QuestionCard";
@@ -32,15 +33,15 @@ import {
 // A mono has one long-lived conversation, so its screen is that conversation.
 export default function MonoScreen() {
   const { monoId } = useLocalSearchParams<{ monoId: string }>();
-  const { monos, sendMessage, stop } = useWorkspace();
+  const { monos, projects, sendMessage, stop } = useWorkspace();
   useDrawerSwipe();
   const mono = monos.find((m) => m.id === monoId);
   const conversationId = mono ? monoConversationId(mono.id) : null;
   const conversation = useConversation(conversationId);
-  const { command, refresh } = useConnectionActions();
+  const { command, refresh } = useConnection();
   // The older desktop app has no profile, reset or delete for a Mono.
   const tools = useMonoTools();
-  const desktop = usePairing()?.desktop.fingerprint;
+  const desktop = useConnection().pairing?.desktop.fingerprint;
   // Its replies are seen as they arrive while its chat is in front, unless
   // it was just marked unread: that holds until the chat is left.
   const focused = useIsFocused();
@@ -90,6 +91,17 @@ export default function MonoScreen() {
       Alert.alert("Couldn’t do that", reason instanceof Error ? reason.message : String(reason));
     }
   };
+  // Back to the project it was opened from, as a session goes back to its
+  // own; the drawer still opens with a swipe from the left edge.
+  const leave = () => {
+    if (!mono) return;
+    const mine = projects.filter((project) => mono.projectIds.includes(project.id));
+    const last = readLastPlace(desktop);
+    const target = homeProjectId(mine.length ? mine : projects, [], last);
+    if (target) router.replace({ pathname: "/project/[projectId]", params: { projectId: target } });
+    else if (router.canGoBack()) router.back();
+    else router.replace("/");
+  };
   if (!mono || !conversationId) return <Redirect href="/" />;
 
   return (
@@ -103,6 +115,7 @@ export default function MonoScreen() {
           ? () => router.push({ pathname: "/mono-profile/[monoId]", params: { monoId: mono.id } })
           : undefined,
       }}
+      back={{ label: "Back", onPress: leave }}
       // Without them, settings on the right, as on a project.
       action={tools ? undefined : { icon: "settings", label: "Settings", onPress: () => router.push("/settings") }}
       // Its details, a fresh start or deleting it, from ⋯ on the right.

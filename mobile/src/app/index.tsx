@@ -1,5 +1,5 @@
 import { Redirect, router } from "expo-router";
-import { usePairing } from "@/features/connection/ConnectionProvider";
+import { useConnection } from "@/features/connection/ConnectionProvider";
 import { homeProjectId, readLastPlace } from "@/features/workspace/lastPlace";
 import { Pressable, Text, View } from "react-native";
 import { useWorkspace } from "@/features/workspace/WorkspaceProvider";
@@ -13,7 +13,7 @@ export default function Index() {
   const home = homeProjectId(
     projects,
     monos,
-    readLastPlace(usePairing()?.desktop.fingerprint),
+    readLastPlace(useConnection().pairing?.desktop.fingerprint),
   );
   if (home)
     return (

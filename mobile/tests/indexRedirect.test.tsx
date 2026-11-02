@@ -22,7 +22,7 @@ vi.mock("react-native", () => ({
   Pressable: ({ children }: { children?: ReactNode }) => <button>{children}</button>,
 }));
 vi.mock("@/features/connection/ConnectionProvider", () => ({
-  usePairing: () => ({ desktop: { fingerprint: "desk" } }),
+  useConnection: () => ({ pairing: { desktop: { fingerprint: "desk" } } }),
 }));
 vi.mock("@/features/connection/ConnectScreen", () => ({
   useConnectionStyles: () => ({ screen: {}, title: {}, subtitle: {}, primary: {}, primaryLabel: {} }),

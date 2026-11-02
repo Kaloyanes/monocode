@@ -5,7 +5,6 @@ import ReanimatedSwipeable, {
 } from "react-native-gesture-handler/ReanimatedSwipeable";
 import Animated, { type EntryOrExitLayoutType, type SharedValue } from "react-native-reanimated";
 
-import { AgentDots } from "@/features/orchestration/AgentDots";
 import { PixelMascot } from "@/features/mascots/PixelMascot";
 import { relativeTime } from "@/features/workspace/relativeTime";
 import type { SessionSummary } from "@/features/workspace/types";

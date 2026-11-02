@@ -6,7 +6,7 @@ const app = vi.hoisted(() => ({ unreadMonos: new Set<string>() }));
 vi.mock("react-native", () => ({ View: () => null }));
 vi.mock("@/ui/theme", () => ({ themedStyles: () => () => ({}) }));
 vi.mock("@/features/connection/ConnectionProvider", () => ({
-  usePairing: () => ({ desktop: { fingerprint: "desk" } }),
+  useConnection: () => ({ pairing: { desktop: { fingerprint: "desk" } } }),
 }));
 vi.mock("@/features/workspace/WorkspaceProvider", () => ({ useWorkspace: () => ({ monos: [] }) }));
 vi.mock("@/features/workspace/monoSeen", () => ({ useUnreadMonos: () => app.unreadMonos }));
