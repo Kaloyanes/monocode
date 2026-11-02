@@ -4,7 +4,6 @@ mod avatar;
 mod media;
 pub use media::phone_image;
 pub use media::png as media_png;
-pub use media::{image_bytes as media_image_bytes, is_image_url, phone_image};
 pub mod azure_devops;
 pub use avatar::png as avatar_png;
 mod github;
@@ -1486,6 +1485,92 @@ mod author_tests {
         assert_eq!(authors(&[ME, "octocat"]).fetch_author(), None);
         assert_ne!(scope(authors(&[ME])), scope(authors(&[])));
         assert_eq!(scope(authors(&[ME, "octocat"])), scope(authors(&[])));
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn links_to_github_and_linear_issues_are_recognised() {
+        assert!(matches!(
+            link_target("https://github.com/acme/app/pull/12/files"),
+            Some(LinkTarget::GitHub(work)) if work.number == 12 && work.kind == "pr"
+        ));
+        assert_eq!(
+            link_target("https://linear.app/acme/issue/eng-42/fix-the-thing"),
+            Some(LinkTarget::Linear("ENG-42".into()))
+        );
+        assert_eq!(
+            link_target("HTTPS://linear.app/acme/issue/ENG-7?x=1#c"),
+            Some(LinkTarget::Linear("ENG-7".into()))
+        );
+        for other in [
+            "https://linear.app/acme/project/roadmap",
+            "https://linear.app/acme/issue/not-a-number",
+            "https://linear.app/acme/issue/ENG",
+            "https://example.com/?u=https://linear.app/acme/issue/ENG-1",
+            "https://github.com/acme/app",
+            "ENG-42",
+        ] {
+            assert_eq!(link_target(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_link_finds_its_listed_item_for_every_provider() {
+        let item =
+            |provider: &str, kind: &str, repo: &str, identifier: &str, number, url: &str| Item {
+                provider: provider.into(),
+                kind: kind.into(),
+                repo: repo.into(),
+                identifier: identifier.into(),
+                number,
+                url: url.into(),
+                ..Default::default()
+            };
+        let items = vec![
+            item(
+                "github",
+                "pr",
+                "acme/app",
+                "",
+                12,
+                "https://github.com/acme/app/pull/12",
+            ),
+            item(
+                "linear",
+                "linear",
+                "ENG",
+                "ENG-42",
+                42,
+                "https://linear.app/acme/issue/ENG-42/x",
+            ),
+            item(
+                "jira",
+                "issue",
+                "",
+                "KEY-5",
+                5,
+                "https://acme.atlassian.net/browse/KEY-5",
+            ),
+        ];
+        let found = |url| find_linked(&items, url).map(|item| item.provider.as_str());
+        assert_eq!(
+            found("https://github.com/Acme/App/pull/12/files"),
+            Some("github")
+        );
+        assert_eq!(found("https://github.com/acme/app/issues/12"), None);
+        assert_eq!(
+            found("https://linear.app/acme/issue/eng-42"),
+            Some("linear")
+        );
+        assert_eq!(
+            found("https://acme.atlassian.net/browse/KEY-5/"),
+            Some("jira")
+        );
+        assert_eq!(found("https://acme.atlassian.net/browse/KEY-6"), None);
     }
 }
 
