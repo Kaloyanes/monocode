@@ -45,6 +45,8 @@ impl Conversation {
         self.install_transfer(settings, None, cx);
         if send {
             self.apply_draft_action(true, cx);
+        } else {
+            self.adopt_saved_draft(cx);
         }
         cx.emit(SessionChanged);
     }

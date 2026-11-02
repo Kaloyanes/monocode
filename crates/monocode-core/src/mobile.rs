@@ -4,11 +4,14 @@
 mod apns;
 pub mod catalog;
 pub mod host;
-mod notify;
+pub mod inbox;
+pub mod notify;
 mod router;
 pub mod watch;
 
 pub use apns::ApnsKey;
-pub use host::{Device, Event, Invite, MobileHost, Push, Request, Status, WatchStart};
+pub use host::{
+    Device, Event, Invite, MobileHost, Push, Request, Status, TerminalStart, WatchStart,
+};
 pub use monocode_mobile_link::Address;
 pub use notify::{LiveTarget, PushTarget};

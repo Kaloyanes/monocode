@@ -39,7 +39,7 @@ impl Shell {
         Ok(())
     }
 
-    fn thread_status(&self, id: i64, cx: &App) -> Value {
+    pub(super) fn thread_status(&self, id: i64, cx: &App) -> Value {
         let metadata = self.session_metadata(id, cx);
         let view = self.sessions.get(&id).map(|v| v.read(cx));
         let waiting = view.and_then(|v| v.mobile_waiting(cx));
@@ -228,12 +228,17 @@ impl Shell {
         .detach();
     }
 
-    fn set_thread_archived(&mut self, id: i64, archived: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_thread_archived(&mut self, id: i64, archived: bool, cx: &mut Context<Self>) {
         if let Some(summary) = self.session_summaries.get_mut(&id) {
             summary.archived = archived;
         }
         if let Some(view) = self.sessions.get(&id) {
-            view.update(cx, |session, _| session.summary.archived = archived);
+            view.update(cx, |session, cx| {
+                session.summary.archived = archived;
+                if archived {
+                    session.cancel_usage_resume(cx);
+                }
+            });
         }
         self.refresh_session_mark(id, cx);
     }

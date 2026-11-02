@@ -264,6 +264,11 @@ impl Shell {
                 SettingsEvent::MobilePair => this.pair_mobile(cx),
                 SettingsEvent::MobileCancelInvite => this.mobile_cancel_invite(cx),
                 SettingsEvent::MobileRevoke(id) => this.mobile_revoke(id, cx),
+                SettingsEvent::MobileTerminal(allowed) => this.mobile_set_terminal(*allowed, cx),
+                SettingsEvent::MobileKillTerminal(id) => {
+                    this.mobile.terminals.kill(id);
+                    this.sync_settings(cx);
+                }
                 SettingsEvent::MobilePushKey(key) => this.mobile_set_push_key(key.clone(), cx),
             },
         ));

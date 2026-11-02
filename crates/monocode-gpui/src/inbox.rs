@@ -522,6 +522,11 @@ impl Inbox {
         cx.notify();
     }
 
+    /// The item on screen, whether or not the list holds it.
+    pub(crate) fn shown(&self) -> Option<Item> {
+        self.item()
+    }
+
     /// Whether the Inbox is the view on screen.
     pub(crate) fn is_active(&self) -> bool {
         self.active

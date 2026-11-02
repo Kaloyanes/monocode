@@ -28,9 +28,16 @@ impl Conversation {
         mode: Option<&'static str>,
         attachments: Vec<std::path::PathBuf>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
         if self.driven_by.is_some() {
-            return;
+            return Ok(());
+        }
+        let (mode, prompt) = match mode {
+            Some(mode) => (Some(mode), prompt),
+            None => split_mode_command(prompt),
+        };
+        if self.is_remote() && matches!(mode, Some("operator" | "orchestrator")) {
+            return Err("This mode is not available on remote projects.".into());
         }
         if !self.history_ready() {
             self.defer_history_action(
@@ -162,22 +169,37 @@ impl Conversation {
             .collect()
     }
 
-    /// The first approval it waits on, or else the first question, with how
-    /// many of that kind there are.
-    pub(crate) fn mobile_request(&self, cx: &gpui::App) -> Option<crate::mobile::catalog::Request> {
-        let inputs = self.pending_notification_inputs(cx);
-        let kind = if inputs.iter().any(|input| input.kind == InputKind::Approval) {
-            InputKind::Approval
-        } else {
-            InputKind::Question
-        };
-        let mut matching = inputs.into_iter().filter(|input| input.kind == kind);
-        let first = matching.next()?;
-        Some(crate::mobile::catalog::Request {
-            id: first.request_id,
-            label: first.label,
-            count: 1 + matching.count(),
+    /// The question the agent waits on, as the phone's `QuestionPrompt`; null
+    /// for none. Only the first: the desktop answers its questions in order.
+    pub(crate) fn mobile_question(&self, cx: &gpui::App) -> Value {
+        self.questions.front().map_or(Value::Null, |(card, _)| {
+            question_prompt(card.read(cx).request())
         })
+    }
+
+    /// A phone's reply to the question it was shown, or with no reply its ask
+    /// to keep a timed question open while it is answered. Goes through the
+    /// card, so it is sent and cleared just as one given on the desktop.
+    pub(crate) fn mobile_answer_question(
+        &mut self,
+        request_id: u64,
+        reply: Option<&Value>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let card = self
+            .questions
+            .front()
+            .map(|(card, _)| card.clone())
+            .filter(|card| question_request_id(card.read(cx).id()) == request_id)
+            .ok_or("This question was already answered")?;
+        match reply {
+            None => card.update(cx, |card, cx| card.keep_open(cx)),
+            Some(reply) => {
+                let answers = question_answers(card.read(cx).request(), reply)?;
+                card.update(cx, |card, cx| card.reply(answers, cx));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn mobile_waiting(&self, cx: &gpui::App) -> Option<Waiting> {

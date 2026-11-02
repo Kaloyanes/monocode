@@ -59,8 +59,14 @@ const APP_METHODS: &[&str] = &[
     "session.rename",
     "session.delete",
     "session.archive",
+    "session.unarchive",
     "orchestration.read",
     "orchestration.action",
+    "draft.read",
+    "draft.frame",
+    "draft.action",
+    "composer.read",
+    "composer.write",
     "mono.document",
     "mono.profile",
     "mono.update",
@@ -118,6 +124,12 @@ struct Config {
     /// The user's APNs key, for Live Activity pushes. None leaves them off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     apns: Option<ApnsKey>,
+    /// Paired phones may open a shell in a project. On unless turned off.
+    #[serde(default = "on")]
+    terminal: bool,
+}
+fn on() -> bool {
+    true
 }
 impl Default for Config {
     fn default() -> Self {
@@ -127,6 +139,7 @@ impl Default for Config {
             remote_address: String::new(),
             devices: Vec::new(),
             apns: None,
+            terminal: true,
         }
     }
 }
@@ -299,34 +312,18 @@ fn unavailable<T>(_: T) -> String {
 
 /// `{"token": "ExponentPushToken[…]", "disabled": [category…]}`, or a null
 /// token to stop notifying the phone.
-fn push_registration(params: &Value) -> Result<Option<PushRegistration>, String> {
-    let token = match &params["token"] {
-        Value::Null => return Ok(None),
-        Value::String(token) => token,
-        _ => return Err("Invalid push token".into()),
-    };
-    let valid = token.len() <= 256
-        && token.ends_with(']')
-        && (token.starts_with("ExponentPushToken[") || token.starts_with("ExpoPushToken["));
-    if !valid {
-        return Err("Invalid push token".into());
-    }
-    let disabled = params["disabled"]
+fn push_registration(params: &Value) -> Result<Option<PushTarget>, String> {
+    let disabled: Vec<&str> = params["disabled"]
         .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|value| value.len() <= 64)
-                .take(16)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(Some(PushRegistration {
-        token: token.clone(),
-        disabled,
-    }))
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let categories: Vec<&str> = super::notify::CATEGORIES
+        .into_iter()
+        .filter(|id| !disabled.contains(id))
+        .collect();
+    PushTarget::from_params(&json!({"token": params["token"], "categories": categories}))
 }
 
 impl MobileHost {
@@ -437,6 +434,7 @@ impl MobileHost {
                 remote_address: remote_address.into(),
                 devices: inner.config.devices.clone(),
                 apns: inner.config.apns.clone(),
+                terminal: inner.config.terminal,
             };
             self.save(&config)?;
             inner.config = config;
@@ -476,6 +474,69 @@ impl MobileHost {
         inner.apns = client.map(Arc::new);
         inner.apns_error = None;
         Ok(())
+    }
+
+    /// The push tokens of paired phones that take `category`.
+    pub fn push_tokens(&self, category: &str) -> Vec<String> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        if !inner.config.enabled {
+            return Vec::new();
+        }
+        inner
+            .config
+            .devices
+            .iter()
+            .filter_map(|device| device.push.as_ref())
+            .filter(|push| push.categories.iter().any(|on| on == category))
+            .map(|push| push.token.clone())
+            .collect()
+    }
+
+    /// Drops tokens Expo says no longer reach a phone, as when the app was
+    /// removed; the phone registers again the next time it connects.
+    pub fn forget_push_tokens(&self, tokens: &[String]) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(unavailable)?;
+        let mut config = inner.config.clone();
+        let mut changed = false;
+        for device in &mut config.devices {
+            if device
+                .push
+                .as_ref()
+                .is_some_and(|push| tokens.contains(&push.token))
+            {
+                device.push = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save(&config)?;
+            inner.config = config;
+        }
+        Ok(())
+    }
+
+    /// Allows or refuses shells for every paired phone. Turning terminals off
+    /// ends the open ones.
+    pub fn set_terminal(&self, allowed: bool) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(unavailable)?;
+        let mut config = inner.config.clone();
+        config.terminal = allowed;
+        self.save(&config)?;
+        inner.config = config;
+        if !allowed {
+            inner.watches.retain(|_, watch| !watch.terminal);
+            self.close_terminals(None);
+        }
+        Ok(())
+    }
+
+    /// Tells the app to close the shells of a device, or all of them. The
+    /// host also refuses their requests, so a lost event leaves a shell no
+    /// phone can reach; the app ends it when it idles out.
+    fn close_terminals(&self, device_id: Option<String>) {
+        let _ = self.events.try_send(Event::TerminalsClosed(device_id));
     }
 
     /// One visible invitation at a time; a new one revokes the last.

@@ -519,7 +519,15 @@ impl Shell {
             let Entry::Session(id) = entry else {
                 continue;
             };
-            let label = age_label(self.session_metadata(*id, cx).summary.updated_at, now);
+            if fresh.contains(id) {
+                continue;
+            }
+            let summary = self.session_metadata(*id, cx).summary;
+            let label = if archived_listed && summary.archived {
+                "Archived"
+            } else {
+                age_label(summary.updated_at, now)
+            };
             if previous != Some(label) {
                 rows.push(Row::Heading { label, first });
                 previous = Some(label);

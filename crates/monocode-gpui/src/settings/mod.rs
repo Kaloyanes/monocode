@@ -151,6 +151,10 @@ pub(crate) enum SettingsEvent {
     MobilePair,
     MobileCancelInvite,
     MobileRevoke(String),
+    /// Allow or refuse a shell from any paired phone.
+    MobileTerminal(bool),
+    /// End one shell a phone has open.
+    MobileKillTerminal(String),
     /// Use this APNs key for Live Activity pushes, or stop.
     MobilePushKey(Option<monocode_core::mobile::ApnsKey>),
 }
@@ -332,11 +336,20 @@ impl SettingsView {
             input.set_font_size(12.);
             input
         });
+        let model_filter = cx.new(|cx| {
+            let mut input = Input::field("Filter models", "Filter models", content(0.35), cx);
+            input.set_font_size(12.);
+            input
+        });
         let mut subscriptions = vec![
             cx.subscribe(&select_filter, |this, input, _: &input::Changed, cx| {
                 this.select_query = input.read(cx).content.to_string();
                 this.select_active = 0;
                 this.select_scroll.scroll_to_item(0);
+                cx.notify();
+            }),
+            cx.subscribe(&model_filter, |this, input, _: &input::Changed, cx| {
+                this.model_query = input.read(cx).content.to_string();
                 cx.notify();
             }),
             cx.subscribe(&skill_filter, |this, input, _: &input::Changed, cx| {

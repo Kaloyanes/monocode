@@ -109,6 +109,9 @@ pub struct Settings {
     /// subagent starts as a MonoCode thread.
     #[serde(skip)]
     pub monocode_subagents_only: bool,
+    /// The objective of the thread's unfinished `/goal`, from its transcript.
+    #[serde(skip)]
+    pub goal: Option<String>,
     #[serde(skip)]
     pub environment: std::collections::HashMap<String, String>,
     #[serde(skip)]

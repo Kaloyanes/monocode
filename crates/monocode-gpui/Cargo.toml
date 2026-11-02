@@ -29,6 +29,9 @@ alacritty_terminal = "0.26"
 portable-pty = { version = "0.9", path = "../../vendor/portable-pty" }
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
+# Chromium for drafts is downloaded on demand and checked against its hash.
+ureq = "2.12"
+sha2 = "0.10"
 rquickjs = "0.14.0"
 # The file editor's native syntax: incremental parses, highlights, folds and
 # syntax errors. Languages without a grammar here use the QuickJS fallback.

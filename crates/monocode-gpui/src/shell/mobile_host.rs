@@ -1,6 +1,8 @@
 //! A paired phone browses and drives this workspace. The core host pairs and
 //! serves devices; the shell answers their requests from its own state, through
 //! the same paths as the sidebar, composer and Changes panel.
+mod composer;
+mod drafts;
 mod inbox;
 
 use super::*;
@@ -16,7 +18,9 @@ use crate::{
 use gpui::{EntityId, Task};
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
-    mobile::{Event, Invite, MobileHost, Push, Request, Status, TerminalStart, WatchStart, watch},
+    mobile::{
+        Event, Invite, MobileHost, Push, Request, Status, TerminalStart, WatchStart, notify, watch,
+    },
     transcript::Row,
 };
 use serde_json::{Value, json};
@@ -326,6 +330,19 @@ impl Shell {
         self.sync_settings(cx);
     }
 
+    pub(super) fn mobile_set_terminal(&mut self, allowed: bool, cx: &mut Context<Self>) {
+        if let Some(host) = &self.mobile.host
+            && let Err(error) = host.set_terminal(allowed)
+        {
+            self.error = Some(format!("Mobile access: {error}"));
+        }
+        // Turning it off ends the open shells; the host says so with an event.
+        if !allowed {
+            self.mobile.terminals.close_for(None);
+        }
+        self.sync_settings(cx);
+    }
+
     pub(super) fn mobile_invite(&mut self, cx: &mut Context<Self>) {
         let Some(host) = self.mobile.host.clone() else {
             return;
@@ -626,6 +643,9 @@ impl Shell {
                 if let Some(lead) = lead {
                     session["leadId"] = json!(lead);
                 }
+                if let Some(mono) = origins.get(&entry.id) {
+                    session["monoId"] = json!(mono);
+                }
                 sessions.push(session);
             }
             sessions.sort_by_key(|s| std::cmp::Reverse(s["updatedAt"].as_u64()));
@@ -802,10 +822,18 @@ impl Shell {
                 request.reply(Ok(project::file_highlight(&job, from)));
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
+            "session.commands" => self.mobile_commands(request, cx),
             "orchestration.read" => {
                 let result = self.mobile_orchestration(&request.params, cx);
                 request.reply(result);
             }
+            "draft.read" => self.mobile_draft_read(request, window, cx),
+            "draft.frame" => self.mobile_draft_frame(request, window, cx),
+            "composer.read" => self.mobile_composer_read(request, cx),
+            method if method.starts_with("inbox.") && method != "inbox.start" => {
+                self.mobile_inbox(request, window, cx)
+            }
+            method if method.starts_with("terminal.") => self.mobile_terminal_request(request, cx),
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }
@@ -1643,6 +1671,8 @@ impl Shell {
             ("orchestration.action", Target::Mono(_)) => {
                 Err("A Mono's conversation has no orchestration".into())
             }
+            ("draft.action", _) => self.mobile_draft_action(params, window, cx),
+            ("composer.write", _) => self.mobile_composer_write(params, cx),
             ("session.answerQuestion" | "session.keepQuestionOpen", target) => {
                 let view = match target {
                     Target::Session(id) => self.sessions.get(id).cloned(),
@@ -1740,7 +1770,10 @@ impl Shell {
                         if view.read(cx).driven_by.is_some() {
                             return Err("A subagent is driven by its lead".into());
                         }
-                        view.update(cx, |v, cx| v.mobile_submit(text, attachments, cx));
+                        view.update(cx, |v, cx| {
+                            v.clear_composer_text_sent_from_phone(&text, draft_rev, cx);
+                            v.mobile_submit(text, mode, attachments, cx)
+                        })?;
                         this.mobile.started.insert(*id);
                         Ok(())
                     }
@@ -2005,7 +2038,7 @@ impl Shell {
         }
         cx.background_executor()
             .spawn(async move {
-                match notify::send(&tokens, &notice) {
+                match notify::send_notice(&tokens, &notice) {
                     Ok(gone) if !gone.is_empty() => {
                         let _ = host.forget_push_tokens(&gone);
                     }

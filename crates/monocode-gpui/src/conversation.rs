@@ -20,6 +20,8 @@ mod notifications;
 mod open_pr;
 mod remote;
 pub(crate) mod remote_plans;
+mod restart;
+mod shell;
 mod response_menu;
 pub(crate) mod subagents;
 #[cfg(test)]
@@ -175,6 +177,8 @@ pub(crate) struct Conversation {
     app_environment: std::collections::HashMap<String, String>,
     /// The running turn's policy, independent of the next composer's mode.
     pub(crate) app_read_only: bool,
+    /// The newest turn ran in Plan mode, so its answer is a plan to review.
+    pub(crate) plan_turn: bool,
     /// The running turn prepares an orchestration plan.
     planning_orchestration: bool,
     /// The plan under review, with the tool call that submitted it (none for
@@ -954,7 +958,7 @@ impl Conversation {
         if self.driven_by.is_some() {
             return;
         }
-        if self.is_remote() && self.remote_send_guard(cx) {
+        if self.is_remote() && self.remote_send_guard(false, cx) {
             return;
         }
         if self.needs_history_restore() {
@@ -1679,11 +1683,18 @@ impl Conversation {
                                 } else {
                                     this.finish_orchestration_plan(cx);
                                 }
-                            });
-                            if stopping {
-                                this.planning_orchestration = false;
-                            } else {
-                                this.finish_orchestration_plan(cx);
+                                this.settings.turns = this.transcript.read(cx).window_turns();
+                                this.save_settings(cx);
+                                this.refresh_git(cx);
+                                this.after_turn_for_network(stopping, cx);
+                                this.run_history_actions(cx);
+                                this.mono_flush_external(cx);
+                                cx.emit(SessionChanged);
+                            } else if incoming_notification_input
+                                || mono_queue_changed
+                                || needed_approval != this.needs_approval()
+                            {
+                                cx.emit(SessionChanged);
                             }
                             this.pump_follow_ups(cx);
                             cx.notify();
@@ -3000,9 +3011,7 @@ impl Conversation {
             return self.thread_composer(cx);
         }
         let radius = COMPOSER_RADIUS;
-        let command = if self.follow_ups.draft_selected {
-            Some(input::Command::Draft)
-        } else if self.settings.orchestrator {
+        let command = if self.settings.orchestrator {
             Some(input::Command::Orchestrator)
         } else if self.settings.plan {
             Some(input::Command::Plan)
@@ -3074,6 +3083,7 @@ impl Conversation {
             .children(self.model_list_popover(cx))
             .children(self.orchestration_card(cx))
             .children(if self.is_remote() { None } else { self.usage_notice(false, cx) })
+            .children(self.goal_shelf(cx))
             .children(self.subagent_strip(cx))
             .child(self.background_shelf(window, cx))
             .children(self.shell_queue(cx))

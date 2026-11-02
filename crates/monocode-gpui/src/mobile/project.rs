@@ -496,14 +496,13 @@ pub(crate) fn git_action(
             Ok(json!({ "message": message }))
         }
         "plan" => {
-            let (kind, binary) =
-                harness().ok_or("No provider CLI is installed to plan commits.")?;
+            let harness =
+                harness(&models.commit).ok_or("No provider CLI is installed to plan commits.")?;
             let index = scm::diff_index(root)?;
             if index.files.is_empty() {
                 return Err("No changes to commit.".into());
             }
-            let plan =
-                crate::changes::generate_commit_plan(kind, binary, root.to_path_buf(), &index)?;
+            let plan = crate::changes::generate_commit_plan(harness, root.to_path_buf(), &index)?;
             let commits = plan
                 .into_iter()
                 .map(|commit| {
@@ -1156,12 +1155,17 @@ mod tests {
         assert_eq!(status["remote"], false);
         assert_eq!(status["canGenerate"], true);
 
-        git_action(root, &json!({ "action": "stageAll" })).unwrap();
+        git_action(
+            root,
+            &json!({ "action": "stageAll" }),
+            &TextModels::default(),
+        )
+        .unwrap();
         assert_eq!(
             changes(root, None, None, None).unwrap()["files"][0]["staged"],
             true
         );
-        assert!(git_action(root, &json!({ "action": "nope" })).is_err());
+        assert!(git_action(root, &json!({ "action": "nope" }), &TextModels::default()).is_err());
         assert!(resolve_root(root, Some("/not/a/worktree")).is_err());
         assert_eq!(worktrees(root).unwrap()["worktrees"], json!([]));
     }
@@ -1214,7 +1218,12 @@ mod tests {
             { "message": "Add a", "paths": ["a.rs"] },
             { "message": "Add b and c", "paths": ["b.rs", "c.rs"] },
         ]);
-        let done = git_action(root, &json!({ "action": "commitPlan", "commits": plan })).unwrap();
+        let done = git_action(
+            root,
+            &json!({ "action": "commitPlan", "commits": plan }),
+            &TextModels::default(),
+        )
+        .unwrap();
         assert_eq!(done["committed"], 2);
         let log = |args: &[&str]| {
             let out = Command::new("git")
@@ -1236,10 +1245,18 @@ mod tests {
                 { "message": "Add d", "paths": ["d.rs"] },
                 { "message": "Add ghost", "paths": ["ghost.rs"] },
             ] }),
+            &TextModels::default(),
         )
         .unwrap_err();
         assert!(failed.starts_with("Made 1 of 2 commits."), "{failed}");
-        assert!(git_action(root, &json!({ "action": "commitPlan", "commits": [] }),).is_err());
+        assert!(
+            git_action(
+                root,
+                &json!({ "action": "commitPlan", "commits": [] }),
+                &TextModels::default()
+            )
+            .is_err()
+        );
     }
 
     /// A repo with `part.rs` partly staged, `kept.rs` staged and `new.rs`
@@ -1285,6 +1302,7 @@ mod tests {
                 { "message": "Add new", "paths": ["new.rs"] },
                 { "message": "  ", "paths": ["part.rs"] },
             ] }),
+            &TextModels::default(),
         )
         .unwrap_err();
         assert!(!failed.starts_with("Made"), "{failed}");
@@ -1317,6 +1335,7 @@ mod tests {
                 &json!({ "action": "commitPlan", "commits": [
                     { "message": "Change part, add new", "paths": ["part.rs", "new.rs"] },
                 ] }),
+                &TextModels::default(),
             )
             .is_err()
         );
@@ -1334,6 +1353,7 @@ mod tests {
             &json!({ "action": "commitPlan", "commits": [
                 { "message": "Add new", "paths": ["new.rs"] },
             ] }),
+            &TextModels::default(),
         )
         .unwrap();
         assert_eq!(done["committed"], 1);

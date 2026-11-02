@@ -1570,7 +1570,10 @@ fn run_operation(
                     "{\"mcpServers\":{}}",
                 ]);
             }
-            let mut allowed: Vec<&str> = Vec::new();
+            let visual_server = (!settings.text_only)
+                .then(|| crate::visual_bridge::mcp_server(&settings.environment))
+                .flatten();
+            let mut allowed = Vec::new();
             if !settings.text_only && settings.access == AccessMode::ReadOnly {
                 command.args(["--tools", "Read,Glob,Grep,Bash"]);
                 allowed.push("Read,Glob,Grep,Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(pwd),Bash(ls *),Bash(rg *)");
@@ -1584,12 +1587,7 @@ fn run_operation(
                 if let Some(instructions) =
                     crate::visual_bridge::instructions(&settings.environment, true)
                 {
-                    command.args(["--append-system-prompt", &guidance]);
-                }
-                if settings.monocode_subagents_only
-                    && crate::visual_bridge::lead_chat(&settings.environment)
-                {
-                    command.args(["--disallowedTools", "Agent"]);
+                    command.args(["--append-system-prompt", &instructions]);
                 }
                 if settings.monocode_subagents_only
                     && crate::visual_bridge::lead_chat(&settings.environment)

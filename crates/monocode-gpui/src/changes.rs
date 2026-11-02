@@ -1933,11 +1933,11 @@ pub(crate) fn generate_commit_message(
 /// A plan splitting every uncommitted file into commits, written by a
 /// read-only turn of `kind`. Blocking.
 pub(crate) fn generate_commit_plan(
-    kind: Kind,
-    binary: PathBuf,
+    harness: TextHarness,
     cwd: PathBuf,
     index: &scm::DiffIndex,
 ) -> Result<Vec<scm::PlannedCommit>, String> {
+    let label = harness.0.label();
     let files = index
         .files
         .iter()
@@ -1951,7 +1951,7 @@ pub(crate) fn generate_commit_plan(
         .join("\n");
     let prompt =
         scm::commit_plan_prompt(index.branch.as_deref(), &files, &scm::working_patch(&cwd)?);
-    let output = text_prompt(kind, binary, cwd, prompt, Arc::new(AtomicBool::new(false)))?;
+    let output = text_prompt(harness, cwd, prompt, Arc::new(AtomicBool::new(false)))?;
     let known = index
         .files
         .iter()
@@ -1960,7 +1960,7 @@ pub(crate) fn generate_commit_plan(
     scm::parse_commit_plan(&output, &known).ok_or_else(|| {
         format!(
             "Could not plan the commits. {} did not return a usable plan.",
-            kind.label()
+            label
         )
     })
 }
