@@ -436,6 +436,7 @@ impl Shell {
         }
         let work_item = self.work_item_badge(id, false, cx);
         let origin = self.archived_origin_badge(id, cx);
+        let mono_tile = self.origin_tile(id, 16., cx);
         let session = self.session_metadata(id, cx);
         let archived = session.summary.archived;
         let selected = self.selected_sessions.contains(&id);
@@ -546,6 +547,7 @@ impl Shell {
                     .when(session.summary.pinned, |d| {
                         d.child(icon("pin", 12.).text_color(content(0.45)))
                     })
+                    .children(mono_tile)
                     .child(title)
                     .when(!header, |d| {
                         d.child(

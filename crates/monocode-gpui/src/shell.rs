@@ -25,6 +25,7 @@ mod list_cascade;
 mod live_agents;
 mod mobile_host;
 pub(crate) mod mobile_terminal;
+mod mono_origin;
 mod mono_panes;
 pub(crate) mod monos;
 mod notifications;
@@ -6487,6 +6488,7 @@ impl Shell {
         }
         let work_item = self.work_item_badge(id, compact, cx);
         let origin = self.archived_origin_badge(id, cx);
+        let mono_tile = self.origin_tile(id, if compact { side } else { 18. }, cx);
         let has_badges = work_item.is_some()
             || origin.is_some()
             || mode.is_some()
@@ -6635,6 +6637,7 @@ impl Shell {
                         .items_center()
                         .gap(px(gap))
                         .child(mark)
+                        .children(mono_tile)
                         .child(title)
                         .when(has_badges, |d| d.child(badges))
                         .child(suffix),
@@ -6658,6 +6661,7 @@ impl Shell {
                         .when(pinned, |d| {
                             d.child(icon("pin", 12.).text_color(content(0.45)))
                         })
+                        .children(mono_tile)
                         .child(title)
                         .child(suffix),
                 )
