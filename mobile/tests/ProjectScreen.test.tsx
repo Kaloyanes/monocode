@@ -21,6 +21,9 @@ const desktop = vi.hoisted(() => ({
     headerBackVisible?: boolean;
   },
   existing: { path: "/repo/.worktrees/mobile", name: "feature/mobile" },
+  terminal: undefined as boolean | undefined,
+  toolbar: [] as { terminal?: boolean }[],
+  ship: [] as Array<{ enabled: boolean }>,
 }));
 
 vi.mock("react-native-svg", () => ({ default: () => <svg />, Path: () => null }));
@@ -118,6 +121,7 @@ vi.mock("@/features/connection/useProjectChanges", () => ({
   useProjectChanges: (_project: string, _enabled: boolean, path?: string) => ({
     result: { branch: path ? desktop.existing.name : "main", files: [] },
     error: null,
+    summary: { files: 0, staged: 0, additions: 0, deletions: 0 },
   }),
 }));
 vi.mock("@/features/connection/useProjectWorktrees", () => ({
@@ -198,7 +202,23 @@ vi.mock("@/features/sessions/SessionsPage", () => ({
 }));
 vi.mock("@/features/sessions/SessionToolbar", () => ({
   SessionTitle: () => null,
-  SessionToolbar: () => null,
+  SessionToolbar: (props: { terminal?: boolean }) => {
+    desktop.toolbar.push(props);
+    return null;
+  },
+}));
+vi.mock("@/features/terminal/TerminalSheet", () => ({ TerminalSheet: () => null }));
+vi.mock("@/features/terminal/TerminalActionsSheet", () => ({
+  TerminalActionsSheet: () => null,
+}));
+vi.mock("@/features/changes/ShipCard", () => ({
+  ShipCard: (props: { enabled: boolean }) => {
+    desktop.ship.push(props);
+    return null;
+  },
+}));
+vi.mock("@/features/connection/ConnectionProvider", () => ({
+  useConnection: () => ({ catalog: { terminal: desktop.terminal } }),
 }));
 vi.mock("@/features/sessions/Transcript", () => ({
   Transcript: () => null,
@@ -332,6 +352,9 @@ describe("new session composer workspace", () => {
     desktop.sendMessage.mockReset().mockResolvedValue(undefined);
     desktop.offline = false;
     desktop.os = "ios";
+    desktop.terminal = undefined;
+    desktop.toolbar = [];
+    desktop.ship = [];
     container = document.createElement("div");
     root = createRoot(container);
   });
@@ -382,6 +405,26 @@ describe("new session composer workspace", () => {
     expect(desktop.header.headerBackVisible).toBe(false);
     expect(desktop.header.headerTitle).toBeTypeOf("function");
     expect(desktop.header.headerRight).toBeTypeOf("function");
+  });
+
+  it("shows the ship card above an existing session's composer only", () => {
+    render("existing-session");
+    expect(desktop.ship.at(-1)?.enabled).toBe(true);
+    act(() => root.unmount());
+    root = createRoot(container);
+    desktop.ship = [];
+    render();
+    expect(desktop.ship).toEqual([]);
+  });
+
+  it("offers the terminal button only when the desktop says it allows one", () => {
+    render("existing-session");
+    expect(desktop.toolbar.at(-1)?.terminal).toBe(false);
+    act(() => root.unmount());
+    root = createRoot(container);
+    desktop.terminal = true;
+    render("existing-session");
+    expect(desktop.toolbar.at(-1)?.terminal).toBe(true);
   });
 
   it("switches to a new worktree from the composer and sends that choice", async () => {

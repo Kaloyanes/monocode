@@ -3,6 +3,7 @@ mod ffi;
 mod tls;
 mod transcript;
 mod transport;
+mod udp;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use p256::ecdsa::{
@@ -24,6 +25,21 @@ pub use transport::{
 pub type LinkResult<T> = Result<T, String>;
 pub const VERSION: u32 = 1;
 pub const PORT: u16 = 38416;
+/// The port the desktop listens on. A debug build takes the next one up, so a
+/// development desktop and the installed app can both accept phones;
+/// `MONOCODE_MOBILE_PORT` picks another.
+pub fn port() -> u16 {
+    choose_port(
+        std::env::var("MONOCODE_MOBILE_PORT").ok().as_deref(),
+        cfg!(debug_assertions),
+    )
+}
+fn choose_port(chosen: Option<&str>, debug: bool) -> u16 {
+    chosen
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port >= 1024)
+        .unwrap_or(if debug { PORT + 1 } else { PORT })
+}
 pub const ALPN: &[u8] = b"monocode-mobile/1";
 /// Room for a message's attachments: the phone caps them at 24 MiB of base64.
 pub const REQUEST_LIMIT: usize = 32 * 1024 * 1024;
@@ -129,7 +145,7 @@ fn url_parts(value: &str) -> LinkResult<Address> {
         (
             host,
             if tail.is_empty() {
-                PORT
+                port()
             } else {
                 tail.strip_prefix(':')
                     .ok_or("Invalid port")?
@@ -141,7 +157,7 @@ fn url_parts(value: &str) -> LinkResult<Address> {
         let (host, port) = value.split_once(':').unwrap();
         (host, port.parse().map_err(|_| "Invalid port")?)
     } else {
-        (value, PORT)
+        (value, port())
     };
     if host.is_empty()
         || port == 0
@@ -179,6 +195,17 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_debug_build_listens_one_port_up_unless_told_otherwise() {
+        assert_eq!(choose_port(None, false), PORT);
+        assert_eq!(choose_port(None, true), PORT + 1);
+        assert_eq!(choose_port(Some("40000"), true), 40000);
+        assert_eq!(choose_port(Some(" 40000 "), false), 40000);
+        // Not a usable port: fall back rather than fail to listen.
+        for chosen in ["", "abc", "0", "80", "70000"] {
+            assert_eq!(choose_port(Some(chosen), false), PORT, "{chosen}");
+        }
+    }
     #[test]
     fn enrollment_proof_binds_both_device_and_invitation() {
         let device = Identity::generate().unwrap();

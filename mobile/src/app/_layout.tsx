@@ -15,6 +15,7 @@ import {
 } from "@/features/connection/ConnectionProvider";
 import { WorkspaceGate } from "@/features/connection/WorkspaceGate";
 
+import { SessionLiveActivity } from "@/features/liveActivity/SessionLiveActivity";
 import { SessionNotifications } from "@/features/notifications/SessionNotifications";
 import { SessionActivity } from "@/features/sessions/SessionActivity";
 import { SessionFrame } from "@/features/sessions/SessionScreen";
@@ -139,6 +140,7 @@ function LinkedWorkspace() {
   return (
     <WorkspaceProvider key={connection.pairing?.desktop.deviceId}>
       <SessionNotifications />
+      <SessionLiveActivity />
       <SessionActivity />
       <ScenePagerHost>
         <SessionFrame>
@@ -162,6 +164,8 @@ function LinkedWorkspace() {
             <Stack.Screen name="settings" options={screens.modal} />
             <Stack.Screen name="models" options={screens.modal} />
             <Stack.Screen name="changes" options={screens.changes} />
+            <Stack.Screen name="commit-plan" options={screens.changes} />
+            <Stack.Screen name="terminal" options={screens.changes} />
           </Stack>
         </SessionFrame>
       </ScenePagerHost>

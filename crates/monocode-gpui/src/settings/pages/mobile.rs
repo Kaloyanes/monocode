@@ -64,6 +64,7 @@ pub(in crate::settings) struct MobileState {
     qr: Option<(String, Arc<Qr>)>,
     poll: Option<Task<()>>,
     _remote_events: Vec<Subscription>,
+    pub(super) push_key: super::mobile_push::PushKeyState,
 }
 
 /// A QR code's modules, row by row, without the quiet zone.
@@ -340,6 +341,7 @@ impl SettingsView {
         };
         if !status.devices.is_empty() {
             page.push(self.mobile_access(&status, cx));
+            page.push(self.mobile_terminal(&status, cx));
         }
         page.push(self.mobile_devices(&status, showing, cx));
         if let Some(error) = &status.error {
@@ -367,6 +369,7 @@ impl SettingsView {
             );
         }
         page.extend(self.mobile_away(&status, cx));
+        page.extend(self.mobile_push_key(&status, cx));
         page
     }
 
@@ -505,6 +508,88 @@ impl SettingsView {
                 Some(description),
                 controls,
             ))
+            .into_any_element()
+    }
+
+    /// Whether paired phones may open a shell in a project, and the shells
+    /// they have open now.
+    fn mobile_terminal(&self, status: &Status, cx: &mut Context<Self>) -> AnyElement {
+        let description: SharedString = if status.terminal {
+            "Paired phones can open a terminal in your projects, as you could here.".into()
+        } else {
+            "Phones can’t open a terminal. Any that were open have been closed.".into()
+        };
+        let toggle = self.toggle(
+            "mobile-terminal",
+            "Allow terminal from phones",
+            status.terminal,
+            false,
+            cx,
+            |_, on, cx| cx.emit(SettingsEvent::MobileTerminal(on)),
+        );
+        let device_name = |id: &str| {
+            status
+                .devices
+                .iter()
+                .find(|device| device.id == id)
+                .map_or_else(|| "Phone".to_string(), |device| device.name.clone())
+        };
+        let open = self.ctx.mobile_terminals.clone();
+        div()
+            .mt_5()
+            .overflow_hidden()
+            .rounded_xl()
+            .border_1()
+            .border_color(content(0.1))
+            .bg(content(0.03))
+            .child(self.row(
+                None,
+                true,
+                "Allow terminal from phones",
+                Some(description),
+                vec![toggle],
+            ))
+            .children(open.into_iter().map(|shell| {
+                let id = shell.id.clone();
+                let detail = format!(
+                    "{} · {} · {}:{:02}{}",
+                    device_name(&shell.device),
+                    shell.name,
+                    shell.seconds / 60,
+                    shell.seconds % 60,
+                    if shell.ended { " · ended" } else { "" },
+                );
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(content(0.1))
+                    .child(icon("terminal", 16.).text_color(content(0.45)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(content(0.6))
+                            .child(detail),
+                    )
+                    .child(
+                        secondary_button(
+                            SharedString::from(format!("mobile-kill-{id}")),
+                            "Kill",
+                            false,
+                            false,
+                        )
+                        .child("Kill")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(SettingsEvent::MobileKillTerminal(id.clone()))
+                        })),
+                    )
+            }))
             .into_any_element()
     }
 
@@ -780,7 +865,7 @@ impl SettingsView {
                         ),
                 )
                 .child(paragraph(
-                    "Automatic mapping needs a public IP. Otherwise, forward UDP port 38416 to this desktop or use a VPN address. Set the address before making a pairing code.".into(),
+                    format!("Automatic mapping needs a public IP. Otherwise, forward UDP port {} to this desktop or use a VPN address. Set the address before making a pairing code.", monocode_core::mobile::port()).into(),
                 ))
                 .child(
                     div()

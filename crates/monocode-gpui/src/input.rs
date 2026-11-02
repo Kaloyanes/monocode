@@ -1952,7 +1952,7 @@ fn style_at(spans: &markdown::Spans, at: usize) -> markdown::Style {
 
 fn markdown_font(style: markdown::Style, base: &gpui::Font) -> gpui::Font {
     let mut font = if style.code {
-        gpui::font(crate::markdown::MONO)
+        gpui::font(crate::fonts::mono())
     } else {
         base.clone()
     };

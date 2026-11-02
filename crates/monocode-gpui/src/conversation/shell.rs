@@ -339,7 +339,7 @@ impl Conversation {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .font_family(crate::markdown::MONO)
+                            .font_family(crate::fonts::mono())
                             .text_size(px(12.))
                             .text_color(content(0.75))
                             .child(queued.command.clone()),

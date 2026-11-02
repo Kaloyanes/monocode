@@ -1,7 +1,7 @@
 //! Automatic NAT-PMP/UPnP UDP mapping so a phone can reach the desktop away
 //! from its network.
 use super::host::MobileHost;
-use monocode_mobile_link::{Address, PORT};
+use monocode_mobile_link::{Address, port as listening_port};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     time::{Duration, Instant},
@@ -108,7 +108,7 @@ fn nat_mapping(port: u16, lifetime: u32) -> Result<(Ipv4Addr, u16), String> {
         return Err("Router is behind another NAT. Add a reachable remote address.".into());
     }
     client
-        .send_port_mapping_request(natpmp::Protocol::UDP, PORT, port, lifetime)
+        .send_port_mapping_request(natpmp::Protocol::UDP, listening_port(), port, lifetime)
         .map_err(|e| e.to_string())?;
     let natpmp::Response::UDP(mapping) = response(&mut client)? else {
         return Err("Invalid NAT-PMP mapping".into());
@@ -116,7 +116,7 @@ fn nat_mapping(port: u16, lifetime: u32) -> Result<(Ipv4Addr, u16), String> {
     Ok((host, mapping.public_port()))
 }
 fn map() -> Result<Mapping, String> {
-    if let Ok((host, port)) = nat_mapping(PORT, 3600) {
+    if let Ok((host, port)) = nat_mapping(listening_port(), 3600) {
         return Ok(Mapping::NatPmp { port, host });
     }
     let mut search = igd_next::SearchOptions::default();
@@ -128,7 +128,7 @@ fn map() -> Result<Mapping, String> {
     }
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     socket.connect(gateway.addr).map_err(|e| e.to_string())?;
-    let local = SocketAddr::new(socket.local_addr().map_err(|e| e.to_string())?.ip(), PORT);
+    let local = SocketAddr::new(socket.local_addr().map_err(|e| e.to_string())?.ip(), listening_port());
     let port = gateway
         .add_any_port(
             igd_next::PortMappingProtocol::UDP,

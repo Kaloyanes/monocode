@@ -4,7 +4,6 @@
 use super::color;
 use crate::{
     diff_view::{expand_tabs, highlight_file},
-    markdown::MONO,
     right_panel::{DIFF_ADD, DIFF_DEL},
     syntax::{HighlightRequest, HighlightSpan},
     theme::content,
@@ -114,7 +113,7 @@ fn frame(key: &str, title: Option<&str>, lines: Vec<AnyElement>) -> AnyElement {
                 .py_2()
                 .flex()
                 .flex_col()
-                .font_family(MONO)
+                .font_family(crate::fonts::mono())
                 .text_size(px(CODE_SIZE))
                 .children(lines),
         )

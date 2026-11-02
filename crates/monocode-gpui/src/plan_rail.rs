@@ -350,7 +350,7 @@ impl PlanRail {
         let count = |s: String| {
             div()
                 .flex_shrink_0()
-                .font_family(crate::markdown::MONO)
+                .font_family(crate::fonts::mono())
                 .text_color(content(0.45))
                 .child(s)
         };

@@ -1,9 +1,11 @@
 //! A paired phone controls the workspace through the app that owns it. The
 //! host pairs devices, serves the link and checks every request; the app
 //! answers them from its own state. No arbitrary app commands are exposed.
+use super::apns::{self, ApnsError, ApnsKey};
 use super::catalog::{recent_sessions, session_page};
+use super::notify::{self, LiveTarget, PushTarget, SendError};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use monocode_mobile_link::{now, Address, Gate, Identity, WatchSink, PORT, VERSION};
+use monocode_mobile_link::{now, port, Address, Gate, Identity, WatchSink, VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -35,14 +37,25 @@ const APP_METHODS: &[&str] = &[
     "session.start",
     "conversation.send",
     "session.cancel",
+    "session.decide",
     "session.rename",
     "session.delete",
     "session.archive",
+];
+/// Methods on a shell the phone opened with `terminal.watch`. The host only
+/// forwards them while terminals are allowed; the app checks the shell is the
+/// device's own.
+const TERMINAL_METHODS: &[&str] = &[
+    "terminal.input",
+    "terminal.resize",
+    "terminal.close",
+    "terminal.actions.save",
 ];
 /// Under the phone's own wait, so it hears why rather than timing out.
 const REPLY_WAIT: Duration = Duration::from_secs(25);
 const MAX_PENDING: usize = 16;
 const MAX_WATCHES_PER_DEVICE: usize = 4;
+const MAX_TERMINALS_PER_DEVICE: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +63,12 @@ pub struct Device {
     pub id: String,
     pub name: String,
     pub fingerprint: String,
+    /// Where the desktop sends this phone's alerts, once it has asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<PushTarget>,
+    /// Where Apple delivers its Live Activity pushes, once it has said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveTarget>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +80,15 @@ struct Config {
     remote_address: String,
     #[serde(default)]
     devices: Vec<Device>,
+    /// Paired phones may open a shell in a project. On unless turned off.
+    #[serde(default = "on")]
+    terminal: bool,
+    /// The user's APNs key, for Live Activity pushes. None leaves them off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    apns: Option<ApnsKey>,
+}
+fn on() -> bool {
+    true
 }
 impl Default for Config {
     fn default() -> Self {
@@ -69,6 +97,8 @@ impl Default for Config {
             open_router: true,
             remote_address: String::new(),
             devices: Vec::new(),
+            terminal: true,
+            apns: None,
         }
     }
 }
@@ -85,8 +115,14 @@ pub struct Status {
     pub open_router: bool,
     pub remote_address: String,
     pub router_status: String,
+    /// Whether paired phones may open a shell in a project.
+    pub terminal: bool,
     /// Why the service could not start, when it could not.
     pub error: Option<String>,
+    /// The APNs key sending Live Activity pushes, if one is set.
+    pub apns: Option<ApnsKey>,
+    /// Why the key can't send, when it can't.
+    pub apns_error: Option<String>,
 }
 
 /// A pairing code: `url` goes in the QR code and expires at `expires` (seconds).
@@ -102,6 +138,8 @@ pub struct Request {
     pub command_id: String,
     pub method: String,
     pub params: Value,
+    /// The paired device asking, as in [`Device::id`].
+    pub device_id: String,
     reply: oneshot::Sender<Result<Value, String>>,
 }
 impl Request {
@@ -130,10 +168,40 @@ impl WatchStart {
     }
 }
 
+/// A phone opens a shell in a project. The app starts it (or, with `shell`,
+/// reattaches to one the device already has), accepts with
+/// [`TerminalStart::accept`], then sends output frames with
+/// [`MobileHost::push`] until [`Event::WatchStop`] or [`Push::Gone`]. A shell
+/// outlives its watch, so a phone that was backgrounded can come back to it.
+pub struct TerminalStart {
+    /// This watch's ID, for [`MobileHost::push`] and [`Event::WatchStop`].
+    pub id: String,
+    pub device_id: String,
+    pub project_id: String,
+    /// A linked worktree of the project, when the phone is in one.
+    pub worktree: Option<String>,
+    /// The shell to reattach to.
+    pub shell: Option<String>,
+    /// The last output sequence the phone has, to resume after.
+    pub after: Option<u64>,
+    pub cols: u16,
+    pub rows: u16,
+    accept: oneshot::Sender<Result<(), String>>,
+}
+impl TerminalStart {
+    pub fn accept(self, result: Result<(), String>) {
+        let _ = self.accept.send(result);
+    }
+}
+
 pub enum Event {
     Request(Request),
     Watch(WatchStart),
+    Terminal(TerminalStart),
     WatchStop(String),
+    /// Close the shells of one device, or of every device when `None`:
+    /// terminals were turned off, or a phone was revoked or left.
+    TerminalsClosed(Option<String>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -150,6 +218,7 @@ struct Invitation {
 struct Watcher {
     peer: String,
     sink: WatchSink,
+    terminal: bool,
 }
 struct Inner {
     config: Config,
@@ -162,6 +231,20 @@ struct Inner {
     router_status: String,
     router_started: bool,
     error: Option<String>,
+    apns: Option<Arc<apns::Client>>,
+    apns_error: Option<String>,
+    /// When each session on the Live Activity began, in Unix seconds.
+    since: HashMap<String, u64>,
+    /// Devices sent a start push, until their new activity checks in.
+    starting: HashMap<String, std::time::Instant>,
+}
+
+struct LivePush {
+    device_id: String,
+    delivery: apns::Delivery,
+    payload: Value,
+    urgent: bool,
+    start: bool,
 }
 
 #[derive(Clone)]
@@ -194,6 +277,11 @@ impl MobileHost {
             gate.allow(device.fingerprint.clone(), None);
         }
         let enabled = config.enabled;
+        let (apns, apns_error) = match config.apns.as_ref().map(apns::Client::new) {
+            Some(Ok(client)) => (Some(Arc::new(client)), None),
+            Some(Err(error)) => (None, Some(error)),
+            None => (None, None),
+        };
         let (events, receiver) = async_channel::bounded(64);
         let host = Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -207,6 +295,10 @@ impl MobileHost {
                 router_status: "Off".into(),
                 router_started: false,
                 error: None,
+                apns,
+                apns_error,
+                since: HashMap::new(),
+                starting: HashMap::new(),
             })),
             gate,
             path,
@@ -237,7 +329,10 @@ impl MobileHost {
             open_router: inner.config.open_router,
             remote_address: inner.config.remote_address.clone(),
             router_status: inner.router_status.clone(),
+            terminal: inner.config.terminal,
             error: inner.error.clone(),
+            apns: inner.config.apns.clone(),
+            apns_error: inner.apns_error.clone(),
         }
     }
 
@@ -263,6 +358,8 @@ impl MobileHost {
                 open_router,
                 remote_address: remote_address.into(),
                 devices: inner.config.devices.clone(),
+                terminal: inner.config.terminal,
+                apns: inner.config.apns.clone(),
             };
             self.save(&config)?;
             inner.config = config;
@@ -276,6 +373,7 @@ impl MobileHost {
                 }
                 inner.invitations.clear();
                 inner.watches.clear();
+                self.close_terminals(None);
             }
         }
         if enabled {
@@ -286,6 +384,43 @@ impl MobileHost {
         }
         super::router::restart(self);
         Ok(())
+    }
+
+    /// Allows or refuses shells for every paired phone. Turning terminals off
+    /// ends the open ones.
+    pub fn set_terminal(&self, allowed: bool) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(unavailable)?;
+        let mut config = inner.config.clone();
+        config.terminal = allowed;
+        self.save(&config)?;
+        inner.config = config;
+        if !allowed {
+            inner.watches.retain(|_, watch| !watch.terminal);
+            self.close_terminals(None);
+        }
+        Ok(())
+    }
+
+    /// Sets the APNs key for Live Activity pushes, or clears it. A key that
+    /// can't load is refused, so Settings can say why.
+    pub fn set_apns(&self, key: Option<ApnsKey>) -> Result<(), String> {
+        let client = key.as_ref().map(apns::Client::new).transpose();
+        let mut inner = self.inner.lock().map_err(unavailable)?;
+        let client = client.inspect_err(|error| inner.apns_error = Some(error.clone()))?;
+        let mut config = inner.config.clone();
+        config.apns = key;
+        self.save(&config)?;
+        inner.config = config;
+        inner.apns = client.map(Arc::new);
+        inner.apns_error = None;
+        Ok(())
+    }
+
+    /// Tells the app to close the shells of a device, or all of them. The
+    /// host also refuses their requests, so a lost event leaves a shell no
+    /// phone can reach; the app ends it when it idles out.
+    fn close_terminals(&self, device_id: Option<String>) {
+        let _ = self.events.try_send(Event::TerminalsClosed(device_id));
     }
 
     /// One visible invitation at a time; a new one revokes the last.
@@ -329,6 +464,7 @@ impl MobileHost {
             self.gate.remove(&device.fingerprint);
             let peer = device.fingerprint.clone();
             inner.watches.retain(|_, watch| watch.peer != peer);
+            self.close_terminals(Some(device.id.clone()));
         }
         config.devices.retain(|device| device.id != device_id);
         self.save(&config)?;
@@ -344,8 +480,222 @@ impl MobileHost {
         {
             return Err("Invalid mobile catalog".into());
         }
-        self.inner.lock().map_err(unavailable)?.catalog = catalog;
+        let mut inner = self.inner.lock().map_err(unavailable)?;
+        let alerts = notify::alerts(&inner.catalog, &catalog);
+        // A Live Activity redraws when its sessions change; one that only
+        // drops a just-finished session has already shown it.
+        let activity = notify::activity(&inner.catalog, &catalog);
+        let changed = notify::activity(&inner.catalog, &inner.catalog)
+            != notify::activity(&catalog, &catalog);
+        inner.catalog = catalog;
+        if alerts.is_empty() && !changed {
+            return Ok(());
+        }
+        let live = if changed {
+            self.live_pushes(&mut inner, &activity)
+        } else {
+            Vec::new()
+        };
+        let apns = inner.apns.clone();
+        let messages: Vec<(String, Vec<Value>)> = inner
+            .config
+            .devices
+            .iter()
+            .filter_map(|device| {
+                let target = device.push.as_ref()?;
+                // Apple redraws the activity itself; no need to wake the app.
+                let pushed = apns.is_some()
+                    && device.live.as_ref().is_some_and(|live| {
+                        live.activity_token.is_some() || live.start_token.is_some()
+                    });
+                let mut messages: Vec<Value> = alerts
+                    .iter()
+                    .filter(|alert| target.categories.iter().any(|c| c == alert.category))
+                    .map(|alert| {
+                        let mut message = notify::message(&target.token, alert);
+                        // An alert wakes the app too, so it carries the
+                        // activity rather than spending a silent push.
+                        if target.activity && !pushed {
+                            message["_contentAvailable"] = json!(true);
+                            message["data"]["activity"] = activity.clone();
+                        }
+                        message
+                    })
+                    .collect();
+                if target.activity && changed && messages.is_empty() && !pushed {
+                    messages.push(notify::silent(&target.token, &activity));
+                }
+                (!messages.is_empty()).then(|| (device.id.clone(), messages))
+            })
+            .collect();
+        drop(inner);
+        let Some(runtime) = self.runtime.get() else {
+            return Ok(());
+        };
+        for (device_id, messages) in messages {
+            let host = self.clone();
+            runtime.spawn_blocking(move || match notify::send(&messages) {
+                Ok(()) => {}
+                Err(SendError::Unregistered) => host.forget_push(&device_id),
+                Err(SendError::Other(error)) => eprintln!("Mobile alert failed: {error}"),
+            });
+        }
+        if let Some(client) = apns {
+            for push in live {
+                let (host, client) = (self.clone(), client.clone());
+                runtime.spawn(async move {
+                    let result = client
+                        .send(&push.delivery, &push.payload, push.urgent)
+                        .await;
+                    host.delivered(&push, result);
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// The Live Activity pushes for this change: an update where an activity
+    /// runs, a start where none does, or an end once nothing works or waits.
+    fn live_pushes(&self, inner: &mut Inner, activity: &Value) -> Vec<LivePush> {
+        let now = monocode_mobile_link::now();
+        let shown: Vec<String> = activity
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| session["id"].as_str().map(str::to_owned))
+            .collect();
+        inner.since.retain(|id, _| shown.contains(id));
+        for id in &shown {
+            inner.since.entry(id.clone()).or_insert(now);
+        }
+        if inner.apns.is_none() {
+            return Vec::new();
+        }
+        let state = notify::live_state(activity, &inner.since);
+        let sessions = state["sessions"].as_array().cloned().unwrap_or_default();
+        let status = |session: &Value| session["status"].as_str().unwrap_or_default().to_owned();
+        let finished = !sessions.is_empty() && sessions.iter().all(|s| status(s) == "done");
+        let urgent = sessions
+            .iter()
+            .any(|s| matches!(status(s).as_str(), "approval" | "question"));
+        let desktop = name();
+        let mut pushes = Vec::new();
+        let mut ended = Vec::new();
+        for device in &inner.config.devices {
+            let Some(live) = &device.live else { continue };
+            let delivery = |token: &String| apns::Delivery {
+                token: token.clone(),
+                bundle_id: live.bundle_id.clone(),
+                sandbox: live.sandbox,
+            };
+            let (token, payload, start) = match (&live.activity_token, &live.start_token) {
+                (Some(token), _) if sessions.is_empty() || finished => {
+                    ended.push(device.id.clone());
+                    (token, apns::end(&state, finished, now), false)
+                }
+                (Some(token), _) => (token, apns::update(&state, now), false),
+                (None, Some(token)) if !sessions.is_empty() && !finished => {
+                    // One start at a time: the new activity checks in with
+                    // its own token, which the next change updates.
+                    let recent = inner
+                        .starting
+                        .get(&device.id)
+                        .is_some_and(|at| at.elapsed() < Duration::from_secs(90));
+                    if recent {
+                        continue;
+                    }
+                    let headline = &sessions[0];
+                    let title = headline["title"]
+                        .as_str()
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or("Session");
+                    let body = match status(headline).as_str() {
+                        "approval" => "Needs your approval",
+                        "question" => "Has a question for you",
+                        _ => "Working",
+                    };
+                    (
+                        token,
+                        apns::start(&desktop, &state, (title, body), now),
+                        true,
+                    )
+                }
+                _ => continue,
+            };
+            if start {
+                inner
+                    .starting
+                    .insert(device.id.clone(), std::time::Instant::now());
+            }
+            pushes.push(LivePush {
+                device_id: device.id.clone(),
+                delivery: delivery(token),
+                payload,
+                urgent,
+                start,
+            });
+        }
+        // An ended activity takes no more pushes; the next session starts one.
+        if !ended.is_empty() {
+            let mut config = inner.config.clone();
+            for device in &mut config.devices {
+                if let Some(live) = device.live.as_mut().filter(|_| ended.contains(&device.id)) {
+                    live.activity_token = None;
+                }
+            }
+            if self.save(&config).is_ok() {
+                inner.config = config;
+            }
+        }
+        pushes
+    }
+
+    fn delivered(&self, push: &LivePush, result: Result<(), ApnsError>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        match result {
+            Ok(()) => inner.apns_error = None,
+            Err(ApnsError::Other(error)) => {
+                eprintln!("Live Activity push failed: {error}");
+                inner.apns_error = Some(format!("Apple refused a push: {error}"));
+            }
+            Err(ApnsError::Unregistered) => {
+                let mut config = inner.config.clone();
+                let Some(live) = config
+                    .devices
+                    .iter_mut()
+                    .find(|v| v.id == push.device_id)
+                    .and_then(|device| device.live.as_mut())
+                else {
+                    return;
+                };
+                let token = if push.start {
+                    &mut live.start_token
+                } else {
+                    &mut live.activity_token
+                };
+                if token.as_deref() == Some(push.delivery.token.as_str()) {
+                    *token = None;
+                    if self.save(&config).is_ok() {
+                        inner.config = config;
+                    }
+                }
+            }
+        }
+    }
+
+    fn forget_push(&self, device_id: &str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let mut config = inner.config.clone();
+        if let Some(device) = config.devices.iter_mut().find(|v| v.id == device_id) {
+            device.push = None;
+        }
+        if self.save(&config).is_ok() {
+            inner.config = config;
+        }
     }
 
     /// The watch's next frame.
@@ -398,13 +748,13 @@ impl MobileHost {
             monocode_mobile_link::server_endpoint(
                 &identity,
                 self.gate.clone(),
-                format!("[::]:{PORT}").parse().unwrap(),
+                format!("[::]:{}", port()).parse().unwrap(),
             )
             .map_err(|error| {
                 // Another copy of the app (or the earlier desktop) holds the
                 // port; phones would reach it instead of this one.
                 if error.contains("in use") || error.contains("os error 48") {
-                    format!("Another MonoCode window or app is already accepting phone connections on port {PORT}. Quit it, then turn Accept connections off and on.")
+                    format!("Another MonoCode window or app is already accepting phone connections on port {}. Quit it, then turn Accept connections off and on.", port())
                 } else {
                     error
                 }
@@ -499,6 +849,8 @@ impl MobileHost {
             id: id.clone(),
             name,
             fingerprint: fingerprint.clone(),
+            push: None,
+            live: None,
         });
         self.save(&config)?;
         inner.config = config;
@@ -547,18 +899,48 @@ impl MobileHost {
                     inner.config = config;
                     self.gate.remove(peer);
                     inner.watches.retain(|_, watch| watch.peer != peer);
+                    self.close_terminals(Some(device.id.clone()));
+                    return Ok(Value::Null);
+                }
+                "device.activity" => {
+                    let mut config = inner.config.clone();
+                    if let Some(entry) = config.devices.iter_mut().find(|v| v.id == device.id) {
+                        let live = LiveTarget::merge(entry.live.take(), &params)?;
+                        if live.activity_token.is_some() {
+                            inner.starting.remove(&device.id);
+                        }
+                        entry.live = Some(live);
+                    }
+                    self.save(&config)?;
+                    inner.config = config;
+                    return Ok(Value::Null);
+                }
+                "device.notify" => {
+                    let push = PushTarget::from_params(&params)?;
+                    let mut config = inner.config.clone();
+                    if let Some(entry) = config.devices.iter_mut().find(|v| v.id == device.id) {
+                        entry.push = push;
+                    }
+                    self.save(&config)?;
+                    inner.config = config;
                     return Ok(Value::Null);
                 }
                 "workspace.list" => {
                     let mut catalog = inner.catalog.clone();
                     catalog["sessions"] = json!(recent_sessions(&catalog["sessions"]));
                     catalog["addresses"] = json!(addresses(&inner));
+                    // So the phone offers a terminal only where it will open.
+                    catalog["terminal"] = json!(inner.config.terminal);
                     return Ok(catalog);
                 }
                 "sessions.list" => return Ok(session_page(&inner.catalog["sessions"], &params)),
                 _ => {}
             }
-            if !APP_METHODS.contains(&method) {
+            if TERMINAL_METHODS.contains(&method) {
+                if !inner.config.terminal {
+                    return Err("Terminals are turned off on the desktop".into());
+                }
+            } else if !APP_METHODS.contains(&method) {
                 return Err("Unsupported mobile operation".into());
             }
             device
@@ -578,6 +960,7 @@ impl MobileHost {
                 command_id: format!("{}:{command_id}", device.id),
                 method: method.into(),
                 params,
+                device_id: device.id.clone(),
                 reply,
             }))
             .is_ok();
@@ -597,42 +980,58 @@ impl MobileHost {
         response
     }
 
-    /// A phone starts watching a conversation. The app sends its state, then
-    /// every change, until the phone goes or the watch is stopped.
+    /// A phone starts watching a conversation, or opens a terminal. The app
+    /// sends its state, then every change, until the phone goes or the watch
+    /// is stopped.
     async fn watch(&self, peer: &str, request: Value, sink: WatchSink) -> Result<(), String> {
         if request["version"] != VERSION {
             return Err("Update MonoCode on both devices".into());
         }
-        if request["method"] != "conversation.watch" {
-            return Err("Unsupported mobile operation".into());
-        }
+        let terminal = match request["method"].as_str() {
+            Some("conversation.watch") => false,
+            Some("terminal.watch") => true,
+            _ => return Err("Unsupported mobile operation".into()),
+        };
         let params = &request["params"];
-        let conversation = params["conversationId"]
-            .as_str()
-            .filter(|id| !id.is_empty() && id.len() <= 256)
-            .ok_or("Missing workspace item")?
-            .to_string();
+        let text = |key: &str| {
+            params[key]
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+                .map(String::from)
+        };
+        let conversation = if terminal {
+            String::new()
+        } else {
+            text("conversationId").ok_or("Missing workspace item")?
+        };
+        let project = if terminal {
+            text("projectId").ok_or("Missing project")?
+        } else {
+            String::new()
+        };
         let id = uuid::Uuid::new_v4().to_string();
+        let device_id;
         {
             let mut inner = self.inner.lock().map_err(unavailable)?;
             if !inner.config.enabled {
                 return Err("Mobile access disabled".into());
             }
-            if !inner
+            if terminal && !inner.config.terminal {
+                return Err("Terminals are turned off on the desktop".into());
+            }
+            device_id = inner
                 .config
                 .devices
                 .iter()
-                .any(|device| device.fingerprint == peer)
-            {
-                return Err("Device revoked or not paired".into());
-            }
+                .find(|device| device.fingerprint == peer)
+                .ok_or("Device revoked or not paired")?
+                .id
+                .clone();
             inner.watches.retain(|_, watch| !watch.sink.is_closed());
-            if inner
-                .watches
-                .values()
-                .filter(|watch| watch.peer == peer)
-                .count()
-                >= MAX_WATCHES_PER_DEVICE
+            let own = || inner.watches.values().filter(|watch| watch.peer == peer);
+            if own().count() >= MAX_WATCHES_PER_DEVICE
+                || (terminal
+                    && own().filter(|watch| watch.terminal).count() >= MAX_TERMINALS_PER_DEVICE)
             {
                 return Err("Desktop is busy; try again".into());
             }
@@ -641,21 +1040,36 @@ impl MobileHost {
                 Watcher {
                     peer: peer.into(),
                     sink: sink.clone(),
+                    terminal,
                 },
             );
         }
         let (accept, accepted) = oneshot::channel();
-        let start = Event::Watch(WatchStart {
-            id: id.clone(),
-            conversation_id: conversation,
-            tail: params["tail"].as_u64(),
-            from: params["from"]
-                .as_str()
-                .filter(|from| from.len() <= 256)
-                .map(Into::into),
-            incremental: params["incremental"] == true,
-            accept,
-        });
+        let start = if terminal {
+            Event::Terminal(TerminalStart {
+                id: id.clone(),
+                device_id,
+                project_id: project,
+                worktree: text("worktreePath"),
+                shell: text("shellId"),
+                after: params["after"].as_u64(),
+                cols: params["cols"].as_u64().unwrap_or(80).clamp(20, 400) as u16,
+                rows: params["rows"].as_u64().unwrap_or(24).clamp(5, 200) as u16,
+                accept,
+            })
+        } else {
+            Event::Watch(WatchStart {
+                id: id.clone(),
+                conversation_id: conversation,
+                tail: params["tail"].as_u64(),
+                from: params["from"]
+                    .as_str()
+                    .filter(|from| from.len() <= 256)
+                    .map(Into::into),
+                incremental: params["incremental"] == true,
+                accept,
+            })
+        };
         let accepted = if self.events.try_send(start).is_ok() {
             tokio::time::timeout(REPLY_WAIT, accepted)
                 .await
@@ -731,7 +1145,7 @@ fn addresses(inner: &Inner) -> Vec<Address> {
             } else {
                 Some(Address {
                     host: ip.to_string(),
-                    port: PORT,
+                    port: port(),
                 })
             }
         })
@@ -859,6 +1273,179 @@ mod tests {
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 
+    fn terminal_watch(project: &str) -> Value {
+        json!({"version":VERSION,"id":"w","method":"terminal.watch","params":{"projectId":project,"cols":80,"rows":24}})
+    }
+
+    #[test]
+    fn terminals_are_on_unless_a_saved_setting_turns_them_off() {
+        assert!(Config::default().terminal);
+        let saved: Config = serde_json::from_str(r#"{"enabled":true,"devices":[]}"#).unwrap();
+        assert!(saved.terminal);
+        let off: Config = serde_json::from_str(r#"{"enabled":true,"terminal":false}"#).unwrap();
+        assert!(!off.terminal);
+    }
+
+    #[tokio::test]
+    async fn terminal_requests_name_the_device_and_stop_when_terminals_are_turned_off() {
+        let (host, events, peer) = paired();
+        let device_id = host.inner.lock().unwrap().config.devices[0].id.clone();
+        let answering = {
+            let events = events.clone();
+            tokio::spawn(async move {
+                let Ok(Event::Request(request)) = events.recv().await else {
+                    panic!("expected a request");
+                };
+                assert_eq!(request.method, "terminal.input");
+                let device = request.device_id.clone();
+                request.reply(Ok(json!({"seq": 1})));
+                device
+            })
+        };
+        let input = json!({"version":VERSION,"id":"i1","method":"terminal.input","params":{"shellId":"s","seq":1,"data":"bHMK"}});
+        host.handle(&peer, input.clone()).await.unwrap();
+        assert_eq!(answering.await.unwrap(), device_id);
+        assert!(host.status().terminal);
+        let catalog = host
+            .handle(
+                &peer,
+                json!({"version":VERSION,"id":"c","method":"workspace.list","params":{}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(catalog["terminal"], true);
+
+        host.set_terminal(false).unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Ok(Event::TerminalsClosed(None))
+        ));
+        assert!(host.handle(&peer, input).await.is_err());
+        let (sink, _updates) = tokio::sync::mpsc::channel(4);
+        assert!(host.watch(&peer, terminal_watch("p"), sink).await.is_err());
+        let catalog = host
+            .handle(
+                &peer,
+                json!({"version":VERSION,"id":"c2","method":"workspace.list","params":{}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(catalog["terminal"], false);
+        // The setting is saved, so it holds across a restart.
+        let saved: Config = serde_json::from_slice(&std::fs::read(&host.path).unwrap()).unwrap();
+        assert!(!saved.terminal);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn actions_reach_the_phone_in_the_catalog_and_its_edits_reach_the_app() {
+        let (host, events, peer) = paired();
+        let device_id = host.inner.lock().unwrap().config.devices[0].id.clone();
+        let actions =
+            json!([{"id":"dev","name":"Run Dev","command":"npm run dev","icon":"rocket"}]);
+        host.publish(json!({
+            "projects": [{"id":"p","name":"monocode","actions": actions}],
+            "monos": [],
+            "sessions": [],
+        }))
+        .unwrap();
+        let list = json!({"version":VERSION,"id":"c","method":"workspace.list","params":{}});
+        let catalog = host.handle(&peer, list).await.unwrap();
+        assert_eq!(catalog["projects"][0]["actions"], actions);
+
+        // The phone's whole list goes to the app as sent, naming the device.
+        let edited = json!([{"id":"dev","name":"Run Dev","command":"npm run dev","icon":"rocket"},{"name":"Test","command":"cargo test","icon":"play"}]);
+        let answering = {
+            let events = events.clone();
+            tokio::spawn(async move {
+                let Ok(Event::Request(request)) = events.recv().await else {
+                    panic!("expected a request");
+                };
+                assert_eq!(request.method, "terminal.actions.save");
+                let seen = (request.device_id.clone(), request.params.clone());
+                request.reply(Ok(json!({"actions": seen.1["actions"]})));
+                seen
+            })
+        };
+        let save = json!({"version":VERSION,"id":"a1","method":"terminal.actions.save","params":{"projectId":"p","actions":edited}});
+        let reply = host.handle(&peer, save.clone()).await.unwrap();
+        assert_eq!(reply["actions"], edited);
+        let (device, params) = answering.await.unwrap();
+        assert_eq!(device, device_id);
+        assert_eq!(params, json!({"projectId":"p","actions":edited}));
+
+        // With terminals off, the phone can't change what they run.
+        host.set_terminal(false).unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Ok(Event::TerminalsClosed(None))
+        ));
+        let mut again = save;
+        again["id"] = json!("a2");
+        assert!(host.handle(&peer, again).await.is_err());
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_terminal_watch_reaches_the_app_and_each_device_has_two() {
+        let (host, events, peer) = paired();
+        let app = tokio::spawn(async move {
+            let mut starts = Vec::new();
+            while starts.len() < 2 {
+                let Ok(Event::Terminal(start)) = events.recv().await else {
+                    panic!("expected a terminal");
+                };
+                assert_eq!(start.project_id, "p");
+                assert_eq!((start.cols, start.rows), (80, 24));
+                start.accept(Ok(()));
+                starts.push(());
+            }
+            events
+        });
+        let mut sinks = Vec::new();
+        for _ in 0..2 {
+            let (sink, updates) = tokio::sync::mpsc::channel(4);
+            host.watch(&peer, terminal_watch("p"), sink).await.unwrap();
+            sinks.push(updates);
+        }
+        let events = app.await.unwrap();
+        let (sink, _updates) = tokio::sync::mpsc::channel(4);
+        let third = host.watch(&peer, terminal_watch("p"), sink).await;
+        assert_eq!(third.unwrap_err(), "Desktop is busy; try again");
+        // A conversation watch is a different budget.
+        assert!(events.is_empty());
+        // Missing project.
+        let (sink, _updates) = tokio::sync::mpsc::channel(4);
+        let bare = json!({"version":VERSION,"id":"w","method":"terminal.watch","params":{}});
+        assert!(host.watch(&peer, bare, sink).await.is_err());
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoking_a_device_closes_its_shells_and_its_terminal_watches() {
+        let (host, events, peer) = paired();
+        let device_id = host.inner.lock().unwrap().config.devices[0].id.clone();
+        let app = tokio::spawn({
+            let events = events.clone();
+            async move {
+                let Ok(Event::Terminal(start)) = events.recv().await else {
+                    panic!("expected a terminal");
+                };
+                start.accept(Ok(()));
+            }
+        });
+        let (sink, _updates) = tokio::sync::mpsc::channel(4);
+        host.watch(&peer, terminal_watch("p"), sink).await.unwrap();
+        app.await.unwrap();
+        host.revoke(&device_id).unwrap();
+        assert!(host.inner.lock().unwrap().watches.is_empty());
+        let Ok(Event::TerminalsClosed(Some(closed))) = events.recv().await else {
+            panic!("expected the device's shells to close");
+        };
+        assert_eq!(closed, device_id);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn the_catalog_answers_workspace_polls_without_the_app() {
         let (host, _events, peer) = paired();
@@ -877,5 +1464,60 @@ mod tests {
         assert!(catalog["addresses"].is_array());
         assert!(host.publish(json!({"projects":[]})).is_err());
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn live_activities_start_then_update_then_end_with_the_users_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, _) = super::apns::tests::key_file(dir.path());
+        let device = json!({"id":"d","name":"iPhone","fingerprint":"f","live":{"startToken":"aa00","bundleId":"com.example.app","sandbox":true}});
+        let path = dir.path().join("mobile-access.json");
+        std::fs::write(
+            &path,
+            json!({"enabled":false,"devices":[device]}).to_string(),
+        )
+        .unwrap();
+        let (host, _events) = MobileHost::open(path).unwrap();
+        let working = json!([{"id":"s","projectId":"p","title":"Fix push","status":"working"}]);
+        {
+            // No key, no pushes: the phone keeps redrawing it itself.
+            let mut inner = host.inner.lock().unwrap();
+            assert!(host.live_pushes(&mut inner, &working).is_empty());
+        }
+        host.set_apns(Some(key)).unwrap();
+        let mut inner = host.inner.lock().unwrap();
+        let started = host.live_pushes(&mut inner, &working);
+        assert_eq!(started.len(), 1);
+        assert!(started[0].start && started[0].delivery.sandbox);
+        assert_eq!(started[0].payload["aps"]["event"], "start");
+        assert_eq!(
+            started[0].payload["aps"]["content-state"]["sessions"][0]["id"],
+            "s"
+        );
+        // Until the new activity checks in, another change doesn't start a second.
+        assert!(host.live_pushes(&mut inner, &working).is_empty());
+
+        inner.config.devices[0]
+            .live
+            .as_mut()
+            .unwrap()
+            .activity_token = Some("bb11".into());
+        let approval = json!([{"id":"s","projectId":"p","title":"Fix push","status":"approval","request":{"id":"r","label":"Run tests","count":1}}]);
+        let updated = host.live_pushes(&mut inner, &approval);
+        assert_eq!(
+            (updated[0].delivery.token.as_str(), updated[0].urgent),
+            ("bb11", true)
+        );
+        assert_eq!(updated[0].payload["aps"]["event"], "update");
+
+        let ended = host.live_pushes(&mut inner, &json!([]));
+        assert_eq!(ended[0].payload["aps"]["event"], "end");
+        assert!(inner.config.devices[0]
+            .live
+            .as_ref()
+            .unwrap()
+            .activity_token
+            .is_none());
+        assert!(inner.since.is_empty());
     }
 }

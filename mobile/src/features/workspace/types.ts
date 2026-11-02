@@ -38,6 +38,17 @@ export type Project = {
   defaultModelName?: string;
   /** The permission mode a new desktop tab would start with. */
   defaultRuntimeMode?: RuntimeMode;
+  /** The desktop footer's saved commands, which the phone's terminal runs too. */
+  actions?: ProjectAction[];
+};
+
+/** A saved command, as the desktop's footer keeps it. */
+export type ProjectAction = {
+  id: string;
+  name: string;
+  command: string;
+  /** One of the desktop's action icons: play, test-tube, hammer, rocket, bug, package. */
+  icon: string;
 };
 
 // Trimmed from the desktop's GitChangedFile (src/platform/tauri/fs.ts) and
@@ -51,6 +62,16 @@ export type DiffLine = {
   newNumber: number | null;
   /** Its syntax colours as runs of [text, index into the file's palette]. */
   runs?: [string, number][];
+};
+
+/** A working copy's changes counted, all of them even when only a page of
+ *  files was read. */
+export type ChangeSummary = {
+  files: number;
+  /** Files staged in full. */
+  staged: number;
+  additions: number;
+  deletions: number;
 };
 
 export type ChangedFile = {
@@ -126,6 +147,8 @@ export type SessionSummary = {
   busy?: boolean;
   /** What it waits on the user for; absent from an older desktop. */
   waiting?: "approval" | "question";
+  /** What it waits on: the first approval (or question), and how many. */
+  request?: { id: string; label: string; count: number };
 };
 
 export type Message = {
