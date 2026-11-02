@@ -7,6 +7,7 @@ vi.mock("react-native", () => ({ View: () => null }));
 vi.mock("@/ui/theme", () => ({ themedStyles: () => () => ({}) }));
 vi.mock("@/features/connection/ConnectionProvider", () => ({
   useConnection: () => ({ pairing: { desktop: { fingerprint: "desk" } } }),
+  usePairing: () => ({ desktop: { fingerprint: "desk" } }),
 }));
 vi.mock("@/features/workspace/WorkspaceProvider", () => ({ useWorkspace: () => ({ monos: [] }) }));
 vi.mock("@/features/workspace/monoSeen", () => ({ useUnreadMonos: () => app.unreadMonos }));

@@ -21,6 +21,7 @@ import { SessionActivity } from "@/features/sessions/SessionActivity";
 import { SessionFrame } from "@/features/sessions/SessionScreen";
 import { WorkspaceDrawer } from "@/features/workspace/WorkspaceDrawer";
 import { WorkspaceProvider } from "@/features/workspace/WorkspaceProvider";
+import { InboxProvider } from "@/features/inbox/InboxProvider";
 import { Timed } from "@/ui/Timed";
 import { codeScreenOptions, HEADER_OWN_BLUR } from "@/features/files/codeScreen";
 import { applySavedAppearance } from "@/features/settings/appearance";
@@ -180,6 +181,7 @@ function LinkedWorkspace() {
             <Stack.Screen name="settings" options={screens.modal} />
             <Stack.Screen name="mono-profile/[monoId]" options={screens.modal} />
             <Stack.Screen name="models" options={screens.modal} />
+            <Stack.Screen name="inbox" options={screens.modal} />
             <Stack.Screen name="agents" options={screens.modal} />
             <Stack.Screen name="draft" options={screens.modal} />
             <Stack.Screen name="changes" options={screens.changes} />

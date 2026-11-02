@@ -39,6 +39,20 @@ export type Catalog = {
   monos: Mono[];
   sessions: SessionSummary[];
   addresses?: Desktop["addresses"];
+  /** The desktop answers Mono profiles, editing, reset, delete and create;
+   *  the older desktop app sends no such flag. */
+  monoTools?: boolean;
+  /** The desktop sends this phone push notifications once it registers;
+   *  the older desktop app doesn't, and the phone posts its own. */
+  push?: boolean;
+  /** The desktop reads and saves a Mono's soul and memory for the phone. */
+  monoFiles?: boolean;
+  /** The desktop serves the Inbox (`inbox.*`); the older desktop app doesn't,
+   *  and the phone leaves the Inbox out. */
+  inbox?: boolean;
+  /** The desktop answers `session.unarchive`, so an archive can be undone;
+   *  the desktop app today only archives, and the phone then offers no Undo. */
+  sessionUnarchive?: boolean;
   /** Whether the desktop lets this phone open a terminal; missing on older desktops. */
   terminal?: boolean;
 };

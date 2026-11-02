@@ -27,6 +27,7 @@ import { selectedWorkspace } from "@/features/connection/selection";
 import type { ModelCatalog, ModelChoice } from "@/features/models/types";
 import { toWire, type Attachment } from "@/features/sessions/attachments";
 import type {
+  ComposerMode,
   DisplayedQuestionPrompt,
   Message,
   Mono,
@@ -698,6 +699,24 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const archiveSession = useCallback(
     (conversationId: string) => removeSession("session.archive", conversationId),
     [removeSession],
+  );
+  const unarchiveSession = useCallback(
+    async (conversationId: string) => {
+      setDeleted((previous) => {
+        const next = new Set(previous);
+        next.delete(conversationId);
+        return next;
+      });
+      try {
+        await mutate("session.unarchive", { conversationId });
+      } catch (reason) {
+        // Still archived there, so still off the lists.
+        setDeleted((previous) => new Set(previous).add(conversationId));
+        throw reason;
+      }
+      void refresh();
+    },
+    [mutate, refresh],
   );
   const readOrchestration = useCallback(
     async (conversationId: string) =>

@@ -3,7 +3,6 @@ import { Fragment } from "react";
 import { Alert, Linking, StyleSheet, Switch, Text, View } from "react-native";
 
 import { useConnection } from "@/features/connection/ConnectionProvider";
-import { MONOS_ENABLED } from "@/features/connection/selection";
 import {
   liveActivitiesAvailable,
   useLiveActivityPreference,

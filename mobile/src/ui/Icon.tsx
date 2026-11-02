@@ -76,6 +76,8 @@ const icons = {
   search: Search01Icon,
   close: Cancel01Icon,
   // The Orchestrator, as the desktop's + menu draws it.
+  plan: AiIdeaIcon,
+  operator: CursorMagicSelection04Icon,
   orchestrator: Share02Icon,
   add: Add01Icon,
   compose: PencilEdit02Icon,

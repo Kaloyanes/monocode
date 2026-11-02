@@ -8,7 +8,7 @@ import { useConnection } from "@/features/connection/ConnectionProvider";
 import { hasNativeTranscript } from "@/features/connection/nativeLink";
 import { useProjectChanges } from "@/features/connection/useProjectChanges";
 import { useProjectWorktrees } from "@/features/connection/useProjectWorktrees";
-import type { ChangeSummary, Project, SessionSummary } from "@/features/workspace/types";
+import type { ChangeSummary, ComposerMode, Project, SessionSummary } from "@/features/workspace/types";
 import { use, useCallback, useEffect, useState, type ReactNode } from "react";
 import { Platform, Pressable, StyleSheet } from "react-native";
 import Animated, {
@@ -110,6 +110,10 @@ export function ProjectScreen({
   title?: string;
 }) {
   const { startSession, sendMessage, stop, sessions } = useWorkspace();
+  // Whether the desktop lets this phone open a terminal.
+  const terminal = useConnection().catalog.terminal === true;
+  const [terminalSheet, setTerminalSheet] = useState<{ run?: string; opened: number } | null>(null);
+  const [actionsSheet, setActionsSheet] = useState(false);
   const [openAfterStarting] = useOpenSessionAfterStarting();
   const createMono = useCreateMono(project.id);
   const colors = useColors();
@@ -330,7 +334,7 @@ export function ProjectScreen({
       session={session}
       worktreePath={worktreePath}
       harness={harness}
-      changed={changes.length}
+      changed={changes.files}
       terminal={terminal}
       onTerminal={(run) => setTerminalSheet({ run, opened: Date.now() })}
       onEditActions={() => setActionsSheet(true)}

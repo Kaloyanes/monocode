@@ -54,10 +54,7 @@ export function homeProjectId(
   return projects[0]?.id;
 }
 
-export function rememberPlace(
-  desktop: string | undefined,
-  place: { kind: "project"; id: string },
-) {
+export function rememberPlace(desktop: string | undefined, place: Place) {
   if (!desktop) return;
   const value = JSON.stringify(place);
   if (written.get(desktop) === value) return;

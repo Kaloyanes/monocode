@@ -1,7 +1,7 @@
 import { ChoiceMenu } from "@/ui/ChoiceMenu";
 import { GlassMenuButton } from "@/ui/GlassMenuButton";
 import { Button } from "@expo/ui/swift-ui";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { Alert, Platform, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import Animated, {
   Easing,

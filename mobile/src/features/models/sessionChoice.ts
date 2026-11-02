@@ -60,7 +60,7 @@ export function useSessionChoice(
   project: Project | undefined,
   sessionId: string | undefined,
 ) {
-  const { sessions, configureSession } = useWorkspace();
+  const { sessions, agents, configureSession } = useWorkspace();
   const desktop = usePairing()?.desktop.fingerprint;
   const defaultModel = useDefaultModel();
   const defaultAccess = useDefaultRuntimeMode();
