@@ -119,10 +119,6 @@ const icons = {
   appearance: DarkModeIcon,
   sun: Sun03Icon,
   moon: Moon02Icon,
-  // The composer modes, as the desktop's + menu draws them.
-  plan: AiIdeaIcon,
-  operator: CursorMagicSelection04Icon,
-  orchestrator: Share02Icon,
   // The Inbox: snooze, items, checks, and the offline note.
   clock: Clock01Icon,
   pullRequest: GitPullRequestIcon,

@@ -80,15 +80,6 @@ const APP_METHODS: &[&str] = &[
     "inbox.start",
     "inbox.media",
 ];
-/// Methods on a shell the phone opened with `terminal.watch`. The host only
-/// forwards them while terminals are allowed; the app checks the shell is the
-/// device's own.
-const TERMINAL_METHODS: &[&str] = &[
-    "terminal.input",
-    "terminal.resize",
-    "terminal.close",
-    "terminal.actions.save",
-];
 /// Under the phone's own wait, so it hears why rather than timing out.
 const REPLY_WAIT: Duration = Duration::from_secs(25);
 const MAX_PENDING: usize = 16;

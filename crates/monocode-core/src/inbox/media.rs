@@ -278,38 +278,6 @@ fn github_auth_token() -> Option<String> {
     super::run_gh(&home, &["auth", "token"], false).ok()
 }
 
-const IMAGE_EXTENSIONS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
-
-/// Whether `url` names an image file on a host `fetch` may read, so a click can
-/// preview it in the app. The query (a `?token=` on private raw files) is ignored.
-pub fn is_image_url(url: &str) -> bool {
-    let Ok(parsed) = parse_allowed_media_url(url) else {
-        return false;
-    };
-    let extension = parsed
-        .path
-        .rsplit('/')
-        .next()
-        .and_then(|name| name.rsplit_once('.'))
-        .map(|(_, extension)| extension.to_ascii_lowercase());
-    extension.is_some_and(|extension| IMAGE_EXTENSIONS.contains(&extension.as_str()))
-}
-
-/// The image at `url` at full resolution with its MIME type, for a zoomable
-/// preview. A stale `?token=` query is dropped on a second try, since the
-/// account's own credentials already cover private files.
-pub fn image_bytes(url: &str) -> Result<(Vec<u8>, &'static str), String> {
-    let bytes = match fetch(url) {
-        Ok(bytes) => bytes,
-        Err(error) => match url.split_once('?') {
-            Some((bare, _)) => fetch(bare).map_err(|_| error)?,
-            None => return Err(error),
-        },
-    };
-    let mime = image_mime(&bytes).ok_or_else(|| "That URL is not an image".to_string())?;
-    Ok((bytes, mime))
-}
-
 fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     match image::guess_format(bytes) {
         Ok(image::ImageFormat::Png) => Some("image/png"),

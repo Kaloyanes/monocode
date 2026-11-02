@@ -1,8 +1,6 @@
 //! A paired phone browses and drives this workspace. The core host pairs and
 //! serves devices; the shell answers their requests from its own state, through
 //! the same paths as the sidebar, composer and Changes panel.
-mod composer;
-mod drafts;
 mod inbox;
 
 use super::*;
@@ -386,7 +384,7 @@ impl Shell {
     // MARK: catalog
 
     /// Projects on the rail and those Monos work in.
-    fn mobile_projects(&self, cx: &App) -> Vec<String> {
+    pub(in crate::shell) fn mobile_projects(&self, cx: &App) -> Vec<String> {
         let mut paths: Vec<String> = Vec::new();
         let monos = self
             .monos
@@ -677,7 +675,7 @@ impl Shell {
                 // Expo, so they no longer post their own alerts. `monoFiles`:
                 // it reads and saves a Mono's soul and memory for the phone.
                 // `inbox`: it answers the phone's `inbox.*` requests.
-                json!({"projects": projects, "monos": monos, "sessions": sessions, "monoTools": true, "push": true, "monoFiles": true, "inbox": true, "sessionUnarchive": true}),
+                json!({"projects": projects, "monos": monos, "sessions": sessions, "monoTools": true, "push": true, "monoFiles": true, "inbox": true}),
                 ids,
                 previews,
             ))
@@ -810,18 +808,9 @@ impl Shell {
                 request.reply(Ok(project::file_highlight(&job, from)));
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
-            "session.commands" => self.mobile_commands(request, cx),
-            "orchestration.read" => {
-                let result = self.mobile_orchestration(&request.params, cx);
-                request.reply(result);
-            }
-            "draft.read" => self.mobile_draft_read(request, window, cx),
-            "draft.frame" => self.mobile_draft_frame(request, window, cx),
-            "composer.read" => self.mobile_composer_read(request, cx),
             method if method.starts_with("inbox.") && method != "inbox.start" => {
                 self.mobile_inbox(request, window, cx)
             }
-            method if method.starts_with("terminal.") => self.mobile_terminal_request(request, cx),
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }

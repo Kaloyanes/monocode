@@ -2,6 +2,7 @@
 //! validation, response parsers and credential file formats.
 mod avatar;
 mod media;
+pub use media::phone_image;
 pub use media::png as media_png;
 pub use media::{image_bytes as media_image_bytes, is_image_url, phone_image};
 pub mod azure_devops;
@@ -999,7 +1000,11 @@ impl Service {
                                 // Best effort: a failed search leaves the rows as listed.
                                 let involved = |involvement| {
                                     github::git_github_involved_for(
-                                        project, &repo, kind, involvement, viewer,
+                                        project,
+                                        &repo,
+                                        kind,
+                                        involvement,
+                                        viewer,
                                     )
                                     .unwrap_or_default()
                                 };
@@ -1413,138 +1418,6 @@ mod notification_tests {
         }
     }
 }
-
-#[cfg(test)]
-mod attention_tests {
-    use super::*;
-
-    fn row(number: i64, assignees: &[&str]) -> Item {
-        Item {
-            provider: "github".into(),
-            kind: "pr".into(),
-            number,
-            assignees: assignees
-                .iter()
-                .map(|login| Person {
-                    login: (*login).into(),
-                    ..Person::default()
-                })
-                .collect(),
-            ..Item::default()
-        }
-    }
-
-    #[test]
-    fn rows_get_the_reason_the_viewer_is_wanted() {
-        let mut rows = vec![
-            row(1, &[]),
-            row(2, &["Octocat"]),
-            row(3, &["octocat"]),
-            row(4, &[]),
-            row(5, &["hubot"]),
-        ];
-        rows[3].attention_reason = "build_failed".into();
-        mark_github_attention(&mut rows, "octocat", &[1, 3, 4], &[1, 2, 5]);
-        let reasons: Vec<_> = rows.iter().map(|r| r.attention_reason.as_str()).collect();
-        assert_eq!(
-            reasons,
-            ["review_requested", "assigned", "review_requested", "build_failed", "mentioned"]
-        );
-    }
-
-    #[test]
-    fn rows_nobody_asked_about_have_no_reason() {
-        let mut rows = vec![row(1, &["hubot"]), row(2, &[])];
-        mark_github_attention(&mut rows, "octocat", &[], &[]);
-        assert!(rows.iter().all(|r| r.attention_reason.is_empty()));
-    }
-}
-
-#[cfg(test)]
-mod link_tests {
-    use super::*;
-
-    #[test]
-    fn links_to_github_and_linear_issues_are_recognised() {
-        assert!(matches!(
-            link_target("https://github.com/acme/app/pull/12/files"),
-            Some(LinkTarget::GitHub(work)) if work.number == 12 && work.kind == "pr"
-        ));
-        assert_eq!(
-            link_target("https://linear.app/acme/issue/eng-42/fix-the-thing"),
-            Some(LinkTarget::Linear("ENG-42".into()))
-        );
-        assert_eq!(
-            link_target("HTTPS://linear.app/acme/issue/ENG-7?x=1#c"),
-            Some(LinkTarget::Linear("ENG-7".into()))
-        );
-        for other in [
-            "https://linear.app/acme/project/roadmap",
-            "https://linear.app/acme/issue/not-a-number",
-            "https://linear.app/acme/issue/ENG",
-            "https://example.com/?u=https://linear.app/acme/issue/ENG-1",
-            "https://github.com/acme/app",
-            "ENG-42",
-        ] {
-            assert_eq!(link_target(other), None, "{other}");
-        }
-    }
-
-    #[test]
-    fn a_link_finds_its_listed_item_for_every_provider() {
-        let item =
-            |provider: &str, kind: &str, repo: &str, identifier: &str, number, url: &str| Item {
-                provider: provider.into(),
-                kind: kind.into(),
-                repo: repo.into(),
-                identifier: identifier.into(),
-                number,
-                url: url.into(),
-                ..Default::default()
-            };
-        let items = vec![
-            item(
-                "github",
-                "pr",
-                "acme/app",
-                "",
-                12,
-                "https://github.com/acme/app/pull/12",
-            ),
-            item(
-                "linear",
-                "linear",
-                "ENG",
-                "ENG-42",
-                42,
-                "https://linear.app/acme/issue/ENG-42/x",
-            ),
-            item(
-                "jira",
-                "issue",
-                "",
-                "KEY-5",
-                5,
-                "https://acme.atlassian.net/browse/KEY-5",
-            ),
-        ];
-        let found = |url| find_linked(&items, url).map(|item| item.provider.as_str());
-        assert_eq!(
-            found("https://github.com/Acme/App/pull/12/files"),
-            Some("github")
-        );
-        assert_eq!(found("https://github.com/acme/app/issues/12"), None);
-        assert_eq!(
-            found("https://linear.app/acme/issue/eng-42"),
-            Some("linear")
-        );
-        assert_eq!(
-            found("https://acme.atlassian.net/browse/KEY-5/"),
-            Some("jira")
-        );
-        assert_eq!(found("https://acme.atlassian.net/browse/KEY-6"), None);
-    }
-}
 #[cfg(test)]
 mod author_tests {
     use super::*;
@@ -1613,5 +1486,112 @@ mod author_tests {
         assert_eq!(authors(&[ME, "octocat"]).fetch_author(), None);
         assert_ne!(scope(authors(&[ME])), scope(authors(&[])));
         assert_eq!(scope(authors(&[ME, "octocat"])), scope(authors(&[])));
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    fn row(number: i64, assignees: &[&str]) -> Item {
+        Item {
+            provider: "github".into(),
+            kind: "pr".into(),
+            number,
+            assignees: assignees
+                .iter()
+                .map(|login| Person {
+                    login: (*login).into(),
+                    ..Person::default()
+                })
+                .collect(),
+            ..Item::default()
+        }
+    }
+
+    #[test]
+    fn rows_get_the_reason_the_viewer_is_wanted() {
+        let mut rows = vec![
+            row(1, &[]),
+            row(2, &["Octocat"]),
+            row(3, &["octocat"]),
+            row(4, &[]),
+            row(5, &["hubot"]),
+        ];
+        rows[3].attention_reason = "build_failed".into();
+        mark_github_attention(&mut rows, "octocat", &[1, 3, 4], &[1, 2, 5]);
+        let reasons: Vec<_> = rows.iter().map(|r| r.attention_reason.as_str()).collect();
+        assert_eq!(
+            reasons,
+            [
+                "review_requested",
+                "assigned",
+                "review_requested",
+                "build_failed",
+                "mentioned"
+            ]
+        );
+    }
+
+    #[test]
+    fn rows_nobody_asked_about_have_no_reason() {
+        let mut rows = vec![row(1, &["hubot"]), row(2, &[])];
+        mark_github_attention(&mut rows, "octocat", &[], &[]);
+        assert!(rows.iter().all(|r| r.attention_reason.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod fetch_scope_tests {
+    use super::*;
+
+    fn projects(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    /// A paired phone is served from the desktop's own fetch only while the two
+    /// scopes are the same string, so everything the fetch depends on must be in it.
+    #[test]
+    fn the_scope_changes_with_everything_that_changes_the_fetch() {
+        let app = projects(&["/work/app"]);
+        let base = ViewState::default().fetch_scope(&app);
+        assert_eq!(base, ViewState::default().fetch_scope(&app));
+
+        let mut assigned = ViewState::default();
+        assigned.filters.assigned_to_me = true;
+        assert_ne!(base, assigned.fetch_scope(&app));
+
+        let mut author = ViewState::default();
+        author.filters.authors = vec!["octo".into()];
+        assert_ne!(base, author.fetch_scope(&app));
+
+        let mut open = ViewState::default();
+        open.filters.status.open = true;
+        assert_ne!(base, open.fetch_scope(&app));
+
+        let team = ViewState {
+            hidden_linear_teams: vec!["t1".into()],
+            ..ViewState::default()
+        };
+        assert_ne!(base, team.fetch_scope(&app));
+
+        assert_ne!(
+            base,
+            ViewState::default().fetch_scope(&projects(&["/work/app", "/work/mono"]))
+        );
+    }
+
+    #[test]
+    fn the_scope_ignores_what_the_desktop_only_filters_on_screen() {
+        let app = projects(&["/work/app"]);
+        let mut shown = ViewState::default();
+        shown.filters.authors = vec!["a".into(), "b".into()];
+        shown.filters.hidden_kinds = vec!["issue".into()];
+        shown.filters.time = "7d".into();
+        shown.source = "linear".into();
+        assert_eq!(
+            ViewState::default().fetch_scope(&app),
+            shown.fetch_scope(&app)
+        );
     }
 }

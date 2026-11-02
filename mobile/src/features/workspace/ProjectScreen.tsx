@@ -72,7 +72,7 @@ import {
   type Workspace,
 } from "@/features/workspace/WorkspaceMenu";
 import { ComposerWorkspace } from "@/features/workspace/ComposerWorkspace";
-import { UnreadDot, useAnyUnread } from "@/features/workspace/UnreadDot";
+import { UnreadDot, useAnyUnreadMono } from "@/features/workspace/UnreadDot";
 import { InboxPage } from "@/features/inbox/InboxPage";
 import { useInboxSupported } from "@/features/inbox/InboxProvider";
 import { Icon } from "@/ui/Icon";

@@ -16,24 +16,28 @@ The workspace catalog carries `"inbox": true` (next to `monoTools`, `push` and
 `monoFiles`). A desktop without it does not answer `inbox.*`; the phone hides
 the Inbox segment.
 
-It also carries `"sessionUnarchive": true` when the desktop answers
-`session.unarchive` (params: the session id). It un-archives the session and
-does nothing if it isn't archived, like `session.archive`; Mono targets are
-refused. The phone offers Undo after an archive only when the flag is set.
-Catalog sessions a Mono launched carry `monoId`.
-
 ## Methods
 
 ### `inbox.list`
 
-`{scope?: "all"|"needsMe"|"done", source?: "github"|"linear"|"jira"|"gitlab"|"azuredevops", projectId?: string, q?: string, cursor?: string, limit?: number (default 30, max 100)}`
+`{scope?: "all"|"needsMe"|"done", source?: "github"|"linear"|"jira"|"gitlab"|"azuredevops", projectId?: string, q?: string, cursor?: string, limit?: number (default 30, max 100), refresh?: boolean}`
 
 → `{items: InboxItem[], nextCursor?: string, stale: boolean, fetchedAt: number (ms), providers: {id, connected, error?}[], counts: {unread, needsMe, done}}`
 
 - Serves the cached snapshot immediately and never waits on a provider. If the
-  snapshot is older than its polling interval the host starts a background
-  refresh through the desktop Inbox; the phone calls again (or on pull to
-  refresh) to see the result.
+  snapshot is older than 30 s the host starts a background refresh through the
+  desktop Inbox; the phone's next poll sees the result.
+- The list is built from a fetch with default filters over the desktop's
+  projects and the Monos' projects, whatever the desktop Inbox's own filters
+  (assigned to me, one author, open only, hidden Linear teams or Jira
+  projects) are set to. While those filters and projects would not change the
+  fetch, the desktop's own snapshot is used and nothing extra runs; otherwise
+  the host keeps a second snapshot for the phone and refreshes it the same way.
+  Items only that snapshot lists start out read.
+- `refresh: true` (pull to refresh, retry) makes the host fetch from the
+  providers now, unless a fetch is already running, and answer when it ends
+  (after 20 s at most, with whatever the Inbox then holds). A phone that
+  doesn't send it gets the cache, as before.
 - `stale` is true while the snapshot is older than its polling interval
   (120 s while the desktop Inbox is on screen, 300 s otherwise), was never
   fetched, or a provider failed. `fetchedAt` is 0 until the first fetch ends.
