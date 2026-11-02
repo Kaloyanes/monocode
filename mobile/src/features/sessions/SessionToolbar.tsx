@@ -271,9 +271,7 @@ export function SessionToolbar({
         </LiquidView>
         {/* Keep the overhang outside both the pill and the button's clip bounds. */}
         {changed > 0 ? (
-          <View pointerEvents="none" style={styles.badge}>
-            <Text style={styles.badgeText}>{changed}</Text>
-          </View>
+          <View pointerEvents="none" style={styles.badge} />
         ) : null}
         {/* Alert.prompt is iOS-only; keep Android's restored Rename action usable. */}
         <Modal
@@ -360,9 +358,9 @@ export function SessionToolbar({
         accessibilityLabel={`Changes, ${changed} ${changed === 1 ? "file" : "files"}`}
         onPress={openChanges}
       >
-        {changed > 0 ? (
-          <Stack.Toolbar.Badge>{String(changed)}</Stack.Toolbar.Badge>
-        ) : null}
+        {/* A dot rather than the count, which a big working copy would
+            stretch across the header; the count is in the label. */}
+        {changed > 0 ? <Stack.Toolbar.Badge /> : null}
       </Stack.Toolbar.Button>
       <Stack.Toolbar.Menu icon="ellipsis" accessibilityLabel="Session actions">
         <Stack.Toolbar.MenuAction
@@ -427,15 +425,11 @@ const useStyles = themedStyles((colors) => ({
     position: "absolute",
     top: 0,
     right: 40,
-    minWidth: 20,
-    height: 20,
-    paddingHorizontal: 4,
-    borderRadius: 10,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
     backgroundColor: "#ff3b30",
-    alignItems: "center",
-    justifyContent: "center",
   },
-  badgeText: { color: "#ffffff", fontSize: 12, fontWeight: "600" },
   renameBackdrop: {
     flex: 1,
     justifyContent: "center",

@@ -212,10 +212,10 @@ it("keeps the title start visible with end truncation and no iOS negative margin
 });
 it("shows changes/count and opens the correct working copy", async () => {
   render();
-  const badgeText = [...container.querySelectorAll("span")].find(
-    (item) => item.textContent === "14",
-  )!;
-  const badge = badgeText.parentElement!;
+  // A dot, not the count: a big working copy would stretch a number.
+  expect(container.textContent).not.toContain("14");
+  const badge = button("Changes, 14 files").parentElement!.nextElementSibling as HTMLElement;
+  expect(badge.textContent).toBe("");
   expect(badge.style.top).toBe("0px");
   // The badge sits above the pill but stays within the measured header wrapper.
   const toolbar = button("Changes, 14 files").parentElement!.parentElement!;

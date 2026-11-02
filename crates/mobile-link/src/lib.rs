@@ -3,6 +3,7 @@ mod ffi;
 mod tls;
 mod transcript;
 mod transport;
+mod udp;
 mod visuals;
 
 // The desktop's scene projection names `monocode_core::visual`; on the phone

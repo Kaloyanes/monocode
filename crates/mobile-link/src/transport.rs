@@ -269,7 +269,7 @@ async fn connect(
                     "[::]:0"
                 };
                 let mut endpoint =
-                    quinn::Endpoint::client(bind.parse().unwrap()).map_err(|e| e.to_string())?;
+                    crate::udp::endpoint(bind.parse().unwrap()).map_err(|e| e.to_string())?;
                 endpoint.set_default_client_config(config.clone());
                 let connecting = endpoint
                     .connect(remote, "monocode.local")
