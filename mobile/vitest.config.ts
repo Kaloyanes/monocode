@@ -12,6 +12,8 @@ export default defineConfig({
       "react-dom": `${root}node_modules/react-dom`,
     },
   },
+  // The protocol tests in ../tests/mobile live outside this root.
+  server: { fs: { allow: [".."] } },
   esbuild: { jsx: "automatic" },
   test: {
     environment: "happy-dom",

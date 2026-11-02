@@ -1,15 +1,30 @@
+import Alert01Icon from "@hugeicons/core-free-icons/Alert01Icon";
+import ArrowUpRight01Icon from "@hugeicons/core-free-icons/ArrowUpRight01Icon";
+import CancelCircleIcon from "@hugeicons/core-free-icons/CancelCircleIcon";
+import CheckmarkCircle01Icon from "@hugeicons/core-free-icons/CheckmarkCircle01Icon";
+import CircleIcon from "@hugeicons/core-free-icons/CircleIcon";
+import Clock01Icon from "@hugeicons/core-free-icons/Clock01Icon";
+import Comment01Icon from "@hugeicons/core-free-icons/Comment01Icon";
+import GitPullRequestIcon from "@hugeicons/core-free-icons/GitPullRequestIcon";
+import Link01Icon from "@hugeicons/core-free-icons/Link01Icon";
+import Undo02Icon from "@hugeicons/core-free-icons/Undo02Icon";
+import WifiOff01Icon from "@hugeicons/core-free-icons/WifiOff01Icon";
 import Add01Icon from "@hugeicons/core-free-icons/Add01Icon";
+import AiIdeaIcon from "@hugeicons/core-free-icons/AiIdeaIcon";
 import ArrowDown01Icon from "@hugeicons/core-free-icons/ArrowDown01Icon";
 import ArrowRight01Icon from "@hugeicons/core-free-icons/ArrowRight01Icon";
+import Archive02Icon from "@hugeicons/core-free-icons/Archive02Icon";
 import ArrowUp02Icon from "@hugeicons/core-free-icons/ArrowUp02Icon";
 import BotIcon from "@hugeicons/core-free-icons/BotIcon";
 import BubbleChatIcon from "@hugeicons/core-free-icons/BubbleChatIcon";
 import Cancel01Icon from "@hugeicons/core-free-icons/Cancel01Icon";
 import ChartBreakoutSquareIcon from "@hugeicons/core-free-icons/ChartBreakoutSquareIcon";
+import ClipboardPasteIcon from "@hugeicons/core-free-icons/ClipboardPasteIcon";
 import ComputerIcon from "@hugeicons/core-free-icons/ComputerIcon";
 import ComputerRemoveIcon from "@hugeicons/core-free-icons/ComputerRemoveIcon";
 import ComputerTerminal01Icon from "@hugeicons/core-free-icons/ComputerTerminal01Icon";
 import Copy01Icon from "@hugeicons/core-free-icons/Copy01Icon";
+import CursorMagicSelection04Icon from "@hugeicons/core-free-icons/CursorMagicSelection04Icon";
 import DarkModeIcon from "@hugeicons/core-free-icons/DarkModeIcon";
 import Delete02Icon from "@hugeicons/core-free-icons/Delete02Icon";
 import File01Icon from "@hugeicons/core-free-icons/File01Icon";
@@ -20,20 +35,25 @@ import Folder01Icon from "@hugeicons/core-free-icons/Folder01Icon";
 import GitBranchIcon from "@hugeicons/core-free-icons/GitBranchIcon";
 import Image01Icon from "@hugeicons/core-free-icons/Image01Icon";
 import InboxIcon from "@hugeicons/core-free-icons/InboxIcon";
+import KeyboardOffIcon from "@hugeicons/core-free-icons/KeyboardOffIcon";
 import LockIcon from "@hugeicons/core-free-icons/LockIcon";
+import ArrowLeft01Icon from "@hugeicons/core-free-icons/ArrowLeft01Icon";
 import LeftToRightListBulletIcon from "@hugeicons/core-free-icons/LeftToRightListBulletIcon";
 import Moon02Icon from "@hugeicons/core-free-icons/Moon02Icon";
 import MinusSignIcon from "@hugeicons/core-free-icons/MinusSignIcon";
+import MoreHorizontalIcon from "@hugeicons/core-free-icons/MoreHorizontalIcon";
 import Menu01Icon from "@hugeicons/core-free-icons/Menu01Icon";
 import Mic01Icon from "@hugeicons/core-free-icons/Mic01Icon";
 import Note01Icon from "@hugeicons/core-free-icons/Note01Icon";
 import Notification01Icon from "@hugeicons/core-free-icons/Notification01Icon";
 import PencilEdit01Icon from "@hugeicons/core-free-icons/PencilEdit01Icon";
 import PencilEdit02Icon from "@hugeicons/core-free-icons/PencilEdit02Icon";
+import PlayIcon from "@hugeicons/core-free-icons/PlayIcon";
 import Robot01Icon from "@hugeicons/core-free-icons/Robot01Icon";
 import Refresh01Icon from "@hugeicons/core-free-icons/Refresh01Icon";
 import Search01Icon from "@hugeicons/core-free-icons/Search01Icon";
 import Settings01Icon from "@hugeicons/core-free-icons/Settings01Icon";
+import Share02Icon from "@hugeicons/core-free-icons/Share02Icon";
 import Shield01Icon from "@hugeicons/core-free-icons/Shield01Icon";
 import Sun03Icon from "@hugeicons/core-free-icons/Sun03Icon";
 import SourceCodeIcon from "@hugeicons/core-free-icons/SourceCodeIcon";
@@ -52,8 +72,11 @@ import { useColors } from "./theme";
 // Deep imports keep the full catalog out of the bundle.
 const icons = {
   menu: Menu01Icon,
+  more: MoreHorizontalIcon,
   search: Search01Icon,
   close: Cancel01Icon,
+  // The Orchestrator, as the desktop's + menu draws it.
+  orchestrator: Share02Icon,
   add: Add01Icon,
   compose: PencilEdit02Icon,
   chat: BubbleChatIcon,
@@ -64,6 +87,7 @@ const icons = {
   mic: Mic01Icon,
   chevronDown: ArrowDown01Icon,
   chevronUpDown: UnfoldMoreIcon,
+  chevronLeft: ArrowLeft01Icon,
   chevronRight: ArrowRight01Icon,
   branch: GitBranchIcon,
   computer: ComputerIcon,
@@ -80,6 +104,9 @@ const icons = {
   wrench: Wrench01Icon,
   minus: MinusSignIcon,
   copy: Copy01Icon,
+  paste: ClipboardPasteIcon,
+  play: PlayIcon,
+  keyboardOff: KeyboardOffIcon,
   trash: Delete02Icon,
   check: Tick02Icon,
   refresh: Refresh01Icon,
@@ -96,6 +123,19 @@ const icons = {
   appearance: DarkModeIcon,
   sun: Sun03Icon,
   moon: Moon02Icon,
+  // The Inbox: snooze, items, checks, and the offline note.
+  clock: Clock01Icon,
+  pullRequest: GitPullRequestIcon,
+  issue: CircleIcon,
+  comment: Comment01Icon,
+  link: Link01Icon,
+  external: ArrowUpRight01Icon,
+  undo: Undo02Icon,
+  archive: Archive02Icon,
+  offline: WifiOff01Icon,
+  alert: Alert01Icon,
+  passing: CheckmarkCircle01Icon,
+  failing: CancelCircleIcon,
 };
 
 export type IconName = keyof typeof icons;

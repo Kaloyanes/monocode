@@ -1,0 +1,63 @@
+<style>
+html,body{height:100%}body{font-family:var(--font-sans);color:var(--foreground)}
+#demo{height:100%;display:flex;flex-direction:column;gap:14px;padding:8px 0}button{font:inherit;color:inherit;cursor:pointer}button:focus-visible{outline:2px solid var(--ring);outline-offset:3px}
+.variants{display:flex;gap:6px;flex-wrap:wrap}.variants button,.replay{border:1px solid var(--border);background:var(--secondary);border-radius:7px;padding:8px 11px;font-size:12px}.variants button[aria-pressed=true]{background:var(--primary);color:var(--primary-foreground);border-color:var(--primary)}
+.stage{flex:1;min-height:365px;display:flex;justify-content:center;padding:20px 16px;background-image:radial-gradient(var(--border) .8px,transparent .8px);background-size:16px 16px;border-radius:12px}
+.anchor{width:min(100%,270px)}.trigger{display:flex;align-items:center;gap:12px;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--popover);color:var(--popover-foreground);font-size:14px}.trigger svg:last-child{margin-left:20px;transition:transform 180ms cubic-bezier(.23,1,.32,1)}.trigger[aria-expanded=true] svg:last-child{transform:rotate(180deg)}svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+.menu{margin-top:8px;background:var(--popover);color:var(--popover-foreground);padding:8px;border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 30px color-mix(in srgb,var(--foreground) 12%,transparent);transform-origin:top left;transition:opacity 180ms cubic-bezier(.23,1,.32,1),transform 180ms cubic-bezier(.23,1,.32,1)}.menu.closed{opacity:0;transform:translateY(-4px) scale(.96);pointer-events:none}.label{padding:8px 10px 10px;color:var(--muted-foreground);font-size:12px}.viewport{overflow:hidden}.track{width:200%;display:flex;transition:transform 220ms cubic-bezier(.23,1,.32,1)}.track.detail{transform:translateX(-50%)}.page{width:50%;flex-shrink:0}.list{position:relative}.row{position:relative;display:flex;gap:11px;align-items:center;border:0;background:transparent;width:100%;height:43px;padding:0 10px;border-radius:6px;text-align:left;font-size:14px;transition:background 125ms ease,transform 180ms cubic-bezier(.23,1,.32,1),opacity 180ms cubic-bezier(.23,1,.32,1)}.end{margin-left:auto;color:var(--muted-foreground);font-size:12px}.icon{display:flex;color:var(--muted-foreground)}.active{color:var(--success-foreground)}.divider{height:1px;background:var(--border);margin:6px 8px}.highlight{position:absolute;top:0;left:0;width:100%;height:43px;border-radius:6px;background:var(--accent-surface);opacity:0;transition:transform 180ms cubic-bezier(.23,1,.32,1),opacity 125ms ease}.menu.cascade.closed .row{opacity:0;transform:translateY(-7px);transition-delay:0ms!important}.footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--muted-foreground);min-height:34px}.footer .replay{margin-left:auto}.status{min-height:18px;font-size:12px;color:var(--muted-foreground)}
+@media(hover:hover) and (pointer:fine){.row:hover{background:var(--accent-surface)}.follow .row:hover{background:transparent}}
+@media(prefers-reduced-motion:reduce){.menu,.row,.track,.trigger svg{transition:none!important}.menu.closed{transform:none}.menu.cascade.closed .row{transform:none}.highlight{transition:none}}
+</style>
+<div id="demo">
+  <div class="variants" aria-label="Animation style">
+    <button type="button" aria-pressed="true">Cascading rows</button><button type="button" aria-pressed="false">Moving highlight</button><button type="button" aria-pressed="false">Icon feedback</button><button type="button" aria-pressed="false">Sliding submenu</button>
+  </div>
+  <div class="stage"><div class="anchor">
+    <button type="button" class="trigger" aria-expanded="true" aria-controls="menu"><span data-icon="chat"></span>Conversation<span data-icon="down"></span></button>
+    <div id="menu" class="menu cascade closed">
+      <div class="viewport"><div class="track">
+        <div class="page"><div class="label">Conversation actions</div><div class="list"><div class="highlight"></div>
+          <button type="button" class="row" data-action="pin"><span class="icon" data-icon="pin"></span><span class="text">Pin conversation</span><span class="end">⌘ P</span></button>
+          <button type="button" class="row" data-action="star"><span class="icon" data-icon="star"></span><span class="text">Add to favorites</span><span class="end">⌘ D</span></button>
+          <button type="button" class="row" data-action="copy"><span class="icon" data-icon="copy"></span><span class="text">Copy link</span><span class="end">⌘ L</span></button>
+          <button type="button" class="row" data-action="preferences"><span class="icon" data-icon="settings"></span><span>Preferences</span><span class="end" data-icon="right"></span></button>
+        </div><div class="divider"></div><button type="button" class="row" data-action="archive"><span class="icon" data-icon="archive"></span>Archive conversation</button></div>
+        <div class="page" inert><button type="button" class="row" id="back"><span data-icon="left"></span>Preferences</button><div class="divider"></div><button type="button" class="row" data-toggle="Notifications"><span data-icon="bell"></span>Notifications<span class="end">On</span></button><button type="button" class="row" data-toggle="Sound"><span data-icon="sound"></span>Sound<span class="end">Off</span></button><button type="button" class="row" data-toggle="Auto archive"><span data-icon="archive"></span>Auto archive<span class="end">Off</span></button></div>
+      </div></div>
+    </div>
+  </div></div>
+  <div class="footer"><span id="description">Rows enter 35 ms apart.</span><button type="button" class="replay">Replay</button></div>
+  <div class="status" aria-live="polite"></div>
+</div>
+<script>
+(() => {
+ const root=document.getElementById('demo'),menu=root.querySelector('.menu'),trigger=root.querySelector('.trigger'),track=root.querySelector('.track'),pages=root.querySelectorAll('.page'),highlight=root.querySelector('.highlight'),status=root.querySelector('.status');
+ const paths={chat:'M4 4h16v12H9l-5 4Z',down:'m6 9 6 6 6-6',right:'m9 6 6 6-6 6',left:'m15 6-6 6 6 6',pin:'m9 3 6 0-1 6 4 4H6l4-4ZM12 13v8',star:'m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3 6.4 20.2l1.1-6.2L3 9.6l6.2-.9Z',copy:'M8 8h12v12H8ZM16 8V4H4v12h4',settings:'M4 7h16M4 17h16M8 4v6M16 14v6',archive:'M4 4h16v4H4ZM6 8v12h12V8M10 12h4',bell:'M5 17h14l-2-3V9a5 5 0 0 0-10 0v5ZM10 21h4',sound:'M4 9h4l5-4v14l-5-4H4ZM17 8q5 4 0 8',check:'m5 12 4 4L19 6'};
+ const icon=name=>'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="'+paths[name]+'"/></svg>';
+ root.querySelectorAll('[data-icon]').forEach(el=>el.innerHTML=icon(el.dataset.icon));
+ let variant=0,version=0;const state={pin:false,star:false};const reduced=matchMedia('(prefers-reduced-motion:reduce)');
+ const descriptions=['Rows enter 35 ms apart.','One highlight glides between focused or hovered rows.','Click Pin, Favorites, or Copy to see feedback.','Preferences slides into the same menu.'];
+ function detail(show){track.classList.toggle('detail',show);pages[0].inert=show;pages[1].inert=!show;}
+ function open(value){menu.classList.toggle('closed',!value);menu.inert=!value;trigger.setAttribute('aria-expanded',String(value));menu.querySelectorAll('.row').forEach((row,i)=>row.style.transitionDelay=value&&variant===0?Math.min(i,4)*35+'ms':'0ms');}
+ function replay(){const ticket=++version;detail(false);highlight.style.opacity='0';open(false);setTimeout(()=>{if(ticket!==version)return;open(true);if(variant===3)setTimeout(()=>{if(ticket===version)detail(true);},450);},200);}
+ root.querySelectorAll('.variants button').forEach((button,i)=>button.onclick=()=>{variant=i;root.querySelectorAll('.variants button').forEach((b,j)=>b.setAttribute('aria-pressed',String(i===j)));menu.classList.toggle('cascade',i===0);menu.classList.toggle('follow',i===1);root.querySelector('#description').textContent=descriptions[i];status.textContent='';replay();});
+ root.querySelector('.replay').onclick=replay;
+ trigger.onclick=()=>{version++;open(trigger.getAttribute('aria-expanded')!=='true');};
+ root.addEventListener('keydown',event=>{if(event.key==='Escape'){version++;open(false);trigger.focus();}});
+ root.querySelector('#back').onclick=()=>{detail(false);root.querySelector('[data-action="preferences"]').focus({preventScroll:true});};
+ root.querySelectorAll('[data-action]').forEach(row=>{
+  const follow=()=>{if(variant!==1)return;highlight.style.transform='translateY('+row.offsetTop+'px)';highlight.style.opacity='1';};
+  row.onpointerenter=follow;row.onfocus=follow;
+  row.onclick=()=>{const action=row.dataset.action;
+   if(action==='preferences'){detail(true);root.querySelector('#back').focus({preventScroll:true});return;}
+   if(action==='pin'||action==='star'){state[action]=!state[action];const on=state[action],mark=row.querySelector('.icon');mark.classList.toggle('active',on);row.querySelector('.text').textContent=action==='pin'?(on?'Unpin conversation':'Pin conversation'):(on?'Remove favorite':'Add to favorites');status.textContent=action==='pin'?(on?'Conversation pinned':'Conversation unpinned'):(on?'Added to favorites':'Removed from favorites');if(variant===2&&!reduced.matches)mark.animate([{transform:'scale(1) rotate(0deg)'},{transform:'scale(1.2) rotate(-14deg)',offset:.45},{transform:'scale(1) rotate(0deg)'}],{duration:250,easing:'cubic-bezier(.23,1,.32,1)'});}
+   if(action==='copy'){row.querySelector('.icon').innerHTML=icon('check');row.querySelector('.text').textContent='Copied';status.textContent='Copy confirmation preview';}
+   if(action==='archive')status.textContent='Archive confirmation preview';
+  };
+ });
+ root.querySelector('.list').onpointerleave=()=>highlight.style.opacity='0';
+ root.querySelector('.list').onfocusout=event=>{if(!root.querySelector('.list').contains(event.relatedTarget))highlight.style.opacity='0';};
+ root.querySelectorAll('[data-toggle]').forEach(button=>button.onclick=()=>{const end=button.querySelector('.end');end.textContent=end.textContent==='On'?'Off':'On';status.textContent=button.dataset.toggle+' '+end.textContent.toLowerCase();});
+ requestAnimationFrame(()=>requestAnimationFrame(()=>open(true)));
+})();
+</script>

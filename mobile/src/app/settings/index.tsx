@@ -4,6 +4,10 @@ import { Alert, Linking, StyleSheet, Switch, Text, View } from "react-native";
 
 import { useConnection } from "@/features/connection/ConnectionProvider";
 import { MONOS_ENABLED } from "@/features/connection/selection";
+import {
+  liveActivitiesAvailable,
+  useLiveActivityPreference,
+} from "@/features/liveActivity/liveActivity";
 import { useNotificationsBlocked } from "@/features/notifications/SessionNotifications";
 import { useAppearancePreference } from "@/features/settings/appearance";
 import { accessMode } from "@/features/models/access";
@@ -26,6 +30,8 @@ import { radii, themedStyles, THEMES, useColors, useTheme } from "@/ui/theme";
 const CATEGORY_ICONS: Record<NotificationCategory, IconName> = {
   agentInput: "lock",
   agentFinished: "check",
+  monoMessages: "chat",
+  inbox: "inbox",
 };
 
 export default function SettingsScreen() {
@@ -41,6 +47,7 @@ export default function SettingsScreen() {
   const notifications = useNotificationPreferences();
   const [openAfterStarting, setOpenAfterStarting] = useOpenSessionAfterStarting();
   const blocked = useNotificationsBlocked();
+  const [liveActivity, setLiveActivity] = useLiveActivityPreference();
   // Both pages act on the project open under settings.
   const params = project ? { projectId: project.id } : {};
   const connection = useConnection();
@@ -111,6 +118,23 @@ export default function SettingsScreen() {
             />
           </Fragment>
         ))}
+        {liveActivitiesAvailable() ? (
+          <>
+            <View style={styles.divider} />
+            <SettingsRow
+              icon="metrics"
+              label="Live Activity"
+              onPress={() => setLiveActivity(!liveActivity)}
+              accessory={
+                <Switch
+                  value={liveActivity}
+                  onValueChange={setLiveActivity}
+                  trackColor={{ true: colors.accent }}
+                />
+              }
+            />
+          </>
+        ) : null}
       </View>
       {blocked ? (
         <Text style={styles.note} onPress={() => void Linking.openSettings()}>
@@ -149,6 +173,18 @@ export default function SettingsScreen() {
             router.push({ pathname: "/settings/permissions", params })
           }
         />
+        {project ? (
+          <>
+            <View style={styles.divider} />
+            <SettingsRow
+              icon="sparkle"
+              label="Skills"
+              onPress={() =>
+                router.push({ pathname: "/settings/skills", params })
+              }
+            />
+          </>
+        ) : null}
       </View>
 
       <Text style={styles.heading}>New sessions</Text>
@@ -175,11 +211,8 @@ export default function SettingsScreen() {
       <View style={styles.card}>
         <SettingsRow
           icon="folder"
-          label={MONOS_ENABLED ? "Projects and monos" : "Projects"}
-          value={String(
-            (selected?.projectIds.length ?? 0) +
-              (MONOS_ENABLED ? (selected?.monoIds.length ?? 0) : 0),
-          )}
+          label="Projects"
+          value={String(selected?.projectIds.length ?? 0)}
           onPress={() => router.push("/settings/workspace")}
         />
         <View style={styles.divider} />

@@ -21,6 +21,7 @@ import {
   X,
 } from "../../../shared/ui/icons";
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -81,9 +82,13 @@ import { invalidateWatchedFiles } from "../../files/model/fileWatch";
 import { MOD } from "../../../platform/tauri/platform";
 import { applyProjectDiffStats } from "../hooks/useProjectDiffStats";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
+import { useRowWindow } from "../../../shared/hooks/useRowWindow";
 import { isRemoteProjectPath } from "../../projects/model/recents";
 
 const GIT_POLL_MS = 2000;
+/** Wait at least this many read durations between polls. */
+const GIT_POLL_COST_FACTOR = 5;
+const GIT_POLL_MAX_MS = 30_000;
 
 function confirmNative(message: string, okLabel?: string): Promise<boolean> {
   return ask(message, {
@@ -556,6 +561,20 @@ function ChangedFiles({
     }
   };
 
+  // Stable handles so typing a commit message doesn't re-render every row.
+  const rowActions = useRef({ run, runFolder });
+  rowActions.current = { run, runFolder };
+  const onRowAction = useCallback(
+    (file: GitChangedFile, action: "stage" | "unstage" | "discard") =>
+      void rowActions.current.run(file, action),
+    [],
+  );
+  const onFolderAction = useCallback(
+    (relative: string, action: "stage" | "unstage") =>
+      void rowActions.current.runFolder(relative, action),
+    [],
+  );
+
   const generate = async () => {
     if (!canGenerate || generateAbortRef.current) return;
     const controller = new AbortController();
@@ -897,8 +916,8 @@ function ChangedFiles({
                   selectedKind={selectedKind}
                   busy={busy}
                   onOpenFile={onOpenFile}
-                  onAction={run}
-                  onFolderAction={runFolder}
+                  onAction={onRowAction}
+                  onFolderAction={onFolderAction}
                 />
               </FileSection>
             ) : null}
@@ -939,8 +958,8 @@ function ChangedFiles({
                   selectedKind={selectedKind}
                   busy={busy}
                   onOpenFile={onOpenFile}
-                  onAction={run}
-                  onFolderAction={runFolder}
+                  onAction={onRowAction}
+                  onFolderAction={onFolderAction}
                 />
               </FileSection>
             ) : null}
@@ -1266,31 +1285,20 @@ type ChangeRowProps = {
   onFolderAction: (relative: string, action: "stage" | "unstage") => void;
 };
 
-export function ChangeList({ files, view, ...rest }: ChangeRowProps) {
-  const tree = useMemo(() => buildChangeTree(files), [files]);
-  if (view === "tree") {
-    return <ChangeDirChildren dir={tree} depth={0} {...rest} />;
-  }
-  return (
-    <>
-      {files.map((file) => (
-        <ChangeRow
-          key={`${rest.kind}:${file.relative}`}
-          file={file}
-          active={isActive(file, rest.selected, rest.selectedKind, rest.kind)}
-          busy={rest.busy !== null}
-          kind={rest.kind}
-          onOpenFile={rest.onOpenFile}
-          onAction={rest.onAction}
-        />
-      ))}
-    </>
-  );
-}
+/** Every change row and folder row is `h-7`. */
+const CHANGE_ROW_HEIGHT = 28;
 
-function ChangeDirChildren({
-  dir,
-  depth,
+type ChangeItem =
+  | { type: "dir"; dir: ChangeDir; depth: number; open: boolean }
+  | { type: "file"; file: GitChangedFile; depth?: number };
+
+/**
+ * Draws only the rows in view: a branch can carry tens of thousands of
+ * changed files, and mounting a row for each one stalls the whole window.
+ */
+export const ChangeList = memo(function ChangeList({
+  files,
+  view,
   kind,
   selected,
   selectedKind,
@@ -1298,58 +1306,108 @@ function ChangeDirChildren({
   onOpenFile,
   onAction,
   onFolderAction,
-}: Omit<ChangeRowProps, "files" | "view"> & {
-  dir: ChangeDir;
-  depth: number;
-}) {
+}: ChangeRowProps) {
+  const tree = useMemo(
+    () => (view === "tree" ? buildChangeTree(files) : null),
+    [files, view],
+  );
+  const [collapseVersion, setCollapseVersion] = useState(0);
+  const items = useMemo(
+    () => (tree ? flattenChangeTree(tree, kind) : listItems(files)),
+    // collapseVersion re-reads the module-level collapsedDirs set.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tree, files, kind, collapseVersion],
+  );
+  const toggleDir = useCallback(
+    (path: string) => {
+      const key = `${kind}:${path}`;
+      if (collapsedDirs.has(key)) collapsedDirs.delete(key);
+      else collapsedDirs.add(key);
+      setCollapseVersion((value) => value + 1);
+    },
+    [kind],
+  );
+  const { anchorRef, start, end } = useRowWindow<HTMLLIElement>(
+    items.length,
+    CHANGE_ROW_HEIGHT,
+  );
+  const isBusy = busy !== null;
   return (
     <>
-      {dir.dirs.map((child) => (
-        <ChangeDirRow
-          key={child.path}
-          dir={child}
-          depth={depth}
-          kind={kind}
-          selected={selected}
-          selectedKind={selectedKind}
-          busy={busy}
-          onOpenFile={onOpenFile}
-          onAction={onAction}
-          onFolderAction={onFolderAction}
-        />
-      ))}
-      {dir.files.map((file) => (
-        <ChangeRow
-          key={`${kind}:${file.relative}`}
-          file={file}
-          active={isActive(file, selected, selectedKind, kind)}
-          busy={busy !== null}
-          kind={kind}
-          depth={depth}
-          onOpenFile={onOpenFile}
-          onAction={onAction}
-        />
-      ))}
+      <li
+        ref={anchorRef}
+        aria-hidden
+        style={{ height: start * CHANGE_ROW_HEIGHT }}
+      />
+      {items.slice(start, end).map((item) =>
+        item.type === "dir" ? (
+          <ChangeDirRow
+            key={`${kind}:dir:${item.dir.path}`}
+            dir={item.dir}
+            depth={item.depth}
+            open={item.open}
+            kind={kind}
+            busy={isBusy}
+            onToggle={toggleDir}
+            onFolderAction={onFolderAction}
+          />
+        ) : (
+          <ChangeRow
+            key={`${kind}:${item.file.relative}`}
+            file={item.file}
+            active={isActive(item.file, selected, selectedKind, kind)}
+            busy={isBusy}
+            kind={kind}
+            depth={item.depth}
+            onOpenFile={onOpenFile}
+            onAction={onAction}
+          />
+        ),
+      )}
+      <li
+        aria-hidden
+        style={{ height: (items.length - end) * CHANGE_ROW_HEIGHT }}
+      />
     </>
   );
+});
+
+function listItems(files: GitChangedFile[]): ChangeItem[] {
+  return files.map((file) => ({ type: "file", file }));
 }
 
-function ChangeDirRow({
+/** Folders first at each level; a collapsed folder hides its descendants. */
+function flattenChangeTree(root: ChangeDir, kind: GitFileDiffKind): ChangeItem[] {
+  const items: ChangeItem[] = [];
+  const visit = (dir: ChangeDir, depth: number) => {
+    for (const child of dir.dirs) {
+      const open = !collapsedDirs.has(`${kind}:${child.path}`);
+      items.push({ type: "dir", dir: child, depth, open });
+      if (open) visit(child, depth + 1);
+    }
+    for (const file of dir.files) items.push({ type: "file", file, depth });
+  };
+  visit(root, 0);
+  return items;
+}
+
+const ChangeDirRow = memo(function ChangeDirRow({
   dir,
   depth,
+  open,
   kind,
-  ...rest
-}: Omit<ChangeRowProps, "files" | "view"> & {
+  busy,
+  onToggle,
+  onFolderAction,
+}: {
   dir: ChangeDir;
   depth: number;
+  open: boolean;
+  kind: GitFileDiffKind;
+  busy: boolean;
+  onToggle: (path: string) => void;
+  onFolderAction: (relative: string, action: "stage" | "unstage") => void;
 }) {
-  const key = `${kind}:${dir.path}`;
-  const [open, setOpen] = useState(() => !collapsedDirs.has(key));
-  const toggle = () => {
-    if (open) collapsedDirs.add(key);
-    else collapsedDirs.delete(key);
-    setOpen(!open);
-  };
   return (
     <li>
       <div
@@ -1360,7 +1418,7 @@ function ChangeDirRow({
           type="button"
           title={dir.path}
           aria-expanded={open}
-          onClick={toggle}
+          onClick={() => onToggle(dir.path)}
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
         >
           <span className="grid size-4 shrink-0 place-items-center text-content/50">
@@ -1378,12 +1436,9 @@ function ChangeDirRow({
         <div className="hidden shrink-0 items-center group-focus-within:flex group-hover:flex">
           <IconAction
             title={`${kind === "staged" ? "Unstage" : "Stage"} Changes in ${dir.path}`}
-            disabled={rest.busy !== null}
+            disabled={busy}
             onClick={() =>
-              rest.onFolderAction(
-                dir.path,
-                kind === "staged" ? "unstage" : "stage",
-              )
+              onFolderAction(dir.path, kind === "staged" ? "unstage" : "stage")
             }
           >
             {kind === "staged" ? (
@@ -1402,19 +1457,9 @@ function ChangeDirRow({
           <span className="size-1.5 rounded-full bg-current" />
         </span>
       </div>
-      {open ? (
-        <ul>
-          <ChangeDirChildren
-            dir={dir}
-            depth={depth + 1}
-            kind={kind}
-            {...rest}
-          />
-        </ul>
-      ) : null}
     </li>
   );
-}
+});
 
 function isActive(
   file: GitChangedFile,
@@ -1434,14 +1479,16 @@ function buildChangeTree(files: GitChangedFile[]): ChangeDir {
     files: [],
     status: null,
   };
+  const byPath = new Map<string, ChangeDir>();
   for (const file of files) {
     const segments = file.relative.split("/");
     let node = root;
     for (const segment of segments.slice(0, -1)) {
       const path = node.path ? `${node.path}/${segment}` : segment;
-      let next = node.dirs.find((dir) => dir.path === path);
+      let next = byPath.get(path);
       if (!next) {
         next = { name: segment, path, dirs: [], files: [], status: null };
+        byPath.set(path, next);
         node.dirs.push(next);
       }
       node = next;
@@ -1452,11 +1499,15 @@ function buildChangeTree(files: GitChangedFile[]): ChangeDir {
   return root;
 }
 
+// One collator instead of a localeCompare per comparison: same order, far
+// cheaper across thousands of files.
+const compareNames = new Intl.Collator().compare;
+
 /** Sorts each level (folders first) and rolls descendant status upward. */
 function sortChangeDir(dir: ChangeDir): string | null {
-  dir.dirs.sort((a, b) => a.name.localeCompare(b.name));
+  dir.dirs.sort((a, b) => compareNames(a.name, b.name));
   dir.files.sort((a, b) =>
-    basename(a.relative).localeCompare(basename(b.relative)),
+    compareNames(basename(a.relative), basename(b.relative)),
   );
   let status: string | null = null;
   let mixed = false;
@@ -1471,7 +1522,7 @@ function sortChangeDir(dir: ChangeDir): string | null {
   return dir.status;
 }
 
-function ChangeRow({
+const ChangeRow = memo(function ChangeRow({
   file,
   active,
   busy,
@@ -1568,7 +1619,7 @@ function ChangeRow({
       </div>
     </li>
   );
-}
+});
 
 function IconAction({
   title,
@@ -1644,6 +1695,8 @@ function useDiffIndex(
     let inFlight = false;
     let pending = false;
     let publishing = false;
+    let readCost = 0;
+    let lastRead = 0;
 
     const load = async () => {
       if (inFlight) {
@@ -1652,8 +1705,10 @@ function useDiffIndex(
       }
       if (document.hidden && nonce === 0) return;
       inFlight = true;
+      const started = performance.now();
       try {
         const next = await gitDiffIndex(cwd);
+        readCost = performance.now() - started;
         if (cancelled) return;
         rememberIndex(cwd, next);
         const prev = indexRef.current;
@@ -1682,6 +1737,7 @@ function useDiffIndex(
         // Never replace it with another checkout's data.
       } finally {
         inFlight = false;
+        lastRead = performance.now();
         if (pending && !cancelled) {
           pending = false;
           void load();
@@ -1693,7 +1749,14 @@ function useDiffIndex(
     const onResume = () => {
       if (!publishing && !document.hidden) void load();
     };
-    const timer = window.setInterval(onResume, GIT_POLL_MS);
+    // Huge checkouts take a while to read. Polling every 2s regardless would
+    // keep Git, IPC and the diff busy nonstop, so space polls out by cost.
+    const onTick = () => {
+      const gap = Math.min(GIT_POLL_MAX_MS, readCost * GIT_POLL_COST_FACTOR);
+      if (performance.now() - lastRead < gap) return;
+      onResume();
+    };
+    const timer = window.setInterval(onTick, GIT_POLL_MS);
     window.addEventListener("focus", onResume);
     document.addEventListener("visibilitychange", onResume);
     const unsubGit = subscribeGitChanged(onResume);

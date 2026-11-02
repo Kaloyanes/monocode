@@ -21,6 +21,8 @@ const desktop = vi.hoisted(() => ({
     headerBackVisible?: boolean;
   },
   existing: { path: "/repo/.worktrees/mobile", name: "feature/mobile" },
+  terminal: undefined as boolean | undefined,
+  toolbar: [] as { terminal?: boolean }[],
 }));
 
 vi.mock("react-native-svg", () => ({ default: () => <svg />, Path: () => null }));
@@ -118,8 +120,10 @@ vi.mock("@/features/connection/useProjectChanges", () => ({
   useProjectChanges: (_project: string, _enabled: boolean, path?: string) => ({
     result: { branch: path ? desktop.existing.name : "main", files: [] },
     error: null,
+    summary: { files: 0, staged: 0, additions: 0, deletions: 0 },
   }),
 }));
+vi.mock("@/features/changes/ShipCard", () => ({ ShipCard: () => null }));
 vi.mock("@/features/connection/useProjectWorktrees", () => ({
   useProjectWorktrees: () => ({ worktrees: [desktop.existing], loaded: true }),
 }));
@@ -198,12 +202,25 @@ vi.mock("@/features/sessions/SessionsPage", () => ({
 }));
 vi.mock("@/features/sessions/SessionToolbar", () => ({
   SessionTitle: () => null,
-  SessionToolbar: () => null,
+  SessionToolbar: (props: { terminal?: boolean }) => {
+    desktop.toolbar.push(props);
+    return null;
+  },
+}));
+vi.mock("@/features/terminal/TerminalSheet", () => ({ TerminalSheet: () => null }));
+vi.mock("@/features/terminal/TerminalActionsSheet", () => ({
+  TerminalActionsSheet: () => null,
+}));
+vi.mock("@/features/connection/ConnectionProvider", () => ({
+  useConnection: () => ({ catalog: { terminal: desktop.terminal } }),
 }));
 vi.mock("@/features/sessions/Transcript", () => ({
   Transcript: () => null,
   TranscriptLoading: () => null,
 }));
+vi.mock("@/features/workspace/useCreateMono", () => ({ useCreateMono: () => undefined }));
+vi.mock("@/features/inbox/InboxPage", () => ({ InboxPage: () => null }));
+vi.mock("@/features/inbox/InboxProvider", () => ({ useInboxSupported: () => false }));
 vi.mock("@/features/workspace/ProjectPages", () => ({
   useProjectPages: () => ({ progress: { get: () => 0 }, view: "chat" }),
   ProjectPages: () => null,
@@ -243,6 +260,27 @@ vi.mock("@/features/workspace/WorkspaceMenu", () => ({
     </>
   ),
   WorkspaceLine: ({ branch }: { branch: string }) => <span>{branch}</span>,
+}));
+// The drawer's pager and its loading cover reach native modules; here the
+// drawer is shut and no screen switch is under way.
+vi.mock("@/ui/ScenePager", () => ({
+  useDrawerActions: () => ({
+    open: vi.fn(),
+    close: vi.fn(),
+    closeThen: (change: () => void) => change(),
+    allowSwipe: () => () => {},
+  }),
+  useDrawerSwipe: vi.fn(),
+  useSceneSwapping: () => false,
+  useSceneSwitching: () => false,
+}));
+vi.mock("@/ui/DitherLoading", () => ({ DitherLoading: () => null }));
+vi.mock("@/features/workspace/useCreateMono", () => ({
+  useCreateMono: () => undefined,
+}));
+vi.mock("@/features/workspace/UnreadDot", () => ({
+  UnreadDot: () => null,
+  useAnyUnread: () => false,
 }));
 vi.mock("@/ui/Icon", () => ({ Icon: () => null }));
 vi.mock("@/ui/LiquidView", async () => {
@@ -332,18 +370,24 @@ describe("new session composer workspace", () => {
     desktop.sendMessage.mockReset().mockResolvedValue(undefined);
     desktop.offline = false;
     desktop.os = "ios";
+    desktop.terminal = undefined;
+    desktop.toolbar = [];
     container = document.createElement("div");
     root = createRoot(container);
   });
   afterEach(() => act(() => root.unmount()));
 
-  it("keeps circular Android project/settings controls after switching projects", () => {
+  it("keeps the circular Android drawer button after switching projects", () => {
     desktop.os = "android";
     render();
-    for (const label of ["Switch project, Monocode", "Settings"]) {
-      expect(button(label).style.borderRadius).toBe("22px");
-      expect(button(label).hasAttribute("data-glass")).toBe(true);
-    }
+    // The drawer's button, where the project switcher was.
+    expect(button("Projects").style.borderRadius).toBe("22px");
+    expect(button("Projects").hasAttribute("data-glass")).toBe(true);
+    // Settings moved off the project's header.
+    const settings = Array.from(container.querySelectorAll("button")).find(
+      (found) => found.getAttribute("aria-label") === "Settings" || found.textContent === "Settings",
+    );
+    expect(settings).toBeUndefined();
     act(() =>
       root.render(
         <ProjectScreen
@@ -352,8 +396,8 @@ describe("new session composer workspace", () => {
         />,
       ),
     );
-    expect(button("Switch project, Other").style.borderRadius).toBe("22px");
-    expect(button("Settings").hasAttribute("data-glass")).toBe(true);
+    expect(button("Projects").style.borderRadius).toBe("22px");
+    expect(button("Projects").hasAttribute("data-glass")).toBe(true);
     expect(desktop.header.headerTitleAlign).toBe("center");
   });
 
@@ -370,9 +414,7 @@ describe("new session composer workspace", () => {
     const renderAvatar = desktop.header.headerLeft as () => ReactNode;
     act(() => root.render(<>{renderAvatar()}</>));
     expect(desktop.headerTarget).toBe(target);
-    expect(button("Switch project, Monocode").hasAttribute("data-glass")).toBe(
-      true,
-    );
+    expect(button("Projects").hasAttribute("data-glass")).toBe(true);
   });
 
   it("keeps Android session titles next to the back target and actions on the right", () => {
@@ -382,6 +424,16 @@ describe("new session composer workspace", () => {
     expect(desktop.header.headerBackVisible).toBe(false);
     expect(desktop.header.headerTitle).toBeTypeOf("function");
     expect(desktop.header.headerRight).toBeTypeOf("function");
+  });
+
+  it("offers the terminal button only when the desktop says it allows one", () => {
+    render("existing-session");
+    expect(desktop.toolbar.at(-1)?.terminal).toBe(false);
+    act(() => root.unmount());
+    root = createRoot(container);
+    desktop.terminal = true;
+    render("existing-session");
+    expect(desktop.toolbar.at(-1)?.terminal).toBe(true);
   });
 
   it("switches to a new worktree from the composer and sends that choice", async () => {
@@ -454,6 +506,8 @@ describe("new session composer workspace", () => {
       "existing-session",
       "Build the app",
       [],
+      undefined,
+      undefined,
     );
     expect(desktop.startSession).not.toHaveBeenCalled();
   });

@@ -18,8 +18,10 @@ import type { SessionSummary } from "@/features/workspace/types";
 import { useWorkspace } from "@/features/workspace/WorkspaceProvider";
 import { LiquidView } from "@/ui/LiquidView";
 import { ChoiceMenu } from "@/ui/ChoiceMenu";
+import { ACTION_SYMBOLS, useTerminalActions } from "@/features/terminal/terminalActions";
 import { themedStyles, useColors } from "@/ui/theme";
 
+import { confirmArchive } from "./archiveActions";
 import { useSessionActions } from "./useSessionActions";
 
 const failed = (title: string) => (reason: unknown) =>
@@ -30,6 +32,10 @@ const failed = (title: string) => (reason: unknown) =>
  *  its button and takes none. Too little left for them and iOS drops a
  *  button rather than squeeze them. */
 const HEADER_ITEMS = 210;
+/** What the terminal button adds to it, when the desktop offers one: its own
+ *  width and the gap beside it. Less and iOS folds the changes button and the
+ *  session menu into an overflow menu behind the terminal button. */
+const TERMINAL_ITEM = 60;
 
 /**
  * A session's title on the left of the stack's header, beside the back button
@@ -39,9 +45,12 @@ const HEADER_ITEMS = 210;
 export function SessionTitle({
   title,
   subtitle,
+  terminal,
 }: {
   title: string;
   subtitle: string;
+  /** Whether the toolbar has a terminal button, which the title leaves room for. */
+  terminal?: boolean;
 }) {
   const styles = useStyles();
   const { width } = useWindowDimensions();
@@ -58,9 +67,24 @@ export function SessionTitle({
     );
   return (
     <Stack.Toolbar placement="left">
+      {onClose ? (
+        <Stack.Toolbar.Button
+          icon="xmark"
+          accessibilityLabel="Close"
+          onPress={onClose}
+        />
+      ) : null}
       <Stack.Toolbar.View hidesSharedBackground>
         <View
-          style={[styles.title, { width: Math.max(width - HEADER_ITEMS, 80) }]}
+          style={[
+            styles.title,
+            {
+              width: Math.max(
+                width - HEADER_ITEMS - (terminal ? TERMINAL_ITEM : 0),
+                80,
+              ),
+            },
+          ]}
         >
           <Text style={styles.name} numberOfLines={1}>
             {title}
@@ -86,6 +110,9 @@ export function SessionToolbar({
   worktreePath,
   harness,
   changed,
+  terminal,
+  onTerminal,
+  onEditActions,
   onSettings,
 }: {
   projectId: string;
@@ -97,6 +124,12 @@ export function SessionToolbar({
   harness?: string;
   /** Files changed in the session's working copy. */
   changed: number;
+  /** Whether the desktop lets this phone open a terminal. */
+  terminal?: boolean;
+  /** Opens the terminal sheet, typing and running `run` if given. */
+  onTerminal?: (run?: string) => void;
+  /** Opens the sheet that edits the terminal's saved actions. */
+  onEditActions?: () => void;
   onSettings: () => void;
 }) {
   const { archiveSession, deleteSession, renameSession } = useWorkspace();
@@ -116,6 +149,10 @@ export function SessionToolbar({
       },
     });
 
+  const [actions] = useTerminalActions(projectId);
+  const openTerminal = (run?: string) => onTerminal?.(run);
+  const editActions = () => onEditActions?.();
+
   const copyId = async () => {
     await Clipboard.setStringAsync(sessionId);
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -131,18 +168,8 @@ export function SessionToolbar({
     remove(target.id).catch(failed(title));
   };
   const archive = (target: SessionSummary) =>
-    Alert.alert(
-      `Archive “${target.title}”?`,
-      "It moves to the archive on your desktop.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Archive",
-          isPreferred: true,
-          onPress: () =>
-            leaveAnd(archiveSession, "Could not archive the session", target),
-        },
-      ],
+    confirmArchive(target, () =>
+      leaveAnd(archiveSession, "Could not archive the session", target),
     );
   const remove = (target: SessionSummary) =>
     Alert.alert(`Delete “${target.title}”?`, "This can’t be undone.", [
@@ -159,6 +186,32 @@ export function SessionToolbar({
     return (
       <View style={styles.androidToolbar}>
         <LiquidView borderRadius={24} innerStyle={styles.androidActions}>
+          {terminal ? (
+            <ChoiceMenu
+              label="Terminal"
+              actions={[
+                { label: "Open Terminal", onPress: () => openTerminal() },
+                ...actions.map((action) => ({
+                  label: action.name,
+                  onPress: () => openTerminal(action.command),
+                })),
+                { label: "Edit Actions…", onPress: editActions },
+              ]}
+            >
+              <View style={styles.androidButton}>
+                <Svg width={24} height={24} viewBox="0 0 24 24">
+                  <Path
+                    d="M5 8l4.5 4L5 16M12.5 17H19"
+                    stroke={colors.content}
+                    strokeWidth={1.8}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    fill="none"
+                  />
+                </Svg>
+              </View>
+            </ChoiceMenu>
+          ) : null}
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={`Changes, ${changed} ${changed === 1 ? "file" : "files"}`}
@@ -218,9 +271,7 @@ export function SessionToolbar({
         </LiquidView>
         {/* Keep the overhang outside both the pill and the button's clip bounds. */}
         {changed > 0 ? (
-          <View pointerEvents="none" style={styles.badge}>
-            <Text style={styles.badgeText}>{changed}</Text>
-          </View>
+          <View pointerEvents="none" style={styles.badge} />
         ) : null}
         {/* Alert.prompt is iOS-only; keep Android's restored Rename action usable. */}
         <Modal
@@ -273,14 +324,43 @@ export function SessionToolbar({
 
   return (
     <Stack.Toolbar placement="right">
+      {terminal ? (
+        <Stack.Toolbar.Menu icon="apple.terminal" accessibilityLabel="Terminal">
+          <Stack.Toolbar.MenuAction
+            icon="apple.terminal"
+            onPress={() => openTerminal()}
+          >
+            Open Terminal
+          </Stack.Toolbar.MenuAction>
+          <Stack.Toolbar.Menu inline>
+            {actions.map((action) => (
+              <Stack.Toolbar.MenuAction
+                key={action.id ?? action.name}
+                icon={(ACTION_SYMBOLS[action.icon] ?? "play") as "play"}
+                onPress={() => openTerminal(action.command)}
+              >
+                {action.name}
+              </Stack.Toolbar.MenuAction>
+            ))}
+          </Stack.Toolbar.Menu>
+          <Stack.Toolbar.Menu inline>
+            <Stack.Toolbar.MenuAction
+              icon="slider.horizontal.3"
+              onPress={editActions}
+            >
+              Edit Actions…
+            </Stack.Toolbar.MenuAction>
+          </Stack.Toolbar.Menu>
+        </Stack.Toolbar.Menu>
+      ) : null}
       <Stack.Toolbar.Button
         icon="plus.forwardslash.minus"
         accessibilityLabel={`Changes, ${changed} ${changed === 1 ? "file" : "files"}`}
         onPress={openChanges}
       >
-        {changed > 0 ? (
-          <Stack.Toolbar.Badge>{String(changed)}</Stack.Toolbar.Badge>
-        ) : null}
+        {/* A dot rather than the count, which a big working copy would
+            stretch across the header; the count is in the label. */}
+        {changed > 0 ? <Stack.Toolbar.Badge /> : null}
       </Stack.Toolbar.Button>
       <Stack.Toolbar.Menu icon="ellipsis" accessibilityLabel="Session actions">
         <Stack.Toolbar.MenuAction
@@ -345,15 +425,11 @@ const useStyles = themedStyles((colors) => ({
     position: "absolute",
     top: 0,
     right: 40,
-    minWidth: 20,
-    height: 20,
-    paddingHorizontal: 4,
-    borderRadius: 10,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
     backgroundColor: "#ff3b30",
-    alignItems: "center",
-    justifyContent: "center",
   },
-  badgeText: { color: "#ffffff", fontSize: 12, fontWeight: "600" },
   renameBackdrop: {
     flex: 1,
     justifyContent: "center",

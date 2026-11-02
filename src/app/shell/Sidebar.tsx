@@ -3997,10 +3997,15 @@ function ProjectSpacesBar({
   const visible = projects.slice(first, first + shown);
   const rowRef = useRef<HTMLDivElement>(null);
   const step = (direction: -1 | 1) => {
-    const next = Math.min(lastStart, Math.max(0, first + direction));
-    if (next === first) return;
-    setStart(next);
-    // A short slide in from the side the new project comes from.
+    setStart(Math.min(lastStart, Math.max(0, first + direction)));
+  };
+  // A short slide in from the side the new projects come from, whether the
+  // window moved by a chevron, a shortcut, or a step that wrapped around.
+  const previousFirst = useRef(first);
+  useLayoutEffect(() => {
+    const before = previousFirst.current;
+    previousFirst.current = first;
+    if (before === first) return;
     const row = rowRef.current;
     if (
       !row ||
@@ -4008,6 +4013,12 @@ function ProjectSpacesBar({
       window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
     )
       return;
+    const direction =
+      projectStep && sameProjectPath(projectStep.to, cwd)
+        ? projectStep.direction
+        : first > before
+          ? 1
+          : -1;
     row.animate(
       [
         { transform: `translateX(${direction * 12}px)`, opacity: 0.4 },
@@ -4015,7 +4026,7 @@ function ProjectSpacesBar({
       ],
       { duration: 200, easing: "cubic-bezier(0.32, 0.72, 0, 1)" },
     );
-  };
+  }, [first, cwd]);
   const chevron = (direction: -1 | 1) => {
     const disabled = direction < 0 ? first <= 0 : first >= lastStart;
     const Icon = direction < 0 ? ChevronLeft : ChevronRight;
@@ -4041,6 +4052,7 @@ function ProjectSpacesBar({
     // footer's; each space takes an equal share.
     <div
       {...projectTooltip.handlers}
+      data-project-spaces
       className="flex h-[30px] shrink-0 items-center gap-1 px-2 pb-0.5"
     >
       {chevron(-1)}

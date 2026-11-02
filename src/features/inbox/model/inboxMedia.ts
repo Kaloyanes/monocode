@@ -30,11 +30,45 @@ const mediaCache = new Map<string, Uint8Array>();
 const mediaRequests = new Map<string, Promise<Uint8Array>>();
 let mediaCacheBytes = 0;
 
+const BLOB_MEDIA_EXTENSION = /\.(png|jpe?g|gif|webp|avif|mp4|mov|webm)$/i;
+
+/**
+ * Maps a `github.com/<owner>/<repo>/blob/<ref>/<file>` image or video link to
+ * the raw file it shows. Other URLs, including blob links to code, come back
+ * unchanged. The host re-checks the result, so this only picks the fetch URL.
+ */
+export function inboxMediaSourceUrl(value: string): string {
+  const trimmed = value.trim();
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return trimmed;
+  }
+  const host = url.hostname.toLowerCase();
+  if (
+    url.protocol !== "https:" ||
+    (host !== "github.com" && host !== "www.github.com")
+  ) {
+    return trimmed;
+  }
+  const parts = url.pathname.split("/").filter(Boolean);
+  const file = parts[parts.length - 1] ?? "";
+  if (
+    parts.length < 5 ||
+    parts[2] !== "blob" ||
+    !BLOB_MEDIA_EXTENSION.test(file)
+  ) {
+    return trimmed;
+  }
+  return `https://raw.githubusercontent.com/${parts[0]}/${parts[1]}/${parts.slice(3).join("/")}`;
+}
+
 /** Remote image/video URLs GitHub and Linear actually put in issue bodies. */
 export function isInboxMediaUrl(value: string): boolean {
   let url: URL;
   try {
-    url = new URL(value.trim());
+    url = new URL(inboxMediaSourceUrl(value));
   } catch {
     return false;
   }
@@ -69,7 +103,7 @@ export function sniffInboxMedia(bytes: Uint8Array): InboxMediaType | null {
 }
 
 export function fetchInboxMedia(url: string): Promise<Uint8Array> {
-  const key = url.trim();
+  const key = inboxMediaSourceUrl(url);
   const cached = mediaCache.get(key);
   if (cached) {
     mediaCache.delete(key);

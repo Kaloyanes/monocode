@@ -1034,3 +1034,30 @@ describe("isReplayedTaskNotificationResult", () => {
     ).toBe(false);
   });
 });
+
+describe("turnMetricsFromResult cost and cache lifetime", () => {
+  it("reads the running total and the tier the turn wrote", () => {
+    expect(
+      turnMetricsFromResult({
+        total_cost_usd: 0.84,
+        usage: {
+          input_tokens: 3,
+          cache_creation: {
+            ephemeral_5m_input_tokens: 0,
+            ephemeral_1h_input_tokens: 900,
+          },
+        },
+      }),
+    ).toMatchObject({ totalCostUsd: 0.84, cacheTtlMs: 3_600_000 });
+  });
+  it("omits the lifetime for a read-only turn", () => {
+    const m = turnMetricsFromResult({
+      total_cost_usd: 1,
+      usage: {
+        input_tokens: 3,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+      },
+    });
+    expect(m?.cacheTtlMs).toBeUndefined();
+  });
+});

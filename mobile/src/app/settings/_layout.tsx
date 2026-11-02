@@ -5,7 +5,6 @@ import {
   modalStackOptions,
   sheetScreenLayout,
 } from "@/features/files/codeScreen";
-import { MONOS_ENABLED } from "@/features/connection/selection";
 import { androidBackHeader } from "@/ui/AndroidHeader";
 import { useColors } from "@/ui/theme";
 
@@ -43,13 +42,17 @@ export default function SettingsLayout() {
         name="permissions"
         options={{ title: "Permissions", ...androidBackHeader("Permissions") }}
       />
+      <Stack.Screen
+        name="skills"
+        options={{ title: "Skills", ...androidBackHeader("Skills") }}
+      />
       {/* The provider's models title themselves. */}
       <Stack.Screen name="models" options={{ title: "" }} />
       <Stack.Screen
         name="workspace"
         options={{
-          title: MONOS_ENABLED ? "Projects and monos" : "Projects",
-          ...androidBackHeader(MONOS_ENABLED ? "Projects and monos" : "Projects"),
+          title: "Projects",
+          ...androidBackHeader("Projects"),
         }}
       />
     </Stack>

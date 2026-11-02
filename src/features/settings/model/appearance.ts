@@ -94,7 +94,7 @@ export const NEW_THREAD_BACKGROUND_EFFECT_DESCRIPTIONS: Record<
   "gradient-blur": "Blurs and fades the artwork into the background below.",
 };
 
-export const THEME_PREFERENCE_DEFAULT: ThemePreference = "dark";
+export const THEME_PREFERENCE_DEFAULT: ThemePreference = "system";
 
 export const ACCENT_COLOR_DEFAULT = null;
 

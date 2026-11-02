@@ -1,0 +1,703 @@
+//! App-wide preferences the Settings pages edit. Defaults are the React
+//! app's (`settings.ts`, `appearance.ts`, `displayPrefs.ts`, `sounds.ts`).
+use monocode_core::provider::Kind;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct Preferences {
+    // General
+    pub sounds: bool,
+    pub notifications: bool,
+    pub project_notifications: serde_json::Value,
+    pub notification_projects: serde_json::Value,
+    pub file_tabs: String,
+    pub file_word_wrap: bool,
+    pub file_view_mode: String,
+    pub tab_animations: bool,
+    pub notes: bool,
+    pub quick_composer: bool,
+    pub working_agents: bool,
+    /// What the title strip shows; `None` until chosen, read through
+    /// `title_bar_mode`.
+    pub title_bar: Option<TitleBarMode>,
+    /// Legacy "Plan in title bar", read when `title_bar` is unset.
+    pub title_plan: bool,
+    pub close_to_tray: bool,
+    /// Running an action shows the terminal it runs in.
+    pub action_opens_terminal: bool,
+    /// The new layout opens the terminal as a right panel tab, not a dock.
+    pub terminal_in_panel: bool,
+    /// Keeping the Mac awake while agents work.
+    pub keep_awake: KeepAwakePrefs,
+    /// Legacy "Hide tab bar", read when `title_bar` is unset.
+    pub hide_tab_bar: bool,
+    // Appearance
+    pub theme: String,
+    pub wayland_window_decorations: bool,
+    pub workspace_theme: String,
+    // Retain the legacy inset-only key when reading and saving preferences.
+    // Window materials now use the shared opacity and main-pane glass values.
+    pub inset_glass: bool,
+    pub accent_color: Option<String>,
+    pub diff_palette: String,
+    pub theme_hue: u32,
+    pub theme_saturation: u32,
+    pub theme_dark_lightness: u32,
+    pub sidebar_opacity: u32,
+    // Retain the saved value for compatibility; native window blur is fixed.
+    pub sidebar_blur: u32,
+    pub body_glass: bool,
+    pub chat_background: Option<String>,
+    pub chat_background_effect: String,
+    pub chat_background_scope: String,
+    pub chat_background_empty: u32,
+    pub chat_background_session: u32,
+    pub collapsed_project_rail: String,
+    pub ui_scale: u32,
+    pub show_excluded_files: bool,
+    // Chat
+    pub transcript_layout: String,
+    pub anchor_prompts: bool,
+    pub paced_reveal: bool,
+    pub follow_up: String,
+    pub model_controls: String,
+    pub autocorrect: bool,
+    pub format_on_save: bool,
+    pub autosave: bool,
+    pub diff_view: String,
+    pub composer_mascot: bool,
+    // Visualizations
+    /// What draws drafts: "webkit", built in, or "chromium", downloaded.
+    pub page_engine: String,
+    // Devices
+    /// iOS Simulators and Android Emulators in the right panel. Off until
+    /// chosen: it installs and runs the device hub with the user's Node.
+    pub devices: bool,
+    /// Agents may open, see and drive devices.
+    pub device_agents: bool,
+    /// What fills an empty session: "ink", "games" or "none".
+    pub empty_session: String,
+    // Providers
+    pub show_remaining_usage: bool,
+    /// Which limit the footer's usage bar follows: "shortest" or "most-used".
+    pub usage_bar_window: String,
+    /// Writes commit messages, pull requests and session titles with this model instead of the session's.
+    pub text_model: Option<ModelChoice>,
+    /// Per-action overrides of `text_model`.
+    pub commit_model: Option<ModelChoice>,
+    pub pr_model: Option<ModelChoice>,
+    pub title_model: Option<ModelChoice>,
+    /// Names new worktree branches. Unlike the actions above it never falls
+    /// back to `text_model`; unset uses the session provider's fast model.
+    pub branch_model: Option<ModelChoice>,
+    pub mask_emails: bool,
+    pub idle_agents: u32,
+    pub claude_hooks: bool,
+    /// Turns off Claude Code's and Codex's own subagent tools in chats that
+    /// can start MonoCode threads.
+    pub monocode_subagents_only: bool,
+    /// Experimental: report Monocode instead of `sdk-cli` as Claude's entrypoint.
+    pub claude_entrypoint: bool,
+    pub binary_paths: HashMap<String, String>,
+    pub disabled_skill_paths: Vec<String>,
+    pub skill_source_paths: Vec<String>,
+    pub default_provider: Option<String>,
+    pub default_models: HashMap<String, String>,
+    pub hidden_providers: Vec<String>,
+    /// Models left out of the model picker unless a search names them.
+    pub hidden_models: Vec<ModelChoice>,
+    pub project_providers: HashMap<String, ProviderDefaults>,
+    pub favorite_models: Vec<ModelChoice>,
+    pub recent_models: Vec<ModelChoice>,
+    /// How new chats pick a model when the project names none: "last",
+    /// "default" or "pinned". `None` predates the setting; see `new_chat_mode`.
+    pub new_chat_model: Option<String>,
+    /// The last model picked for each provider, `None` for its default.
+    pub last_models: HashMap<String, Option<String>>,
+    pub model_picker_tab: Option<String>,
+    /// The last access mode picked in a composer; new chats start with it.
+    pub default_access: Option<String>,
+    /// Last explicit effort choice for each provider, shared across projects.
+    pub provider_efforts: HashMap<String, String>,
+    /// The model for session titles, branch names, commit messages and pull
+    /// requests; `None` lets each use its own harness's quick model.
+    pub background_model: Option<ModelChoice>,
+    // Monos
+    pub monos: bool,
+    pub rail_monos_pinned: bool,
+    pub mono_menu_bar_icon: bool,
+    // Archive
+    pub show_archived: bool,
+    /// Archive conversations idle this many days; 0 never does.
+    pub auto_archive_days: u32,
+    // Keybindings: a changed shortcut, or `None` for a disabled one.
+    pub keybindings: HashMap<String, Option<String>>,
+}
+
+pub(crate) const UI_SCALE_PERCENTS: [u32; 16] = [
+    50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200,
+];
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            sounds: true,
+            notifications: false,
+            project_notifications: serde_json::json!({}),
+            notification_projects: serde_json::json!([]),
+            file_tabs: "pane".into(),
+            file_word_wrap: true,
+            file_view_mode: "preview".into(),
+            tab_animations: false,
+            notes: true,
+            quick_composer: true,
+            working_agents: true,
+            title_bar: None,
+            title_plan: false,
+            close_to_tray: true,
+            action_opens_terminal: true,
+            terminal_in_panel: false,
+            keep_awake: KeepAwakePrefs::default(),
+            hide_tab_bar: false,
+            theme: "dark".into(),
+            wayland_window_decorations: true,
+            workspace_theme: "default".into(),
+            inset_glass: true,
+            accent_color: None,
+            diff_palette: "default".into(),
+            theme_hue: 240,
+            theme_saturation: 0,
+            theme_dark_lightness: 9,
+            sidebar_opacity: 85,
+            sidebar_blur: 24,
+            body_glass: true,
+            chat_background: None,
+            chat_background_effect: "none".into(),
+            chat_background_scope: "all".into(),
+            chat_background_empty: 24,
+            chat_background_session: 24,
+            collapsed_project_rail: "compact".into(),
+            ui_scale: 100,
+            show_excluded_files: false,
+            transcript_layout: "chat".into(),
+            anchor_prompts: true,
+            paced_reveal: true,
+            follow_up: "steer".into(),
+            model_controls: "menu".into(),
+            autocorrect: false,
+            format_on_save: true,
+            autosave: false,
+            diff_view: "editor".into(),
+            composer_mascot: true,
+            page_engine: "webkit".into(),
+            devices: false,
+            device_agents: false,
+            empty_session: "ink".into(),
+            show_remaining_usage: false,
+            usage_bar_window: "shortest".into(),
+            text_model: None,
+            commit_model: None,
+            pr_model: None,
+            title_model: None,
+            branch_model: None,
+            mask_emails: true,
+            idle_agents: 3,
+            claude_hooks: true,
+            monocode_subagents_only: true,
+            claude_entrypoint: false,
+            binary_paths: HashMap::new(),
+            disabled_skill_paths: Vec::new(),
+            skill_source_paths: Vec::new(),
+            default_provider: None,
+            default_models: HashMap::new(),
+            hidden_providers: Vec::new(),
+            hidden_models: Vec::new(),
+            project_providers: HashMap::new(),
+            favorite_models: Vec::new(),
+            recent_models: Vec::new(),
+            new_chat_model: None,
+            last_models: HashMap::new(),
+            model_picker_tab: None,
+            default_access: None,
+            provider_efforts: HashMap::new(),
+            background_model: None,
+            monos: true,
+            rail_monos_pinned: false,
+            mono_menu_bar_icon: true,
+            show_archived: false,
+            auto_archive_days: 0,
+            keybindings: HashMap::new(),
+        }
+    }
+}
+
+/// The footer's keep-awake control. Minutes, so the rulers' steps round-trip.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct KeepAwakePrefs {
+    /// The popover's switch. On, working agents keep the Mac awake.
+    #[serde(alias = "auto")]
+    pub enabled: bool,
+    pub grace_minutes: u32,
+    pub timer_minutes: u32,
+    pub display: bool,
+    pub lid: bool,
+    /// The lid hold on battery too, not just plugged in.
+    pub lid_on_battery: bool,
+    /// "off", "dim" or "leave".
+    pub lid_screen: String,
+    /// Lock the screen when a held lid closes.
+    pub lock: bool,
+    /// "leave", "mute" or "pause".
+    pub lid_sound: String,
+    pub low_power: bool,
+    pub heat_guard: bool,
+    /// 0 never stops for the battery.
+    pub stop_below: u32,
+    /// Join `hotspot_ssid` when Wi-Fi drops while agents work. Its password,
+    /// if any, is in the Keychain.
+    pub hotspot: bool,
+    pub hotspot_ssid: String,
+    /// Send "continue" once the internet is back to a reply a dropped
+    /// connection cut off.
+    pub continue_after_drop: bool,
+}
+
+impl Default for KeepAwakePrefs {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            grace_minutes: 5,
+            timer_minutes: 120,
+            display: false,
+            lid: false,
+            lid_on_battery: false,
+            lid_screen: "off".into(),
+            lock: true,
+            lid_sound: "mute".into(),
+            low_power: false,
+            heat_guard: true,
+            stop_below: 20,
+            hotspot: false,
+            hotspot_ssid: String::new(),
+            continue_after_drop: true,
+        }
+    }
+}
+
+impl KeepAwakePrefs {
+    /// A hotspot is chosen and switched on.
+    pub(crate) fn hotspot_ready(&self) -> bool {
+        self.hotspot && !self.hotspot_ssid.trim().is_empty()
+    }
+    pub(crate) fn settings(&self) -> monocode_core::keep_awake::Settings {
+        use monocode_core::keep_awake::{LidScreen, LidSound, Settings};
+        use std::time::Duration;
+        Settings {
+            enabled: self.enabled,
+            grace: Duration::from_secs(u64::from(self.grace_minutes) * 60),
+            length: Duration::from_secs(u64::from(self.timer_minutes.max(5)) * 60),
+            display: self.display,
+            lid: self.lid,
+            lid_on_battery: self.lid_on_battery,
+            lid_screen: LidScreen::from_key(&self.lid_screen),
+            lock: self.lock,
+            lid_sound: LidSound::from_key(&self.lid_sound),
+            low_power: self.low_power,
+            heat_guard: self.heat_guard,
+            stop_below: (self.stop_below > 0).then(|| self.stop_below.min(100) as u8),
+        }
+    }
+}
+
+/// What the title strip shows. Anything but tabs makes the sidebar the
+/// session list: ⌘1–9 and tab stepping follow its order, and new sessions
+/// appear at its top.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TitleBarMode {
+    Tabs,
+    Plan,
+    SessionTitle,
+}
+
+impl TitleBarMode {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Tabs => "tabs",
+            Self::Plan => "plan",
+            Self::SessionTitle => "session-title",
+        }
+    }
+
+    pub(crate) fn from_key(key: &str) -> Self {
+        match key {
+            "plan" => Self::Plan,
+            "session-title" => Self::SessionTitle,
+            _ => Self::Tabs,
+        }
+    }
+}
+
+/// An action that has the CLI write text for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextTask {
+    Commit,
+    PullRequest,
+    Title,
+    Branch,
+}
+
+impl Preferences {
+    /// Before one setting covered the title strip, "Plan in title bar" took
+    /// it over and "Hide tab bar" left the session's title.
+    pub(crate) fn title_bar_mode(&self) -> TitleBarMode {
+        self.title_bar.unwrap_or(if self.title_plan {
+            TitleBarMode::Plan
+        } else if self.hide_tab_bar {
+            TitleBarMode::SessionTitle
+        } else {
+            TitleBarMode::Tabs
+        })
+    }
+
+    /// The model chosen for `task`, else the general text model; `None` leaves
+    /// the choice to the caller's default.
+    pub(crate) fn text_model_for(&self, task: TextTask) -> Option<&ModelChoice> {
+        match task {
+            TextTask::Commit => &self.commit_model,
+            TextTask::PullRequest => &self.pr_model,
+            TextTask::Title => &self.title_model,
+            TextTask::Branch => return self.branch_model.as_ref(),
+        }
+        .as_ref()
+        .or(self.text_model.as_ref())
+    }
+
+    pub(crate) fn apply_workspace_theme(&mut self, id: String) {
+        let color: gpui::Hsla = gpui::rgb(super::palette(&id, false).surface).into();
+        self.theme_hue = (color.h * 360.).round() as u32;
+        self.theme_saturation = (color.s * 100.).round() as u32;
+        self.theme_dark_lightness = ((color.l * 100.).round() as u32).min(30);
+        self.workspace_theme = id;
+    }
+
+    /// The color settings a project copies when it gets its own theme.
+    pub(crate) fn project_theme(&self) -> monocode_core::project_appearance::ProjectTheme {
+        monocode_core::project_appearance::ProjectTheme {
+            workspace_theme: self.workspace_theme.clone(),
+            accent_color: self.accent_color.clone(),
+            hue: self.theme_hue,
+            saturation: self.theme_saturation,
+            dark_lightness: self.theme_dark_lightness,
+        }
+    }
+
+    pub(crate) fn wayland_decorations(&self, compositor: &str) -> Option<gpui::WindowDecorations> {
+        (compositor == "Wayland").then_some(if self.wayland_window_decorations {
+            gpui::WindowDecorations::Server
+        } else {
+            gpui::WindowDecorations::Client
+        })
+    }
+
+    /// SettingsView's Restore defaults: the Appearance page only.
+    pub(crate) fn restore_appearance(&mut self) {
+        let d = Self::default();
+        self.theme = d.theme;
+        self.wayland_window_decorations = d.wayland_window_decorations;
+        self.accent_color = d.accent_color;
+        self.workspace_theme = d.workspace_theme;
+        self.sidebar_opacity = d.sidebar_opacity;
+        self.sidebar_blur = d.sidebar_blur;
+        self.theme_hue = d.theme_hue;
+        self.theme_saturation = d.theme_saturation;
+        self.theme_dark_lightness = d.theme_dark_lightness;
+        self.body_glass = d.body_glass;
+        self.inset_glass = d.inset_glass;
+        self.show_excluded_files = d.show_excluded_files;
+        self.chat_background_empty = d.chat_background_empty;
+        self.chat_background_session = d.chat_background_session;
+        self.chat_background_scope = d.chat_background_scope;
+        self.diff_palette = d.diff_palette;
+        self.chat_background_effect = d.chat_background_effect;
+        self.chat_background = d.chat_background;
+        self.ui_scale = d.ui_scale;
+        self.collapsed_project_rail = d.collapsed_project_rail;
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ProviderDefaults {
+    pub provider: Option<String>,
+    pub models: HashMap<String, String>,
+    pub hidden: Vec<String>,
+    pub hidden_models: Vec<ModelChoice>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ModelChoice {
+    pub provider: String,
+    pub model: Option<String>,
+}
+
+impl gpui::Global for Preferences {}
+impl Preferences {
+    /// The background model picked in Settings, if any.
+    pub(crate) fn background_text_model(&self) -> Option<(Kind, Option<String>)> {
+        let choice = self.background_model.as_ref()?;
+        Some((Kind::parse(&choice.provider)?, choice.model.clone()))
+    }
+    pub(crate) fn hidden_for(&self, project: &str) -> Vec<String> {
+        let mut hidden = self.hidden_providers.clone();
+        if let Some(settings) = self.project_providers.get(project) {
+            hidden.extend(settings.hidden.clone());
+        }
+        hidden.sort();
+        hidden.dedup();
+        hidden
+    }
+    /// The models hidden globally and for this project.
+    pub(crate) fn hidden_models_for(&self, project: &str) -> Vec<ModelChoice> {
+        let mut hidden = self.hidden_models.clone();
+        if let Some(settings) = self.project_providers.get(project) {
+            for choice in &settings.hidden_models {
+                if !hidden.contains(choice) {
+                    hidden.push(choice.clone());
+                }
+            }
+        }
+        hidden
+    }
+    /// Before the setting existed a chosen default model was the only way to
+    /// steer new chats, so keep honoring it for anyone who set one.
+    pub(crate) fn new_chat_mode(&self) -> &str {
+        match self.new_chat_model.as_deref() {
+            Some(mode @ ("last" | "default" | "pinned")) => mode,
+            _ if !self.default_models.is_empty() => "pinned",
+            _ => "last",
+        }
+    }
+    /// The model a new chat starts on; `None` leaves it to the provider.
+    /// The project's model wins, then the mode's choice. Last used skips a
+    /// model hidden since, and with no history falls back to the first favorite.
+    pub(crate) fn model_for_new_chat(&self, provider: &str, project: &str) -> Option<String> {
+        if let Some(model) = self.project_model(provider, project) {
+            return Some(model);
+        }
+        match self.new_chat_mode() {
+            "pinned" => self.default_models.get(provider).cloned(),
+            "default" => None,
+            _ => {
+                let hidden = self.hidden_models_for(project);
+                let shown = |model: &Option<String>| {
+                    !hidden
+                        .iter()
+                        .any(|c| c.provider == provider && &c.model == model)
+                };
+                // Recents seed the choice for picks made before `last_models`.
+                let last = self.last_models.get(provider).or_else(|| {
+                    self.recent_models
+                        .iter()
+                        .find(|c| c.provider == provider)
+                        .map(|c| &c.model)
+                });
+                match last.filter(|model| shown(model)) {
+                    Some(model) => model.clone(),
+                    None => self
+                        .favorite_models
+                        .iter()
+                        .find(|c| c.provider == provider && c.model.is_some() && shown(&c.model))
+                        .and_then(|c| c.model.clone()),
+                }
+            }
+        }
+    }
+    /// The model for unattended runs (automations, Monos), which should not
+    /// drift with whatever was last tried in a chat.
+    pub(crate) fn stable_model(&self, provider: &str, project: &str) -> Option<String> {
+        self.project_model(provider, project).or_else(|| {
+            (self.new_chat_mode() == "pinned")
+                .then(|| self.default_models.get(provider).cloned())
+                .flatten()
+        })
+    }
+    fn project_model(&self, provider: &str, project: &str) -> Option<String> {
+        self.project_providers
+            .get(project)
+            .and_then(|p| p.models.get(provider))
+            .cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choice(provider: &str, model: &str) -> ModelChoice {
+        ModelChoice {
+            provider: provider.into(),
+            model: Some(model.into()),
+        }
+    }
+
+    #[test]
+    fn a_default_model_set_before_the_setting_keeps_new_chats_pinned() {
+        let mut prefs = Preferences::default();
+        assert_eq!(prefs.new_chat_mode(), "last");
+        prefs
+            .default_models
+            .insert("claude".into(), "sonnet".into());
+        assert_eq!(prefs.new_chat_mode(), "pinned");
+        assert_eq!(
+            prefs.model_for_new_chat("claude", "/work").as_deref(),
+            Some("sonnet")
+        );
+        prefs.new_chat_model = Some("last".into());
+        assert_eq!(prefs.new_chat_mode(), "last");
+    }
+
+    #[test]
+    fn last_used_is_per_provider_and_the_project_model_wins() {
+        let mut prefs = Preferences {
+            recent_models: vec![choice("codex", "gpt-mini"), choice("claude", "opus")],
+            ..Default::default()
+        };
+        // Recents answer until a pick records the provider's last model.
+        assert_eq!(
+            prefs.model_for_new_chat("claude", "/work").as_deref(),
+            Some("opus")
+        );
+        prefs
+            .last_models
+            .insert("claude".into(), Some("sonnet".into()));
+        prefs.last_models.insert("codex".into(), None);
+        assert_eq!(
+            prefs.model_for_new_chat("claude", "/work").as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(prefs.model_for_new_chat("codex", "/work"), None);
+        prefs
+            .project_providers
+            .entry("/work".into())
+            .or_default()
+            .models
+            .insert("claude".into(), "haiku".into());
+        assert_eq!(
+            prefs.model_for_new_chat("claude", "/work").as_deref(),
+            Some("haiku")
+        );
+        assert_eq!(
+            prefs.model_for_new_chat("claude", "/other").as_deref(),
+            Some("sonnet")
+        );
+    }
+
+    #[test]
+    fn a_hidden_or_missing_last_model_falls_back_to_a_favorite() {
+        let mut prefs = Preferences {
+            favorite_models: vec![choice("codex", "gpt-big"), choice("claude", "sonnet")],
+            ..Default::default()
+        };
+        assert_eq!(
+            prefs.model_for_new_chat("claude", "/work").as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(prefs.model_for_new_chat("grok", "/work"), None);
+        prefs
+            .last_models
+            .insert("claude".into(), Some("opus".into()));
+        prefs.hidden_models.push(choice("claude", "opus"));
+        assert_eq!(
+            prefs.model_for_new_chat("claude", "/work").as_deref(),
+            Some("sonnet")
+        );
+    }
+
+    #[test]
+    fn provider_default_and_unattended_runs_ignore_the_last_pick() {
+        let mut prefs = Preferences {
+            new_chat_model: Some("default".into()),
+            default_models: HashMap::from([("claude".into(), "sonnet".into())]),
+            last_models: HashMap::from([("claude".into(), Some("opus".into()))]),
+            ..Default::default()
+        };
+        assert_eq!(prefs.model_for_new_chat("claude", "/work"), None);
+        assert_eq!(prefs.stable_model("claude", "/work"), None);
+        prefs.new_chat_model = Some("last".into());
+        assert_eq!(prefs.stable_model("claude", "/work"), None);
+        prefs.new_chat_model = Some("pinned".into());
+        assert_eq!(
+            prefs.stable_model("claude", "/work").as_deref(),
+            Some("sonnet")
+        );
+    }
+}
+
+#[cfg(test)]
+mod decoration_tests {
+    use super::{Preferences, TitleBarMode};
+
+    #[test]
+    fn decoration_requests_are_scoped_to_the_wayland_backend() {
+        for enabled in [true, false] {
+            let prefs = Preferences {
+                wayland_window_decorations: enabled,
+                ..Default::default()
+            };
+            for compositor in ["X11", "Headless", ""] {
+                assert_eq!(prefs.wayland_decorations(compositor), None);
+            }
+            assert_eq!(
+                prefs.wayland_decorations("Wayland"),
+                Some(if enabled {
+                    gpui::WindowDecorations::Server
+                } else {
+                    gpui::WindowDecorations::Client
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn title_bar_mode_carries_over_the_legacy_toggles() {
+        let read = |json: &str| {
+            serde_json::from_str::<Preferences>(json)
+                .unwrap()
+                .title_bar_mode()
+        };
+        assert_eq!(read("{}"), TitleBarMode::Tabs);
+        assert_eq!(read(r#"{"hide_tab_bar":true}"#), TitleBarMode::SessionTitle);
+        assert_eq!(
+            read(r#"{"title_plan":true,"hide_tab_bar":true}"#),
+            TitleBarMode::Plan
+        );
+        assert_eq!(
+            read(r#"{"title_plan":true,"title_bar":"session-title"}"#),
+            TitleBarMode::SessionTitle
+        );
+        let prefs = Preferences {
+            title_bar: Some(TitleBarMode::Plan),
+            ..Default::default()
+        };
+        assert_eq!(
+            read(&serde_json::to_string(&prefs).unwrap()),
+            TitleBarMode::Plan
+        );
+    }
+
+    #[test]
+    fn decorations_default_persist_and_restore() {
+        let mut prefs: Preferences = serde_json::from_str("{}").unwrap();
+        assert!(prefs.wayland_window_decorations);
+        prefs.wayland_window_decorations = false;
+        let saved = serde_json::to_string(&prefs).unwrap();
+        let mut restored: Preferences = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.wayland_window_decorations);
+        restored.restore_appearance();
+        assert!(restored.wayland_window_decorations);
+    }
+}

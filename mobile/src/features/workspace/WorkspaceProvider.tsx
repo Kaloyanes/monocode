@@ -22,10 +22,24 @@ import {
   useConnection,
   type Conversation,
 } from "@/features/connection/ConnectionProvider";
+import { backoff, pause, waitForActive } from "@/features/connection/appActivity";
 import { selectedWorkspace } from "@/features/connection/selection";
 import type { ModelCatalog, ModelChoice } from "@/features/models/types";
 import { toWire, type Attachment } from "@/features/sessions/attachments";
-import type { Message, Mono, Project, SessionSummary, Turn, TurnItem } from "./types";
+import type {
+  DisplayedQuestionPrompt,
+  Message,
+  Mono,
+  OrchestrationActionName,
+  OrchestrationRun,
+  OrchestrationTask,
+  Project,
+  QuestionPrompt,
+  QuestionReply,
+  SessionSummary,
+  Turn,
+  TurnItem,
+} from "./types";
 import { applyFrames, type WatchFrame } from "./watchUpdates";
 /**
  * The workspace: what the desktop has and what can be done with it. Changes
@@ -34,12 +48,40 @@ import { applyFrames, type WatchFrame } from "./watchUpdates";
  */
 /** A new session's model and permissions, and where it works if not the
  *  project's checkout: a new worktree off HEAD, or an existing one. */
-type StartChoice = Partial<ModelChoice> & { workspaceMode?: "worktree"; worktreePath?: string };
+type StartChoice = Partial<ModelChoice> & {
+  workspaceMode?: "worktree";
+  worktreePath?: string;
+  mode?: ComposerMode;
+};
+
+export type MonoChange = {
+  name?: string;
+  mascot?: string;
+  color?: string;
+  addProject?: string;
+  removeProject?: string;
+};
+type MonoField = "name" | "mascot" | "color" | "projectIds";
+/** A field changed here, with what the desktop had then: it shows only while
+ *  the catalog still has that, so the desktop's own copy takes over. */
+type MonoEdits = Record<string, Partial<Record<MonoField, { value: unknown; from: unknown }>>>;
+const sameValue = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
 type Workspace = {
   projects: Project[];
   monos: Mono[];
   sessions: SessionSummary[];
+  /** Orchestrator workers, apart from `sessions` so no list shows them. */
+  agents: SessionSummary[];
+  /** A lead's plan under review and latest run, in full. */
+  readOrchestration: (conversationId: string) => Promise<OrchestrationRun[]>;
+  /** Presses one of a card's buttons; resolves to the cards as they are after it. */
+  orchestrationAction: (
+    conversationId: string,
+    run: OrchestrationRun,
+    action: OrchestrationActionName,
+    task?: OrchestrationTask,
+  ) => Promise<OrchestrationRun[]>;
   watch: (id: string | null) => void;
   startSession: (
     projectId: string,
@@ -47,8 +89,23 @@ type Workspace = {
     choice?: StartChoice,
     attachments?: Attachment[],
   ) => Promise<string>;
-  sendMessage: (conversationId: string, text: string, attachments?: Attachment[]) => Promise<void>;
+  sendMessage: (
+    conversationId: string,
+    text: string,
+    attachments?: Attachment[],
+    mode?: ComposerMode,
+    /** The desktop composer revision the text was based on, so the desktop clears it. */
+    draftRev?: number,
+  ) => Promise<void>;
   stop: (conversationId: string) => Promise<void>;
+  /** Answers, or skips, the question an agent waits on, as the desktop's card does. */
+  answerQuestion: (
+    conversationId: string,
+    requestId: number,
+    reply: QuestionReply,
+  ) => Promise<void>;
+  /** Stops a timed question skipping itself while it is being answered, as on desktop. */
+  keepQuestionOpen: (conversationId: string, requestId: number) => Promise<void>;
   /** A page of a project's sessions, newest first, beyond the recent ones the poll carries. */
   listSessions: (
     projectId: string,
@@ -65,11 +122,27 @@ type Workspace = {
   configureSession: (conversationId: string, choice: Partial<ModelChoice>) => Promise<void>;
   /** Renames a session as the desktop sidebar does; the new title shows at once. */
   renameSession: (session: SessionSummary, title: string) => Promise<void>;
+  /** Every project on the desktop, chosen for this phone or not, as a Mono can work in any. */
+  allProjects: Project[];
+  /** Every Mono on the desktop, whether this phone lists its chat or not: the
+   *  chip on a session it started names it from here. */
+  allMonos: Mono[];
+  /**
+   * Changes a Mono's look or projects. Shown at once, as the desktop's catalog
+   * will have it; undone if the desktop refuses.
+   */
+  editMono: (mono: Mono, change: MonoChange) => Promise<void>;
   /** Deletes a session on the desktop. It leaves every list at once, and comes
    *  back if the desktop refuses. */
   deleteSession: (conversationId: string) => Promise<void>;
-  /** Archives a session on the desktop; like a delete, it leaves every list at once. */
+  /** Archives a session on the desktop; like a delete, it leaves every list at once,
+   *  and comes back if the desktop refuses. */
   archiveSession: (conversationId: string) => Promise<void>;
+  /** Takes an archive back: the session returns to its lists at once, and leaves
+   *  again if the desktop refuses. Only where `canUnarchive`. */
+  unarchiveSession: (conversationId: string) => Promise<void>;
+  /** Whether the desktop can unarchive; without it an archive can't be undone. */
+  canUnarchive: boolean;
   /** A session as the phone last changed it, or null once deleted here. */
   edited: (session: SessionSummary) => SessionSummary | null;
   nativeTranscriptStatus: (id: string, status: NativeTranscriptStatus) => void;
@@ -90,6 +163,8 @@ type Live = {
 type Status = {
   busy: Record<string, boolean>;
   errors: Record<string, string>;
+  /** What each conversation's agent waits on the user to answer. */
+  questions: Record<string, DisplayedQuestionPrompt>;
 };
 export type SessionPage = { sessions: SessionSummary[]; hasMore: boolean };
 /** Narrows a page to sessions active since a time, and without some providers.
@@ -115,6 +190,10 @@ export type NativeTranscriptStatus = {
   ready?: boolean;
   lastUserId?: string | null;
   notice?: Extract<TurnItem, { type: "notice" }> | null;
+  /** Absent from a native build that predates questions. */
+  question?: QuestionPrompt | null;
+  /** Persistent across coalesced snapshots; absent from older native builds. */
+  questionGeneration?: number;
 };
 const WorkspaceContext = createContext<Workspace | null>(null);
 const LiveContext = createContext<Live | null>(null);
@@ -168,6 +247,39 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     turnsRef.current = turns;
   }, [turns]);
   const [busy, setBusy] = useState<Record<string, boolean>>({});
+  const [questions, setQuestions] = useState<Record<string, DisplayedQuestionPrompt>>({});
+  // The question each conversation answered here last. A frame sent before
+  // the desktop took the answer must not bring its card back.
+  const answered = useRef(new Map<string, number>());
+  // A token for each question as it appears, so an answer hides only the
+  // showing it answered, not a later one that reuses its ID.
+  const displayed = useRef(new Map<string, { requestId: number; token: number; generation?: number }>());
+  const nextToken = useRef(0);
+  const showQuestion = useCallback((id: string, question: QuestionPrompt | null | undefined, generation?: number) => {
+    const previous = displayed.current.get(id);
+    const replaced = generation !== undefined && previous?.generation !== undefined && generation > previous.generation;
+    // Gone on the desktop too: a later question may reuse the ID.
+    if (!question) {
+      answered.current.delete(id);
+      displayed.current.delete(id);
+    } else if (previous?.requestId !== question.requestId || replaced) {
+      if (replaced) answered.current.delete(id);
+      displayed.current.set(id, { requestId: question.requestId, token: ++nextToken.current, generation });
+    } else if (generation !== undefined) {
+      // Adopt an unversioned baseline or a recreated transcript's lower counter.
+      previous.generation = generation;
+    }
+    const shown = question && answered.current.get(id) !== question.requestId
+      ? { ...question, displayId: displayed.current.get(id)!.token }
+      : null;
+    setQuestions((previous) =>
+      shown
+        ? JSON.stringify(previous[id]) === JSON.stringify(shown)
+          ? previous
+          : withValue(previous, id, shown)
+        : withoutKey(previous, id),
+    );
+  }, []);
   const [pending, setPending] = useState<Record<string, PendingSend>>({});
   const nativeUserCounts = useRef<Record<string, number>>({});
   const nativeLastUsers = useRef<Record<string, string | null>>({});
@@ -183,6 +295,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   // Renames and deletes made here, until the desktop's catalog catches up. A
   // rename holds only while the desktop still has the title it replaced.
   const [renamed, setRenamed] = useState<Record<string, { title: string; from: string }>>({});
+  const [monoEdits, setMonoEdits] = useState<MonoEdits>({});
   const [deleted, setDeleted] = useState<ReadonlySet<string>>(new Set());
   const [watching, watch] = useState<string | null>(null);
   // Conversations showing turns from the disk cache, until the desktop's arrive.
@@ -208,6 +321,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       setPending((previous) => withoutConfirmedPending(previous, id, received));
       if (countUserItems(received) > 0) starting.current.delete(id);
       setBusy((previous) => withValue(previous, id, result.busy));
+      showQuestion(id, result.question);
       // A read carries the whole conversation.
       setWindowOlder((previous) => withValue(previous, id, false));
       setErrors((previous) => withoutKey(previous, id));
@@ -216,7 +330,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       if (current.current.pairing === paired && !startupCatalogError(starting.current, id, message))
         setErrors((previous) => withValue(previous, id, message));
     }
-  }, []);
+  }, [showQuestion]);
   // The open conversation streams from the desktop: one watch, whose frames
   // land as the desktop sends them. A desktop that cannot watch, or a dropped
   // link, falls back to reading once a second until a watch opens again.
@@ -225,7 +339,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     const id = watching;
     let disposed = false;
     let watchId: number | null = null;
-    const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const stop = new AbortController();
+    // Failed opens in a row, for waiting longer between them.
+    let failures = 0;
     // What the watch has built so far: frames are changes against it.
     let known: Turn[] = [];
     // The turn a reopened watch was asked to carry on from. If it opens
@@ -254,6 +370,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       setPending((previous) => withoutConfirmedPending(previous, id, applied.turns));
       if (countUserItems(applied.turns) > 0) starting.current.delete(id);
       if (applied.busy !== undefined) setBusy((previous) => withValue(previous, id, applied.busy!));
+      for (const question of applied.questions) showQuestion(id, question);
       if (applied.older !== undefined)
         setWindowOlder((previous) => withValue(previous, id, applied.older!));
       const error = applied.error && !startupCatalogError(starting.current, id, applied.error)
@@ -277,9 +394,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         }
       }
       while (!disposed) {
+        // Backgrounded: wait to be shown again rather than wake to check.
+        await waitForActive(stop.signal);
+        if (disposed) break;
         const pairing = current.current.pairing;
-        if (AppState.currentState !== "active" || !pairing) {
-          await pause(500);
+        if (!pairing) {
+          await pause(500, stop.signal);
           continue;
         }
         try {
@@ -302,12 +422,18 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           while (!disposed && AppState.currentState === "active") {
             const frames = await nextUpdates<WatchFrame>(watchId, 10_000);
             if (disposed || current.current.pairing !== pairing) break;
+            failures = 0;
             if (frames.length && !apply(frames)) break;
           }
         } catch {
           if (disposed) break;
           await read(id);
-          await pause((starting.current.get(id) ?? 0) > Date.now() ? 200 : 1000);
+          await pause(
+            (starting.current.get(id) ?? 0) > Date.now()
+              ? 200
+              : backoff(1000, failures++, 15_000),
+            stop.signal,
+          );
         }
         if (watchId !== null) void closeWatch(watchId);
         watchId = null;
@@ -324,11 +450,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     });
     return () => {
       disposed = true;
+      stop.abort();
       subscription.remove();
       save();
       if (watchId !== null) void closeWatch(watchId);
     };
-  }, [watching, desktop, read]);
+  }, [watching, desktop, read, showQuestion]);
   const mutationIds = useRef(new Map<string, string>());
   const { command, refresh } = connection;
   const mutate = useCallback(async <T,>(method: string, params: object): Promise<T> => {
@@ -383,7 +510,13 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   );
   // The message shows at once, as its own turn, until the desktop's transcript
   // has one more user message than when it was sent.
-  const sendMessage = useCallback(async (conversationId: string, text: string, attachments: Attachment[] = []) => {
+  const sendMessage = useCallback(async (
+    conversationId: string,
+    text: string,
+    attachments: Attachment[] = [],
+    mode?: ComposerMode,
+    draftRev?: number,
+  ) => {
     const at = Date.now();
     const id = `pending:${at}`;
     const userCount = hasNativeTranscript
@@ -392,7 +525,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     setPending((previous) => ({
       ...previous,
       [conversationId]: {
-        turn: { id, items: [userItem(id, text, at, attachments)] },
+        turn: {
+          id,
+          items: [
+            userItem(id, text, at, attachments),
+            // A Mono's chat shows it thinking at once, as the desktop's turn
+            // will, so taking that turn over moves nothing on screen.
+            ...(conversationId.startsWith("mono:")
+              ? [{ type: "header" as const, id: `${id}:header`, live: true, label: "Thinking…", entries: [] }]
+              : []),
+          ],
+        },
         userCount,
         ...(hasNativeTranscript && nativeLastUsers.current[conversationId]
           ? { afterUserId: nativeLastUsers.current[conversationId]! } : {}),
@@ -403,6 +546,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         conversationId,
         text,
         ...(attachments.length ? { attachments: toWire(attachments) } : {}),
+        ...(mode ? { mode } : {}),
+        ...(draftRev !== undefined ? { draftRev } : {}),
       });
     } catch (reason) {
       setPending((previous) => withoutKey(previous, conversationId));
@@ -465,6 +610,28 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     },
     [mutate, read],
   );
+  const answerQuestion = useCallback(
+    async (conversationId: string, requestId: number, reply: QuestionReply) => {
+      const shown = displayed.current.get(conversationId);
+      const token = shown?.requestId === requestId ? shown.token : undefined;
+      await mutate("session.answerQuestion", { conversationId, requestId, reply });
+      // Only while it still shows: the desktop's clear may have come first.
+      if (token === undefined || displayed.current.get(conversationId)?.token !== token) return;
+      answered.current.set(conversationId, requestId);
+      setQuestions((previous) =>
+        previous[conversationId]?.requestId === requestId
+          ? withoutKey(previous, conversationId)
+          : previous,
+      );
+    },
+    [mutate],
+  );
+  const keepQuestionOpen = useCallback(
+    async (conversationId: string, requestId: number) => {
+      await mutate("session.keepQuestionOpen", { conversationId, requestId });
+    },
+    [mutate],
+  );
   const renameSession = useCallback(
     async (session: SessionSummary, title: string) => {
       await mutate("session.rename", { conversationId: session.id, title });
@@ -472,6 +639,40 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       void refresh();
     },
     [mutate, refresh],
+  );
+  const editMono = useCallback(
+    async (mono: Mono, change: MonoChange) => {
+      const next: Partial<Record<MonoField, unknown>> = {};
+      if (change.name !== undefined) next.name = change.name.trim();
+      if (change.mascot !== undefined) next.mascot = change.mascot;
+      if (change.color !== undefined) next.color = change.color;
+      if (change.addProject || change.removeProject)
+        next.projectIds = [
+          ...mono.projectIds.filter((id) => id !== change.removeProject),
+          ...(change.addProject && !mono.projectIds.includes(change.addProject) ? [change.addProject] : []),
+        ];
+      const fields = Object.keys(next) as MonoField[];
+      setMonoEdits((previous) => {
+        const edits = { ...previous[mono.id] };
+        for (const field of fields)
+          edits[field] = { value: next[field], from: edits[field]?.from ?? mono[field] };
+        return { ...previous, [mono.id]: edits };
+      });
+      try {
+        await command("mono.update", { monoId: mono.id, ...change });
+      } catch (reason) {
+        // Undone, unless a later change has replaced it meanwhile.
+        setMonoEdits((previous) => {
+          const edits = { ...previous[mono.id] };
+          for (const field of fields)
+            if (sameValue(edits[field]?.value, next[field])) delete edits[field];
+          return { ...previous, [mono.id]: edits };
+        });
+        throw reason;
+      }
+      void refresh();
+    },
+    [command, refresh],
   );
   const removeSession = useCallback(
     async (method: "session.delete" | "session.archive", conversationId: string) => {
@@ -497,6 +698,30 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const archiveSession = useCallback(
     (conversationId: string) => removeSession("session.archive", conversationId),
     [removeSession],
+  );
+  const readOrchestration = useCallback(
+    async (conversationId: string) =>
+      (await command<{ runs: OrchestrationRun[] }>("orchestration.read", { conversationId })).runs,
+    [command],
+  );
+  const orchestrationAction = useCallback(
+    async (
+      conversationId: string,
+      run: OrchestrationRun,
+      action: OrchestrationActionName,
+      task?: OrchestrationTask,
+    ) => {
+      const result = await mutate<{ runs: OrchestrationRun[] }>("orchestration.action", {
+        conversationId,
+        call: run.call,
+        action,
+        ...(task ? { taskId: task.id, index: task.index } : {}),
+      });
+      // The lead's row and strip follow on the next catalog.
+      void refresh();
+      return result.runs;
+    },
+    [mutate, refresh],
   );
   const listSessions = useCallback(
     (projectId: string, query: string, offset: number, filters?: SessionListFilters) =>
@@ -533,6 +758,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     setErrors((previous) => error ? withValue(previous, id, error) : withoutKey(previous, id));
     if (status.ready === false) return;
     setBusy((previous) => withValue(previous, id, status.busy));
+    showQuestion(id, status.question, status.questionGeneration);
     if (status.userCount > 0) starting.current.delete(id);
     if (!status.pendingId) {
       setPending((previous) => {
@@ -543,7 +769,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         return confirmed ? withoutKey(previous, id) : previous;
       });
     }
-  }, []);
+  }, [showQuestion]);
   const workspace = useMemo<Workspace>(() => {
     const selected = selectedWorkspace(catalog, selection);
     const known = new Set(selected.sessions.map((session) => session.id));
@@ -553,30 +779,50 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         : renamed[session.id]?.from === session.title
           ? { ...session, title: renamed[session.id].title }
           : session;
+    const all = [
+      ...selected.sessions,
+      ...Object.values(remembered).filter((session) => !known.has(session.id)),
+    ].flatMap((session) => edited(session) ?? []);
     return {
       projects: selected.projects,
-      monos: selected.monos,
-      sessions: [
-        ...selected.sessions,
-        ...Object.values(remembered).filter((session) => !known.has(session.id)),
-      ].flatMap((session) => edited(session) ?? []),
+      allProjects: catalog.projects,
+      allMonos: catalog.monos,
+      monos: selected.monos.map((mono) => {
+        const edits = monoEdits[mono.id];
+        if (!edits) return mono;
+        const shown = { ...mono };
+        for (const [field, edit] of Object.entries(edits) as [MonoField, { value: unknown; from: unknown }][])
+          if (sameValue(mono[field], edit.from)) Object.assign(shown, { [field]: edit.value });
+        return shown;
+      }),
+      sessions: all.filter((session) => !session.leadId),
+      agents: all.filter((session) => !!session.leadId),
+      readOrchestration,
+      orchestrationAction,
       watch,
       startSession,
       sendMessage,
       stop,
+      answerQuestion,
+      keepQuestionOpen,
       listSessions,
       rememberSession,
       loadOlder,
       listModels,
       configureSession,
       renameSession,
+      editMono,
       deleteSession,
       archiveSession,
+      unarchiveSession,
+      canUnarchive: catalog.sessionUnarchive === true,
       edited,
       nativeTranscriptStatus,
     };
   }, [
     renamed,
+    monoEdits,
+    editMono,
     deleted,
     catalog,
     selection,
@@ -584,6 +830,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     startSession,
     sendMessage,
     stop,
+    readOrchestration,
+    orchestrationAction,
+    answerQuestion,
+    keepQuestionOpen,
     listSessions,
     rememberSession,
     loadOlder,
@@ -592,13 +842,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     renameSession,
     deleteSession,
     archiveSession,
+    unarchiveSession,
     nativeTranscriptStatus,
   ]);
   const live = useMemo<Live>(
     () => ({ messages, turns, pending, history, windowOlder }),
     [messages, turns, pending, history, windowOlder],
   );
-  const status = useMemo<Status>(() => ({ busy, errors }), [busy, errors]);
+  const status = useMemo<Status>(
+    () => ({ busy, errors, questions }),
+    [busy, errors, questions],
+  );
   return (
     <WorkspaceContext value={workspace}>
       <StatusContext value={status}>
@@ -637,6 +891,7 @@ export function useConversation(id: string | null, watching = true) {
   return {
     busy: id ? !!status.busy[id] : false,
     error: id ? (status.errors[id] ?? null) : null,
+    question: id ? (status.questions[id] ?? null) : null,
   };
 }
 /** A conversation's turns as they stream in. Re-renders with every frame. */

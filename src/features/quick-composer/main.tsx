@@ -32,7 +32,7 @@ function applyAppearance() {
   // The native blur follows the window's appearance, not the page's, so
   // match it to the app theme rather than the system one.
   void getCurrentWindow()
-    .setTheme(scheme)
+    .setTheme(loadThemePreference() === "system" ? null : scheme)
     .catch(() => undefined);
 }
 

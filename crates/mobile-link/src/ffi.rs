@@ -71,6 +71,13 @@ enum Call {
     TranscriptDrop {
         transcript_id: u64,
     },
+    /// A visual's 3D scene from an orbit, for drawing while it is dragged.
+    VisualScene {
+        scene: Value,
+        yaw: f32,
+        pitch: f32,
+        zoom: f32,
+    },
 }
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -192,6 +199,12 @@ fn execute(input: &str) -> LinkResult<Value> {
             }
             update_transcript(transcript_id, json!({"type":"frames","frames":updates}))
         }
+        Call::VisualScene {
+            scene,
+            yaw,
+            pitch,
+            zoom,
+        } => crate::visuals::project_scene(&scene, yaw, pitch, zoom),
         Call::TranscriptDrop { transcript_id } => {
             transcripts().lock().unwrap().remove(&transcript_id);
             Ok(Value::Null)

@@ -4,6 +4,7 @@ import type {
   Attachment,
   Block,
   Session,
+  TurnMetrics,
   TaskListItem,
   ToolPreview,
 } from "../../../features/sessions/model/session";
@@ -245,6 +246,7 @@ function mergeTurnMetrics(
   if (userIndex < 0) return session;
 
   const current = session.blocks[userIndex];
+  const cost = turnCost(session, userIndex, event.totalCostUsd);
   const metrics = {
     ...(current.turnMetrics ?? {}),
     ...(event.inputTokens != null ? { inputTokens: event.inputTokens } : {}),
@@ -258,10 +260,41 @@ function mergeTurnMetrics(
     ...(event.cacheHitPercent != null
       ? { cacheHitPercent: event.cacheHitPercent }
       : {}),
+    ...(event.cacheTtlMs != null ? { cacheTtlMs: event.cacheTtlMs } : {}),
+    ...cost,
   };
   const blocks = session.blocks.slice();
   blocks[userIndex] = { ...current, turnMetrics: metrics };
   return { ...session, blocks };
+}
+
+/**
+ * Turn cost from a provider's running session total. A second result in the
+ * same turn adds its own delta; a total that drops means the CLI restarted its
+ * counter, so the new total is all spent since.
+ */
+function turnCost(
+  session: Session,
+  userIndex: number,
+  total: number | undefined,
+): Pick<TurnMetrics, "costUsd" | "totalCostUsd"> {
+  if (total == null) return {};
+  const own = session.blocks[userIndex].turnMetrics;
+  let baseline = own?.totalCostUsd;
+  let spent = own?.costUsd ?? 0;
+  if (baseline == null) {
+    spent = 0;
+    baseline = 0;
+    for (let index = userIndex - 1; index >= 0; index -= 1) {
+      const earlier = session.blocks[index].turnMetrics?.totalCostUsd;
+      if (earlier != null) {
+        baseline = earlier;
+        break;
+      }
+    }
+  }
+  const delta = total >= baseline ? total - baseline : total;
+  return { costUsd: spent + delta, totalCostUsd: total };
 }
 
 function upsertPlan(

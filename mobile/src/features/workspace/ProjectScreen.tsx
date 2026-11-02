@@ -4,10 +4,11 @@ import {
   ReconnectingStatus,
   useOffline,
 } from "@/features/connection/ConnectionNotice";
+import { useConnection } from "@/features/connection/ConnectionProvider";
 import { hasNativeTranscript } from "@/features/connection/nativeLink";
 import { useProjectChanges } from "@/features/connection/useProjectChanges";
 import { useProjectWorktrees } from "@/features/connection/useProjectWorktrees";
-import type { Project, SessionSummary } from "@/features/workspace/types";
+import type { ChangeSummary, Project, SessionSummary } from "@/features/workspace/types";
 import { use, useCallback, useEffect, useState, type ReactNode } from "react";
 import { Platform, Pressable, StyleSheet } from "react-native";
 import Animated, {
@@ -21,22 +22,24 @@ import Animated, {
 import { scheduleOnRN } from "react-native-worklets";
 
 import { useEmptyBackground } from "@/features/background/useEmptyBackground";
-import { ProjectMascot } from "@/features/mascots/ProjectMascot";
 import { effortLabel } from "@/features/models/modelChoice";
 import {
   useForgetChoiceOnLeave,
   useSessionChoice,
 } from "@/features/models/sessionChoice";
 import { useModelCatalog } from "@/features/models/useModelCatalog";
+import { useCreateMono } from "@/features/workspace/useCreateMono";
 import { useOpenSessionAfterStarting } from "@/features/settings/newSessions";
 import type { Attachment } from "@/features/sessions/attachments";
 import { Composer } from "@/features/sessions/Composer";
+import { QuestionCard } from "@/features/sessions/QuestionCard";
 import { EmptySession } from "@/features/sessions/EmptySession";
 import {
   latestSessionError,
   useReportSessionError,
   useSessionErrorNotice,
 } from "@/features/sessions/sessionError";
+import { OrchestrationStrip } from "@/features/orchestration/OrchestrationStrip";
 import { LiveSessions } from "@/features/sessions/LiveSessions";
 import { NativeTranscript } from "@/features/sessions/NativeTranscript";
 import { FileOpener } from "@/features/sessions/Markdown";
@@ -46,10 +49,13 @@ import {
 } from "@/features/sessions/activityStore";
 import { SessionContent, SessionScreen } from "@/features/sessions/SessionScreen";
 import { SessionsPage } from "@/features/sessions/SessionsPage";
+import { TerminalActionsSheet } from "@/features/terminal/TerminalActionsSheet";
+import { TerminalSheet } from "@/features/terminal/TerminalSheet";
 import {
   SessionTitle,
   SessionToolbar,
 } from "@/features/sessions/SessionToolbar";
+import { ShipCard } from "@/features/changes/ShipCard";
 import { Transcript, TranscriptLoading } from "@/features/sessions/Transcript";
 import {
   ProjectPages,
@@ -67,9 +73,14 @@ import {
   type Workspace,
 } from "@/features/workspace/WorkspaceMenu";
 import { ComposerWorkspace } from "@/features/workspace/ComposerWorkspace";
+import { UnreadDot, useAnyUnread } from "@/features/workspace/UnreadDot";
+import { InboxPage } from "@/features/inbox/InboxPage";
+import { useInboxSupported } from "@/features/inbox/InboxProvider";
 import { Icon } from "@/ui/Icon";
 import { androidBackHeader } from "@/ui/AndroidHeader";
 import { GlassBlurTarget, LiquidView } from "@/ui/LiquidView";
+import { useDrawerActions, useDrawerSwipe } from "@/ui/ScenePager";
+import { Timed } from "@/ui/Timed";
 import { useColors } from "@/ui/theme";
 import { usePushedIn, usePushStarted } from "@/ui/usePushedIn";
 
@@ -77,22 +88,37 @@ import { usePushedIn, usePushStarted } from "@/ui/usePushedIn";
  * A project's screen: a new session, or with `sessionId` one of its sessions.
  * A new session comes first, then the project's sessions to its right;
  * swiping left slides the sessions in (and the composer out with the new
- * session), the header switch following the finger. The menu button opens
- * the project picker, and the button on the right settings; a session's
- * right has its changes and a menu of its actions instead. A session, or
+ * session), the header switch following the finger; a swipe right from the
+ * new session opens the drawer. The project's mascot opens it too; a session's
+ * right has its changes and a menu of its actions. A session, or
  * one just started, is pushed over it as a screen of its own: its chat under
- * the stack's native header (see the session route).
+ * the stack's native header (see the session route). With `sheet`, a session
+ * is presented over a Mono's chat instead, and closes rather than goes back.
  */
+const NO_CHANGES: ChangeSummary = { files: 0, staged: 0, additions: 0, deletions: 0 };
+
 export function ProjectScreen({
   project,
   sessionId,
+  sheet = false,
+  title,
 }: {
   project: Project;
   sessionId: string | undefined;
+  sheet?: boolean;
+  /** Its title until the session is in the catalog, which may leave it out. */
+  title?: string;
 }) {
-  const { startSession, sendMessage, stop } = useWorkspace();
+  const { startSession, sendMessage, stop, sessions } = useWorkspace();
   const [openAfterStarting] = useOpenSessionAfterStarting();
+  const createMono = useCreateMono(project.id);
   const colors = useColors();
+  const drawer = useDrawerActions();
+  // Read here: the native header's buttons render outside this tree.
+  const unread = useAnyUnread();
+  // A session is pushed over its project and swipes back; only the project
+  // itself swipes the drawer open.
+  useDrawerSwipe(!sessionId);
   const blurTarget = use(GlassBlurTarget);
   // What it runs with, as the model picker, a route over it, sets it.
   const { session, chosen, startAccess, accounts } = useSessionChoice(project, sessionId);
@@ -125,7 +151,8 @@ export function ProjectScreen({
     sessionId,
   );
   // Only a new session has pages; a session is the chat alone.
-  const pages = useProjectPages(project.id, !sessionId);
+  const inboxOn = useInboxSupported();
+  const pages = useProjectPages(project.id, !sessionId, inboxOn);
   // Between pages, mid-swipe or springing to one.
   const swiping = useDerivedValue(() => {
     const at = pages.progress.get();
@@ -155,12 +182,16 @@ export function ProjectScreen({
   // Read while the screen is up so the switch can mark that there are some,
   // as the desktop's Changes tab does. Guessing from its branch, a session's
   // wait for the worktree list rather than read the checkout's and throw them away.
+  // Not while a page over it, such as Changes, reads the same changes itself.
+  const focused = useIsFocused();
   const changesState = useProjectChanges(
     project.id,
-    sessionId ? pushedIn && (loaded || !offCheckout) : !fresh,
+    focused && (sessionId ? pushedIn && (loaded || !offCheckout) : !fresh),
     worktreePath,
+    // Only counted here; the Changes page reads the files themselves.
+    0,
   );
-  const changes = fresh ? [] : (changesState.result?.files ?? []);
+  const changes = fresh ? NO_CHANGES : changesState.summary;
   const branch = sessionId
     ? changesState.result?.branch || sessionBranch
     : fresh
@@ -193,12 +224,11 @@ export function ProjectScreen({
   // that session is closed again.
   const emptyOpacity = useSharedValue(1);
   const emptyStyle = useAnimatedStyle(() => ({ opacity: emptyOpacity.get() }));
-  const focused = useIsFocused();
   useEffect(() => {
     if (focused) emptyOpacity.set(1);
   }, [focused, emptyOpacity]);
 
-  const start = async (text: string, attachments: Attachment[]) => {
+  const start = async (text: string, attachments: Attachment[], mode?: ComposerMode) => {
     // When opening the session, wait for the background and intro to fade,
     // even if the desktop replies first. Otherwise stay ready for another.
     const faded = openAfterStarting
@@ -233,6 +263,7 @@ export function ProjectScreen({
             ...(workspace.mode === "existing"
               ? { worktreePath: workspace.worktree.path }
               : {}),
+            ...(mode ? { mode } : {}),
           },
           attachments,
         ),
@@ -266,37 +297,32 @@ export function ProjectScreen({
   const headerSurface = (content: ReactNode) => (
     <GlassBlurTarget value={blurTarget}>{content}</GlassBlurTarget>
   );
-  const projectAvatar = (
+  const menuButton = (
     <ProjectHeaderButton
-      label={`Switch project, ${project.name}`}
-      onPress={() => router.push({
-        pathname: "/projects",
-        params: { current: project.id },
-      })}
+      label={unread ? "Projects, new replies" : "Projects"}
+      onPress={drawer.open}
     >
-      <ProjectMascot
-        project={project.path}
-        name={project.mascot}
-        color={project.color}
-        size={20}
-      />
-    </ProjectHeaderButton>
-  );
-  const settingsButton = (
-    <ProjectHeaderButton
-      label="Settings"
-      onPress={openSettings}
-    >
-      <Icon name="settings" size={22} color={colors.content} />
+      {/* The drawer's button, as on every screen it opens from. */}
+      <Icon name="menu" size={22} color={colors.content} />
+      {unread ? <UnreadDot /> : null}
     </ProjectHeaderButton>
   );
 
   const sessionTitle = sessionId ? (
     <SessionTitle
-      title={session?.title ?? "Session"}
+      title={session?.title ?? title ?? "Session"}
       subtitle={[project.name, branch].filter(Boolean).join(" · ")}
+      terminal={terminal}
     />
   ) : null;
+  // A lead's agents, or a worker's way back to its lead.
+  const lead = session?.leadId
+    ? sessions.find((entry) => entry.id === session.leadId)
+    : undefined;
+  const orchestrationStrip =
+    session && (lead || session.orchestration) ? (
+      <OrchestrationStrip session={session} lead={lead} />
+    ) : undefined;
   const sessionToolbar = sessionId ? (
     <SessionToolbar
       projectId={project.id}
@@ -305,6 +331,9 @@ export function ProjectScreen({
       worktreePath={worktreePath}
       harness={harness}
       changed={changes.length}
+      terminal={terminal}
+      onTerminal={(run) => setTerminalSheet({ run, opened: Date.now() })}
+      onEditActions={() => setActionsSheet(true)}
       onSettings={openSettings}
     />
   ) : null;
@@ -314,7 +343,9 @@ export function ProjectScreen({
       // Where a new session will work, under the tabs and in view across its
       // pages; a session's composer shows where it does.
       below={
-        sessionId ? undefined : offline ? (
+        sessionId ? (
+          orchestrationStrip
+        ) : offline ? (
           // Nothing to pick from while the desktop can't be reached.
           <ReconnectingStatus />
         ) : (
@@ -324,7 +355,7 @@ export function ProjectScreen({
             onChange={setWorkspace}
             branch={branch}
             checkoutBranch={project.branch}
-            files={changes}
+            summary={changes}
             onOpenChanges={() =>
               router.push({
                 pathname: "/changes",
@@ -344,50 +375,78 @@ export function ProjectScreen({
       // The composer, its blur and all, slides off with the new session's page.
       dockStyle={sessionId ? undefined : pages.slide}
       composer={
-        <Composer
-          key={sessionId ?? project.id}
-          notice={sessionNotice}
-          context={project.name}
-          branch={sessionId ? (session?.branch ?? project.branch) : branch}
-          model={model}
-          effort={effort}
-          harness={harness}
-          onModelPress={() =>
-            router.push({
-              pathname: "/models",
-              params: {
-                projectId: project.id,
-                ...(sessionId ? { sessionId } : {}),
-              },
-            })
-          }
-          {...(sessionId
-            ? {
-                busy: conversation.busy,
-                onStop: () => stop(sessionId),
-                onSend: (text: string, attachments: Attachment[]) => {
-                  markStartedHere(sessionId);
-                  return sendMessage(sessionId, text, attachments);
+        <>
+          {sessionId ? (
+            <ShipCard
+              projectId={project.id}
+              worktreePath={worktreePath}
+              harness={harness}
+              summary={changes}
+              enabled={!conversation.busy && !offline}
+            />
+          ) : null}
+          {sessionId && conversation.question ? (
+            <QuestionCard conversationId={sessionId} prompt={conversation.question} />
+          ) : null}
+          <Composer
+            key={sessionId ?? project.id}
+            // A worker's thread is driven by its lead and has no draft of its own.
+            conversationId={session?.leadId ? undefined : sessionId}
+            notice={sessionNotice}
+            context={project.name}
+            branch={sessionId ? (session?.branch ?? project.branch) : branch}
+            model={model}
+            effort={effort}
+            harness={harness}
+            modes
+            onNewMono={createMono}
+            slash={{
+              projectId: project.id,
+              ...(worktreePath ? { worktreePath } : {}),
+              ...(sessionId ? { conversationId: sessionId } : {}),
+            }}
+            onModelPress={() =>
+              router.push({
+                pathname: "/models",
+                params: {
+                  projectId: project.id,
+                  ...(sessionId ? { sessionId } : {}),
                 },
-                workspace: (
-                  <WorkspaceLine
-                    current={!worktreePath}
-                    branch={branch}
-                    files={changes}
-                  />
-                ),
-              }
-            : {
-                onSend: start,
-                workspace: (
-                  <ComposerWorkspace
-                    value={workspace}
-                    onChange={setWorkspace}
-                    disabled={offline}
-                  />
-                ),
-              })}
-        />
+              })
+            }
+            {...(sessionId
+              ? {
+                  busy: conversation.busy,
+                  onStop: () => stop(sessionId),
+                  onSend: (
+                    text: string,
+                    attachments: Attachment[],
+                    mode?: ComposerMode,
+                    draftRev?: number,
+                  ) => {
+                    markStartedHere(sessionId);
+                    return sendMessage(sessionId, text, attachments, mode, draftRev);
+                  },
+                  workspace: (
+                    <WorkspaceLine
+                      current={!worktreePath}
+                      branch={branch}
+                      summary={changes}
+                    />
+                  ),
+                }
+              : {
+                  onSend: start,
+                  workspace: (
+                    <ComposerWorkspace
+                      value={workspace}
+                      onChange={setWorkspace}
+                      disabled={offline}
+                    />
+                  ),
+                })}
+          />
+        </>
       }
     >
       {/* The stack's native header: native items, so the same ones morph
@@ -404,14 +463,13 @@ export function ProjectScreen({
                   headerTitleAlign: "left",
                   headerRight: () => headerSurface(sessionToolbar),
                 }
-              : { headerTitle: "", headerBackVisible: true }
+              : { headerTitle: "", headerBackVisible: !sheet }
             : {
-                headerTitle: () => <ProjectSwitch pages={pages} />,
+                headerTitle: () => <ProjectSwitch pages={pages} projectId={project.id} />,
                 ...(Platform.OS === "android"
                   ? {
                       headerTitleAlign: "center" as const,
-                      headerLeft: () => headerSurface(projectAvatar),
-                      headerRight: () => headerSurface(settingsButton),
+                      headerLeft: () => headerSurface(menuButton),
                       headerBackVisible: false,
                     }
                   : {}),
@@ -424,20 +482,11 @@ export function ProjectScreen({
         )
       ) : Platform.OS === "android" ? null : (
         <Stack.Toolbar placement="left">
-          {/* The project's mascot in the bar's glass, for the button. */}
-          <Stack.Toolbar.View>{projectAvatar}</Stack.Toolbar.View>
+          {/* The drawer's menu button in the bar's glass. */}
+          <Stack.Toolbar.View>{menuButton}</Stack.Toolbar.View>
         </Stack.Toolbar>
       )}
-      {sessionId ? (
-        Platform.OS === "android" ? null : (
-          sessionToolbar
-        )
-      ) : Platform.OS === "android" ? null : (
-        <Stack.Toolbar placement="right">
-          {/* The app's own cog in the bar's glass, as the mascot on the left. */}
-          <Stack.Toolbar.View>{settingsButton}</Stack.Toolbar.View>
-        </Stack.Toolbar>
-      )}
+      {sessionId && Platform.OS !== "android" ? sessionToolbar : null}
       <SessionContent>
         {sessionId ? (
           <SessionTranscript
@@ -452,23 +501,38 @@ export function ProjectScreen({
             pages={pages}
             chat={
               <Animated.View style={[styles.chat, emptyStyle]}>
-                <ProjectEmptySession
-                  project={project}
-                  inView={focused && pages.view === "chat"}
-                  swiping={swiping}
-                  onOpen={(session) => openSession(session.id)}
-                />
+                <Timed id="project new-session page">
+                  <ProjectEmptySession
+                    project={project}
+                    inView={focused && pages.view === "chat"}
+                    swiping={swiping}
+                    onOpen={(session) => openSession(session.id)}
+                  />
+                </Timed>
               </Animated.View>
             }
             sessions={
-              <SessionsPage
-                projectId={project.id}
-                active={pages.view === "sessions"}
-                worktree={
-                  workspace.mode === "existing" ? workspace.worktree : undefined
-                }
-                onOpen={(session) => openSession(session.id)}
-              />
+              <Timed id="project sessions page">
+                <SessionsPage
+                  projectId={project.id}
+                  active={pages.view === "sessions"}
+                  worktree={
+                    workspace.mode === "existing" ? workspace.worktree : undefined
+                  }
+                  onOpen={(session) => openSession(session.id)}
+                />
+              </Timed>
+            }
+            inbox={
+              inboxOn ? (
+                <Timed id="project inbox page">
+                  <InboxPage
+                    projectId={project.id}
+                    projectName={project.name}
+                    active={focused && pages.view === "inbox"}
+                  />
+                </Timed>
+              ) : undefined
             }
           />
         )}
@@ -476,6 +540,24 @@ export function ProjectScreen({
       {/* After the content: iOS blurs under the header the scroll view it
           finds first, down each view's first child. */}
       <ConnectionNotice error={conversation.error} />
+      {sessionId && terminal ? (
+        <>
+          <TerminalSheet
+            project={project}
+            worktreePath={worktreePath}
+            run={terminalSheet?.run}
+            opened={terminalSheet?.opened ?? 0}
+            isPresented={terminalSheet !== null}
+            onDismiss={() => setTerminalSheet(null)}
+          />
+          <TerminalActionsSheet
+            projectId={project.id}
+            projectName={project.name}
+            isPresented={actionsSheet}
+            onDismiss={() => setActionsSheet(false)}
+          />
+        </>
+      ) : null}
     </SessionScreen>
   );
 }

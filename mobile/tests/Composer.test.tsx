@@ -144,6 +144,7 @@ vi.mock("react-native-reanimated", () => {
 });
 vi.mock("@expo/ui/swift-ui", () => ({
   Button: () => null,
+  Divider: () => null,
   Host: () => null,
   HStack: () => null,
   Menu: () => null,
@@ -184,6 +185,27 @@ vi.mock("@/features/sessions/attachments", () => ({
   isImage: () => false,
 }));
 vi.mock("@/ui/Icon", () => ({ Icon: () => null }));
+vi.mock("@/features/sessions/useComposerDraft", () => ({
+  useComposerDraft: () => ({ typed: () => {}, flush: () => {}, sent: () => undefined }),
+}));
+vi.mock("@/features/skills/SkillsSheet", () => ({
+  SkillsSheet: ({ isPresented, onPick }: { isPresented: boolean; onPick: (name: string) => void }) =>
+    isPresented ? <button aria-label="Pick deploy" onClick={() => onPick("deploy")} /> : null,
+}));
+vi.mock("@/features/skills/useSlashCatalog", () => ({
+  useSlashCatalog: (_scope: unknown, active: boolean) => ({
+    skills: active
+      ? [
+          { name: "review", description: "Review the diff", scope: "project", source: "agents" },
+          { name: "deploy", description: "Ship it", scope: "user", source: "agents" },
+        ]
+      : [],
+    commands: active ? [{ name: "compact", description: "Shrink context" }] : [],
+    loading: false,
+    error: null,
+    refresh: () => {},
+  }),
+}));
 vi.mock("@/ui/LiquidView", () => ({ LiquidView: () => null }));
 vi.mock("@/ui/theme", () => ({
   useColors: () => ({}),
@@ -254,8 +276,83 @@ it("excludes the hidden model from Android touches, then permits only its contro
   act(() => button("Model: GPT").click());
   expect(model).toHaveBeenCalledOnce();
   await act(async () => button("Send").click());
-  expect(send).toHaveBeenCalledWith("Hello", []);
+  expect(send).toHaveBeenCalledWith("Hello", [], undefined, undefined);
   expect(modelTouches()).toBe("none");
+});
+
+it("sends the mode picked from the add menu with the next message only", async () => {
+  act(() =>
+    root.render(
+      <Composer context="Project" branch="main" model="GPT" onSend={send} modes />,
+    ),
+  );
+  const menuItem = (label: string) =>
+    [...container.querySelectorAll("button")].find(
+      (item) => item.textContent?.replace("✓  ", "") === label,
+    )!;
+  act(() => button("Add files or pick a mode").click());
+  act(() => menuItem("Operator").click());
+  expect(button("Operator, on")).not.toBeNull();
+  const input = container.querySelector("textarea")!;
+  act(() => {
+    input.value = "Open the logs";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () => button("Send").click());
+  expect(send).toHaveBeenCalledWith("Open the logs", [], "operator", undefined);
+  expect(button("Operator, on")).toBeNull();
+});
+
+it("suggests skills and commands for a slash word and puts the pick in its place", async () => {
+  (HTMLTextAreaElement.prototype as unknown as { setSelection: () => void }).setSelection = () => {};
+  act(() =>
+    root.render(
+      <Composer context="Project" branch="main" model="GPT" onSend={send} slash={{ projectId: "p" }} />,
+    ),
+  );
+  const input = container.querySelector("textarea")!;
+  const type = (value: string) =>
+    act(() => {
+      input.value = value;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  type("please /rev");
+  expect(button("Skill review")).not.toBeNull();
+  expect(container.querySelector('[aria-label="Command compact"]')).toBeNull();
+  act(() => button("Skill review").click());
+  expect(input.value).toBe("please /review ");
+  expect(container.querySelector('[aria-label="Skill review"]')).toBeNull();
+
+  // `$` finds skills only; a price stays text.
+  type("$");
+  expect(container.querySelector('[aria-label="Command compact"]')).toBeNull();
+  type("costs $5");
+  expect(container.querySelector('[aria-label="Skill deploy"]')).toBeNull();
+  type("/");
+  expect(button("Command compact")).not.toBeNull();
+});
+
+it("lists skills from the add menu and leads the draft with the pick", async () => {
+  act(() =>
+    root.render(
+      <Composer context="Project" branch="main" model="GPT" onSend={send} slash={{ projectId: "p" }} />,
+    ),
+  );
+  const input = container.querySelector("textarea")!;
+  act(() => {
+    input.value = "the main branch";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  act(() => button("Add photos or files").click());
+  act(() =>
+    [...container.querySelectorAll("button")]
+      .find((item) => item.textContent === "Skills and commands")!
+      .click(),
+  );
+  act(() => button("Pick deploy").click());
+  expect(input.value).toBe("/deploy the main branch");
+  await act(async () => button("Send").click());
+  expect(send).toHaveBeenCalledWith("/deploy the main branch", [], undefined, undefined);
 });
 
 it("blocks model hits throughout a morph and dictation, and preserves the stop action", () => {

@@ -131,11 +131,55 @@ fn too_large() -> String {
 }
 
 fn parse_allowed_media_url(raw: &str) -> Result<MediaUrl, String> {
-    let parsed = parse_https_url(raw)?;
+    let parsed = parse_https_url(&github_blob_media_to_raw(raw))?;
     if !is_allowed_media_target(&parsed) {
         return Err("That media host is not allowed".into());
     }
     Ok(parsed)
+}
+
+/// Maps a `github.com/<owner>/<repo>/blob/<ref>/<file>` image or video link to
+/// the raw file it shows. Other URLs, including blob links to code, come back
+/// unchanged so they are still rejected by the allowlist.
+fn github_blob_media_to_raw(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Some(rest) = trimmed.strip_prefix("https://") else {
+        return trimmed.to_string();
+    };
+    let Some(slash) = rest.find('/') else {
+        return trimmed.to_string();
+    };
+    let host = rest[..slash]
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !is_github_site(&host) {
+        return trimmed.to_string();
+    }
+    let path = rest[slash..].split(['?', '#']).next().unwrap_or("");
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let is_media =
+        parts.len() >= 5 && parts[2] == "blob" && has_media_extension(parts[parts.len() - 1]);
+    if !is_media {
+        return trimmed.to_string();
+    }
+    format!(
+        "https://raw.githubusercontent.com/{}/{}/{}",
+        parts[0],
+        parts[1],
+        parts[3..].join("/")
+    )
+}
+
+fn has_media_extension(file: &str) -> bool {
+    const EXTENSIONS: [&str; 9] = [
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".mp4", ".mov", ".webm",
+    ];
+    let lower = file.to_ascii_lowercase();
+    EXTENSIONS
+        .iter()
+        .any(|extension| lower.ends_with(extension))
 }
 
 fn parse_https_url(raw: &str) -> Result<MediaUrl, String> {
@@ -319,6 +363,23 @@ mod tests {
         )
         .is_err());
         assert!(parse_allowed_media_url("https://127.0.0.1/shot.png").is_err());
+    }
+
+    #[test]
+    fn github_blob_media_links_map_to_raw_files() {
+        assert_eq!(
+            github_blob_media_to_raw(
+                "https://github.com/acme/web/blob/main/docs/shot.png?raw=true#top"
+            ),
+            "https://raw.githubusercontent.com/acme/web/main/docs/shot.png"
+        );
+        assert!(
+            parse_allowed_media_url("https://github.com/acme/web/blob/main/docs/shot.PNG").is_ok()
+        );
+        assert!(
+            parse_allowed_media_url("https://github.com/acme/web/blob/main/src/lib.rs").is_err()
+        );
+        assert!(parse_allowed_media_url("https://github.com/acme/web/blob/main/../x.png").is_err());
     }
 
     #[test]

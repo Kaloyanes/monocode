@@ -364,6 +364,9 @@ pub struct Transcript {
     history_older: Option<bool>,
     pending: Value,
     busy: bool,
+    /// What the agent waits on the user to answer, as the desktop sent it.
+    question: Value,
+    question_generation: u64,
     older: bool,
     error: Option<String>,
     ready: bool,
@@ -372,6 +375,17 @@ pub struct Transcript {
     cache: HashMap<String, TurnCache>,
     sent: HashMap<String, Arc<Row>>,
     order: Vec<String>,
+    /// Names this transcript's visual runtimes apart from another's.
+    key: u64,
+    /// What each visual row draws now (`{"tree"}` or `{"error"}`), and the
+    /// program that drew it.
+    visuals: HashMap<String, (String, Value)>,
+}
+
+impl Drop for Transcript {
+    fn drop(&mut self) {
+        crate::visuals::forget(&crate::visuals::key(self.key, ""));
+    }
 }
 
 impl Transcript {
@@ -382,6 +396,8 @@ impl Transcript {
             history_older: None,
             pending: Value::Null,
             busy: false,
+            question: Value::Null,
+            question_generation: 0,
             older: false,
             error: None,
             ready: false,
@@ -390,6 +406,11 @@ impl Transcript {
             cache: HashMap::new(),
             sent: HashMap::new(),
             order: Vec::new(),
+            key: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
+            visuals: HashMap::new(),
         }
     }
 
@@ -411,7 +432,9 @@ impl Transcript {
                     .cloned()
                     .unwrap_or_else(|| from_messages(&command["messages"]));
                 self.busy = command["busy"].as_bool().unwrap_or(false);
-                self.older = false;
+                self.set_question(&command["question"]);
+                // A read says whether turns precede its window, as a watch does.
+                self.older = command["older"].as_bool().unwrap_or(false);
                 self.error = None;
                 self.ready = true;
                 self.confirm_pending();
@@ -447,6 +470,37 @@ impl Transcript {
                     }
                 }
                 self.expanded.insert(id, open);
+            }
+            // A control in a visual changed, or the person reset it.
+            "visual" | "visualReset" => {
+                let id = string(&command, "id").to_owned();
+                let source = self
+                    .cache
+                    .values()
+                    .flat_map(|cache| cache.rows.iter())
+                    .find(|row| row.id == id && row.kind == "visual")
+                    .and_then(|row| row.action["source"].as_str().map(str::to_owned));
+                // A row that scrolled out of the window has nothing to change.
+                let Some(source) = source else {
+                    return Ok(self.frame());
+                };
+                let key = crate::visuals::key(self.key, &id);
+                let drawn = if command["type"] == "visualReset" {
+                    crate::visuals::reset(&key, &source)
+                } else {
+                    crate::visuals::dispatch(
+                        &key,
+                        &source,
+                        string(&command, "handler"),
+                        command["value"].clone(),
+                    )
+                };
+                self.visuals.insert(id.clone(), (source, drawn));
+                for (turn_id, cache) in &mut self.cache {
+                    if id.starts_with(&format!("{turn_id}/")) {
+                        cache.source = Value::Null;
+                    }
+                }
             }
             "collapsed" => {
                 self.collapsed = command["value"].as_bool().unwrap_or(true);
@@ -496,6 +550,14 @@ impl Transcript {
         Ok(self.frame())
     }
 
+    fn set_question(&mut self, question: &Value) {
+        // Keep clears even when a burst or the UI relay publishes only its last snapshot.
+        if question["requestId"] != self.question["requestId"] {
+            self.question_generation += 1;
+        }
+        self.question = question.clone();
+    }
+
     fn frames(&mut self, frames: &[Value]) -> LinkResult<()> {
         // Merge a whole transport burst before projecting/layout.
         let mut order: Vec<String> = self.turns.iter().map(|t| string(t, "id").into()).collect();
@@ -517,6 +579,10 @@ impl Transcript {
                 }
                 if let Some(older) = frame["older"].as_bool() {
                     self.older = older;
+                }
+                // Sent when it changes; null once answered.
+                if let Some(question) = frame.get("question") {
+                    self.set_question(question);
                 }
                 for turn in frame["turns"].as_array().into_iter().flatten() {
                     let id = string(turn, "id");
@@ -608,12 +674,34 @@ impl Transcript {
         }
         let mut rows: Vec<Arc<Row>> = Vec::new();
         let mut live_turns = HashSet::new();
+        let pending_id = self.pending["turn"]["id"].as_str();
+        let mut pending_from = None;
         for turn in &turns {
             let id = string(turn, "id");
+            if Some(id) == pending_id {
+                pending_from = Some(rows.len());
+            }
             live_turns.insert(id.to_owned());
             let cache = self.cache.entry(id.into()).or_default();
             if cache.source.is_null() {
                 let mut next = project(turn, &mut cache.markdown, &self.expanded, self.collapsed);
+                for row in next.iter_mut().filter(|row| row.kind == "visual") {
+                    let source = row.action["source"].as_str().unwrap_or_default();
+                    // A republished program starts again; the same one keeps its state.
+                    let drawn = match self.visuals.get(&row.id) {
+                        Some((drew, drawn)) if drew == source => drawn.clone(),
+                        _ => {
+                            let drawn = crate::visuals::render(
+                                &crate::visuals::key(self.key, &row.id),
+                                source,
+                            );
+                            self.visuals
+                                .insert(row.id.clone(), (source.to_owned(), drawn.clone()));
+                            drawn
+                        }
+                    };
+                    Arc::make_mut(row).presentation = drawn;
+                }
                 let previous: HashMap<&str, &Arc<Row>> =
                     cache.rows.iter().map(|r| (r.id.as_str(), r)).collect();
                 // Reuse identical blocks after parsing the mutable tail.
@@ -629,10 +717,33 @@ impl Transcript {
             rows.extend(cache.rows.iter().cloned());
         }
         self.cache.retain(|id, _| live_turns.contains(id));
+        // A message sent while a Mono works would show above its working
+        // mascot until the desktop confirms it; carry the mascot under it at
+        // once, where that confirmation puts it. Only a Mono's has nothing
+        // folded under it to leave behind.
+        let working = pending_from.and_then(|from| {
+            rows[..from].iter().rposition(|r| {
+                r.kind == "fold" && r.action["live"] == true && r.action["expandable"] == false
+            })
+        });
+        if let Some(at) = working {
+            let row = rows.remove(at);
+            rows.push(row);
+        }
+        stack_user_rows(&mut rows);
         let order: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        if !self.visuals.is_empty() {
+            let shown: HashSet<&str> = order.iter().map(String::as_str).collect();
+            self.visuals.retain(|id, _| shown.contains(id.as_str()));
+        }
+        // Stacking copies rows each frame; an equal copy is nothing new.
         let changed: Vec<&Row> = rows
             .iter()
-            .filter(|r| self.sent.get(&r.id).is_none_or(|old| !Arc::ptr_eq(old, r)))
+            .filter(|r| {
+                self.sent
+                    .get(&r.id)
+                    .is_none_or(|old| !Arc::ptr_eq(old, r) && **old != ***r)
+            })
             .map(|r| r.as_ref())
             .collect();
         let latest_error = self
@@ -650,7 +761,8 @@ impl Transcript {
             "rows": changed,
             "order": if order == self.order { None } else { Some(&order) },
             "status": { "busy":self.busy, "error":self.error, "hasTurns":!turns.is_empty(), "ready":self.ready, "lastUserId":self.last_user_id(),
-                "userCount":self.user_count(), "pendingId":self.pending["turn"]["id"], "notice":latest_error },
+                "userCount":self.user_count(), "pendingId":self.pending["turn"]["id"], "notice":latest_error,
+                "question":self.question, "questionGeneration":self.question_generation },
             "older": self.history_older.unwrap_or(self.older),
             "firstTurnId": self.history.first().or(self.turns.first()).map(|t| string(t,"id")),
             "watchFrom": self.turns.first().map(|t| string(t,"id")),
@@ -729,6 +841,63 @@ fn apply_edits(turn: &mut Value, patch: &Value) -> LinkResult<()> {
     Ok(())
 }
 
+/// The emoji of a reply that is only `<reaction>…</reaction>`, which a Mono
+/// sends to acknowledge a message without words.
+fn reaction(text: &str) -> Option<&str> {
+    text.trim()
+        .strip_prefix("<reaction>")
+        .and_then(|s| s.strip_suffix("</reaction>"))
+        .map(str::trim)
+        .filter(|emoji| !emoji.is_empty() && emoji.chars().count() <= 16)
+}
+
+/// Pins each reaction reply onto the message before it, as the desktop shows
+/// it, and drops the reply, even from a desktop that sends the raw tag. True
+/// when the turn's replies were all reactions.
+fn fold_reactions(items: &mut Vec<Value>) -> bool {
+    let mut reacted = false;
+    let mut replied = false;
+    let mut message: Option<usize> = None;
+    let mut kept = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        match string(&item, "type") {
+            "user" => {
+                message = Some(kept.len());
+                kept.push(item);
+            }
+            "text" => match (reaction(string(&item, "text")), message) {
+                (Some(emoji), Some(at)) => {
+                    kept[at]["reaction"] = json!(emoji);
+                    reacted = true;
+                }
+                _ => {
+                    replied = true;
+                    kept.push(item);
+                }
+            },
+            _ => kept.push(item),
+        }
+    }
+    *items = kept;
+    reacted && !replied
+}
+
+/// Messages sent back to back are turns of their own; each still sits close
+/// under the one before, as two in one turn do.
+fn stack_user_rows(rows: &mut [Arc<Row>]) {
+    for at in 1..rows.len() {
+        if rows[at].kind != "user" || rows[at - 1].kind != "user" {
+            continue;
+        }
+        if rows[at].presentation["afterUser"] != true {
+            Arc::make_mut(&mut rows[at]).presentation["afterUser"] = json!(true);
+        }
+        if rows[at - 1].presentation["beforeUser"] != true {
+            Arc::make_mut(&mut rows[at - 1]).presentation["beforeUser"] = json!(true);
+        }
+    }
+}
+
 fn string<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
 }
@@ -747,7 +916,8 @@ fn project(
         row.action = turn["stampAt"].clone();
         rows.push(Arc::new(row));
     }
-    let items = turn["items"].as_array().cloned().unwrap_or_default();
+    let mut items = turn["items"].as_array().cloned().unwrap_or_default();
+    let reacted_only = fold_reactions(&mut items);
     for (item_index, item) in items.iter().enumerate() {
         let id = format!("{turn_id}/{}", string(item, "id"));
         match string(item, "type") {
@@ -755,9 +925,17 @@ fn project(
                 let mut row = Row::text(id.clone(), "user", string(item, "text"));
                 row.action = item.clone();
                 row.action["nativeExpanded"] = json!(expanded.get(&id).copied().unwrap_or(false));
+                // Stacked under another of the user's messages, it sits close.
+                row.presentation["afterUser"] =
+                    json!(item_index > 0 && string(&items[item_index - 1], "type") == "user");
                 rows.push(Arc::new(row));
             }
             "text" => {
+                // Two replies in a row in one turn: the desktop's Mono chat
+                // breaks them with its pixel divider (drawn on Mono screens only).
+                if item_index > 0 && string(&items[item_index - 1], "type") == "text" {
+                    rows.push(Arc::new(Row::text(format!("{id}:divider"), "divider", "")));
+                }
                 let from = rows.len();
                 markdown_rows(
                     &id,
@@ -772,7 +950,22 @@ fn project(
                     Arc::make_mut(&mut rows[from]).presentation["top"] =
                         json!(if under_line { 4 } else { 12 });
                     Arc::make_mut(rows.last_mut().unwrap()).presentation["bottom"] = json!(4);
+                    // A Mono's chat draws the reply as one bubble across its rows.
+                    let last = rows.len() - 1;
+                    for (index, row) in rows[from..].iter_mut().enumerate() {
+                        let p = &mut Arc::make_mut(row).presentation;
+                        p["reply"] = json!(true);
+                        p["replyFirst"] = json!(index == 0);
+                        p["replyLast"] = json!(from + index == last);
+                    }
                 }
+            }
+            // The desktop sends a visual's program with the notice older
+            // phones show; this phone runs it.
+            "notice" if crate::visuals::SUPPORTED && item["visual"]["source"].is_string() => {
+                let mut row = Row::text(id, "visual", string(&item["visual"], "title"));
+                row.action = item["visual"].clone();
+                rows.push(Arc::new(row));
             }
             "notice" => {
                 let mut row = Row::text(
@@ -784,6 +977,12 @@ fn project(
                     },
                     string(item, "text"),
                 );
+                row.action = item.clone();
+                rows.push(Arc::new(row));
+            }
+            // A card the phone opens the live page from.
+            "draft" => {
+                let mut row = Row::text(id, "draft", string(item, "title"));
                 row.action = item.clone();
                 rows.push(Arc::new(row));
             }
@@ -857,10 +1056,70 @@ fn project(
                     }
                 }
             }
+            "choices" => {
+                // Suggested replies, lettered in one card. A tap sends one;
+                // once a reply follows, the one sent stays and the rest dim.
+                let options: Vec<&str> = item["options"]
+                    .as_array()
+                    .map(|options| options.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if !options.is_empty() {
+                    let mut row = Row::text(id, "choices", &options.join("\n"));
+                    row.action = json!({"options": options, "chosen": item["chosen"]});
+                    row.presentation = json!({"top": 4, "bottom": 8});
+                    rows.push(Arc::new(row));
+                }
+            }
+            "visual" => {
+                // A chart or dashboard the agent drew, laid out natively from
+                // the tree the desktop rendered.
+                let mut row = Row::text(id, "visual", string(item, "title"));
+                row.action = item.clone();
+                row.presentation = json!({"top": 8, "bottom": 8});
+                rows.push(Arc::new(row));
+            }
+            "document" => {
+                // A document the Mono wrote: a tap opens it in the reader.
+                let mut row = Row::text(id, "document", string(item, "title"));
+                row.action = item.clone();
+                row.presentation = json!({"top": 4, "bottom": 8});
+                rows.push(Arc::new(row));
+            }
+            "sessions" => {
+                // Sessions a Mono started: a card each, under the reply after
+                // the launch. A tap opens the session over the Mono's chat.
+                let sessions = item["sessions"].as_array().cloned().unwrap_or_default();
+                for (index, session) in sessions.iter().enumerate() {
+                    let mut row = Row::text(
+                        format!("{id}/{}", string(session, "id")),
+                        "launch",
+                        string(session, "title"),
+                    );
+                    row.action = session.clone();
+                    row.action["sessionId"] = session["id"].clone();
+                    row.action["type"] = json!("session");
+                    row.presentation = json!({
+                        "top": if index == 0 { 4 } else { 0 },
+                        "bottom": if index + 1 == sessions.len() { 8 } else { 0 },
+                    });
+                    rows.push(Arc::new(row));
+                }
+            }
             _ => {}
         }
     }
-    if turn["footer"] == true {
+    // When the reply landed, shown beside its last bubble on a slide aside.
+    if turn["completedAt"].is_number() {
+        if let Some(row) = rows
+            .iter_mut()
+            .rev()
+            .find(|r| r.presentation["replyLast"] == true)
+        {
+            Arc::make_mut(row).presentation["at"] = turn["completedAt"].clone();
+        }
+    }
+    // A reply that was only a reaction has nothing of its own to copy or time.
+    if turn["footer"] == true && !reacted_only {
         let mut row = Row::text(format!("{turn_id}:footer"), "footer", "");
         row.action = json!({"type":"footer","copyText":turn["copyText"],"metrics":turn["metrics"],"durationMs":turn["durationMs"],"completedAt":turn["completedAt"]});
         rows.push(Arc::new(row));
@@ -942,6 +1201,92 @@ fn from_messages(messages: &Value) -> Vec<Value> {
 }
 
 #[cfg(test)]
+mod reaction_tests {
+    use super::*;
+
+    #[test]
+    fn a_reaction_reply_lands_on_the_message_before_it() {
+        let mut items = vec![
+            json!({"type":"user","id":"u","text":"cool"}),
+            json!({"type":"text","id":"a","text":" <reaction>👍</reaction>\n"}),
+        ];
+        assert!(fold_reactions(&mut items));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["reaction"], "👍");
+    }
+
+    #[test]
+    fn back_to_back_replies_get_a_divider_between_them() {
+        let turn = json!({"id":"t","items":[
+            {"type":"user","id":"u","text":"go"},
+            {"type":"text","id":"a","text":"First."},
+            {"type":"text","id":"b","text":"Second."},
+        ]});
+        let rows = project(&turn, &mut HashMap::new(), &HashMap::new(), false);
+        let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
+        let divider = kinds.iter().position(|kind| *kind == "divider").unwrap();
+        // After the first reply, before the second; none after the message.
+        assert_eq!(kinds.iter().filter(|kind| **kind == "divider").count(), 1);
+        assert!(divider > 1 && divider < kinds.len() - 1);
+    }
+
+    #[test]
+    fn a_monos_launched_sessions_become_cards_that_open_them() {
+        let turn = json!({"id":"t","items":[
+            {"type":"user","id":"u","text":"go"},
+            {"type":"text","id":"a","text":"On it."},
+            {"type":"sessions","id":"a:launches","sessions":[
+                {"id":"app-1","projectId":"p","project":"repo","title":"Fix","harness":"codex","state":"working"},
+                {"id":"app-2","projectId":"p","project":"repo","title":"Test","harness":"claude","state":"done"},
+            ]},
+        ]});
+        let rows = project(&turn, &mut HashMap::new(), &HashMap::new(), false);
+        let cards: Vec<_> = rows.iter().filter(|row| row.kind == "launch").collect();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].id, "t/a:launches/app-1");
+        assert_eq!(cards[0].action["type"], "session");
+        assert_eq!(cards[0].action["sessionId"], "app-1");
+        assert_eq!(cards[0].action["projectId"], "p");
+        assert_eq!(cards[1].runs[0].text, "Test");
+    }
+
+    #[test]
+    fn a_monos_choices_and_documents_become_cards() {
+        let turn = json!({"id":"t","items":[
+            {"type":"user","id":"u","text":"next?"},
+            {"type":"choices","id":"c","options":["Review it","Wait"],"chosen":"Review it"},
+            {"type":"document","id":"d","documentId":"doc","title":"Report","kind":"document"},
+        ]});
+        let rows = project(&turn, &mut HashMap::new(), &HashMap::new(), false);
+        let choices: Vec<_> = rows.iter().filter(|row| row.kind == "choices").collect();
+        assert_eq!(choices.len(), 1);
+        assert_eq!(
+            choices[0].action,
+            json!({"options":["Review it","Wait"],"chosen":"Review it"})
+        );
+        let document = rows.iter().find(|row| row.kind == "document").unwrap();
+        assert_eq!(document.action["documentId"], "doc");
+        assert_eq!(document.runs[0].text, "Report");
+    }
+
+    #[test]
+    fn written_replies_and_lone_tags_stay_as_text() {
+        let mut items = vec![
+            json!({"type":"user","id":"u","text":"hi"}),
+            json!({"type":"text","id":"a","text":"<reaction>👍</reaction>"}),
+            json!({"type":"text","id":"b","text":"Here is the answer."}),
+        ];
+        assert!(!fold_reactions(&mut items));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["reaction"], "👍");
+        // With no message before it there is nothing to pin it to.
+        let mut lone = vec![json!({"type":"text","id":"a","text":"<reaction>👍</reaction>"})];
+        assert!(!fold_reactions(&mut lone));
+        assert_eq!(lone.len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -966,6 +1311,51 @@ mod tests {
             .iter()
             .any(|r| r.code && r.text == "src/main.ts:4"));
         assert!(table[1].runs.is_empty());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_visual_notice_becomes_a_live_row_its_controls_change() {
+        let source = "const s = visual.state({ n: 1 });\nreturn () => visual.column([visual.text('n ' + s.n), visual.button('Add', () => { s.n += 1; })]);";
+        let turn = json!({"id":"t","items":[
+            {"id":"u","type":"user","text":"chart please"},
+            {"id":"v","type":"notice","text":"Counter · Open on desktop to interact",
+             "visual":{"title":"Counter","source":source}},
+            {"id":"a","type":"text","text":"Done"}
+        ]});
+        let mut transcript = Transcript::new(vec![turn], false);
+        let frame = transcript.update(json!({"type":"render"})).unwrap();
+        let row = frame["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "t/v")
+            .unwrap()
+            .clone();
+        assert_eq!(row["kind"], "visual");
+        assert_eq!(row["runs"][0]["text"], "Counter");
+        assert_eq!(row["presentation"]["tree"]["children"][0]["text"], "n 1");
+        let handler = row["presentation"]["tree"]["children"][1]["handler"].clone();
+        let next = transcript
+            .update(json!({"type":"visual","id":"t/v","handler":handler,"value":null}))
+            .unwrap();
+        let changed = next["rows"].as_array().unwrap();
+        assert_eq!(changed.len(), 1, "only the visual row changes");
+        assert_eq!(
+            changed[0]["presentation"]["tree"]["children"][0]["text"],
+            "n 2"
+        );
+        let reset = transcript
+            .update(json!({"type":"visualReset","id":"t/v"}))
+            .unwrap();
+        assert_eq!(
+            reset["rows"][0]["presentation"]["tree"]["children"][0]["text"],
+            "n 1"
+        );
+        // A row that is gone is not an error.
+        assert!(transcript
+            .update(json!({"type":"visual","id":"t/gone","handler":"x","value":null}))
+            .is_ok());
     }
 
     #[test]
@@ -999,6 +1389,20 @@ mod tests {
         assert_eq!(reply[0].presentation["top"], 4);
         assert_eq!(reply[1].presentation["gap"], 12);
         assert_eq!(reply[1].presentation["bottom"], 4);
+    }
+
+    #[test]
+    fn a_draft_is_a_card_row_that_carries_what_opens_it() {
+        let turn = json!({"id":"t","items":[
+            {"id":"r3","type":"draft","draft":"draft-1-a","title":"Pricing"},
+            {"id":"r4","type":"draft","draft":"kept:p.html","title":"Kept","kept":true}
+        ]});
+        let rows = project(&turn, &mut HashMap::new(), &HashMap::new(), false);
+        let cards: Vec<_> = rows.iter().filter(|r| r.kind == "draft").collect();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].id, "t/r3");
+        assert_eq!(cards[0].action["draft"], "draft-1-a");
+        assert_eq!(cards[1].action["kept"], true);
     }
 
     #[test]
@@ -1122,6 +1526,30 @@ mod tests {
         assert!(t.cache.is_empty());
     }
     #[test]
+    fn a_message_sent_while_a_mono_works_takes_its_mascot_and_stacks_under_the_last() {
+        let working = json!({"id":"1","items":[
+            {"id":"u","type":"user","text":"Hey"},
+            {"id":"h","type":"header","live":true,"label":"Thinking…","entries":[]},
+        ]});
+        let mut t = Transcript::new(vec![working], true);
+        let frame = t
+            .update(
+                json!({"type":"pending","pending":{"afterUserId":"1/u","userCount":1,
+                "turn":{"id":"pending:1","items":[{"id":"u","type":"user","text":"You there"}]}}}),
+            )
+            .unwrap();
+        assert_eq!(frame["order"], json!(["1/u", "pending:1/u", "1/h"]));
+        let rows = frame["rows"].as_array().unwrap();
+        let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(row("1/u")["presentation"]["beforeUser"], true);
+        assert_eq!(row("pending:1/u")["presentation"]["afterUser"], true);
+        // The next frame resends none of the stacked copies.
+        let again = t
+            .update(json!({"type":"frames","frames":[{"order":["1"],"turns":[]}]}))
+            .unwrap();
+        assert_eq!(again["rows"], json!([]));
+    }
+    #[test]
     fn a_reopened_window_confirms_by_last_user_id_even_when_its_count_shrinks() {
         let turn =
             |id: &str| json!({"id":id,"items":[{"id":"u","type":"user","text":"same prompt"}]});
@@ -1136,6 +1564,75 @@ mod tests {
             .unwrap();
         assert!(after["status"]["pendingId"].is_null());
         assert_eq!(after["status"]["lastUserId"], "4/u");
+    }
+    #[test]
+    fn question_generation_survives_coalesced_clears_and_snapshot_refreshes() {
+        let mut transcript = Transcript::new(vec![], false);
+        for command in [
+            json!({"type":"frames","frames":[{"question":null},{"question":null}]}),
+            json!({"type":"replace","turns":[]}),
+        ] {
+            let snapshot = transcript.update(command).unwrap();
+            assert_eq!(snapshot["status"]["questionGeneration"], 0);
+        }
+        let question = json!({"requestId":7,"questions":[]});
+        let asked = transcript
+            .update(json!({"type":"frames","frames":[{"question":question}]}))
+            .unwrap();
+        let first = asked["status"]["questionGeneration"].as_u64().unwrap();
+        let replacement = transcript
+            .update(json!({"type":"frames","frames":[{"question":null},{"question":question}]}))
+            .unwrap();
+        let generation = replacement["status"]["questionGeneration"]
+            .as_u64()
+            .unwrap();
+        assert!(generation > first);
+        assert_eq!(replacement["status"]["question"], question);
+        let refreshed = json!({"requestId":7,"questions":[],"autoResolveAt":1234});
+        for command in [
+            json!({"type":"frames","frames":[{"question":refreshed}]}),
+            json!({"type":"replace","turns":[],"question":refreshed}),
+            json!({"type":"frames","frames":[{"busy":true}]}),
+        ] {
+            let snapshot = transcript.update(command).unwrap();
+            assert_eq!(snapshot["status"]["questionGeneration"], generation);
+        }
+        let different = transcript
+            .update(json!({"type":"frames","frames":[{"question":{"requestId":8,"questions":[]}}]}))
+            .unwrap();
+        assert!(different["status"]["questionGeneration"].as_u64().unwrap() > generation);
+        let cleared = transcript
+            .update(json!({"type":"frames","frames":[{"question":null}]}))
+            .unwrap();
+        let idle = transcript
+            .update(json!({"type":"frames","frames":[{"question":null},{"question":null}]}))
+            .unwrap();
+        assert_eq!(
+            idle["status"]["questionGeneration"],
+            cleared["status"]["questionGeneration"]
+        );
+    }
+
+    #[test]
+    fn pending_question_holds_until_the_desktop_clears_it() {
+        let mut t = Transcript::new(Vec::new(), true);
+        let question = json!({"requestId":7,"questions":[{"id":"q","prompt":"Which?","multiSelect":false,"allowCustom":true,"options":[]}]});
+        let asked = t
+            .update(json!({"type":"frames","frames":[{"busy":true,"order":[],"turns":[],"question":question.clone()}]}))
+            .unwrap();
+        assert_eq!(asked["status"]["question"], question);
+        let streaming = t
+            .update(json!({"type":"frames","frames":[{"busy":true,"order":[],"turns":[]}]}))
+            .unwrap();
+        assert_eq!(streaming["status"]["question"], question);
+        let answered = t
+            .update(json!({"type":"frames","frames":[{"order":[],"turns":[],"question":null}]}))
+            .unwrap();
+        assert!(answered["status"]["question"].is_null());
+        let read = t
+            .update(json!({"type":"replace","turns":[],"busy":true,"question":question.clone()}))
+            .unwrap();
+        assert_eq!(read["status"]["question"], question);
     }
     #[test]
     fn completed_blocks_share_allocations_and_stream_completion_has_no_text_delta() {

@@ -1,6 +1,6 @@
 import { ChoiceMenu } from "@/ui/ChoiceMenu";
-import { Button, Host, HStack, Menu, Spacer } from "@expo/ui/swift-ui";
-import { accessibilityLabel, contentShape, frame, shapes } from "@expo/ui/swift-ui/modifiers";
+import { GlassMenuButton } from "@/ui/GlassMenuButton";
+import { Button } from "@expo/ui/swift-ui";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Alert, Platform, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import Animated, {
@@ -14,11 +14,15 @@ import Animated, {
 } from "react-native-reanimated";
 
 import { PulsingDot, useOffline } from "@/features/connection/ConnectionNotice";
-import type { Harness } from "@/features/workspace/types";
+import { SkillsSheet } from "@/features/skills/SkillsSheet";
+import { SlashRow } from "@/features/skills/SlashRow";
+import { insert, prepend, rank, tokenAt, type SlashToken } from "@/features/skills/slash";
+import { useSlashCatalog, type SlashScope } from "@/features/skills/useSlashCatalog";
+import type { ComposerMode, Harness } from "@/features/workspace/types";
 import { FileTypeIcon } from "@/features/files/FileTypeIcon";
 import { Icon, type IconName } from "@/ui/Icon";
 import { LiquidView } from "@/ui/LiquidView";
-import { themedStyles, useColors, useScheme } from "@/ui/theme";
+import { themedStyles, useColors, useScheme, type Scheme } from "@/ui/theme";
 
 import {
   isImage,
@@ -29,9 +33,11 @@ import {
   type Attachment,
 } from "./attachments";
 import { DictationBar } from "./DictationBar";
+import { cachedText } from "./composerDraft";
 import { canDictate, insertDictation } from "./dictation";
 import { ProviderLogo } from "./ProviderLogo";
 import { COMPOSER_INPUT_ID } from "./SessionScreen";
+import { useComposerDraft } from "./useComposerDraft";
 
 export const COMPOSER_PLACEHOLDER = "Plan, ask, build…";
 /** Mid-turn the desktop steers with the message or queues it, as its setting says. */
@@ -44,17 +50,57 @@ const COLLAPSED = BUTTON + EDGE * 2;
 const RADIUS = COLLAPSED / 2;
 /** Expanded layout: context row on top, buttons and model along the bottom. */
 const TOP_ROW = 46;
+/** The card's top edge above the field when there is no context to show. */
+const TOP_BARE = 12;
 /** The attachments' strip, under the context row as on the desktop. */
 const THUMB = 48;
 const STRIP = THUMB + 10;
+/** The message being replied to, as an outlined pill above the field. */
+const REPLY_ROW = 44;
 const BOTTOM_ROW = BUTTON + EDGE * 2;
 const INPUT_MIN = 64;
+/** A compact field's least height once it has its own row: two lines. */
+const INPUT_MIN_COMPACT = 60;
 const INPUT_MAX = 160;
 /** Inset from the screen edges: roomier as a pill, wider as a card. */
 const MARGIN_COLLAPSED = 20;
 const MARGIN_EXPANDED = 12;
 const MORPH = { duration: 280, easing: Easing.out(Easing.cubic) };
+
+/** The desktop's + menu modes, in its order and with its words and hues. */
+const MODES: {
+  id: ComposerMode;
+  label: string;
+  hint: string;
+  systemImage: ComponentProps<typeof Button>["systemImage"];
+  tint: Record<Scheme, string>;
+}[] = [
+  {
+    id: "plan",
+    label: "Plan mode",
+    hint: "Review a plan before building",
+    systemImage: "lightbulb",
+    tint: { dark: "#fde047", light: "#a16207" },
+  },
+  {
+    id: "operator",
+    label: "Operator",
+    hint: "Give this thread access to MonoCode",
+    systemImage: "cursorarrow.rays",
+    tint: { dark: "#7dd3fc", light: "#0369a1" },
+  },
+  {
+    id: "orchestrator",
+    label: "Orchestrator",
+    hint: "Plan and coordinate agent work",
+    systemImage: "point.3.connected.trianglepath.dotted",
+    tint: { dark: "#f0abfc", light: "#a21caf" },
+  },
+];
 const DICTATION_FADE = { duration: 180, easing: Easing.out(Easing.cubic) };
+/** A `/` suggestion's row, and how many show before the list scrolls. */
+const SUGGESTION_ROW = 48;
+const SUGGESTIONS_SHOWN = 3.5;
 
 /**
  * The prompt field. At rest it's a single glass pill: add, the field and the
@@ -66,8 +112,17 @@ const DICTATION_FADE = { duration: 180, easing: Easing.out(Easing.cubic) };
  * While the desktop can't be reached, or the session's latest error stands,
  * the field gives way to a line saying so and nothing can be sent; a draft
  * waits under it.
+ * With `modes`, the add menu also offers the desktop's Plan, Operator and
+ * Orchestrator. The one picked shows as a chip by the model and goes with the
+ * next message only, as on the desktop.
+ * With `slash`, typing `/` or `$` suggests the chat's provider commands and
+ * the project's skills above the field, and the add menu lists them all.
+ * Either puts in `/name`, which the desktop reads as it does a typed one.
+ * With `conversationId`, the text is the thread's: it follows the desktop
+ * composer's text for the same thread, and typing here changes it there.
  */
 export function Composer({
+  conversationId,
   context,
   branch,
   model,
@@ -79,7 +134,15 @@ export function Composer({
   onModelPress,
   workspace,
   notice,
+  modes = false,
+  onNewMono,
+  slash,
+  compact = false,
+  reply,
+  onClearReply,
 }: {
+  /** The thread whose composer text this shares with the desktop. */
+  conversationId?: string;
   /** Where this runs: the project, or the mono. */
   context: string;
   branch: string;
@@ -87,7 +150,13 @@ export function Composer({
   /** The model's effort, shown dimmer after its name as on desktop. */
   effort?: string;
   harness?: Harness;
-  onSend: (text: string, attachments: Attachment[]) => void | Promise<void>;
+  onSend: (
+    text: string,
+    attachments: Attachment[],
+    mode?: ComposerMode,
+    /** The desktop composer revision the text was based on, which it clears. */
+    draftRev?: number,
+  ) => void | Promise<void>;
   busy?: boolean;
   onStop?: () => Promise<void>;
   /** Opens the model sheet. */
@@ -96,6 +165,21 @@ export function Composer({
   workspace?: ReactNode;
   /** The session's latest error, in place of the field until tapped away. */
   notice?: { text: string; dismiss: () => void } | null;
+  /** Offers the composer modes; a Mono's chat has none. */
+  modes?: boolean;
+  /** Adds "New Mono" to the add menu, after the modes; absent where a Mono can't be made. */
+  onNewMono?: () => void;
+  /** Where skills and commands come from; a Mono's chat has none. */
+  slash?: SlashScope;
+  /**
+   * One line, as a Mono's chat has it: no model or context, and the pill
+   * stays a pill until the draft outgrows it. Then the field takes its own
+   * row above add and send.
+   */
+  compact?: boolean;
+  /** A Mono's message being replied to, shown over the field until sent or cleared. */
+  reply?: string | null;
+  onClearReply?: () => void;
 }) {
   const scheme = useScheme();
   const colors = useColors();
@@ -103,16 +187,39 @@ export function Composer({
   const offline = useOffline();
   const blocked = offline ? "offline" : notice ? "error" : null;
   const input = useRef<TextInput>(null);
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => cachedText(conversationId));
   const [sending, setSending] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [mode, setMode] = useState<ComposerMode | null>(null);
   const [inputHeight, setInputHeight] = useState(INPUT_MIN);
   const [dictating, setDictating] = useState(false);
   // Where dictated words go: the cursor, or the selection they replace.
   const selection = useRef({ start: 0, end: 0 });
+  // The field's text as of its last change, ahead of the render that shows it,
+  // since a selection event can arrive between the two.
+  const latest = useRef(text);
+  // The `/name` or `$name` at the cursor. Set only when it changes, so moving
+  // the cursor, or focusing, doesn't commit alongside the keyboard's rise.
+  const [token, setToken] = useState<SlashToken | null>(null);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  // The desktop's text for this thread, while the person isn't typing here.
+  const showDesktopText = useCallback((next: string) => {
+    latest.current = next;
+    setText(next);
+    setToken(null);
+  }, []);
+  const shared = useComposerDraft(conversationId, showDesktopText);
+  const catalog = useSlashCatalog(slash, !!token || skillsOpen);
+  const suggestions = token
+    ? rank(token.query, token.trigger, catalog.skills, catalog.commands).slice(0, 30)
+    : [];
   const canSend = (text.trim().length > 0 || attachments.length > 0) && !sending;
-  // A draft, in words or files, keeps the card open.
-  const hasText = text.length > 0 || attachments.length > 0;
+  // A draft, in words, files or a mode, keeps the card open.
+  const hasText = text.length > 0 || attachments.length > 0 || mode !== null;
+  // A compact draft past the pill's one line, measured at the pill's width so
+  // the wider row it moves to can't fold it straight back.
+  const [wraps, setWraps] = useState(false);
+  const opens = compact ? wraps || attachments.length > 0 || !!reply : hasText || !!reply;
 
   // Focus lives on the UI thread rather than in React state. The keyboard
   // starts moving as the field focuses, and a React commit in that same frame
@@ -124,9 +231,14 @@ export function Composer({
   const progress = useSharedValue(0);
   const morph = (expand: boolean) => progress.set(withTiming(expand ? 1 : 0, MORPH));
   useEffect(() => {
-    if (hasText) progress.set(withTiming(1, MORPH));
-    else if (!focused.get()) progress.set(withTiming(0, MORPH));
-  }, [hasText, focused, progress]);
+    if (opens) progress.set(withTiming(1, MORPH));
+    else if (compact || !focused.get()) progress.set(withTiming(0, MORPH));
+  }, [opens, compact, focused, progress]);
+
+  // Picking a message to reply to is ready to type the reply.
+  useEffect(() => {
+    if (reply) input.current?.focus();
+  }, [reply]);
 
   // Lets go of the keyboard as the field gives way.
   useEffect(() => {
@@ -134,11 +246,17 @@ export function Composer({
   }, [blocked]);
 
   const strip = attachments.length > 0 ? STRIP : 0;
-  const expandedHeight = TOP_ROW + strip + inputHeight + BOTTOM_ROW;
+  const suggest = Math.min(suggestions.length, SUGGESTIONS_SHOWN) * SUGGESTION_ROW;
+  const replyRow = reply ? REPLY_ROW : 0;
+  // A Mono's chat has no project or branch to name; the card closes up.
+  const topRow = !compact && (workspace || context || branch) ? TOP_ROW : TOP_BARE;
+  // A compact card keeps the pill's inset, so the pill's line measures true.
+  const marginExpanded = compact ? MARGIN_COLLAPSED : MARGIN_EXPANDED;
+  const expandedHeight = topRow + replyRow + strip + suggest + inputHeight + BOTTOM_ROW;
 
   const containerStyle = useAnimatedStyle(() => ({
     height: interpolate(progress.get(), [0, 1], [COLLAPSED, expandedHeight]),
-    marginHorizontal: interpolate(progress.get(), [0, 1], [MARGIN_COLLAPSED, MARGIN_EXPANDED]),
+    marginHorizontal: interpolate(progress.get(), [0, 1], [MARGIN_COLLAPSED, marginExpanded]),
   }));
   // The field slides from between the pill's buttons to its own band in the card.
   const inputStyle = useAnimatedStyle(() => {
@@ -146,7 +264,7 @@ export function Composer({
     return {
       left: interpolate(p, [0, 1], [EDGE + BUTTON + 8, 18]),
       right: interpolate(p, [0, 1], [EDGE + BUTTON + 8, 18]),
-      top: interpolate(p, [0, 1], [EDGE - 1, TOP_ROW + strip]),
+      top: interpolate(p, [0, 1], [EDGE - 1, topRow + replyRow + strip + suggest]),
       bottom: interpolate(p, [0, 1], [EDGE, BOTTOM_ROW]),
     };
   });
@@ -193,6 +311,8 @@ export function Composer({
     setText((current) => {
       const next = insertDictation(current, words, selection.current);
       selection.current = { start: next.cursor, end: next.cursor };
+      latest.current = next.text;
+      shared.typed(next.text);
       return next.text;
     });
   };
@@ -215,24 +335,88 @@ export function Composer({
     }
   };
 
-  // Clears, lets go of the keyboard and folds back to the pill at once; the
-  // draft comes back if the desktop never takes it.
+  // Picking the mode that's on turns it off, as the desktop's menu does.
+  const toggleMode = (picked: ComposerMode) => {
+    const next = mode === picked ? null : picked;
+    setMode(next);
+    // Ready to say what it's for.
+    if (next) input.current?.focus();
+  };
+
+  const findToken = (value: string, cursor: number) => {
+    const next = slash ? tokenAt(value, cursor) : null;
+    setToken((current) =>
+      current?.trigger === next?.trigger &&
+      current?.start === next?.start &&
+      current?.end === next?.end &&
+      current?.query === next?.query
+        ? current
+        : next,
+    );
+  };
+  const changeText = (value: string) => {
+    // Where the cursor will be, until the selection event says.
+    const cursor = Math.max(0, selection.current.end + value.length - latest.current.length);
+    latest.current = value;
+    setText(value);
+    shared.typed(value);
+    findToken(value, Math.min(cursor, value.length));
+  };
+  // Puts `/name` in the field and the cursor after it, ready for the request.
+  const putCommand = (next: { text: string; cursor: number }) => {
+    latest.current = next.text;
+    selection.current = { start: next.cursor, end: next.cursor };
+    setText(next.text);
+    shared.typed(next.text);
+    setToken(null);
+    requestAnimationFrame(() => input.current?.setSelection(next.cursor, next.cursor));
+  };
+  const pickSuggestion = (name: string) => {
+    if (token) putCommand(insert(text, token, name));
+  };
+  // From the sheet the name leads the message, where provider commands
+  // must be; the field takes the keyboard back once the sheet is down.
+  const pickFromSheet = (name: string) => {
+    setSkillsOpen(false);
+    putCommand(prepend(text, name));
+    setTimeout(() => input.current?.focus(), 350);
+  };
+  const openSkills = () => {
+    input.current?.blur();
+    setSkillsOpen(true);
+  };
+
+  // Clears and folds back to the pill at once; the draft comes back if the
+  // desktop never takes it. A Mono's chat keeps the keyboard up for the next
+  // message, as a messaging app; a session's card lets go of it.
   const send = async () => {
     // The draft stays put until the desktop can take it.
     if (!canSend || blocked) return;
     const message = text.trim();
     const files = attachments;
+    const sentMode = mode;
     setSending(true);
+    const draftRev = shared.sent();
     setText("");
+    latest.current = "";
+    setToken(null);
     setAttachments([]);
-    focused.set(false);
+    setMode(null);
     morph(false);
-    input.current?.blur();
+    if (!compact) {
+      focused.set(false);
+      input.current?.blur();
+    }
     try {
-      await onSend(message, files);
+      await onSend(message, files, sentMode ?? undefined, draftRev);
     } catch (reason) {
-      setText((current) => current || message);
+      setText((current) => {
+        latest.current = current || message;
+        shared.typed(latest.current);
+        return latest.current;
+      });
       setAttachments((current) => (current.length ? current : files));
+      setMode((current) => current ?? sentMode);
       Alert.alert("Message not sent", reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSending(false);
@@ -245,18 +429,36 @@ export function Composer({
         <View />
       </LiquidView>
 
-      <Animated.View style={[styles.contextRow, expandedOnly]}>
-        <View style={styles.picker}>
-          {workspace ?? (
-            <Text style={styles.context} numberOfLines={1}>
-              {context} <Text style={styles.branch}>{branch}</Text>
-            </Text>
-          )}
-        </View>
-      </Animated.View>
+      {topRow === TOP_ROW ? (
+        <Animated.View style={[styles.contextRow, expandedOnly]}>
+          <View style={styles.picker}>
+            {workspace ?? (
+              <Text style={styles.context} numberOfLines={1}>
+                {context} <Text style={styles.branch}>{branch}</Text>
+              </Text>
+            )}
+          </View>
+        </Animated.View>
+      ) : null}
+
+      {reply ? (
+        <Animated.View style={[styles.reply, { top: topRow - 2 }, expandedOnly]}>
+          <Text style={styles.replyText} numberOfLines={1}>
+            {reply.replace(/\s+/g, " ").trim()}
+          </Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Cancel reply"
+            hitSlop={10}
+            onPress={onClearReply}
+          >
+            <Icon name="close" size={16} color={colors.muted} />
+          </Pressable>
+        </Animated.View>
+      ) : null}
 
       {attachments.length > 0 ? (
-        <Animated.View style={[styles.strip, expandedOnly]}>
+        <Animated.View style={[styles.strip, { top: topRow + replyRow }, expandedOnly]}>
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
@@ -276,32 +478,61 @@ export function Composer({
         </Animated.View>
       ) : null}
 
+      {suggestions.length > 0 ? (
+        <Animated.View
+          style={[styles.suggestions, { top: TOP_ROW + strip, height: suggest }, expandedOnly]}
+        >
+          <ScrollView
+            keyboardShouldPersistTaps="always"
+            showsVerticalScrollIndicator={false}
+            accessibilityLabel={token?.trigger === "$" ? "Skills" : "Skills and commands"}
+          >
+            {suggestions.map((entry) => (
+              <SlashRow
+                key={`${entry.kind}:${entry.name}`}
+                entry={entry}
+                onPress={() => pickSuggestion(entry.name)}
+              />
+            ))}
+          </ScrollView>
+        </Animated.View>
+      ) : null}
+
       <Animated.View style={[styles.inputSlot, inputStyle, fieldShown]}>
         <TextInput
           ref={input}
           nativeID={COMPOSER_INPUT_ID}
           value={text}
           editable={!dictating && !blocked}
-          onChangeText={setText}
+          onChangeText={changeText}
           onSelectionChange={(event) => {
-            selection.current = event.nativeEvent.selection;
+            const picked = event.nativeEvent.selection;
+            selection.current = picked;
+            findToken(latest.current, picked.start === picked.end ? picked.end : -1);
           }}
           onFocus={() => {
             focused.set(true);
-            morph(true);
+            if (!compact) morph(true);
           }}
           onBlur={() => {
             focused.set(false);
-            if (!hasText) morph(false);
+            shared.flush();
+            if (!opens) morph(false);
           }}
           onContentSizeChange={(event) =>
             setInputHeight(
-              Math.min(INPUT_MAX, Math.max(INPUT_MIN, event.nativeEvent.contentSize.height + 12)),
+              Math.min(
+                INPUT_MAX,
+                Math.max(compact ? INPUT_MIN_COMPACT : INPUT_MIN, event.nativeEvent.contentSize.height + 12),
+              ),
             )
           }
           placeholder={busy ? BUSY_PLACEHOLDER : COMPOSER_PLACEHOLDER}
           placeholderTextColor={colors.muted}
           multiline
+          // The pill's field is a point shorter than its one line, so it would
+          // bounce; only a draft taller than the card scrolls.
+          scrollEnabled={inputHeight >= INPUT_MAX}
           keyboardAppearance={scheme}
           cursorColor={colors.accent}
           selectionColor={colors.accent}
@@ -352,9 +583,26 @@ export function Composer({
         <AddMenu
           onPhotos={() => void attach(pickPhotos)}
           onFiles={() => void attach(pickFiles)}
+          mode={mode}
+          onMode={modes ? toggleMode : undefined}
+          onNewMono={onNewMono}
+          onSkills={slash ? openSkills : undefined}
         />
       </Animated.View>
 
+      {compact ? (
+        // Lays the draft out at the pill field's width, unseen, to tell when it wraps.
+        <Text
+          aria-hidden
+          pointerEvents="none"
+          style={[styles.input, styles.measure]}
+          onTextLayout={(event) => setWraps(event.nativeEvent.lines.length > 1)}
+        >
+          {text || " "}
+        </Text>
+      ) : null}
+
+      {compact ? null : (
       <Animated.View
         style={[styles.modelChip, expandedOnly]}
       >
@@ -372,7 +620,9 @@ export function Composer({
           </Text>
           <Icon name="chevronDown" size={14} color={colors.muted} />
         </Pressable>
+        {mode ? <ModeChip mode={mode} onClear={() => setMode(null)} /> : null}
       </Animated.View>
+      )}
 
       <Animated.View
         pointerEvents={blocked ? "none" : "auto"}
@@ -399,50 +649,87 @@ export function Composer({
           <DictationBar onClose={endDictation} />
         </Animated.View>
       ) : null}
+
+      {slash ? (
+        <SkillsSheet
+          isPresented={skillsOpen}
+          onDismiss={() => setSkillsOpen(false)}
+          scope={slash}
+          onPick={pickFromSheet}
+        />
+      ) : null}
     </Animated.View>
   );
 }
 
 /**
- * The add button: a native menu to attach photos or files. The menu lies
- * over the button, its label an invisible box of the button's size, as in
- * SessionFilterMenu.
+ * The add button: a native menu to attach photos or files. The menu grows
+ * out of the button (see GlassMenuButton).
  */
-function AddMenu({ onPhotos, onFiles }: { onPhotos: () => void; onFiles: () => void }) {
+function AddMenu({
+  onPhotos,
+  onFiles,
+  mode,
+  onMode,
+  onNewMono,
+  onSkills,
+}: {
+  onPhotos: () => void;
+  onFiles: () => void;
+  mode: ComposerMode | null;
+  onMode?: (mode: ComposerMode) => void;
+  onNewMono?: () => void;
+  onSkills?: () => void;
+}) {
   const styles = useStyles();
   const colors = useColors();
+  const label = onMode ? "Add files or pick a mode" : "Add photos or files";
   if (Platform.OS === "android") return (
-    <ChoiceMenu label="Add photos or files" actions={[
+    <ChoiceMenu label={label} actions={[
       { label: "Photo Library", onPress: onPhotos },
       { label: "Files", onPress: onFiles },
+      ...(onSkills ? [{ label: "Skills and commands", onPress: onSkills }] : []),
+      ...(onMode
+        ? MODES.map((entry) => ({
+            label: entry.label,
+            selected: entry.id === mode,
+            onPress: () => onMode(entry.id),
+          }))
+        : []),
+      ...(onNewMono ? [{ label: "New Mono", onPress: onNewMono }] : []),
     ]}>
       <View style={styles.round}><Icon name="add" size={18} color={colors.content} /></View>
     </ChoiceMenu>
   );
   return (
-    <View>
-      <View style={styles.round}>
-        <Icon name="add" size={18} color={colors.content} />
-      </View>
-      <Host style={StyleSheet.absoluteFill}>
-        <Menu
-          modifiers={[accessibilityLabel("Add photos or files")]}
-          label={
-            <HStack
-              modifiers={[
-                frame({ width: BUTTON, height: BUTTON }),
-                contentShape(shapes.circle()),
-              ]}
-            >
-              <Spacer />
-            </HStack>
-          }
-        >
-          <Button label="Photo Library" systemImage="photo.on.rectangle" onPress={onPhotos} />
-          <Button label="Files" systemImage="folder" onPress={onFiles} />
-        </Menu>
-      </Host>
-    </View>
+    <GlassMenuButton icon="add" symbol="plus" label="Add photos or files" size={BUTTON}>
+      <Button label="Photo Library" systemImage="photo.on.rectangle" onPress={onPhotos} />
+      <Button label="Files" systemImage="folder" onPress={onFiles} />
+    </GlassMenuButton>
+  );
+}
+
+/** The mode the next message goes in, by the model; tapping it turns it off. */
+function ModeChip({ mode, onClear }: { mode: ComposerMode; onClear: () => void }) {
+  const styles = useStyles();
+  const colors = useColors();
+  const scheme = useScheme();
+  const entry = MODES.find((candidate) => candidate.id === mode)!;
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`${entry.label}, on`}
+      accessibilityHint="Turns it off for this message"
+      hitSlop={4}
+      onPress={onClear}
+      style={({ pressed }) => [styles.modePill, pressed && styles.pressed]}
+    >
+      <Icon name={mode} size={16} color={entry.tint[scheme]} />
+      <Text style={styles.modeLabel} numberOfLines={1}>
+        {entry.label.replace(" mode", "")}
+      </Text>
+      <Icon name="close" size={12} color={colors.muted} />
+    </Pressable>
   );
 }
 
@@ -552,9 +839,34 @@ const useStyles = themedStyles((colors) => ({
   inputSlot: {
     position: "absolute",
   },
+  // Over the field, between the context row and the text being typed.
+  suggestions: {
+    position: "absolute",
+    left: 8,
+    right: 8,
+  },
+  reply: {
+    position: "absolute",
+    left: 12,
+    right: 12,
+    height: REPLY_ROW - 8,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingLeft: 16,
+    paddingRight: 14,
+    borderRadius: (REPLY_ROW - 8) / 2,
+    borderCurve: "continuous",
+    borderWidth: StyleSheet.hairlineWidth * 2,
+    borderColor: colors.stroke,
+  },
+  replyText: {
+    flex: 1,
+    color: colors.muted,
+    fontSize: 15,
+  },
   strip: {
     position: "absolute",
-    top: TOP_ROW,
     left: 0,
     right: 0,
     height: STRIP,
@@ -611,6 +923,14 @@ const useStyles = themedStyles((colors) => ({
     lineHeight: 22,
     textAlignVertical: "top",
   },
+  measure: {
+    position: "absolute",
+    top: 0,
+    left: EDGE + BUTTON + 8,
+    right: EDGE + BUTTON + 8,
+    flex: 0,
+    opacity: 0,
+  },
   button: {
     position: "absolute",
     bottom: EDGE,
@@ -646,6 +966,22 @@ const useStyles = themedStyles((colors) => ({
     paddingHorizontal: 12,
     borderRadius: BUTTON / 2,
     backgroundColor: colors.fill,
+  },
+  modePill: {
+    flexShrink: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    height: BUTTON,
+    marginLeft: 6,
+    paddingHorizontal: 12,
+    borderRadius: BUTTON / 2,
+    backgroundColor: colors.fill,
+  },
+  modeLabel: {
+    color: colors.content,
+    fontSize: 15,
+    fontWeight: "500",
   },
   model: {
     flexShrink: 1,

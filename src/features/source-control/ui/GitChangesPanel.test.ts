@@ -415,6 +415,28 @@ describe("GitChangesPanel folder actions", () => {
   });
 });
 
+describe("GitChangesPanel large change sets", () => {
+  it("mounts a bounded window of rows and reserves space for the rest", async () => {
+    const files = Array.from({ length: 20_000 }, (_, i) =>
+      changedFile(`file${i}.ts`),
+    );
+    vi.mocked(gitDiffIndex).mockResolvedValue(index({ files }));
+    await renderPanel();
+
+    const rows = container.querySelectorAll("li:not([aria-hidden])");
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.length).toBeLessThan(200);
+    const spacers = [
+      ...container.querySelectorAll<HTMLLIElement>("li[aria-hidden]"),
+    ];
+    const reserved = spacers.reduce(
+      (sum, spacer) => sum + parseFloat(spacer.style.height || "0"),
+      0,
+    );
+    expect(reserved + rows.length * 28).toBe(20_000 * 28);
+  });
+});
+
 describe("GitChangesPanel pull action", () => {
   it("disables Pull when the branch has no upstream", async () => {
     vi.mocked(gitDiffIndex).mockResolvedValue(

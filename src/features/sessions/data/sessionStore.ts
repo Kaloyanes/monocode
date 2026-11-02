@@ -1286,6 +1286,13 @@ function sanitizeTurnMetrics(value: unknown): TurnMetrics | undefined {
     ...(number("cacheHitPercent") != null
       ? { cacheHitPercent: number("cacheHitPercent") }
       : {}),
+    ...(number("costUsd") != null ? { costUsd: number("costUsd") } : {}),
+    ...(number("totalCostUsd") != null
+      ? { totalCostUsd: number("totalCostUsd") }
+      : {}),
+    ...(number("cacheTtlMs") != null
+      ? { cacheTtlMs: number("cacheTtlMs") }
+      : {}),
   };
   return Object.keys(metrics).length > 0 ? metrics : undefined;
 }

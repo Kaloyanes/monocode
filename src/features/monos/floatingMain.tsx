@@ -50,7 +50,7 @@ function applyFloatingAppearance() {
   const scheme = applyThemePreference(loadThemePreference());
   activateWindowAppearance();
   void getCurrentWindow()
-    .setTheme(scheme)
+    .setTheme(loadThemePreference() === "system" ? null : scheme)
     .catch(() => undefined);
 }
 

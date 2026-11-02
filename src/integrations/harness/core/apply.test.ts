@@ -1271,6 +1271,36 @@ describe("applyHarnessEvent context", () => {
   });
 });
 
+describe("applyHarnessEvent turn cost", () => {
+  const totals = (...values: number[]) => {
+    let session = newSession("claude", "/repo");
+    for (const total of values) {
+      session = appendUser(session, "go");
+      session = applyHarnessEvent(session, { type: "turn.metrics", totalCostUsd: total });
+    }
+    return session.blocks
+      .filter((block) => block.role === "user")
+      .map((block) => block.turnMetrics?.costUsd);
+  };
+
+  it("turns the running total into per-turn deltas", () => {
+    const [a, b] = totals(0.5, 0.8);
+    expect(a).toBeCloseTo(0.5);
+    expect(b).toBeCloseTo(0.3);
+  });
+
+  it("treats a lower total as a counter reset", () => {
+    expect(totals(2, 0.4)[1]).toBeCloseTo(0.4);
+  });
+
+  it("adds a second result in the same turn", () => {
+    let session = appendUser(newSession("claude", "/repo"), "go");
+    session = applyHarnessEvent(session, { type: "turn.metrics", totalCostUsd: 0.5 });
+    session = applyHarnessEvent(session, { type: "turn.metrics", totalCostUsd: 0.7 });
+    expect(session.blocks[0]?.turnMetrics?.costUsd).toBeCloseTo(0.7);
+  });
+});
+
 describe("applyHarnessEvent turn metrics", () => {
   it("attaches provider metrics to the latest user turn", () => {
     let session = appendUser(newSession("claude", "/repo"), "Explain this");
