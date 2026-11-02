@@ -70,7 +70,7 @@ impl Shell {
                     side,
                     true,
                 ))
-                .tooltip(move |_, cx| cx.new(|_| project_rail::ProjectTooltip(tip.clone())).into())
+                .tip(tip)
                 // The row below starts a drag and selects on click.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, window, cx| {
