@@ -1,7 +1,6 @@
 import { View } from "react-native";
 
-import { useConnection } from "@/features/connection/ConnectionProvider";
-import { useFinishedCount } from "@/features/sessions/activityStore";
+import { usePairing } from "@/features/connection/ConnectionProvider";
 import { themedStyles } from "@/ui/theme";
 
 import { useUnreadMonos } from "./monoSeen";
@@ -17,9 +16,8 @@ export function unreadTotal(unreadMonos: number, finishedSessions: number) {
  *  have a place in the drawer, so their replies dot the button that opens it. */
 export function useAnyUnread() {
   const { monos } = useWorkspace();
-  const desktop = useConnection().pairing?.desktop.fingerprint;
-  const unreadMonos = useUnreadMonos(desktop, monos).size;
-  return unreadTotal(unreadMonos, useFinishedCount()) > 0;
+  const desktop = usePairing()?.desktop.fingerprint;
+  return useUnreadMonos(desktop, monos).size > 0;
 }
 
 /** The unread dot on the drawer's menu button, at its top right. */

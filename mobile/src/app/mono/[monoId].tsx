@@ -9,7 +9,8 @@ import { PixelMascot } from "@/features/mascots/PixelMascot";
 import { useMonoModel } from "@/features/models/useMonoModel";
 import { useDrawerActions, useDrawerSwipe } from "@/ui/ScenePager";
 import { Timed } from "@/ui/Timed";
-import { useConnection, useMonoTools } from "@/features/connection/ConnectionProvider";
+import { useMonoTools, useConnectionActions, usePairing } from "@/features/connection/ConnectionProvider";
+import { rememberPlace } from "@/features/workspace/lastPlace";
 import { markMonoSeen, markMonoUnread } from "@/features/workspace/monoSeen";
 import { Composer } from "@/features/sessions/Composer";
 import { MonoChoose, MonoMessageActions } from "@/features/sessions/MonoCards";
@@ -38,10 +39,15 @@ export default function MonoScreen() {
   const mono = monos.find((m) => m.id === monoId);
   const conversationId = mono ? monoConversationId(mono.id) : null;
   const conversation = useConversation(conversationId);
-  const { command, refresh } = useConnection();
+  // Where the app opens next time.
+  const { command, refresh } = useConnectionActions();
   // The older desktop app has no profile, reset or delete for a Mono.
   const tools = useMonoTools();
-  const desktop = useConnection().pairing?.desktop.fingerprint;
+  const desktop = usePairing()?.desktop.fingerprint;
+  const placeId = mono?.id;
+  useEffect(() => {
+    if (placeId) rememberPlace(desktop, { kind: "mono", id: placeId });
+  }, [desktop, placeId]);
   // Its replies are seen as they arrive while its chat is in front, unless
   // it was just marked unread: that holds until the chat is left.
   const focused = useIsFocused();
