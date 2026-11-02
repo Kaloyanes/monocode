@@ -314,15 +314,14 @@ impl Shell {
         .detach();
     }
 
-    pub(super) fn mobile_set_terminal(&mut self, allowed: bool, cx: &mut Context<Self>) {
-        if let Some(host) = &self.mobile.host
-            && let Err(error) = host.set_terminal(allowed)
-        {
-            self.error = Some(format!("Mobile access: {error}"));
-        }
-        // Turning it off ends the open shells; the host says so with an event.
-        if !allowed {
-            self.mobile.terminals.close_for(None);
+    /// Settings shows a refused key's reason from the host's status.
+    pub(super) fn mobile_set_push_key(
+        &mut self,
+        key: Option<monocode_core::mobile::ApnsKey>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(host) = &self.mobile.host {
+            let _ = host.set_apns(key);
         }
         self.sync_settings(cx);
     }
@@ -468,9 +467,7 @@ impl Shell {
                             Some(crate::conversation::MobileWaiting::Question) => Some("question"),
                             None => None,
                         },
-                        orchestration: mobile_orchestration::current(view.orchestration_views())
-                            .last()
-                            .map(|(_, run)| mobile_orchestration::summary(run)),
+                        request: view.mobile_request(cx),
                     }
                 });
                 Some(CatalogEntry {
@@ -1515,6 +1512,28 @@ impl Shell {
         let target = self.mobile_target(&conversation, cx)?;
         let reply = json!({"sessionId": conversation});
         match (request.method.as_str(), &target) {
+            // An approval answered from the phone's Live Activity.
+            ("session.decide", target) => {
+                let request_id = string(params, "requestId").ok_or("Missing approval")?;
+                let decision = match string(params, "decision").as_deref() {
+                    Some("allow") => monocode_core::agent::Decision::Allow,
+                    Some("deny") => monocode_core::agent::Decision::Deny,
+                    _ => return Err("Unknown decision".into()),
+                };
+                let view = match target {
+                    Target::Session(id) => self.sessions.get(id).cloned(),
+                    Target::Mono(mono) => {
+                        self.monos.as_ref().and_then(|m| m.read(cx).open_chat(mono))
+                    }
+                }
+                .ok_or("This session is no longer open on desktop")?;
+                if !view.update(cx, |v, cx| {
+                    v.decide_notification_request(&request_id, decision, cx)
+                }) {
+                    return Err("The agent is no longer waiting for this approval".into());
+                }
+                Ok(reply)
+            }
             ("session.cancel", Target::Session(id)) => {
                 if let Some(view) = self.sessions.get(id) {
                     view.update(cx, |v, cx| v.stop_if_busy(cx));

@@ -15,7 +15,7 @@ import {
 } from "@/features/connection/ConnectionProvider";
 import { WorkspaceGate } from "@/features/connection/WorkspaceGate";
 
-import { InboxProvider } from "@/features/inbox/InboxProvider";
+import { SessionLiveActivity } from "@/features/liveActivity/SessionLiveActivity";
 import { SessionNotifications } from "@/features/notifications/SessionNotifications";
 import { SessionActivity } from "@/features/sessions/SessionActivity";
 import { SessionFrame } from "@/features/sessions/SessionScreen";
@@ -153,6 +153,7 @@ function LinkedWorkspace() {
     <WorkspaceProvider key={connection.pairing?.desktop.deviceId}>
       <InboxProvider>
       <SessionNotifications />
+      <SessionLiveActivity />
       <SessionActivity />
       <ScenePagerHost drawer={<WorkspaceDrawer />}>
         <Timed id="persistent frame">

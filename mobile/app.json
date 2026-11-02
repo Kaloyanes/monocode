@@ -17,7 +17,11 @@
       "infoPlist": {
         "CFBundleDisplayName": "Monocode",
         "NSLocalNetworkUsageDescription": "Connect securely to your paired Monocode desktop.",
-        "ITSAppUsesNonExemptEncryption": false
+        "NSSupportsLiveActivities": true,
+        "NSSupportsLiveActivitiesFrequentUpdates": true
+      },
+      "entitlements": {
+        "com.apple.developer.usernotifications.time-sensitive": true
       }
     },
     "android": {
@@ -49,7 +53,7 @@
       [
         "expo-notifications",
         {
-          "defaultChannel": "sessions"
+          "enableBackgroundRemoteNotifications": true
         }
       ],
       "./plugins/with-scene-lifecycle",
@@ -94,7 +98,8 @@
           "enableBackgroundPlayback": false
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "./plugins/with-live-activity"
     ],
     "experiments": {
       "typedRoutes": true,

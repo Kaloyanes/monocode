@@ -5,7 +5,11 @@ import { useEffect, useRef, useState } from "react";
 import { AppState, Platform } from "react-native";
 
 import { useConnection } from "@/features/connection/ConnectionProvider";
-import { inboxTarget } from "@/features/inbox/routing";
+import { request } from "@/features/connection/nativeLink";
+import {
+  liveActivitiesAvailable,
+  useLiveActivityPreference,
+} from "@/features/liveActivity/liveActivity";
 import {
   NOTIFICATION_CATEGORIES,
   useNotificationPreferences,
@@ -16,7 +20,7 @@ import type {
   SessionSummary,
 } from "@/features/workspace/types";
 
-// Only for when the app is out of view; one landing as it comes back stays
+// In front of the user, the app itself shows what changed; the alert waits
 // in the list.
 Notifications.setNotificationHandler({
   handleNotification: async () => {
@@ -41,19 +45,23 @@ type Target = Partial<Data> & { monoId?: string };
 const SESSION_CHANNEL = "sessions";
 
 /**
- * Notifications for the desktop's sessions. A desktop that can sends them
- * by push, so they arrive with the app closed: for sessions the phone
- * started, and whatever a Mono says. The phone registers its push token and
- * the categories it turned off each time it connects.
- *
- * With the older desktop app, they are local, after its own: an agent that
- * finishes, or stops for an approval or a question, from the session list
- * as the phone polls it, so only while the app runs and is out of view.
- * Tapping one opens its session, Mono or inbox item.
+ * Alerts for the desktop's sessions: an agent that finishes, or stops for an
+ * approval or a question. The desktop sends them as push notifications, so
+ * they arrive with the app closed; this registers the phone with it and opens
+ * a session when one is tapped. Android has no push yet, so it raises them
+ * itself from the session list as the phone polls it, while the app runs and
+ * is out of view.
  */
 export function SessionNotifications() {
   const connection = useConnection();
   const preferences = useNotificationPreferences();
+  const categories = NOTIFICATION_CATEGORIES.map(({ id }) => id).filter((id) =>
+    preferences.enabled(id),
+  );
+  const anyOn = categories.length > 0;
+  const [activityOn] = useLiveActivityPreference();
+  // What this desktop last heard, so a poll does not register again.
+  const registered = useRef<string | null>(null);
   const current = useRef(preferences);
   // Read by the effects below; kept up to date ahead of them.
   useEffect(() => {
@@ -62,26 +70,6 @@ export function SessionNotifications() {
   // Each session as last seen; null until a list from the desktop itself
   // arrives, as the one cached from last time is no news.
   const seen = useRef<Map<string, Seen> | null>(null);
-  const anyOn = NOTIFICATION_CATEGORIES.some(({ id }) =>
-    preferences.enabled(id),
-  );
-  // Android has no push credentials yet (FCM), so it keeps local alerts.
-  const push = connection.catalog.push === true && Platform.OS === "ios";
-  const disabled = NOTIFICATION_CATEGORIES.filter(
-    ({ id }) => !preferences.enabled(id),
-  )
-    .map(({ id }) => id)
-    .join(",");
-  // Bumped once the permission prompt is answered, and on coming back from
-  // system settings, where notifications may have been turned on or off.
-  const [permissionCheck, setPermissionCheck] = useState(0);
-  const command = useRef(connection.command);
-  useEffect(() => {
-    command.current = connection.command;
-  });
-  // Whether the desktop holds this phone's token; until it does, the phone
-  // goes on posting its own alerts.
-  const registered = useRef(false);
 
   // Ask after pairing, only when alerts are enabled and the OS allows asking.
   useEffect(() => {
@@ -110,6 +98,51 @@ export function SessionNotifications() {
     );
   }, [anyOn, connection.pairing]);
 
+  // Tell the desktop where to send alerts, and which, and whether to wake the
+  // app to redraw its Live Activity. Sent again after each reconnect, in case
+  // the desktop forgot an expired token.
+  const pairing = connection.pairing;
+  const wanted = categories.join(",");
+  const activity = activityOn && liveActivitiesAvailable();
+  useEffect(() => {
+    if (!connection.connected) {
+      registered.current = null;
+      return;
+    }
+    // Expo's push service reaches Android only through FCM, which this app
+    // does not set up yet.
+    if (!pairing || Platform.OS !== "ios") return;
+    let cancelled = false;
+    const register = async () => {
+      const settings = await Notifications.getPermissionsAsync();
+      // A silent push needs no permission; an alert does.
+      const token =
+        (wanted && settings.granted) || activity
+          ? (
+              await Notifications.getExpoPushTokenAsync({
+                projectId: Constants.expoConfig?.extra?.eas?.projectId,
+              })
+            ).data
+          : null;
+      const kinds = settings.granted && wanted ? wanted.split(",") : [];
+      const key = `${pairing.desktop.fingerprint}|${token}|${kinds}|${activity}`;
+      if (cancelled || registered.current === key) return;
+      await request(
+        pairing,
+        "device.notify",
+        token ? { token, categories: kinds, activity } : {},
+      );
+      if (!cancelled) registered.current = key;
+    };
+    void register().catch((reason) =>
+      console.warn("Could not register for session notifications", reason),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [connection.connected, pairing, wanted, activity]);
+
+  // Android's alerts until push reaches it: raised here from each new list.
   useEffect(() => {
     if (!push) return;
     const subscription = AppState.addEventListener("change", (state) => {
@@ -161,6 +194,7 @@ export function SessionNotifications() {
       seen.current = null;
       return;
     }
+    if (Platform.OS !== "android") return;
     const sessions = connection.catalog.sessions;
     const before = seen.current;
     seen.current = new Map(
@@ -218,7 +252,7 @@ export function SessionNotifications() {
             sessionId: session.id,
           } satisfies Data,
         },
-        trigger: Platform.OS === "android" ? { channelId: SESSION_CHANNEL } : null,
+        trigger: { channelId: SESSION_CHANNEL },
       });
     }
   }, [connection.connected, connection.catalog, push]);

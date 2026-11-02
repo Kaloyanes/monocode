@@ -12,8 +12,13 @@ const state = vi.hoisted(() => ({
   appState: "active",
   paired: true,
   enabled: true,
-  push: false,
-  sessions: [] as { id: string; projectId: string; busy: boolean; waiting: string | null }[],
+  sessions: [] as {
+    id: string;
+    projectId: string;
+    title?: string;
+    busy: boolean;
+    waiting: string | null;
+  }[],
   settings: { status: "undetermined", canAskAgain: true } as {
     status: string;
     canAskAgain: boolean;
@@ -24,6 +29,9 @@ const state = vi.hoisted(() => ({
   getPermissions: vi.fn(),
   requestPermissions: vi.fn(),
   setChannel: vi.fn(),
+  activity: false,
+  pushToken: vi.fn(),
+  request: vi.fn(),
   schedule: vi.fn(),
   pushToken: vi.fn(),
   command: vi.fn(),
@@ -47,6 +55,7 @@ vi.mock("expo-notifications", () => ({
   getPermissionsAsync: state.getPermissions,
   requestPermissionsAsync: state.requestPermissions,
   setNotificationChannelAsync: state.setChannel,
+  getExpoPushTokenAsync: state.pushToken,
   scheduleNotificationAsync: state.schedule,
   getExpoPushTokenAsync: state.pushToken,
   useLastNotificationResponse: () => state.response,
@@ -55,13 +64,19 @@ vi.mock("expo-notifications", () => ({
   AndroidImportance: { DEFAULT: 3 },
   IosAuthorizationStatus: { NOT_DETERMINED: 0 },
 }));
-vi.mock("expo-router", () => ({ router: { push: state.navigate } }));
+vi.mock("expo-router", () => ({ router: { push: vi.fn() } }));
 vi.mock("expo-constants", () => ({
   default: { expoConfig: { extra: { eas: { projectId: "project-id" } } } },
 }));
+vi.mock("@/features/connection/nativeLink", () => ({ request: state.request }));
+vi.mock("@/features/liveActivity/liveActivity", () => ({
+  liveActivitiesAvailable: () => true,
+  useLiveActivityPreference: () => [state.activity, vi.fn()],
+}));
+const pairing = { desktop: { fingerprint: "desktop" } };
 vi.mock("@/features/connection/ConnectionProvider", () => ({
   useConnection: () => ({
-    pairing: state.paired ? "desktop" : null,
+    pairing: state.paired ? pairing : null,
     connected: state.paired,
     catalog: { sessions: state.sessions, projects: [], push: state.push },
     command: state.command,
@@ -87,11 +102,13 @@ beforeEach(() => {
   state.enabled = true;
   state.push = false;
   state.sessions = [];
-  state.response = null;
+  state.activity = false;
   state.settings = { status: "undetermined", canAskAgain: true };
   state.getPermissions.mockImplementation(async () => state.settings);
   state.requestPermissions.mockResolvedValue({ status: "granted" });
   state.setChannel.mockResolvedValue(null);
+  state.pushToken.mockResolvedValue({ data: "ExponentPushToken[phone]" });
+  state.request.mockResolvedValue(null);
   state.schedule.mockResolvedValue("notification");
   state.pushToken.mockResolvedValue({ data: "ExponentPushToken[phone]" });
   state.command.mockResolvedValue(null);
@@ -147,17 +164,87 @@ it("does not prompt again for provisional iOS authorization", async () => {
   expect(state.requestPermissions).not.toHaveBeenCalled();
 });
 
-it.each(["android", "ios"])("routes immediate session alerts on %s", async (os) => {
-  state.os = os;
+it("registers the iOS push token and enabled categories with the desktop", async () => {
+  state.os = "ios";
+  state.settings = { status: "granted", canAskAgain: true, granted: true } as never;
+  await render();
+  expect(state.pushToken).toHaveBeenCalledWith({ projectId: "project-id" });
+  expect(state.request).toHaveBeenCalledWith(pairing, "device.notify", {
+    token: "ExponentPushToken[phone]",
+    categories: ["agentFinished"],
+    activity: false,
+  });
+  // A re-render with nothing changed does not register again.
+  await render();
+  expect(state.request).toHaveBeenCalledOnce();
+});
+
+it("asks the desktop to stop sending when every category is off", async () => {
+  state.os = "ios";
+  state.enabled = false;
+  state.settings = { status: "granted", canAskAgain: true, granted: true } as never;
+  await render();
+  expect(state.pushToken).not.toHaveBeenCalled();
+  expect(state.request).toHaveBeenCalledWith(pairing, "device.notify", {});
+});
+
+it("registers for silent pushes with alerts off while a Live Activity is wanted", async () => {
+  state.os = "ios";
+  state.enabled = false;
+  state.activity = true;
+  await render();
+  expect(state.request).toHaveBeenCalledWith(pairing, "device.notify", {
+    token: "ExponentPushToken[phone]",
+    categories: [],
+    activity: true,
+  });
+});
+
+it("does not register Android, which has no push service set up", async () => {
+  await render();
+  expect(state.request).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["finishes", { busy: false, waiting: null }, "Finished"],
+  ["needs approval", { busy: true, waiting: "approval" }, "Needs your approval"],
+  ["asks a question", { busy: true, waiting: "question" }, "Has a question for you"],
+])("raises a local Android alert when a session %s while the app is away", async (_name, next, body) => {
+  const session = { id: "session", projectId: "project", title: "Fix tests", busy: true, waiting: null };
+  state.sessions = [session];
+  await render();
+  state.appState = "background";
+  state.sessions = [{ ...session, ...next }];
+  await render();
+  expect(state.request).not.toHaveBeenCalled();
+  expect(state.schedule).toHaveBeenCalledOnce();
+  expect(state.schedule).toHaveBeenCalledWith({
+    content: {
+      title: "Fix tests",
+      subtitle: undefined,
+      body,
+      data: { projectId: "project", sessionId: "session" },
+    },
+    trigger: { channelId: "sessions" },
+  });
+});
+
+it("keeps Android alerts quiet while the app is in front", async () => {
+  state.sessions = [{ id: "session", projectId: "project", busy: true, waiting: null }];
+  await render();
+  state.sessions = [{ ...state.sessions[0], busy: false }];
+  await render();
+  expect(state.schedule).not.toHaveBeenCalled();
+});
+
+it("leaves iOS alerts to the desktop's pushes", async () => {
+  state.os = "ios";
   state.sessions = [{ id: "session", projectId: "project", busy: true, waiting: null }];
   await render();
   state.appState = "background";
   state.sessions = [{ ...state.sessions[0], busy: false }];
   await render();
-  expect(state.schedule).toHaveBeenCalledWith(expect.objectContaining({
-    content: expect.objectContaining({ body: "Finished" }),
-    trigger: os === "android" ? { channelId: "sessions" } : null,
-  }));
+  expect(state.schedule).not.toHaveBeenCalled();
 });
 
 it.each([true, false])("reflects Android notification denial with canAskAgain %s and updates after returning from Settings", async (canAskAgain) => {

@@ -151,10 +151,8 @@ pub(crate) enum SettingsEvent {
     MobilePair,
     MobileCancelInvite,
     MobileRevoke(String),
-    /// Allow or refuse a shell from any paired phone.
-    MobileTerminal(bool),
-    /// End one shell a phone has open.
-    MobileKillTerminal(String),
+    /// Use this APNs key for Live Activity pushes, or stop.
+    MobilePushKey(Option<monocode_core::mobile::ApnsKey>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
