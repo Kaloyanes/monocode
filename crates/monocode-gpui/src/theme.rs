@@ -350,11 +350,13 @@ pub(crate) fn title_tab_fill(selected: bool, hovered: bool) -> Hsla {
 
 /// The plate for session tabs in the title bar.
 /// Headline ink owns inactive dimming; the plate never fades its children.
+/// Its icon tile sits as far from the left edge as from the top and bottom.
 pub(crate) fn title_tab_plate(selected: bool, hovered: bool) -> Div {
     div()
         .h(px(TAB_PLATE_HEIGHT))
         .rounded_md()
-        .px_2()
+        .pl(px(crate::tab_tile::tab_tile_inset()))
+        .pr_2()
         .flex()
         .items_center()
         .bg(title_tab_fill(selected, hovered))

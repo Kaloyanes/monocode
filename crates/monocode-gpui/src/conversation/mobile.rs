@@ -18,6 +18,85 @@ pub(crate) enum Waiting {
 }
 
 impl Conversation {
+    pub(crate) fn mobile_usage_limit(&self, cx: &gpui::App) -> serde_json::Value {
+        let limit = self.settings.usage_limit.clone().or_else(|| {
+            self.is_remote()
+                .then(|| self.account_recovery_limit(cx))
+                .flatten()
+        });
+        usage_state(
+            self.summary.id,
+            &self.summary.provider,
+            self.model.as_deref(),
+            &self.settings,
+            limit.as_ref(),
+            self.busy || self.stopping || self.account_switching || self.needs_history_restore(),
+            self.is_remote(),
+        )
+    }
+
+    /// Validate against the live desktop state, then use the desktop action.
+    pub(crate) fn mobile_resume_usage(
+        &mut self,
+        token: &serde_json::Value,
+        automatic: Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.settings.worktree_removed {
+            return Err("This session’s working copy was removed. Select a branch or worktree on desktop to continue.".into());
+        }
+        if self.needs_history_restore() {
+            self.load(cx);
+            return Err("This session is still opening on desktop. Try again in a moment.".into());
+        }
+        let kind = Kind::from_id(&self.summary.provider);
+        if automatic != Some(false)
+            && self.settings.account.id != monocode_core::accounts::DEFAULT
+            && crate::accounts::get(cx)
+                .is_some_and(|center| !center.read(cx).book.exists(kind, &self.settings.account.id))
+        {
+            return Err(
+                "This provider account was removed. Choose an account on desktop and try again."
+                    .into(),
+            );
+        }
+        let state = self.mobile_usage_limit(cx);
+        if state.is_null() {
+            return Err("This session is no longer paused by a usage limit".into());
+        }
+        if &state["token"] != token {
+            return Err("This session changed. Wait for it to refresh and try again.".into());
+        }
+        let eligible = if automatic.is_some() {
+            "canAutoResume"
+        } else {
+            "canResume"
+        };
+        if state[eligible] != true {
+            return Err(format!(
+                "{}. Check the session on desktop or try again after the allowance resets.",
+                state["resetLabel"]
+                    .as_str()
+                    .unwrap_or("Cannot continue right now")
+            ));
+        }
+        if let Some(enabled) = automatic {
+            self.set_usage_resume_at_reset(enabled, cx);
+        } else {
+            self.resume_usage(cx);
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_usage_resume_at_reset(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Some(limit) = &mut self.settings.usage_limit {
+            limit.resume_at_reset = enabled;
+            self.save_settings(cx);
+            cx.emit(SessionChanged);
+            cx.notify();
+        }
+    }
+
     /// A phone's message, as if typed: it starts a turn, or while one runs it
     /// steers or queues. The desktop composer's own draft and files stay put.
     /// `mode` is the phone's Plan, Operator or Orchestrator pick; without one,

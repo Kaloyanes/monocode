@@ -124,6 +124,15 @@ export type Mono = {
   lastActiveAt: number;
   harness?: Harness;
   model?: string;
+  /** What sessions it starts run on when it names no model; unset parts
+   *  are its own. Missing on desktops that predate it. */
+  subsessions?: MonoSubsessions | null;
+};
+
+export type MonoSubsessions = {
+  harness?: Harness;
+  model?: string;
+  effort?: string;
 };
 
 // The desktop composer's one-shot modes, from its + menu. A message is sent
@@ -352,4 +361,15 @@ export type TurnMetrics = {
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
   cacheHitPercent?: number;
+};
+
+/** Desktop-owned usage recovery state; mobile only renders these capabilities. */
+export type UsageLimitState = {
+  token: string;
+  resetsAt?: number | null;
+  resumeAtReset: boolean;
+  canResume: boolean;
+  canAutoResume: boolean;
+  resetLabel: string;
+  limitation: string;
 };

@@ -3,7 +3,8 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ProjectScreen } from "@/features/workspace/ProjectScreen";
-import type { Project } from "@/features/workspace/types";
+import MonoScreen from "@/app/mono/[monoId]";
+import type { UsageLimitState, Project } from "@/features/workspace/types";
 import type { Workspace } from "@/features/workspace/WorkspaceMenu";
 import { GlassBlurTarget } from "@/ui/LiquidView";
 
@@ -11,7 +12,13 @@ const desktop = vi.hoisted(() => ({
   startSession: vi.fn(),
   sendMessage: vi.fn(),
   offline: false,
+  page: "chat",
+  focused: true,
   os: "ios",
+  usageLimit: undefined as UsageLimitState | undefined,
+  cardMounts: 0,
+  monoId: "first",
+  watched: null as string | null,
   headerTarget: undefined as unknown,
   header: {} as {
     headerTitle?: unknown;
@@ -25,6 +32,30 @@ const desktop = vi.hoisted(() => ({
   toolbar: [] as { terminal?: boolean }[],
 }));
 
+vi.mock("@/features/sessions/UsageLimitCard", () => ({
+  UsageLimitCard: ({ conversationId, state }: { conversationId: string; state: UsageLimitState }) => {
+    const [mount] = useState(() => ++desktop.cardMounts);
+    return <output data-usage-card data-mount={mount}>{conversationId}:{state.token}</output>;
+  },
+}));
+vi.mock("@/features/mascots/PixelMascot", () => ({ PixelMascot: () => null }));
+vi.mock("expo-haptics", () => ({}));
+vi.mock("@/ui/useNativeHeaderHeight", () => ({ useNativeHeaderHeight: () => 0 }));
+vi.mock("@/features/settings/monoOnly", () => ({ useMonoOnlyLayout: () => [false] }));
+vi.mock("@/features/connection/ConnectionProvider", () => ({
+  useConnection: () => ({}),
+  useMonoTools: () => false,
+}));
+vi.mock("@/features/models/useMonoModel", () => ({ useMonoModel: () => ({}) }));
+vi.mock("@/features/workspace/monoAccent", () => ({ useMonoAccent: () => "theme" }));
+vi.mock("@/features/workspace/lastPlace", () => ({ rememberPlace: vi.fn() }));
+vi.mock("@/features/workspace/monoSeen", () => ({ markMonoSeen: vi.fn(), markMonoUnread: vi.fn() }));
+vi.mock("@/features/sessions/MonoCards", () => ({
+  MonoChoose: ({ children }: { children: ReactNode }) => children,
+  MonoMessageActions: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("@/features/sessions/MonoMenu", () => ({ MonoMenu: () => null }));
+vi.mock("@/ui/Timed", () => ({ Timed: ({ children }: { children: ReactNode }) => children }));
 vi.mock("react-native-svg", () => ({ default: () => <svg />, Path: () => null }));
 vi.mock("react-native", () => ({
   Platform: {
@@ -86,6 +117,8 @@ vi.mock("react-native-reanimated", () => ({
 vi.mock("react-native-worklets", () => ({ scheduleOnRN: vi.fn() }));
 vi.mock("expo-router", () => ({
   router: { push: vi.fn() },
+  Redirect: () => null,
+  useLocalSearchParams: () => ({ monoId: desktop.monoId }),
   Stack: {
     Screen: ({ options }: { options: typeof desktop.header }) => {
       desktop.header = options;
@@ -106,7 +139,7 @@ vi.mock("expo-router", () => ({
     },
     Toolbar: Object.assign(() => null, { View: () => null }),
   },
-  useIsFocused: () => true,
+  useIsFocused: () => desktop.focused,
 }));
 vi.mock("@/features/connection/ConnectionNotice", () => ({
   useOffline: () => desktop.offline,
@@ -149,12 +182,14 @@ vi.mock("@/features/settings/newSessions", () => ({
 vi.mock("@/features/sessions/Composer", () => ({
   Composer: ({
     workspace,
+    active,
     onSend,
   }: {
     workspace?: ReactNode;
+    active?: boolean;
     onSend: (text: string, attachments: never[]) => Promise<void>;
   }) => (
-    <section data-composer>
+    <section data-composer data-active={String(active)}>
       {workspace}
       <button onClick={() => void onSend("Build the app", [])}>Send</button>
     </section>
@@ -222,7 +257,7 @@ vi.mock("@/features/workspace/useCreateMono", () => ({ useCreateMono: () => unde
 vi.mock("@/features/inbox/InboxPage", () => ({ InboxPage: () => null }));
 vi.mock("@/features/inbox/InboxProvider", () => ({ useInboxSupported: () => false }));
 vi.mock("@/features/workspace/ProjectPages", () => ({
-  useProjectPages: () => ({ progress: { get: () => 0 }, view: "chat" }),
+  useProjectPages: () => ({ progress: { get: () => 0 }, view: desktop.page }),
   ProjectPages: () => null,
   ProjectSwitch: () => null,
 }));
@@ -230,8 +265,10 @@ vi.mock("@/features/workspace/WorkspaceProvider", () => ({
   useWorkspace: () => ({
     startSession: desktop.startSession,
     sendMessage: desktop.sendMessage,
+    monos: ["first", "second"].map(id => ({ id, name: id, mascot: "cat", color: "blue", status: "idle" })),
   }),
-  useConversation: () => ({}),
+  monoConversationId: (id: string) => `mono:${id}`,
+  useConversation: (id: string | null) => { desktop.watched = id; return { usageLimit: desktop.usageLimit }; },
   useConversationTurns: () => ({ turns: [], hasOlder: false }),
 }));
 vi.mock("@/features/workspace/WorkspaceMenu", () => ({
@@ -319,6 +356,10 @@ vi.mock("@/ui/theme", () => {
   const colors = { content: "white", muted: "gray", fill: "gray" };
   return {
     useColors: () => colors,
+    useScheme: () => "dark",
+    useAccent: () => "theme",
+    ACCENTS: {},
+    AccentOverride: ({ children }: { children: ReactNode }) => children,
     themedStyles: (create: (value: typeof colors) => object) => () =>
       create(colors),
   };
@@ -369,6 +410,8 @@ describe("new session composer workspace", () => {
     desktop.startSession.mockReset().mockResolvedValue("started-session");
     desktop.sendMessage.mockReset().mockResolvedValue(undefined);
     desktop.offline = false;
+    desktop.page = "chat";
+    desktop.focused = true;
     desktop.os = "ios";
     desktop.terminal = undefined;
     desktop.toolbar = [];
@@ -496,6 +539,8 @@ describe("new session composer workspace", () => {
     click("Current checkout");
     expect(container.querySelector('[aria-label="New worktree"]')).toBeNull();
     desktop.offline = false;
+    desktop.page = "chat";
+    desktop.focused = true;
     render("existing-session");
     expect(
       container.querySelector('[aria-label="Current checkout"]'),

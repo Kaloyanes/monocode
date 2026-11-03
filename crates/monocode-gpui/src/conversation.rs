@@ -3,6 +3,7 @@ mod approvals;
 mod attachment_drop;
 mod background_tasks;
 mod btw;
+mod changes_shelf;
 mod commands;
 pub(crate) mod composer_features;
 mod composer_shelf;
@@ -51,7 +52,9 @@ use gpui::{
     AnyElement, Context, CursorStyle, Entity, EventEmitter, Focusable, MouseButton, Role,
     SharedString, StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
 };
-pub(crate) use mobile::{Waiting as MobileWaiting, mobile_access_modes};
+pub(crate) use mobile::{
+    Waiting as MobileWaiting, mobile_access_modes, usage_state as mobile_usage_state,
+};
 pub(crate) use mono::QueueChanged as MonoQueueChanged;
 pub(crate) use mono::Submitted as MonoSubmitted;
 use monocode_core::{
@@ -165,6 +168,7 @@ pub(crate) struct Conversation {
     folder_selected: bool,
     follow_ups: follow_up::FollowUps,
     background: background_tasks::BackgroundTasks,
+    changes: changes_shelf::ChangesShelf,
     attachments: Vec<std::path::PathBuf>,
     pending_attachments: Vec<std::path::PathBuf>,
     attachment_photos: std::collections::HashMap<
@@ -600,10 +604,16 @@ impl Conversation {
                 cx.emit(SessionChanged);
             }
         });
+        // The changes pill and its ledge card read the review's files. Files
+        // the recorded turns changed, also through shell commands, count as
+        // this session's edits for the commit pill.
         let review_observation = cx.observe(&review, |this, review, cx| {
-            let shown = review.read(cx).shown();
-            this.transcript
-                .update(cx, |view, cx| view.set_review_shown(shown, cx));
+            let paths = review.read(cx).paths();
+            let known = this.session_edits.len();
+            this.remember_session_edits(paths);
+            if this.session_edits.len() != known {
+                this.refresh_git_actions(cx);
+            }
             cx.notify();
         });
         let transcript = cx.new(|_| {
@@ -662,6 +672,7 @@ impl Conversation {
             folder_selected: false,
             follow_ups: Default::default(),
             background: Default::default(),
+            changes: Default::default(),
             attachments: Vec::new(),
             pending_attachments: Vec::new(),
             attachment_photos: Default::default(),
@@ -3817,11 +3828,15 @@ impl Conversation {
                 let alternate = if cfg!(target_os = "macos") {
                     modifiers.platform
                 } else {
-                    modifiers.control
-                };
-                this.send_follow_up(alternate, cx);
-            }
-        }))
+                    let modifiers = event.modifiers();
+                    let alternate = if cfg!(target_os = "macos") {
+                        modifiers.platform
+                    } else {
+                        modifiers.control
+                    };
+                    this.send_follow_up(alternate, cx);
+                }
+            }))
     }
     // EmptySession.tsx: the composer centred under its question, or resting
     // where it will dock once a neighbouring pane squeezes it narrower than
@@ -4287,8 +4302,17 @@ impl Render for Conversation {
                 )
             })
             .child({
-                let pill = self.git_action_pill(cx);
-                let beside = pill.is_some();
+                let git = self.git_action_pill(cx);
+                let changes = self.changes_pill(cx);
+                let beside = git.is_some() || changes.is_some();
+                let pill = beside.then(|| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .children(git)
+                        .children(changes)
+                });
                 self.transcript
                     .update(cx, |t, cx| t.set_jump_beside_pill(beside, cx));
                 div()

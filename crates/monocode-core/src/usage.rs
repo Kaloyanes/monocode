@@ -92,6 +92,10 @@ impl Default for Limit {
     }
 }
 impl Limit {
+    /// Manual continuation becomes available when the reported reset passes.
+    pub fn waiting(&self, now: i64) -> bool {
+        self.resets_at.is_some_and(|at| at > now)
+    }
     pub fn from_error(message: &str) -> Option<Self> {
         // Claude's synthetic assistant errors use this code before the result
         // frame arrives. Ordinary transient HTTP 429s must remain retryable.

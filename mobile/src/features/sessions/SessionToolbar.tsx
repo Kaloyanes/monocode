@@ -9,10 +9,10 @@ import {
   Pressable,
   Text,
   TextInput,
-  useWindowDimensions,
   View,
 } from "react-native";
 import Svg, { Circle, Path } from "react-native-svg";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { SessionSummary } from "@/features/workspace/types";
 import { useWorkspace } from "@/features/workspace/WorkspaceProvider";
@@ -53,7 +53,17 @@ export function SessionTitle({
   terminal?: boolean;
 }) {
   const styles = useStyles();
-  const { width } = useWindowDimensions();
+  const width = useContentWidth();
+  const insets = useSafeAreaInsets();
+  const titleWidth = Math.max(
+    // Side controls already occupy the horizontal safe area. Reserve the
+    // larger of that inset and the top-bar budget, rather than adding both.
+    Math.min(
+      width - Math.max(insets.left + insets.right, HEADER_ITEMS),
+      MAX_TITLE_WIDTH,
+    ),
+    80,
+  );
   if (Platform.OS === "android")
     return (
       <View style={styles.androidTitle}>
@@ -229,29 +239,38 @@ export function SessionToolbar({
           </Pressable>
           <ChoiceMenu
             label="Session actions"
-            actions={[
-              {
-                label: "Rename",
-                disabled: !session,
-                onPress: () => {
-                  if (session) {
-                    setName(session.title);
-                    setRenaming(true);
-                  }
+            title="Session"
+            sections={[
+              [
+                {
+                  label: "Rename",
+                  icon: "edit",
+                  disabled: !session,
+                  onPress: () => {
+                    if (session) {
+                      setName(session.title);
+                      setRenaming(true);
+                    }
+                  },
                 },
-              },
-              { label: "Copy Session ID", onPress: () => void copyId() },
-              { label: "Settings", onPress: onSettings },
-              {
-                label: "Archive",
-                disabled: !session,
-                onPress: () => session && archive(session),
-              },
-              {
-                label: "Delete",
-                disabled: !session,
-                onPress: () => session && remove(session),
-              },
+                { label: "Copy Session ID", icon: "copy", onPress: () => void copyId() },
+                { label: "Settings", icon: "settings", onPress: onSettings },
+              ],
+              [
+                {
+                  label: "Archive",
+                  icon: "archive",
+                  disabled: !session,
+                  onPress: () => session && archive(session),
+                },
+                {
+                  label: "Delete",
+                  icon: "trash",
+                  destructive: true,
+                  disabled: !session,
+                  onPress: () => session && remove(session),
+                },
+              ],
             ]}
           >
             <View style={styles.androidButton}>

@@ -21,9 +21,18 @@ import { SessionActivity } from "@/features/sessions/SessionActivity";
 import { SessionFrame } from "@/features/sessions/SessionScreen";
 import { WorkspaceDrawer } from "@/features/workspace/WorkspaceDrawer";
 import { WorkspaceProvider } from "@/features/workspace/WorkspaceProvider";
+import { WorkspaceLayout } from "@/features/workspace/WorkspaceLayout";
 import { Timed } from "@/ui/Timed";
-import { codeScreenOptions, HEADER_OWN_BLUR } from "@/features/files/codeScreen";
+import {
+  codeScreenOptions,
+  HEADER_OWN_BLUR,
+  modalStackOptions,
+} from "@/features/files/codeScreen";
 import { applySavedAppearance } from "@/features/settings/appearance";
+import { modalSheetOptions } from "@/ui/ModalSheet";
+import { useLayoutChanging, useMonoOnlyLayout } from "@/features/settings/monoOnly";
+import { DitherLoading } from "@/ui/DitherLoading";
+import { useState } from "react";
 import { ScenePagerHost } from "@/ui/ScenePager";
 import {
   paletteFor,
@@ -84,11 +93,20 @@ const screenOptions = (colors: Palette) => ({
     animation: "default",
     gestureEnabled: true,
   } satisfies NativeStackNavigationOptions,
+  // A modal sheet with its own stack, as ModalSheet draws it.
+  sheet: modalSheetOptions(colors.sheet),
   // Full-screen modals with their own stacks and headers.
   modal: {
     presentation: "modal",
     animation: "default",
     contentStyle: { backgroundColor: colors.sheet },
+  } satisfies NativeStackNavigationOptions,
+  // A modal of one screen, as a modal stack's are: a transparent native
+  // header over the sheet's colour, with the screen's own gradual blur.
+  page: {
+    presentation: "modal",
+    animation: "default",
+    ...modalStackOptions(colors),
   } satisfies NativeStackNavigationOptions,
   code: codeScreenOptions(colors),
   // Changes over a session: a code screen's modal, on the page's own colour
@@ -149,6 +167,13 @@ export default function RootLayout() {
 function LinkedWorkspace() {
   const connection = useConnection();
   const { screens } = useNavigationLook();
+  // Monos only: no drawer, and the frame stands aside for the list and for
+  // each chat's own frame.
+  const [monoOnly] = useMonoOnlyLayout();
+  // Switching layouts: covered while the app starts over in the new one.
+  const changing = useLayoutChanging();
+  const [covered, setCovered] = useState(changing);
+  if (changing && !covered) setCovered(true);
   return (
     <WorkspaceProvider key={connection.pairing?.desktop.deviceId}>
       <InboxProvider>

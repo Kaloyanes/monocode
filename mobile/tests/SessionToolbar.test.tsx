@@ -56,12 +56,14 @@ vi.mock("@/features/terminal/terminalActions", () => ({
 vi.mock("react-native-safe-area-context", () => ({
   useSafeAreaInsets: () => ({ bottom: 0 }),
 }));
+vi.mock("@/ui/Icon", () => ({ Icon: () => null }));
 vi.mock("react-native-svg", () => ({
   default: () => <svg />,
   Circle: () => null,
   Path: () => null,
 }));
 vi.mock("react-native", () => ({
+  StyleSheet: { create: (styles: unknown) => styles },
   Platform: {
     get OS() {
       return app.os;

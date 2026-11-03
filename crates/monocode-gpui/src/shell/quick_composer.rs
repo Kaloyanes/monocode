@@ -31,8 +31,7 @@ impl Shell {
     /// its project is still open, else the current project's defaults.
     fn quick_choice(&self, cx: &App) -> crate::quick_composer::Launch {
         let cwd = self.workspace.project.clone();
-        let kind = self.default_kind();
-        let p = &self.workspace.preferences;
+        let new = self.new_chat_choice(&cwd);
         let initial = crate::quick_composer::Launch::choice(
             cwd.clone(),
             kind,

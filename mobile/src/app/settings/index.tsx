@@ -1,5 +1,5 @@
-import { router, useLocalSearchParams } from "expo-router";
-import { Fragment } from "react";
+import { router, useLocalSearchParams, useNavigationContainerRef } from "expo-router";
+import { Fragment, useState } from "react";
 import { Alert, Linking, StyleSheet, Switch, Text, View } from "react-native";
 
 import { useConnection } from "@/features/connection/ConnectionProvider";
@@ -21,6 +21,7 @@ import {
   type NotificationCategory,
 } from "@/features/settings/notifications";
 import { useOpenSessionAfterStarting } from "@/features/settings/newSessions";
+import { useChangeLayout, useMonoOnlyLayout } from "@/features/settings/monoOnly";
 import { SettingsPage, SettingsRow } from "@/features/settings/SettingsUI";
 import { projectForRoute } from "@/features/workspace/routing";
 import { useWorkspace } from "@/features/workspace/WorkspaceProvider";
@@ -206,6 +207,30 @@ export default function SettingsScreen() {
       <Text style={styles.note}>
         Turn off to stay on the new session screen and start more sessions.
       </Text>
+
+      {MONOS_ENABLED ? (
+        <>
+          <Text style={styles.heading}>Layout</Text>
+          <View style={styles.card}>
+            <SettingsRow
+              icon="chat"
+              label="Monos only"
+              onPress={() => changeLayout(!(picked ?? monoOnly))}
+              accessory={
+                <Switch
+                  accessibilityLabel="Monos only"
+                  value={picked ?? monoOnly}
+                  onValueChange={changeLayout}
+                  trackColor={{ true: colors.accent }}
+                />
+              }
+            />
+          </View>
+          <Text style={styles.note}>
+            A list of your Monos and their chats, with no sidebar or projects.
+          </Text>
+        </>
+      ) : null}
 
       <Text style={styles.heading}>Workspace</Text>
       <View style={styles.card}>
