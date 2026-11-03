@@ -1,6 +1,6 @@
 //! Compact project tool tabs shared by the rounded and expanded layouts.
 use crate::{right_panel::RightTab, theme::*};
-use gpui::{App, MouseButton, Role, Stateful, Window, div, prelude::*, px};
+use gpui::{App, MouseButton, Role, SharedString, Stateful, Window, div, prelude::*, px};
 use std::time::Instant;
 
 const TAB_TEXT_SIZE: f32 = 12.;
@@ -37,14 +37,14 @@ impl<T: Copy + PartialEq> TabReveal<T> {
 }
 
 pub(crate) struct TabLabel {
-    text: &'static str,
+    text: SharedString,
     count: usize,
     max_width: Option<f32>,
 }
 impl From<&'static str> for TabLabel {
     fn from(text: &'static str) -> Self {
         Self {
-            text,
+            text: text.into(),
             count: 0,
             max_width: None,
         }
@@ -53,8 +53,17 @@ impl From<&'static str> for TabLabel {
 impl From<(&'static str, usize)> for TabLabel {
     fn from((text, count): (&'static str, usize)) -> Self {
         Self {
-            text,
+            text: text.into(),
             count,
+            max_width: None,
+        }
+    }
+}
+impl From<SharedString> for TabLabel {
+    fn from(text: SharedString) -> Self {
+        Self {
+            text,
+            count: 0,
             max_width: None,
         }
     }
@@ -85,7 +94,7 @@ pub(crate) fn tab_button(
     } else {
         0.
     };
-    let natural_width = label_width(label.text, window) + 6. + count_width;
+    let natural_width = label_width(&label.text, window) + 6. + count_width;
     let width = label
         .max_width
         .map_or(natural_width, |max| max.min(natural_width));
@@ -101,7 +110,7 @@ pub(crate) fn tab_button(
         .id(id)
         .debug_selector(move || id.into())
         .role(Role::Tab)
-        .aria_label(label.text)
+        .aria_label(label.text.clone())
         .aria_selected(selected)
         .group(id)
         .cursor_pointer()
@@ -160,7 +169,7 @@ pub(crate) fn tab_button(
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .child(label.text),
+                                    .child(label.text.clone()),
                             )
                             .when(label.count > 0, |d| {
                                 d.child(

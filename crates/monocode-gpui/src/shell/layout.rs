@@ -583,27 +583,40 @@ impl Shell {
             .corner_reveal
             .as_ref()
             .and_then(|reveal| reveal.progress(current, window, cx));
-        let mut tabs = vec![
+        let mut tabs: Vec<(&'static str, gpui::SharedString, &'static str, RightTab)> = vec![
             (
                 "right-panel-explorer",
-                "Explorer",
+                "Explorer".into(),
                 "file-script",
                 RightTab::Files,
             ),
-            ("right-panel-history", "History", "clock", RightTab::Graph),
+            (
+                "right-panel-history",
+                "History".into(),
+                "clock",
+                RightTab::Graph,
+            ),
         ];
         if self.terminal_in_panel(cx) {
             tabs.insert(
                 1,
                 (
                     "right-panel-terminal",
-                    "Terminal",
+                    "Terminal".into(),
                     "terminal",
                     RightTab::Terminal,
                 ),
             );
         }
+        if let Some(label) = self
+            .right_panel
+            .as_ref()
+            .and_then(|panel| panel.read(cx).issue_tab().cloned())
+        {
+            tabs.push(("right-panel-issue", label, "external-link", RightTab::Issue));
+        }
         let count = tabs.len();
+        let close_room = self.work_item_close_room(cx);
         row.pl_1p5()
             .pr(px(12. + self.window_controls))
             .when(open, |d| {
@@ -628,35 +641,57 @@ impl Shell {
                                     _ if selected => 1.,
                                     _ => 0.,
                                 };
-                                tab_button(
-                                    id,
-                                    crate::project_tabs::TabLabel::from(label).max_width(
-                                        crate::right_panel::tab_label_width(
-                                            self.project_tabs_width(cx),
-                                            count,
+                                let close = (tab == RightTab::Issue && selected).then(|| {
+                                    crate::right_panel::icon_action(
+                                        "right-panel-issue-close",
+                                        "Close",
+                                        "close",
+                                        true,
+                                    )
+                                    .debug_selector(|| "right-panel-issue-close".into())
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.close_work_item_panel(window, cx)
+                                        },
+                                    ))
+                                });
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        tab_button(
+                                            id,
+                                            crate::project_tabs::TabLabel::from(label).max_width(
+                                                crate::right_panel::tab_label_width(
+                                                    self.project_tabs_width(cx) - close_room,
+                                                    count,
+                                                ),
+                                            ),
+                                            path,
+                                            selected,
+                                            false,
+                                            unfolded,
+                                            window,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                let Some(panel) = this.right_panel.clone() else {
+                                                    return;
+                                                };
+                                                let closing = panel.read(cx).tab();
+                                                if closing == tab {
+                                                    return;
+                                                }
+                                                this.corner_reveal =
+                                                    Some(TabReveal::new(tab, closing));
+                                                panel.update(cx, |p, cx| p.select(tab, cx));
+                                                this.invalidate_chrome(cx);
+                                                cx.notify();
+                                            }),
                                         ),
-                                    ),
-                                    path,
-                                    selected,
-                                    false,
-                                    unfolded,
-                                    window,
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        let Some(panel) = this.right_panel.clone() else {
-                                            return;
-                                        };
-                                        let closing = panel.read(cx).tab();
-                                        if closing == tab {
-                                            return;
-                                        }
-                                        this.corner_reveal = Some(TabReveal::new(tab, closing));
-                                        panel.update(cx, |p, cx| p.select(tab, cx));
-                                        this.invalidate_chrome(cx);
-                                        cx.notify();
-                                    },
-                                ))
+                                    )
+                                    .children(close)
                             })),
                     )
                     .child(titlebar_drag_area().flex_1().min_w_0())

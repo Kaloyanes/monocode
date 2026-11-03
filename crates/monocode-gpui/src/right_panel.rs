@@ -70,8 +70,8 @@ pub(crate) enum RightTab {
     /// Simulators and emulators, when Devices are on. Last, and never part
     /// of the saved order.
     Device,
-    /// A work item followed from a thread; the shell paints it. Never part
-    /// of the strip or the saved order.
+    /// A work item followed from a thread; the shell paints it. A strip tab
+    /// only while one is open, and never part of the saved order.
     Issue,
 }
 impl RightTab {
@@ -103,8 +103,13 @@ impl RightTab {
     }
 }
 
+/// Room the open work item's close button takes in the strip: 20px and a gap.
+pub(crate) const ISSUE_CLOSE_ROOM: f32 = 22.;
+
 pub(crate) enum PanelEvent {
     Tab(RightTab),
+    /// The work item tab's close button.
+    CloseIssue,
     Reordered(Vec<RightTab>),
 }
 
@@ -275,8 +280,10 @@ pub(crate) struct RightPanel {
     sidebar_tab: Option<RightTab>,
     /// Whether the Terminal tab follows the others; the shell draws its pane.
     terminal_tab: bool,
-    /// Whether the Device tab ends the strip.
+    /// Whether the Device tab follows the others.
     device_tab: bool,
+    /// The open work item's tab label, such as "PR #7". Ends the strip.
+    issue_tab: Option<SharedString>,
     /// Classic reserves the title bar's height; rounded content starts at
     /// the card's top edge, below the window-wide title bar.
     top_inset: f32,
@@ -328,6 +335,7 @@ impl RightPanel {
             sidebar_tab: None,
             terminal_tab: false,
             device_tab: false,
+            issue_tab: None,
             top_inset: 0.,
             tab_width: tabs_width(3),
             drag: None,
@@ -350,7 +358,26 @@ impl RightPanel {
         if self.device_tab {
             tabs.push(RightTab::Device);
         }
+        if self.issue_tab.is_some() {
+            tabs.push(RightTab::Issue);
+        }
         tabs
+    }
+    pub(crate) fn issue_tab(&self) -> Option<&SharedString> {
+        self.issue_tab.as_ref()
+    }
+    /// Adds, renames or removes the work item tab; Explorer takes over when
+    /// it goes.
+    pub(crate) fn set_issue_tab(&mut self, label: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.issue_tab == label {
+            return;
+        }
+        let gone = label.is_none();
+        self.issue_tab = label;
+        if gone && self.tab == RightTab::Issue {
+            self.select(RightTab::Files, cx);
+        }
+        cx.notify();
     }
     /// Adds or removes the Device tab; Explorer takes over when it goes.
     pub(crate) fn set_device_tab(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -480,8 +507,9 @@ impl RightPanel {
             .iter()
             .zip(&self.tab_bounds)
             .map(|(tab, slot)| {
-                slot.get()
-                    .filter(|_| !matches!(tab, RightTab::Terminal | RightTab::Device))
+                slot.get().filter(|_| {
+                    !matches!(tab, RightTab::Terminal | RightTab::Device | RightTab::Issue)
+                })
             })
             .collect();
         if let Some(Some(own)) = bounds.get(from) {
@@ -544,6 +572,11 @@ impl RightPanel {
             .filter(|d| d.active)
             .map(|d| (d.tab, d.offset));
         let count = self.tabs().len();
+        let issue_room = if self.issue_tab.is_some() {
+            ISSUE_CLOSE_ROOM
+        } else {
+            0.
+        };
         let tabs: Vec<AnyElement> = self
             .tabs()
             .into_iter()
@@ -566,6 +599,17 @@ impl RightPanel {
                     _ => 0.,
                 };
                 let shift = dragging.filter(|(t, _)| *t == tab).map(|(_, o)| o);
+                let name = match (tab, &self.issue_tab) {
+                    (RightTab::Issue, Some(label)) => label.clone(),
+                    _ => tab.label().into(),
+                };
+                let close = (tab == RightTab::Issue && active).then(|| {
+                    icon_action("right-panel-issue-close", "Close", "close", true)
+                        .self_center()
+                        .debug_selector(|| "right-panel-issue-close".into())
+                        .cursor_pointer()
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(PanelEvent::CloseIssue)))
+                });
                 div()
                     .relative()
                     .flex_shrink_0()
@@ -577,8 +621,8 @@ impl RightPanel {
                     .child(
                         tab_button(
                             id,
-                            TabLabel::from(tab.label())
-                                .max_width(tab_label_width(self.tab_width, count)),
+                            TabLabel::from(name)
+                                .max_width(tab_label_width(self.tab_width - issue_room, count)),
                             path,
                             active,
                             false,
@@ -606,6 +650,7 @@ impl RightPanel {
                             },
                         )),
                     )
+                    .children(close)
                     .into_any_element()
             })
             .collect();

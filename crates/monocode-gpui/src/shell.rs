@@ -748,7 +748,9 @@ pub(crate) struct Shell {
     /// The list-less Inbox behind the right panel's Issue tab, and the tab
     /// it replaced.
     work_item_panel: Option<Entity<crate::inbox::Inbox>>,
-    work_item_return: Option<crate::right_panel::RightTab>,
+    /// Whether following the link opened the panel, so closing it closes the
+    /// panel again.
+    work_item_opened_panel: bool,
     automations: Option<Entity<crate::automations::Automations>>,
     active_app_view: Option<app_views::AppView>,
     app_view_events: Vec<Subscription>,
@@ -1168,7 +1170,7 @@ impl Shell {
             notes: None,
             inbox: None,
             work_item_panel: None,
-            work_item_return: None,
+            work_item_opened_panel: false,
             automations: None,
             active_app_view: None,
             app_view_events: Vec::new(),
@@ -1919,7 +1921,16 @@ impl Shell {
             && !self.app_view_open()
             && self.settings.is_none()
             && self.app_search.is_none()
-            && (self.mono_active(cx) || self.git.read(cx).available())
+            && self.right_panel_usable(cx)
+    }
+    /// A Mono, a git project, or a work item followed from any thread. The
+    /// panel has no other use without git.
+    fn right_panel_usable(&self, cx: &App) -> bool {
+        self.mono_active(cx)
+            || self.git.read(cx).available()
+            || self.right_panel.as_ref().is_some_and(|panel| {
+                panel.read(cx).tab() == crate::right_panel::RightTab::Issue
+            })
     }
     fn sync_right_panel(&mut self, cx: &mut Context<Self>) {
         let opening = self.right_slide.as_ref().is_some_and(PaneSlide::opening);
@@ -1996,14 +2007,6 @@ impl Shell {
         }
     }
     fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Reopening the panel does not bring a closed work item back.
-        if !self.workspace.right_panel_open
-            && let Some(panel) = &self.right_panel
-            && panel.read(cx).tab() == crate::right_panel::RightTab::Issue
-        {
-            let tab = self.workspace.right_panel_tab;
-            panel.update(cx, |panel, cx| panel.select(tab, cx));
-        }
         self.set_right_panel_open(!self.workspace.right_panel_open, window, cx);
     }
     fn open_plan_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2018,7 +2021,7 @@ impl Shell {
     }
     fn set_right_panel_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.app_view_open()
-            || (!self.mono_active(cx) && !self.git.read(cx).available())
+            || !self.right_panel_usable(cx)
             || self.workspace.right_panel_open == open
         {
             return;
@@ -2147,7 +2150,7 @@ impl Shell {
         let changes = panel.read(cx).changes.clone();
         changes.update(cx, |c, cx| c.set_view(view, cx));
         self.observations
-            .push(cx.subscribe(&panel, |this, _, event: &PanelEvent, cx| {
+            .push(cx.subscribe_in(&panel, window, |this, _, event: &PanelEvent, window, cx| {
                 match event {
                     PanelEvent::Tab(tab) => {
                         // A work item is not restored on the next launch.
@@ -2161,6 +2164,10 @@ impl Shell {
                         if *tab == crate::right_panel::RightTab::Device {
                             this.sync_right_panel(cx);
                         }
+                    }
+                    PanelEvent::CloseIssue => {
+                        this.close_work_item_panel(window, cx);
+                        return;
                     }
                     PanelEvent::Reordered(order) => this.workspace.right_panel_tabs = order.clone(),
                 }
@@ -5612,14 +5619,31 @@ impl Shell {
             - padding
             - self.window_controls)
             .clamp(
-                crate::right_panel::tab_icons_width(self.right_tab_count(cx)),
-                crate::right_panel::tabs_width(self.right_tab_count(cx)),
+                crate::right_panel::tab_icons_width(self.right_tab_count(cx))
+                    + self.work_item_close_room(cx),
+                crate::right_panel::tabs_width(self.right_tab_count(cx))
+                    + self.work_item_close_room(cx),
             )
     }
     /// Explorer and History, and Terminal when it lives in the panel. Changes
     /// opens from the diff stat instead.
     fn right_tab_count(&self, cx: &App) -> usize {
-        2 + usize::from(self.terminal_in_panel(cx)) + usize::from(self.devices_in_panel())
+        2 + usize::from(self.terminal_in_panel(cx))
+            + usize::from(self.devices_in_panel())
+            + usize::from(self.work_item_tab_open(cx))
+    }
+    /// A work item has a tab; its close button needs room beside the label.
+    fn work_item_tab_open(&self, cx: &App) -> bool {
+        self.right_panel
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).issue_tab().is_some())
+    }
+    pub(super) fn work_item_close_room(&self, cx: &App) -> f32 {
+        if self.work_item_tab_open(cx) {
+            crate::right_panel::ISSUE_CLOSE_ROOM
+        } else {
+            0.
+        }
     }
     /// Settings › Devices adds the Device tab.
     pub(crate) fn devices_in_panel(&self) -> bool {
