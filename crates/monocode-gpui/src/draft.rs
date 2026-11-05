@@ -155,6 +155,14 @@ pub(crate) fn reopen_requests() -> async_channel::Receiver<(i64, String)> {
     reopens().1.clone()
 }
 
+/// Notes that a draft is saved though its page is not open, so its card can
+/// offer to open it again.
+pub(crate) fn mark_saved(id: &str, cx: &mut App) {
+    if cx.default_global::<Reopening>().saved.insert(id.to_owned()) {
+        changed(cx);
+    }
+}
+
 /// Whether the draft is saved and its card can offer to open it again.
 pub(crate) fn reopenable(id: &str, cx: &App) -> bool {
     cx.try_global::<Reopening>()
@@ -213,6 +221,22 @@ pub(crate) fn cover() -> gpui::AnyElement {
         .absolute()
         .size_full(),
     )
+    .into_any_element()
+}
+
+/// Marks the area it fills as floating over any draft beneath: the page keeps
+/// running with a hole cut in it there, for both drawing and the pointer. For
+/// anything drawn over the thread that is not `deferred`. A surface that holds
+/// a draft of its own is fine, as its page comes after this.
+pub(crate) fn float(radius: gpui::Pixels) -> gpui::AnyElement {
+    gpui::canvas(
+        move |bounds, window, _| {
+            window.insert_hitbox(bounds, gpui::HitboxBehavior::Float(radius));
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
     .into_any_element()
 }
 
@@ -453,9 +477,18 @@ pub(crate) struct Saved {
     light: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The person closed the card. The page stays saved so the card can open
+    /// it again, but nothing opens it by itself, not even after a restart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    dismissed: bool,
 }
 
 impl Saved {
+    /// Whether the person closed this draft's card.
+    pub(crate) fn dismissed(&self) -> bool {
+        self.dismissed
+    }
+
     pub(crate) fn read(path: &std::path::Path) -> Option<Self> {
         let saved: Self = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
         (saved.html.is_some() || saved.url.is_some()).then_some(saved)
@@ -640,11 +673,21 @@ impl Draft {
         let Some(path) = self.saved.clone() else {
             return;
         };
+        let saved = self.snapshot(false);
+        cx.background_spawn(async move {
+            if !Self::write(&path, &saved) {
+                eprintln!("Could not save draft to {}", path.display());
+            }
+        })
+        .detach();
+    }
+
+    fn snapshot(&self, dismissed: bool) -> Saved {
         let (html, url) = match self.shared.content() {
             DraftContent::Html(html) => (Some(html.clone()), None),
             DraftContent::Url(url) => (None, Some(url.clone())),
         };
-        let saved = Saved {
+        Saved {
             html,
             url,
             title: self.shared.title().map(str::to_owned),
@@ -652,22 +695,33 @@ impl Draft {
             height: self.height,
             light: self.light,
             state: self.shared.state().cloned(),
+            dismissed,
+        }
+    }
+
+    fn write(path: &std::path::Path, saved: &Saved) -> bool {
+        let Ok(bytes) = serde_json::to_vec(saved) else {
+            return false;
         };
-        cx.background_spawn(async move {
-            let Ok(bytes) = serde_json::to_vec(&saved) else {
-                return;
-            };
-            let partial = path.with_extension("json.partial");
-            let written = path
-                .parent()
-                .is_some_and(|dir| std::fs::create_dir_all(dir).is_ok())
-                && std::fs::write(&partial, bytes).is_ok()
-                && std::fs::rename(&partial, &path).is_ok();
-            if !written {
-                eprintln!("Could not save draft to {}", path.display());
-            }
-        })
-        .detach();
+        let partial = path.with_extension("json.partial");
+        path.parent()
+            .is_some_and(|dir| std::fs::create_dir_all(dir).is_ok())
+            && std::fs::write(&partial, bytes).is_ok()
+            && std::fs::rename(&partial, path).is_ok()
+    }
+
+    /// The person closed the card. The page stays saved, marked as closed, so
+    /// the card can open it again. False if it was never saved; then there is
+    /// nothing to come back to and the caller should `forget` it.
+    pub(crate) fn dismiss(&mut self) -> bool {
+        self._save = None;
+        self.save_due = false;
+        let Some(path) = self.saved.clone() else {
+            return false;
+        };
+        // Written now rather than in the background, so a later write of the
+        // same page cannot land after it and bring the page back.
+        Self::write(&path, &self.snapshot(true))
     }
 
     /// The page reports its `mc.state`, as the card's watch reads it.
@@ -726,12 +780,33 @@ impl Draft {
         self.shared.waiting()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_waiting_for_test(&mut self, waiting: bool) {
+        self.shared.set_waiting(waiting);
+    }
+
+    /// Whether an agent's lease is asking for a page no card shows.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn leased_without_page_for_test(&self) -> bool {
+        self.host.leased_without_page().is_some()
+    }
+
     pub(crate) fn shared(&self) -> &SharedDraft {
         &self.shared
     }
 
     /// The page as the phone draws it, themed light or dark like the phone.
     /// A dev server has none: it runs on this machine.
+    /// How tall the page was laid out at a phone's width, for a card that
+    /// has not loaded it yet.
+    pub(crate) fn phone_height(&self) -> Option<u32> {
+        let phone = monocode_core::visual_bridge::DRAFT_LAYOUT_WIDTHS.first()?;
+        self.layouts
+            .iter()
+            .find(|layout| layout.width == *phone)
+            .map(|layout| layout.height)
+    }
+
     pub(crate) fn phone_page(&self, light: bool) -> Option<String> {
         let html = self.html()?;
         Some(page::phone(
@@ -776,7 +851,12 @@ impl Draft {
         values: &serde_json::Map<String, serde_json::Value>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        self.shared.patch_state(values)?;
+        if self.shared.state().is_some() {
+            self.shared.patch_state(values)?;
+        } else {
+            // This page has not run here, so the phone's values start the record.
+            self.shared.report_state(values.clone());
+        }
         self.shared.touch(Vec::new());
         self.persist(cx);
         #[cfg(target_os = "macos")]
@@ -832,6 +912,12 @@ impl Draft {
     #[cfg(all(debug_assertions, target_os = "macos"))]
     pub(crate) fn placement(&self) -> Option<[f64; 5]> {
         self.host.placement()
+    }
+
+    /// See `web::Host::holes`.
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    pub(crate) fn holes(&self) -> Vec<[f64; 6]> {
+        self.host.holes()
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -1752,7 +1838,7 @@ fn flatten(png: &[u8], color: [u8; 3]) -> Option<Vec<u8>> {
 
 /// A PNG as a JPEG, small enough to send to a phone every second.
 #[cfg(target_os = "macos")]
-fn jpeg(png: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn jpeg(png: &[u8]) -> Option<Vec<u8>> {
     let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
         .ok()?
         .into_rgb8();
@@ -2684,6 +2770,51 @@ async fn act(
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    /// A stand-in for a page's canvas: records the floats over it at paint.
+    fn page(found: &std::rc::Rc<std::cell::Cell<Option<usize>>>, left: f32) -> impl IntoElement {
+        let found = found.clone();
+        gpui::canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+            move |_, hitbox, window, _| found.set(Some(window.floats_over(&hitbox).len())),
+        )
+        .absolute()
+        .top(gpui::px(0.))
+        .left(gpui::px(left))
+        .size(gpui::px(100.))
+    }
+
+    #[gpui::test]
+    fn a_float_cuts_what_came_before_it_and_nothing_after(cx: &mut TestAppContext) {
+        let (under, beside, above) = (Default::default(), Default::default(), Default::default());
+        let cx = cx.add_empty_window();
+        cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(400.), gpui::px(400.)),
+            |_, _| {
+                let control = |left: f32| {
+                    div()
+                        .absolute()
+                        .top(gpui::px(10.))
+                        .left(gpui::px(left))
+                        .size(gpui::px(20.))
+                        .child(float(gpui::px(10.)))
+                };
+                div()
+                    .relative()
+                    .size_full()
+                    .child(page(&under, 0.))
+                    .child(page(&beside, 200.))
+                    .child(control(10.))
+                    // An overlay holding a draft of its own: its page is in
+                    // front of the float.
+                    .child(page(&above, 0.))
+            },
+        );
+        assert_eq!(under.get(), Some(1), "the page beneath the control");
+        assert_eq!(beside.get(), Some(0), "a page the control does not reach");
+        assert_eq!(above.get(), Some(0), "a page drawn after the control");
+    }
 
     #[cfg(target_os = "macos")]
     #[gpui::test]

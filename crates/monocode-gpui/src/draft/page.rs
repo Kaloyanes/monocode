@@ -135,6 +135,11 @@ for(const l of ['log','info','warn','error']){const o=console[l];console[l]=(...
 addEventListener('error',e=>post({k:'c',l:'error',t:(e.message||'Script error')+(e.lineno?' (line '+e.lineno+')':'')}));
 addEventListener('unhandledrejection',e=>post({k:'c',l:'error',t:'Unhandled rejection: '+text([e.reason])}));
 addEventListener('securitypolicyviolation',e=>post({k:'c',l:'error',t:'Blocked by the page policy: '+e.blockedURI+' ('+e.violatedDirective+')'}));
+const failed=(m,u,why)=>post({k:'c',l:'error',t:'Request failed: '+String(m||'GET').toUpperCase()+' '+String(u).slice(0,300)+' ('+why+')'});
+const pageFetch=window.fetch;
+window.fetch=function(i,o){const m=o&&o.method||i&&i.method,u=i&&i.url||i;return pageFetch.apply(this,arguments).then(r=>{if(r.status>=400)failed(m,u,r.status);return r},e=>{if(!e||e.name!=='AbortError')failed(m,u,e);throw e})};
+const xhrOpen=XMLHttpRequest.prototype.open,xhrs=new WeakMap();
+XMLHttpRequest.prototype.open=function(m,u){if(!xhrs.has(this)){this.addEventListener('error',()=>failed(...xhrs.get(this),'network error'));this.addEventListener('load',()=>{if(this.status>=400)failed(...xhrs.get(this),this.status)})}xhrs.set(this,[m,u]);return xhrOpen.apply(this,arguments)};
 const metrics=()=>{const r=document.documentElement;if(!r)return;post({k:'m',w:r.scrollWidth,vw:r.clientWidth,fontsReady:document.fonts.status==='loaded',failedImages:Array.from(document.images).filter(i=>i.complete&&!i.naturalWidth).length})};
 document.fonts.ready.then(metrics);
 document.fonts.addEventListener('loadingdone',metrics);
@@ -174,7 +179,8 @@ const anchor=(el,x,y)=>{const p=path(el);if(!p)return null;const r=el.getBoundin
 const on=a=>{if(!a||typeof a.path!=='string'||!Number.isFinite(a.ax)||!Number.isFinite(a.ay))return null;let el=document.body;for(const i of a.path.split('.')){el=el&&el.children[+i];if(!el)return null}const r=el.getBoundingClientRect();return r.width>0&&r.height>0?{x:r.left+scrollX+a.ax*r.width,y:r.top+scrollY+a.ay*r.height}:null};
 const where=q=>{const a=on(q.at);if(a)return a;if(q.px==null)return q;const f=frame();return {x:q.px*f.w/100,y:q.py*f.h/100}};
 const replace=()=>{for(const {p,q} of placed){const w=where(q);p.style.left=w.x-11+'px';p.style.top=w.y-11+'px'}};
-new ResizeObserver(replace).observe(document.documentElement);addEventListener('load',replace);
+const pinLayout=new ResizeObserver(replace);if(document.documentElement)pinLayout.observe(document.documentElement);
+addEventListener('DOMContentLoaded',()=>{if(document.documentElement)pinLayout.observe(document.documentElement)});addEventListener('load',replace);
 const pin=(q,n)=>{const w=where(q);const p=ui('div',{position:'absolute',left:w.x-11+'px',top:w.y-11+'px',width:'22px',height:'22px',borderRadius:'11px',background:'var(--accent,#4da3f5)',color:'#fff',font:'600 12px/22px system-ui',textAlign:'center',zIndex:'2147483646',pointerEvents:'none',boxShadow:'0 2px 8px rgba(0,0,0,.35)'},String(n));document.documentElement.appendChild(p);placed.push({p,q})};
 const open=e=>{close();const el=e.target;pending={el,x:e.pageX,y:e.pageY};
 box=ui('div',{position:'absolute',left:Math.max(8,Math.min(e.pageX+12,document.documentElement.clientWidth-268))+'px',top:e.pageY+12+'px',width:'256px',padding:'8px',background:sheet,color:ink,border:'1px solid '+line,borderRadius:'12px',boxShadow:'0 20px 25px -5px rgba(0,0,0,.25)',font:'13px system-ui',zIndex:'2147483647',display:'flex',flexDirection:'column',gap:'8px'});
@@ -316,17 +322,18 @@ pub(crate) fn browser_probe() -> String {
 }
 
 /// The agent's page inside a sandboxed iframe, clear over the thread.
-/// Nothing in it can reach the app, the network or the filesystem.
+/// Nothing in it can reach the app or the filesystem. It can call HTTPS and
+/// WSS servers, from a null origin and without cookies.
 pub(crate) fn sandbox(body: &str, palette: Palette) -> String {
     let theme = tokens(palette);
     let policy = format!(
-        "script-src 'unsafe-inline' {}; style-src 'unsafe-inline' {}; img-src data: blob:; font-src data: {}; media-src data: blob:",
+        "script-src 'unsafe-inline' 'wasm-unsafe-eval' {}; style-src 'unsafe-inline' {}; img-src data: blob: https:; font-src data: {}; media-src data: blob: https:",
         csp_sources(&SCRIPT_HOSTS),
         csp_sources(&STYLE_HOSTS),
         csp_sources(&FONT_HOSTS),
     );
     let csp = format!(
-        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; {policy}; worker-src blob:; connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'\"><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; {policy}; worker-src blob:; connect-src https: wss:; frame-src 'none'; base-uri 'none'; form-action 'none'\"><meta name=viewport content=\"width=device-width,initial-scale=1\">"
     );
     let source = format!(
         "<!doctype html>{csp}<style id=mc-theme>{theme}</style><style>*{{box-sizing:border-box}}html{{background:transparent!important;scrollbar-width:none}}html::-webkit-scrollbar{{display:none}}:where(:focus-visible){{outline:2px solid var(--ring);outline-offset:-2px}}body{{margin:0;font:var(--font-size)/1.5 var(--font-sans);color:var(--foreground);background:transparent!important;-webkit-font-smoothing:antialiased}}a{{color:var(--link)}}::selection{{background:var(--selection)}}{KIT_STYLE}</style>{PAGE_PROBE}<script>{KIT_SCRIPT}</script><body>{body}"
@@ -341,9 +348,12 @@ pub(crate) fn sandbox(body: &str, palette: Palette) -> String {
 }
 
 /// Passes what the page tells the wrapper on to the phone app: state, notes,
-/// the person's input and page messages. The phone's web view has no other
-/// way to read it.
-const PHONE_BRIDGE: &str = r#"<script>addEventListener('message',e=>{const d=e.data;if(!d||d.__mc!==1||!/^[vfun]$/.test(d.k))return;try{window.ReactNativeWebView.postMessage(JSON.stringify(d))}catch(x){}});</script>"#;
+/// the person's input, page messages and the page's height. The phone's web
+/// view has no other way to read it. WebKit on iOS sends touches only where the
+/// outer document listens for them, and the sandboxed page's own listeners do
+/// not count: without these, a tap reached the page as a bare click, so nothing
+/// but a slider saw `pointerdown` and `mc.send` refused every button.
+const PHONE_BRIDGE: &str = r#"<script>for(const type of ['touchstart','pointerdown'])addEventListener(type,()=>{},{passive:true});addEventListener('message',e=>{const d=e.data;if(!d||d.__mc!==1||!/^[vfunh]$/.test(d.k))return;try{window.ReactNativeWebView.postMessage(JSON.stringify(d))}catch(x){}});</script>"#;
 
 /// The same sandboxed page for the phone's web view, laid out at the phone's
 /// width. The phone drives it with `__mcSend`, as the desktop does.
@@ -369,17 +379,23 @@ mod tests {
         );
         assert!(html.contains("sandbox=\"allow-scripts\""));
         assert!(!html.contains("allow-same-origin"));
-        assert!(html.contains("connect-src 'none'"));
         assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]
-    fn pages_load_code_only_from_listed_cdns_and_never_connect_or_fetch_images() {
+    fn pages_load_code_only_from_listed_cdns_and_connect_only_over_tls() {
         let page = sandbox("<p>x</p>", Palette::forced(false));
-        assert!(page.contains("script-src 'unsafe-inline' https://cdn.jsdelivr.net"));
-        assert!(!page.contains("script-src 'unsafe-inline' https:;"));
-        assert!(page.contains("img-src data: blob:;"));
+        assert!(
+            page.contains("script-src 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net")
+        );
+        assert!(!page.contains("'wasm-unsafe-eval' https:;"));
+        // WebAssembly may compile, but strings still may not run as code.
+        assert!(!page.contains("'unsafe-eval'"));
+        assert!(page.contains("connect-src https: wss:;"));
+        assert!(page.contains("img-src data: blob: https:;"));
+        assert!(page.contains("media-src data: blob: https:;"));
         assert!(page.contains("frame-src 'none'"));
+        assert!(page.contains("form-action 'none'"));
     }
 
     #[test]
@@ -407,7 +423,7 @@ mod tests {
         assert!(page.starts_with("<!doctype html><meta name=viewport"));
         assert!(page.contains("ReactNativeWebView.postMessage"));
         assert!(page.contains("sandbox=\"allow-scripts\""));
-        assert!(page.contains("connect-src 'none'"));
+        assert!(page.contains("connect-src https: wss:;"));
         // Only the outer document is changed; the page itself is not.
         assert_eq!(page.matches(PHONE_BRIDGE).count(), 1);
     }
@@ -435,6 +451,8 @@ mod tests {
         assert!(PAGE_PROBE.contains("pin({px:d.__mcPin.x,py:d.__mcPin.y,at:d.__mcPin.at},pins)"));
         // Pins follow their element when the page lays out again.
         assert!(PAGE_PROBE.contains("new ResizeObserver(replace)"));
+        // Chromium runs the probe before a dev server's page has a root.
+        assert!(!PAGE_PROBE.contains("new ResizeObserver(replace).observe"));
         assert!(PAGE_PROBE.contains("realNow()-touched>2000"));
     }
 }

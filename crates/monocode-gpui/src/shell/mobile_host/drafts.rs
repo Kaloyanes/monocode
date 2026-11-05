@@ -1,8 +1,11 @@
-//! A paired phone opens a conversation's drafts. It draws its own copy of the
-//! page and changes the same record the desktop's card does, so the notes, the
-//! page's state and who is driving are one thing on either screen.
+//! A paired phone shows a conversation's drafts in the thread. It draws its own
+//! copy of the page and changes the same record the desktop's card does, so the
+//! notes, the page's state and who is driving are one thing on either screen.
+//!
+//! The phone looks at a card just by scrolling past it, so a read with `peek`
+//! never opens anything; only the person's own tap does.
 use super::*;
-use crate::draft::Draft;
+use crate::draft::{self, Draft, DraftEvent};
 use monocode_core::visual_bridge::{DraftAnchor, DraftContent, DraftFeedback};
 
 /// How long a phone's read waits for the draft to change before answering.
@@ -18,13 +21,21 @@ const FRAME_WIDTH: u32 = 1290;
 impl Shell {
     /// `draft.read`: the draft's record, and its page when the phone does not
     /// have this version. With `since`, it answers once the record moves past
-    /// that revision, or after a while with the same one.
+    /// that revision, or after a while with the same one. With `peek`, a draft
+    /// that is not open only says so.
     pub(super) fn mobile_draft_read(
         &mut self,
         request: Request,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if request.params["peek"] == true {
+            match self.mobile_draft_shut(&request.params, cx) {
+                Ok(Some(shut)) => return request.reply(Ok(shut)),
+                Ok(None) => {}
+                Err(error) => return request.reply(Err(error)),
+            }
+        }
         let draft = match self.mobile_draft(&request.params, window, cx) {
             Ok(Some(draft)) => draft,
             Ok(None) => return request.reply(Ok(json!({"live": false}))),
@@ -93,6 +104,35 @@ impl Shell {
         .detach();
     }
 
+    /// `draft.poster`: the picture kept of a draft, for its card while the
+    /// page is not open. It is the picture beside the kept page, as a JPEG.
+    pub(super) fn mobile_draft_poster(
+        &mut self,
+        params: &Value,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        let (session, id) = self.mobile_draft_name(params, cx)?;
+        let name = id
+            .strip_prefix(turns::KEPT_DRAFT)
+            .ok_or("Only a kept draft has a picture")?;
+        let page = locked(&self.store)?
+            .thread_image_page(session, name)?
+            .ok_or("That draft's picture is no longer available")?;
+        let picture = ["png", "jpg", "jpeg"]
+            .iter()
+            .map(|extension| page.with_extension(extension))
+            .find(|path| path.is_file())
+            .ok_or("That draft's picture is no longer available")?;
+        let bytes = std::fs::read(&picture).map_err(|error| error.to_string())?;
+        let bytes = match picture.extension().and_then(|extension| extension.to_str()) {
+            Some("png") => draft::jpeg(&bytes).ok_or("That draft's picture could not be read")?,
+            _ => bytes,
+        };
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Ok(json!({"picture": format!("data:image/jpeg;base64,{data}")}))
+    }
+
     /// `draft.action`: the person did something in the phone's copy.
     pub(super) fn mobile_draft_action(
         &mut self,
@@ -104,6 +144,11 @@ impl Shell {
             .mobile_draft(params, window, cx)?
             .ok_or("That draft was closed")?;
         let action = params["action"].as_str().unwrap_or_default();
+        if action == "close" {
+            // As the card's own close: the page stays saved and can open again.
+            draft.update(cx, |_, cx| cx.emit(DraftEvent::Closed));
+            return Ok(json!({"live": false, "saved": true, "dismissed": true}));
+        }
         draft.update(cx, |draft, cx| -> Result<(), String> {
             match action {
                 "pin" => {
@@ -128,7 +173,14 @@ impl Shell {
                     let values = params["values"]
                         .as_object()
                         .ok_or("values must be an object")?;
-                    draft.patch_from_phone(values, cx)?;
+                    // A page the agent has since replaced has no say in the new one.
+                    let current = draft.shared().generation();
+                    if params["generation"]
+                        .as_u64()
+                        .is_none_or(|sent| sent == current)
+                    {
+                        draft.patch_from_phone(values, cx)?;
+                    }
                 }
                 "message" => {
                     let text = params["text"].as_str().unwrap_or_default().trim();
@@ -146,6 +198,53 @@ impl Shell {
         Ok(read(draft.read(cx), known, light))
     }
 
+    /// The conversation and draft id a phone's request names.
+    fn mobile_draft_name(
+        &mut self,
+        params: &Value,
+        cx: &mut Context<Self>,
+    ) -> Result<(i64, String), String> {
+        let conversation = string(params, "conversationId").unwrap_or_default();
+        let session = match self.mobile_target(&conversation, cx)? {
+            Target::Session(session) => session,
+            Target::Mono(mono) => self
+                .monos
+                .as_ref()
+                .and_then(|monos| monos.read(cx).roster.get(&mono)?.session_id)
+                .ok_or("This Mono has no conversation yet")?,
+        };
+        Ok((session, string(params, "draft").ok_or("Missing draft")?))
+    }
+
+    /// What a phone is told about a draft that is not open, or `None` for one
+    /// that is. Nothing opens here.
+    fn mobile_draft_shut(
+        &mut self,
+        params: &Value,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<Value>, String> {
+        let (session, id) = self.mobile_draft_name(params, cx)?;
+        if let Some(name) = id.strip_prefix(turns::KEPT_DRAFT) {
+            let page = locked(&self.store)?.thread_image_page(session, name)?;
+            let open = page.as_ref().is_some_and(|page| {
+                self.draft_named(session, &draft::kept_id(page), cx)
+                    .is_some()
+            });
+            return Ok((!open).then(|| json!({"live": false, "saved": page.is_some()})));
+        }
+        if self.draft_named(session, &id, cx).is_some() {
+            return Ok(None);
+        }
+        let saved = self
+            .draft_file(session, &id)
+            .and_then(|path| draft::Saved::read(&path));
+        Ok(Some(json!({
+            "live": false,
+            "saved": saved.is_some(),
+            "dismissed": saved.is_some_and(|saved| saved.dismissed()),
+        })))
+    }
+
     /// The draft a phone names: a live one in the conversation, or a kept
     /// one's page, which opens live for both screens.
     fn mobile_draft(
@@ -154,11 +253,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Option<Entity<Draft>>, String> {
-        let conversation = string(params, "conversationId").unwrap_or_default();
-        let Target::Session(session) = self.mobile_target(&conversation, cx)? else {
-            return Err("A Mono's conversation has no drafts".into());
-        };
-        let id = string(params, "draft").ok_or("Missing draft")?;
+        let (session, id) = self.mobile_draft_name(params, cx)?;
         let Some(name) = id.strip_prefix(turns::KEPT_DRAFT) else {
             // A saved draft opens again for both screens, as its card does.
             return Ok(self.reopen_draft(session, &id, window, cx));
@@ -177,6 +272,9 @@ fn read(draft: &Draft, known: Option<u64>, light: bool) -> Value {
     let mut reply = shared.summary();
     reply["live"] = true.into();
     reply["title"] = draft.title().to_string().into();
+    if let Some(height) = draft.phone_height() {
+        reply["height"] = height.into();
+    }
     if let DraftContent::Url(url) = shared.content() {
         // Shown, not loaded: the phone gets pictures of it with `draft.frame`.
         reply["url"] = url.as_str().into();
@@ -310,9 +408,18 @@ mod tests {
                 assert!(pinned["pending"][0].get("at").is_none());
                 assert_eq!(draft.read(cx).shared().pending().len(), 1);
 
-                // The page has no state yet, so there is none to change.
-                assert!(shell
+                // No page has run here, so the phone's values start the record,
+                // unless they come from a page the agent has since replaced.
+                let old = json!(generation.as_u64().unwrap() - 1);
+                let stale = json!({"action": "state", "values": {"a": 1}, "generation": old});
+                shell.mobile_draft_action(&params(stale), window, cx).unwrap();
+                assert!(draft.read(cx).shared().state().is_none());
+                let started = shell
                     .mobile_draft_action(&params(json!({"action": "state", "values": {"a": 1}})), window, cx)
+                    .unwrap();
+                assert_eq!(started["state"]["a"], 1);
+                assert!(shell
+                    .mobile_draft_action(&params(json!({"action": "state", "values": {"b": 2}})), window, cx)
                     .is_err());
                 assert!(shell
                     .mobile_draft_action(&params(json!({"action": "explode"})), window, cx)
@@ -337,6 +444,281 @@ mod tests {
                 assert!(shell.mobile_draft_action(&outside, window, cx).is_err());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_phone_scrolling_past_a_closed_draft_leaves_it_closed(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("monocode-draft-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = monocode_core::store::Store::open(&dir.join("monocode.db")).unwrap();
+        let (window, _, _) = crate::shell::tests::window_with(cx, store);
+        let id = "draft-1-peek";
+        let (open, params) = window
+            .update(cx, |shell, window, cx| {
+                cx.set_reduce_motion(true);
+                let open = shell.visible_session().expect("a conversation is open");
+                let (reply, _answer) = std::sync::mpsc::channel();
+                shell.handle_draft_request(
+                    DraftRequest {
+                        session: open,
+                        draft: None,
+                        content: Some(DraftContent::Html("<p>Hi</p>".into())),
+                        action: DraftAction::Snapshot,
+                        width: None,
+                        height: None,
+                        light: None,
+                        title: Some("Pricing".into()),
+                        id: Some(id.into()),
+                        reply,
+                    },
+                    window,
+                    cx,
+                );
+                let params = json!({"conversationId": shell.mobile_session_id(open), "draft": id});
+                (open, params)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, window, cx| {
+                // An open draft reads as usual.
+                assert_eq!(shell.mobile_draft_shut(&params, cx).unwrap(), None);
+                // The card's close, from the phone.
+                let mut close = params.clone();
+                close["action"] = "close".into();
+                let reply = shell.mobile_draft_action(&close, window, cx).unwrap();
+                assert_eq!(reply["live"], false);
+                assert_eq!(reply["dismissed"], true);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let shut = shell.mobile_draft_shut(&params, cx).unwrap().unwrap();
+                assert_eq!(
+                    shut,
+                    json!({"live": false, "saved": true, "dismissed": true})
+                );
+                assert!(
+                    shell.draft_named(open, id, cx).is_none(),
+                    "a peek opens nothing"
+                );
+                // One that was never saved has nothing to open.
+                let mut gone = params.clone();
+                gone["draft"] = "draft-0-0".into();
+                let shut = shell.mobile_draft_shut(&gone, cx).unwrap().unwrap();
+                assert_eq!(shut["saved"], false);
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn a_monos_chat_reaches_the_drafts_in_its_conversation(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                cx.set_reduce_motion(true);
+                let open = shell.visible_session().expect("a conversation is open");
+                let (reply, _answer) = std::sync::mpsc::channel();
+                shell.handle_draft_request(
+                    DraftRequest {
+                        session: open,
+                        draft: None,
+                        content: Some(DraftContent::Html("<p>Hi</p>".into())),
+                        action: DraftAction::Snapshot,
+                        width: None,
+                        height: None,
+                        light: None,
+                        title: Some("Plan".into()),
+                        id: Some("draft-1-mono".into()),
+                        reply,
+                    },
+                    window,
+                    cx,
+                );
+                let monos = shell.mono_manager();
+                let (chat, fresh) = monos.update(cx, |monos, _| {
+                    let chat = monos.roster.create(Vec::new()).id.clone();
+                    monos.roster.get_mut(&chat).unwrap().session_id = Some(open);
+                    (chat, monos.roster.create(Vec::new()).id.clone())
+                });
+                let press = |mono: &str| {
+                    json!({
+                        "conversationId": format!("mono:{mono}"),
+                        "draft": "draft-1-mono",
+                        "action": "input",
+                        "actions": ["clicked \"Go\""],
+                    })
+                };
+                let read = shell
+                    .mobile_draft_action(&press(&chat), window, cx)
+                    .unwrap();
+                assert_eq!(read["live"], true);
+                assert_eq!(read["title"], "Plan");
+                assert!(
+                    shell
+                        .mobile_draft_action(&press(&fresh), window, cx)
+                        .is_err()
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_session_says_when_the_agent_waits_on_a_draft(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                cx.set_reduce_motion(true);
+                let open = shell.visible_session().expect("a conversation is open");
+                let (reply, _answer) = std::sync::mpsc::channel();
+                shell.handle_draft_request(
+                    DraftRequest {
+                        session: open,
+                        draft: None,
+                        content: Some(DraftContent::Html("<p>Hi</p>".into())),
+                        action: DraftAction::Snapshot,
+                        width: None,
+                        height: None,
+                        light: None,
+                        title: None,
+                        id: Some("draft-1-wait".into()),
+                        reply,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(shell.waiting_draft(open, cx), None);
+                let draft = shell.draft_named(open, "draft-1-wait", cx).unwrap();
+                draft.update(cx, |draft, _| draft.set_waiting_for_test(true));
+                assert_eq!(
+                    shell.waiting_draft(open, cx).as_deref(),
+                    Some("draft-1-wait")
+                );
+            })
+            .unwrap();
+    }
+
+    /// The Mac need not show the card for the person to answer on the phone.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn a_wait_keeps_the_page_running_with_no_card_on_the_mac(cx: &mut gpui::TestAppContext) {
+        crate::chromium::INSTALLED_IN_TEST.set(true);
+        let (window, _, _) = crate::shell::tests::window(cx);
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Preferences {
+                page_engine: "chromium".into(),
+                ..Default::default()
+            })
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                let open = shell.visible_session().expect("a conversation is open");
+                let (reply, _answer) = std::sync::mpsc::channel();
+                shell.handle_draft_request(
+                    DraftRequest {
+                        session: open,
+                        draft: None,
+                        content: Some(DraftContent::Html("<p>Hi</p>".into())),
+                        action: DraftAction::Wait { seconds: Some(1) },
+                        width: None,
+                        height: None,
+                        light: None,
+                        title: None,
+                        id: Some("draft-1-away".into()),
+                        reply,
+                    },
+                    window,
+                    cx,
+                );
+                let draft = shell.draft_named(open, "draft-1-away", cx).unwrap();
+                assert!(draft.read(cx).leased_without_page_for_test());
+            })
+            .unwrap();
+        crate::chromium::INSTALLED_IN_TEST.set(false);
+    }
+
+    #[gpui::test]
+    fn notes_held_for_a_request_that_fails_reach_the_conversation(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let (open, draft) = window
+            .update(cx, |shell, window, cx| {
+                cx.set_reduce_motion(true);
+                let open = shell.visible_session().expect("a conversation is open");
+                let (reply, _answer) = std::sync::mpsc::channel();
+                shell.handle_draft_request(
+                    DraftRequest {
+                        session: open,
+                        draft: None,
+                        content: Some(DraftContent::Html("<p>Hi</p>".into())),
+                        action: DraftAction::Snapshot,
+                        width: None,
+                        height: None,
+                        light: None,
+                        title: None,
+                        id: Some("draft-1-held".into()),
+                        reply,
+                    },
+                    window,
+                    cx,
+                );
+                let draft = shell.draft_named(open, "draft-1-held", cx).unwrap();
+
+                // Sent during a wait, the notes are held for its reply.
+                draft.update(cx, |draft, _| draft.set_waiting_for_test(true));
+                let conversation = shell.mobile_session_id(open);
+                let note =
+                    json!({"note": "Bigger", "tag": "button", "name": "Go", "x": 10, "y": 20});
+                for mut action in [
+                    json!({"action": "input", "actions": ["clicked \"Go\""]}),
+                    json!({"action": "pin", "notes": [note]}),
+                    json!({"action": "send"}),
+                ] {
+                    action["conversationId"] = json!(conversation);
+                    action["draft"] = json!("draft-1-held");
+                    shell.mobile_draft_action(&action, window, cx).unwrap();
+                }
+                (open, draft)
+            })
+            .unwrap();
+        // The event of the send runs here, while the wait still holds them.
+        cx.run_until_parked();
+        let refused = window
+            .update(cx, |shell, window, cx| {
+                draft.update(cx, |draft, _| draft.set_waiting_for_test(false));
+                // The person has control, so the agent's change is refused.
+                let (reply, refused) = std::sync::mpsc::channel();
+                shell.handle_draft_request(
+                    DraftRequest {
+                        session: open,
+                        draft: Some("draft-1-held".into()),
+                        content: None,
+                        action: DraftAction::Set {
+                            values: serde_json::from_value(json!({"a": 1})).unwrap(),
+                        },
+                        width: None,
+                        height: None,
+                        light: None,
+                        title: None,
+                        id: None,
+                        reply,
+                    },
+                    window,
+                    cx,
+                );
+                refused
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let error = refused.try_recv().unwrap().err().unwrap();
+        assert!(error.contains("controls this draft"), "{error}");
+        let outbox = draft.update(cx, |draft, _| draft.take_outbox());
+        assert!(
+            outbox.notes.is_empty(),
+            "the notes went to the conversation"
+        );
     }
 
     #[test]

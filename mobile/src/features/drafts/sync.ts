@@ -17,9 +17,12 @@ export type DraftNote = {
 };
 export type DraftState = Record<string, unknown>;
 
+/** A draft whose page is not open on the desktop, as a `peek` says. */
+export type ShutDraft = { live: false; saved?: boolean; dismissed?: boolean };
+
 /** The desktop's record of a draft, as `draft.read` and `draft.action` answer. */
 export type DraftRecord =
-  | { live: false }
+  | ShutDraft
   | {
       live: true;
       title: string;
@@ -36,6 +39,8 @@ export type DraftRecord =
       page?: string | null;
       /** A dev server's address; the phone gets pictures of it, not the page. */
       url?: string;
+      /** How tall the page was at a phone's width, before the page says itself. */
+      height?: number;
     };
 export type LiveDraft = Extract<DraftRecord, { live: true }>;
 
@@ -44,7 +49,8 @@ export type PageMessage =
   | { k: "v"; v: DraftState }
   | { k: "f"; f: DraftNote }
   | { k: "u"; a?: string }
-  | { k: "n"; t: string };
+  | { k: "n"; t: string }
+  | { k: "h"; v: number };
 
 /** What the page needs to be sent, by `__mcSend`. */
 export type PageCommand =
@@ -151,8 +157,10 @@ export function reportState(
     }
     return { page: [], desktop: null };
   }
-  if (!record.state || sameState(record.state, values) || now - touchedAt > TOUCH_WINDOW_MS)
+  if (sameState(record.state, values) || now - touchedAt > TOUCH_WINDOW_MS)
     return { page: [], desktop: null };
+  // The desktop's page has not run, so this page's values start the record.
+  if (!record.state) return { page: [], desktop: { action: "state", values } };
   const patch = statePatch(record.state, values);
   if (!Object.keys(patch).length) return { page: [], desktop: null };
   return { page: [], desktop: { action: "state", values: patch } };
@@ -209,6 +217,8 @@ export function parseMessage(data: string): PageMessage | null {
       return { k: "u", a: typeof message.a === "string" ? message.a : undefined };
     case "n":
       return typeof message.t === "string" ? { k: "n", t: message.t } : null;
+    case "h":
+      return Number.isFinite(message.v) ? { k: "h", v: message.v as number } : null;
     default:
       return null;
   }

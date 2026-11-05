@@ -54,6 +54,8 @@ pub(crate) struct LiveSession {
     pub metadata: MobileSessionMetadata,
     pub busy: bool,
     pub waiting: Option<&'static str>,
+    /// The draft the agent is waiting on, when `waiting` is "draft".
+    pub waiting_draft: Option<String>,
     /// The newest Orchestrator card of a lead (`orchestration::summary`).
     pub orchestration: Option<Value>,
 }
@@ -144,6 +146,9 @@ pub(crate) fn session(
     if let Some(waiting) = live.and_then(|live| live.waiting) {
         value["waiting"] = json!(waiting);
     }
+    if let Some(draft) = live.and_then(|live| live.waiting_draft.as_deref()) {
+        value["waitingDraft"] = json!(draft);
+    }
     if let Some(orchestration) = live.and_then(|live| live.orchestration.clone()) {
         value["orchestration"] = orchestration;
     }
@@ -214,6 +219,7 @@ mod tests {
             metadata: Default::default(),
             busy: false,
             waiting: None,
+            waiting_draft: None,
             orchestration: None,
         };
         let mut opening = session(

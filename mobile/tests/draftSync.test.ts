@@ -40,6 +40,21 @@ describe("reportState", () => {
     expect(early).toEqual({ page: [], desktop: null });
   });
 
+  it("starts the record with the person's change when no page has reported", () => {
+    const sync = freshSync();
+    const empty = record({ state: null });
+    expect(reportState(sync, empty, { radius: 8 }, -Infinity, 0)).toEqual({
+      page: [],
+      desktop: null,
+    });
+    const now = 10_000;
+    expect(reportState(sync, empty, { radius: 9 }, -Infinity, now).desktop).toBeNull();
+    expect(reportState(sync, empty, { radius: 12 }, now - 100, now).desktop).toEqual({
+      action: "state",
+      values: { radius: 12 },
+    });
+  });
+
   it("sends the keys the person changed, right after their touch", () => {
     const sync = freshSync();
     reportState(sync, record(), { radius: 8, glow: false }, -Infinity, 0);
@@ -144,6 +159,8 @@ describe("parseMessage", () => {
       v: { a: 1 },
     });
     expect(parseMessage(JSON.stringify({ __mc: 1, k: "v", v: [1] }))).toBeNull();
+    expect(parseMessage(JSON.stringify({ __mc: 1, k: "h", v: 320 }))).toEqual({ k: "h", v: 320 });
+    expect(parseMessage(JSON.stringify({ __mc: 1, k: "h", v: "tall" }))).toBeNull();
     expect(parseMessage(JSON.stringify({ k: "u" }))).toBeNull();
     expect(parseMessage(JSON.stringify({ __mc: 1, k: "f", f: { note: "x" } }))).toBeNull();
     expect(parseMessage("not json")).toBeNull();

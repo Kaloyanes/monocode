@@ -69,9 +69,9 @@ from the page itself:
   `draft_keep`. The bridge then puts its card into the running turn once that
   call's page has answered, so a failed call adds no card, and a failed first
   call closes the new draft and deletes its file. Later versions of a shown
-  draft appear in its card as they come. Drafts never shown get their cards
-  when the turn ends (`Server::unpublished`, added by the runtime after the
-  provider exits). Each agent request holds a lease on the page, so it opens
+  draft appear in its card as they come. A draft the agent never shows
+  stays out of the thread (it was added when the turn ended before 2026-11-03);
+  its card stays held in the bridge, so a later turn can still publish it. Each agent request, `draft_wait` included, holds a lease on the page, so it opens
   and runs whether or not the card is on screen: WebKit parks the view clear
   and out of the pointer's way in the window, Chromium runs its tab off
   screen. If Chromium gives up while the agent waits (it is tried three
@@ -155,37 +155,69 @@ record. Anything else the page kept (scroll, focus, typed text outside
 
 ## On the phone
 
-A draft belongs to its thread, not to one screen. A paired phone shows each
-draft, and each picture kept from one, as a card in the conversation. Tapping it
-opens the page in a full-screen sheet:
+A draft runs inside the thread on a paired phone too, at its place in the
+conversation, with no screen of its own. Each one is a card: its title, the
+page at the phone's width, and the desktop's controls (comment, close, send
+notes, hand back). On iOS the card is a native view the transcript owns
+(`TranscriptDraft.swift`), because rows are recycled and a page has to outlive
+them; on Android it is a React view (`DraftCard.tsx`). Both are driven by
+`DraftController.ts`, and the rules for what crosses between the screens are in
+`sync.ts`.
 
-- The phone draws its own copy of an HTML draft in a web view, with the same
-  sandbox and content security policy, laid out at the phone's width and
-  themed like the phone. A kept draft opens live for both screens, as
-  **Open draft** does on the desktop.
-- What the two copies share is one record per draft, held by the desktop
-  (`SharedDraft` in `monocode-core`): the page's `mc.state`, the notes and
-  their pins, who has control, and whether the agent is waiting. Move a
-  control on the phone and the card follows; pin a note on either screen and
-  it shows on both, with one **Send N notes** for all of them. **Hand back**
-  works from either screen.
-- Scroll, focus and anything a page keeps outside `mc.state` stay on the screen
-  where they changed. The agent's clicks and typing act on the desktop's copy.
-- The phone reads the record with `draft.read`, which waits up to 15 seconds
-  for it to change, and changes it with `draft.action` (`pin`, `send`,
-  `input`, `state`, `message`, `handBack`). Its page reports reach the desktop
-  only right after the person's own touch, and notes only in comment mode, so
-  a page's script cannot speak for the person.
-- A localhost `url` draft cannot load on the phone. The phone shows pictures
-  of the desktop's copy instead, about once a second, from `draft.frame`; it
-  cannot be touched there.
-- A pin carries the element it was placed on (its child indexes from `<body>`
-  and the point inside its box), so it lands on the same element at the other
-  screen's width and moves with it when the page lays out again. The agent's
-  notes carry only the percentages.
-- The agent still sees the desktop's copy. Its requests lease that page, so
-  the conversation need not be open there, but the desktop app must be
-  running.
+- **Reading never opens.** A card reads with `peek`, so scrolling past a closed
+  draft leaves it closed and retires nothing on the desktop. A paused card offers
+  "Paused · tap to run"; only that press opens the page. A draft the person
+  closed says so in one line, with **Open again**.
+- **On screen means running.** A card off screen stops following the record and
+  pauses its page. iOS keeps at most three pages per thread and gives up the one
+  used longest ago; the card asks the desktop for it when it comes back.
+- **Height.** The page reports its height (`h`) and the card follows it, up to
+  12,000 points. The row is measured again alone, so nothing else in the thread
+  is laid out for it. Until the page speaks, the card uses the height the
+  desktop measured at phone width.
+- **Touch.** A vertical drag scrolls the thread; a sideways drag on the page
+  belongs to the page. What the page reports counts only within two seconds of a
+  real touch, and a touch that became a scroll does not count: the input it
+  reported is dropped, so scrolling past a card does not take control of it.
+  While a finger is on a page, the screen's own pans sit out the touch (iOS 26's
+  swipe back from anywhere, the drawer on a Mono's chat). The edge swipe stays.
+- **Touch events.** WebKit on iOS sends touches only where the outer document
+  listens, and the sandboxed page's listeners do not count, so the phone bridge
+  adds passive ones. Without them a tap arrives as a bare click, with no
+  `pointerdown`, and `mc.send` refuses it.
+- **State.** The desktop page's first report starts the record. If that page has
+  not run, the person's first change on the phone starts it instead.
+- **Dev servers** show pictures from `draft.frame`, once a second, with no page.
+- **Kept pictures** are shown in the card from `draft.poster`, on the card of the
+  draft they were kept from. **Open draft** brings the page back.
+- **Full view.** iOS moves the same page into a full screen view and back, so
+  nothing the page keeps to itself is lost. Android has no full view.
+- **Waiting.** When the agent waits on a draft that is off screen, a pill above
+  the composer goes to it, and the sessions list says so. The catalog carries
+  `waitingDraft` for this. A card less than 120 points past the edge still
+  counts as on screen, because its row is kept that far out. The wait holds a
+  lease, so the person can answer here while the desktop shows no card.
+- **Mono chats.** A Mono's chat is not among the sessions, so `draft.*` calls
+  name it by Mono and the desktop finds the drafts in its conversation. Notes
+  sent there go to that chat.
+- **Charts** (`visual_show`) are live on iOS through the shared QuickJS core.
+  Android, which has no native link, draws the tree the desktop rendered, static.
+
+A phone from before this reads the same rows as the plain line "Pricing · Open on
+desktop to view"; the card rides on that notice as `draft`.
+
+To check on a real phone paired to a desktop built from this source:
+
+- Scroll past a closed draft and confirm it stays closed on the desktop.
+- Move a control on the phone and see it move on the desktop, then the reverse.
+- Press a button in the page that calls `mc.send`, and see the turn start.
+- Leave a note on the phone, press **Send**, and see it reach the agent.
+- With the agent in `draft_wait`, scroll away and follow the pill back.
+- With the desktop on another conversation, answer a `draft_wait` on the phone:
+  the agent gets the answer, not an error.
+- Keep a picture of a draft, and open the page again from its card.
+- Drag a slider in a Mono's chat: the drawer must stay shut.
+- On Android, repeat these with a card in a long thread.
 
 ## Verifying
 

@@ -24,7 +24,13 @@ impl Shell {
             while let Ok((session, id)) = reopens.recv().await {
                 if this
                     .update_in(cx, |this, window, cx| {
-                        this.reopen_draft(session, &id, window, cx);
+                        // A card the person closed stays closed, with its
+                        // button to open it again.
+                        if this.draft_dismissed(session, &id, cx) {
+                            draft::mark_saved(&id, cx);
+                        } else {
+                            this.reopen_draft(session, &id, window, cx);
+                        }
                     })
                     .is_err()
                 {
@@ -60,6 +66,15 @@ impl Shell {
         let _ = request.reply.send(result);
     }
 
+    /// The draft in this conversation the agent is waiting on, if any.
+    pub(super) fn waiting_draft(&self, session: i64, cx: &App) -> Option<String> {
+        self.drafts
+            .get(&session)?
+            .iter()
+            .find(|draft| draft.read(cx).waiting())
+            .map(|draft| draft.read(cx).id().to_owned())
+    }
+
     pub(super) fn draft_named(&self, session: i64, id: &str, cx: &App) -> Option<Entity<Draft>> {
         self.drafts
             .get(&session)?
@@ -78,8 +93,14 @@ impl Shell {
         let draft = match (&request.draft, &request.content) {
             (Some(id), _) => {
                 // A retired page, or one not drawn since a restart, comes
-                // back from its saved file under the same id.
-                match self.reopen_draft(session, id, window, cx) {
+                // back from its saved file under the same id. One the person
+                // closed does not: that is theirs to open again.
+                let reopened = if self.draft_dismissed(session, id, cx) {
+                    None
+                } else {
+                    self.reopen_draft(session, id, window, cx)
+                };
+                match reopened {
                     Some(draft) => draft,
                     None => {
                         return Self::reply_draft(
@@ -108,14 +129,19 @@ impl Shell {
         cx.notify();
         self.keep_running(session, &draft, cx);
         // The page keeps running for the request even when its conversation
-        // is in the background. A wait is on the person, who can only use
-        // the page where they see it.
-        let lease = (!matches!(request.action, DraftAction::Wait { .. }))
-            .then(|| draft.update(cx, |draft, cx| draft.lease(window, cx)));
+        // is in the background. That holds for a wait too: the person may be
+        // answering on their phone, with no card on screen here.
+        let lease = draft.update(cx, |draft, cx| draft.lease(window, cx));
         let weak = draft.downgrade();
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let result = Draft::run(&weak, &request, cx).await;
             drop(lease);
+            // A failed wait hands over no notes, so they go as a message.
+            if result.is_err()
+                && let Some(draft) = weak.upgrade()
+            {
+                let _ = this.update(cx, |this, cx| this.deliver_draft_notes(session, &draft, cx));
+            }
             Self::reply_draft(&request, result);
         })
         .detach();
@@ -153,12 +179,22 @@ impl Shell {
     }
 
     /// Where a draft is saved in its conversation's folder.
-    fn draft_file(&self, session: i64, id: &str) -> Option<std::path::PathBuf> {
+    pub(super) fn draft_file(&self, session: i64, id: &str) -> Option<std::path::PathBuf> {
         crate::runtime::locked(&self.store)
             .ok()?
             .thread_draft_file(session, id)
             .ok()
             .flatten()
+    }
+
+    /// Whether the person closed this draft's card and has not opened it
+    /// since. An open page is never dismissed.
+    fn draft_dismissed(&self, session: i64, id: &str, cx: &App) -> bool {
+        self.draft_named(session, id, cx).is_none()
+            && self
+                .draft_file(session, id)
+                .and_then(|path| draft::Saved::read(&path))
+                .is_some_and(|saved| saved.dismissed())
     }
 
     /// Opens a saved draft again under its own id, for a card whose page is
@@ -176,7 +212,12 @@ impl Shell {
         }
         let path = self.draft_file(session, id)?;
         let saved = draft::Saved::read(&path)?;
+        let was_dismissed = saved.dismissed();
         let draft = cx.new(|cx| Draft::reopen(id.to_owned(), session, saved, path, cx));
+        if was_dismissed {
+            // Open again for good: a restart must not find it closed.
+            draft.read(cx).save_now(cx);
+        }
         self.add_draft(session, &draft, window, cx);
         cx.notify();
         Some(draft)
@@ -195,7 +236,10 @@ impl Shell {
             window,
             move |this, draft, event: &DraftEvent, _, cx| match event {
                 DraftEvent::Closed => {
-                    this.drop_draft(session, &id, true, cx);
+                    // A saved page stays saved: the card offers to open it
+                    // again. One that was never saved is gone for good.
+                    let kept = draft.update(cx, |draft, _| draft.dismiss());
+                    this.drop_draft(session, &id, !kept, cx);
                     cx.notify();
                 }
                 DraftEvent::Send => this.deliver_draft_notes(session, draft, cx),
@@ -241,13 +285,18 @@ impl Shell {
         }
         let title = draft.read(cx).title();
         let text = DraftFeedback::message(&title, &outbox.notes, &outbox.messages, &outbox.actions);
-        if let Some(view) = self.sessions.get(&session).cloned() {
+        // A Mono's chat is not among the sessions, and its agent drafts too.
+        let view = self.sessions.get(&session).cloned().or_else(|| {
+            let monos = self.monos.as_ref()?.read(cx);
+            monos.open_chat(&monos.roster.of_session(session)?.id)
+        });
+        if let Some(view) = view {
             view.update(cx, |view, cx| view.send_draft_feedback(text, cx));
         }
     }
 
-    /// Takes a draft out of its conversation. A closed one is no longer
-    /// saved, so its card stays closed after a restart.
+    /// Takes a draft out of its conversation. With `close` it is no longer
+    /// saved, so its card stays closed with nothing to open again.
     fn drop_draft(&mut self, session: i64, id: &str, close: bool, cx: &mut Context<Self>) {
         let Some(live) = self.drafts.get_mut(&session) else {
             return;
@@ -468,6 +517,62 @@ mod tests {
                 assert!(shell.reopen_draft(open, id, window, cx).is_none());
             })
             .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn a_card_the_person_closed_stays_closed_but_opens_again(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("monocode-draft-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = monocode_core::store::Store::open(&dir.join("monocode.db")).unwrap();
+        let (window, _, _) = crate::shell::tests::window_with(cx, store);
+        let id = "draft-1-c1ose";
+        let (file, open) = window
+            .update(cx, |shell, window, cx| {
+                cx.set_reduce_motion(true);
+                let open = shell.visible_session().unwrap();
+                let page = Some(DraftContent::Html("<p>Mine</p>".into()));
+                let (mut first, _answer) = request(open, None, page, DraftAction::Snapshot);
+                first.id = Some(id.into());
+                shell.handle_draft_request(first, window, cx);
+                (shell.draft_file(open, id).unwrap(), open)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                // The person presses the card's close button.
+                let draft = shell.draft_named(open, id, cx).unwrap();
+                draft.update(cx, |_, cx| cx.emit(DraftEvent::Closed));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(draft::live(id, cx).is_none(), "the page is gone");
+                assert!(file.is_file(), "its saved page is kept");
+                assert!(draft::reopenable(id, cx), "the card offers to open it");
+                assert!(shell.draft_dismissed(open, id, cx));
+            })
+            .unwrap();
+        window
+            .update(cx, |shell, window, cx| {
+                let open = shell.visible_session().unwrap();
+                // The agent cannot revive a page the person put away.
+                let (agent, answer) = request(open, Some(id.into()), None, DraftAction::Snapshot);
+                shell.handle_draft_request(agent, window, cx);
+                assert!(answer.try_recv().unwrap().is_err());
+                assert!(draft::live(id, cx).is_none());
+                // The card's own button does.
+                let reopened = shell.reopen_draft(open, id, window, cx).unwrap();
+                assert_eq!(reopened.read(cx).html(), Some("<p>Mine</p>"));
+                assert!(!shell.draft_dismissed(open, id, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // Opened again for good: the saved page no longer says it is closed.
+        assert!(!draft::Saved::read(&file).unwrap().dismissed());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
