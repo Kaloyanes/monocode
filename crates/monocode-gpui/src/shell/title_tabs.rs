@@ -81,12 +81,24 @@ impl Shell {
 
     /// With the strip hidden, its room stays a drag area that names the
     /// open session, left-aligned like a header.
-    pub(super) fn hidden_strip(&self, width: Pixels, cx: &App) -> AnyElement {
+    pub(super) fn hidden_strip(&self, width: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let title = self
             .active_title_tab(cx)
             .and_then(|tab| tab.session())
             .filter(|id| self.session_summaries.contains_key(id))
             .map(|id| self.tab_copy(id, cx).headline);
+        let origin = self
+            .active_title_tab(cx)
+            .and_then(|tab| tab.session())
+            .and_then(|tab| {
+                self.origin_tile_in(
+                    "header-origin",
+                    self.workspace
+                        .session_for_pane(self.workspace.tab_focus(tab)),
+                    16.,
+                    cx,
+                )
+            });
         titlebar_drag_area()
             .id("hidden-tab-strip")
             .debug_selector(|| "hidden-tab-strip".into())
@@ -96,6 +108,8 @@ impl Shell {
             .flex()
             .items_center()
             .px_3()
+            .gap(px(6.))
+            .children(origin)
             .children(title.map(|title| {
                 // The sidebar rows' title animation: the new glyphs reveal
                 // while the old ones drift away.
@@ -106,11 +120,13 @@ impl Shell {
                     .h(px(20.))
                     .text_size(px(13.))
                     .text_color(content(0.6))
-                    .child(crate::particle_text::particle_text(title.to_string()))
+                    .child(crate::particle_text::particle_text(title.to_string(), None))
             }))
             .into_any_element()
     }
 
+    /// Every tab this scope shows, pinned ones first in pin order, then the
+    /// strip's own. Shortcuts and cycling walk this order.
     pub(super) fn visible_tabs(&self, cx: &App) -> Vec<TitleTab> {
         let mut tabs = self.scoped_tabs(cx);
         let pinned = &self.workspace.pinned_tabs;
@@ -370,7 +386,17 @@ impl Shell {
             }
             ordered
         };
-        let next = if replace {
+        // Pins never close on their own, so the strip keeps one tab beside
+        // them: closing its last falls back to a blank session, not a pin.
+        let strip_left = before
+            .iter()
+            .any(|tab| !closing.contains(tab) && !self.workspace.pinned_tabs.contains(tab));
+        let pins_left = before
+            .iter()
+            .any(|tab| !closing.contains(tab) && self.workspace.pinned_tabs.contains(tab));
+        let next = if replace && pins_left && !strip_left {
+            None
+        } else if replace {
             preferred
                 .filter(|tab| before.contains(tab) && !closing.contains(tab))
                 .or_else(|| {

@@ -605,14 +605,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[gpui::test]
     fn a_wait_keeps_the_page_running_with_no_card_on_the_mac(cx: &mut gpui::TestAppContext) {
-        crate::chromium::INSTALLED_IN_TEST.set(true);
         let (window, _, _) = crate::shell::tests::window(cx);
-        cx.update(|cx| {
-            cx.set_global(crate::settings::Preferences {
-                page_engine: "chromium".into(),
-                ..Default::default()
-            })
-        });
         window
             .update(cx, |shell, window, cx| {
                 let open = shell.visible_session().expect("a conversation is open");
@@ -634,10 +627,9 @@ mod tests {
                     cx,
                 );
                 let draft = shell.draft_named(open, "draft-1-away", cx).unwrap();
-                assert!(draft.read(cx).leased_without_page_for_test());
+                assert!(draft.read(cx).leased_for_test());
             })
             .unwrap();
-        crate::chromium::INSTALLED_IN_TEST.set(false);
     }
 
     #[gpui::test]

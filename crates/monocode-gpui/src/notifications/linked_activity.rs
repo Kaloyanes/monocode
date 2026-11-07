@@ -19,6 +19,7 @@ pub(crate) enum Cleanup {
     Archive,
     Delete,
 }
+#[derive(Clone)]
 pub(crate) struct LinkedActivity {
     card: Option<Card>,
     cleanup: Option<Cleanup>,
@@ -125,6 +126,7 @@ impl Render for LinkedActivity {
             .child(
                 div()
                     .id("dismiss-linked-activity")
+                    .debug_selector(|| "dismiss-linked-activity".into())
                     .role(Role::Button)
                     .aria_label(format!("Dismiss updates for {kind} {number}"))
                     .tip(format!("Dismiss updates for {kind} {number}"))
@@ -166,12 +168,18 @@ impl Render for LinkedActivity {
                                 .child(card.title.clone()),
                         ),
                 )
-                .child(
-                    div()
-                        .mt(px(6.))
-                        .text_size(px(11.))
-                        .text_color(content(0.55))
-                        .child(card.summary()),
+                // With nothing new, the cleanup row below already says what changed.
+                .when(
+                    !card.entries.is_empty() || card.terminal_label().is_none(),
+                    |d| {
+                        d.child(
+                            div()
+                                .mt(px(6.))
+                                .text_size(px(11.))
+                                .text_color(content(0.55))
+                                .child(card.summary()),
+                        )
+                    },
                 ),
         );
         for (ix, entry) in card.entries.iter().take(3).enumerate() {
@@ -254,7 +262,7 @@ impl Render for LinkedActivity {
                         div()
                             .text_size(px(11.))
                             .text_color(content(0.75))
-                            .child(format!("{terminal}   Clean up this session")),
+                            .child(format!("{terminal} · Clean up this thread")),
                     )
                     .child(
                         div()
@@ -283,7 +291,7 @@ impl Render for LinkedActivity {
                                     .child(if self.cleanup == Some(Cleanup::Archive) {
                                         "Archiving…"
                                     } else {
-                                        "Archive session"
+                                        "Archive thread"
                                     }),
                             )
                             .child(
@@ -375,6 +383,7 @@ impl Render for LinkedActivity {
         );
         super::surface::glass_frame()
             .id("linked-work-item-update-notice")
+            .debug_selector(|| "linked-activity".into())
             .role(Role::Status)
             .aria_label(format!("New activity on {kind} {number}"))
             .w(px(320.))

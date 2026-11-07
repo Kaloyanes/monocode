@@ -49,6 +49,8 @@ pub(crate) struct SearchView {
     logos: HashMap<String, String>,
     classic: bool,
     original_header: Option<f32>,
+    /// Floating command panel; otherwise the original full page.
+    panel: bool,
     files: Arc<search::FilenameIndex>,
     filename_hits: Vec<Hit>,
     filename_task: Option<Task<()>>,
@@ -132,6 +134,7 @@ impl SearchView {
             logos: sources.logos,
             classic: sources.classic,
             original_header: None,
+            panel: sources.panel,
             files: Arc::default(),
             filename_hits: vec![],
             filename_task: None,
@@ -616,7 +619,7 @@ impl SearchView {
         hits.extend(
             self.recent
                 .iter()
-                .filter_map(|path| self.files.iter().find(|f| &f.path == path))
+                .filter_map(|path| self.files.get(path))
                 .take(files)
                 .map(|f| Hit {
                     id: format!("file:{}", f.path),

@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod host;
 pub mod inbox;
 pub mod notify;
+mod presence;
 mod router;
 pub mod watch;
 
@@ -15,3 +16,4 @@ pub use host::{
 };
 pub use monocode_mobile_link::Address;
 pub use notify::{LiveTarget, PushTarget};
+pub use presence::Attendance;

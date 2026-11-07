@@ -5,12 +5,7 @@ use monocode_core::session_filters::{Status, TimeFilter};
 impl Shell {
     pub(super) fn filter_menu_items(&self, cx: &App) -> Vec<MenuItem> {
         let filters = &self.workspace.session_filters;
-        let mut items = vec![
-            MenuAction::new("archived", "Archived")
-                .checked(self.workspace.preferences.show_archived)
-                .into(),
-            MenuItem::Header("Status".into()),
-        ];
+        let mut items = vec![MenuItem::Header("Status".into())];
         for (id, label, checked) in [
             ("working", "Working", filters.status.working),
             ("approval", "Needs approval", filters.status.needs_approval),
@@ -57,7 +52,7 @@ impl Shell {
             }
         }
         items.extend(self.origin_filter_items(cx));
-        if filters.active(self.workspace.preferences.show_archived) {
+        if filters.active(false) {
             items.push(MenuItem::Separator);
             items.push(MenuAction::new("clear", "Clear filters").keep_open().into());
         }
@@ -67,16 +62,10 @@ impl Shell {
     pub(super) fn change_session_filter(&mut self, action: &str, cx: &mut Context<Self>) {
         let filters = &mut self.workspace.session_filters;
         match action {
-            "archived" => {
-                self.workspace.preferences.show_archived = !self.workspace.preferences.show_archived
-            }
             "working" => filters.status.working = !filters.status.working,
             "approval" => filters.status.needs_approval = !filters.status.needs_approval,
             "done" => filters.status.done = !filters.status.done,
-            "clear" => {
-                *filters = Default::default();
-                self.workspace.preferences.show_archived = false;
-            }
+            "clear" => *filters = Default::default(),
             _ => {
                 if let Some(provider) = action.strip_prefix("provider:") {
                     filters.toggle_provider(provider);
@@ -115,7 +104,7 @@ impl Shell {
                 done: self.unseen_finished.contains(&id),
             },
             start,
-            self.workspace.preferences.show_archived,
+            true,
         ) && self.origin_visible(id, cx)
     }
 }

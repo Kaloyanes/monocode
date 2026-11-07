@@ -1474,6 +1474,8 @@ impl ReviewPane {
                 cx.emit(ReviewEvent::Comment(text.clone()));
                 return;
             }
+            // Only the Inbox's pull request diff offers it.
+            DiffEvent::Ask(_) | DiffEvent::Review { .. } => return,
             DiffEvent::StageFile(id) | DiffEvent::DiscardFile(id) => {
                 let Some(relative) = id.strip_prefix("unstaged:").map(str::to_owned) else {
                     return;

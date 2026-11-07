@@ -12,6 +12,7 @@ import {
   sent,
   settle,
   startWrite,
+  marksChanged,
   syncFor,
   typed,
   unsent,
@@ -74,6 +75,7 @@ function link(conversationId: string): Link {
     ).then(
       (reply) => {
         apply(written(sync, next, reply, Date.now()));
+        marksChanged();
         later(WRITE_DELAY_MS);
       },
       () => {
@@ -129,6 +131,7 @@ function link(conversationId: string): Link {
     },
     typed(text) {
       typed(sync, text, Date.now());
+      marksChanged();
       clearWrite();
       writeTimer = setTimeout(write, WRITE_DELAY_MS);
       // A desktop copy that waited is taken once typing stops.
@@ -141,7 +144,9 @@ function link(conversationId: string): Link {
     flush: write,
     sent() {
       clearWrite();
-      return sent(sync);
+      const base = sent(sync);
+      marksChanged();
+      return base;
     },
   };
 }

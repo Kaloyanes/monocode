@@ -71,6 +71,9 @@ mod tests {
         assert!(source.contains("Use thread_start instead of your built-in subagent"));
         assert!(source.contains("\"name\":\"new_thread\""));
         assert!(source.contains("\"threads.new\""));
+        // thread_wait's list needs a real array, not a string.
+        assert!(source.contains("threadIds"));
+        assert!(source.contains("Type.Array(schema(value.items)"));
         assert!(!source.contains("private-test-token"));
         request
             .settings
@@ -92,9 +95,12 @@ mod tests {
             r#"#!/usr/bin/env python3
 import json,os,sys
 only=os.environ['MONOCODE_TEST_SUBAGENTS_ONLY']=='1'
-assert (['--disallowedTools','Agent'] in [sys.argv[i:i+2] for i in range(len(sys.argv))])==only, sys.argv
+assert any('Agent' in sys.argv[i+1].split(',') for i in range(len(sys.argv)-1) if sys.argv[i]=='--disallowedTools')==only, sys.argv
+blocked=[x for i,v in enumerate(sys.argv) if v=='--disallowedTools' for x in sys.argv[i+1].split(',')]
+assert 'mcp__claude-artifacts' in blocked, sys.argv
 prompt=sys.argv[sys.argv.index('--append-system-prompt')+1]
 assert 'thread_start' in prompt and 'built-in subagent' in prompt, prompt
+assert os.environ.get('MONOCODE_VISUAL_PROMPTED')=='1', 'the server would repeat the prompt'
 def send(value):
     print(json.dumps(value),flush=True)
 for line in sys.stdin:
@@ -113,6 +119,7 @@ for line in sys.stdin:
 import json,os,sys
 only=os.environ['MONOCODE_TEST_SUBAGENTS_ONLY']=='1'
 assert ('features.multi_agent=false' in sys.argv)==only, sys.argv
+assert 'MONOCODE_VISUAL_PROMPTED' not in os.environ
 def send(value):
     print(json.dumps(value),flush=True)
 for line in sys.stdin:
@@ -137,7 +144,7 @@ for line in sys.stdin:
             ("MONOCODE_VISUAL_ENDPOINT", "127.0.0.1:1"),
             ("MONOCODE_VISUAL_TOKEN", "fixture"),
             ("MONOCODE_VISUAL_SESSION", "7"),
-            ("MONOCODE_VISUAL_EXECUTABLE", "/fixture/app"),
+            ("MONOCODE_VISUAL_EXECUTABLE", "/bin/sh"),
         ] {
             settings.environment.insert(key.into(), value.into());
         }
@@ -209,7 +216,7 @@ for line in sys.stdin:
             ("MONOCODE_VISUAL_ENDPOINT", "127.0.0.1:1"),
             ("MONOCODE_VISUAL_TOKEN", "fixture"),
             ("MONOCODE_VISUAL_SESSION", "7"),
-            ("MONOCODE_VISUAL_EXECUTABLE", "/fixture/app"),
+            ("MONOCODE_VISUAL_EXECUTABLE", "/bin/sh"),
         ] {
             settings.environment.insert(key.into(), value.into());
         }

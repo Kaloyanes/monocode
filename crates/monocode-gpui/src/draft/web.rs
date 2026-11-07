@@ -1,5 +1,5 @@
-//! The AppKit side of the Draft panel: a `WKWebView` placed over the window's
-//! content view where the panel's canvas is, and the calls that read it.
+//! The AppKit side of a draft: a `WKWebView` placed over the window's content
+//! view where the card's canvas is, and the calls that read it.
 use gpui::{Context, Window, canvas, prelude::*};
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
@@ -10,10 +10,12 @@ use objc2_app_kit::{
     NSApplication, NSBitmapFormat, NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventMask,
     NSEventType, NSImage, NSView, NSWindowOrderingMode,
 };
+use objc2_core_graphics::CGMutablePath;
 use objc2_foundation::{
-    NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
-    NSURL, NSURLRequest,
+    NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString, NSURL, NSURLRequest,
 };
+use objc2_quartz_core::{CALayer, CAShapeLayer, CATransaction, kCAFillRuleEvenOdd};
 use objc2_web_kit::{
     WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationType,
     WKScriptMessage, WKScriptMessageHandler, WKSnapshotConfiguration, WKUserContentController,
@@ -21,6 +23,9 @@ use objc2_web_kit::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+
+/// A draft's page, for the tasks that read and drive it.
+pub(super) type Page = Retained<WKWebView>;
 
 /// When AppKit last delivered the person's own click or key press to a
 /// draft's page. The page reports input too, but anything it runs can forge
@@ -33,6 +38,55 @@ pub(super) struct Clip {
     input: Input,
     /// Kept running out of sight for the agent; see `Lease`.
     parked: std::cell::Cell<bool>,
+    /// Where GPUI's controls float over the page, in this view's coordinates.
+    holes: RefCell<Vec<Hole>>,
+}
+
+/// A rounded rectangle cut out of the page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hole {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    radius: f64,
+}
+
+impl Hole {
+    /// In a window's points, offset to the clip view at `origin`. The radius
+    /// never exceeds half a side, which Core Graphics would abort on.
+    fn new(bounds: gpui::Bounds<gpui::Pixels>, radius: gpui::Pixels, origin: (f64, f64)) -> Self {
+        let (width, height) = (f64::from(bounds.size.width), f64::from(bounds.size.height));
+        Self {
+            x: f64::from(bounds.left()) - origin.0,
+            y: f64::from(bounds.top()) - origin.1,
+            width,
+            height,
+            radius: f64::from(radius).min(width / 2.).min(height / 2.),
+        }
+    }
+
+    fn contains(&self, x: f64, y: f64) -> bool {
+        let (left, top) = (x - self.x, y - self.y);
+        if left < 0. || top < 0. || left > self.width || top > self.height {
+            return false;
+        }
+        // Past a corner's center, the point has to be within its arc.
+        let dx = (self.radius - left)
+            .max(left - self.width + self.radius)
+            .max(0.);
+        let dy = (self.radius - top)
+            .max(top - self.height + self.radius)
+            .max(0.);
+        dx * dx + dy * dy <= self.radius * self.radius
+    }
+
+    fn rect(&self) -> NSRect {
+        NSRect::new(
+            NSPoint::new(self.x, self.y),
+            NSSize::new(self.width, self.height),
+        )
+    }
 }
 
 define_class!(
@@ -58,6 +112,7 @@ define_class!(
                 .map(|event| event.r#type());
             let hit: Option<Retained<NSView>> = if self.ivars().parked.get()
                 || kind == Some(NSEventType::ScrollWheel) && !self.ivars().scrolls.get()
+                || self.in_hole(point)
             {
                 None
             } else {
@@ -79,6 +134,20 @@ define_class!(
         }
     }
 );
+
+impl DraftClip {
+    /// Whether `point`, in the superview's coordinates, is on a control GPUI
+    /// floats over the page: the press belongs to the control.
+    fn in_hole(&self, point: NSPoint) -> bool {
+        let holes = self.ivars().holes.borrow();
+        if holes.is_empty() {
+            return false;
+        }
+        let parent = unsafe { self.superview() };
+        let here = self.convertPoint_fromView(point, parent.as_deref());
+        holes.iter().any(|hole| hole.contains(here.x, here.y))
+    }
+}
 
 /// Credits a key press to the draft whose page has the keyboard. Installed
 /// once; it only reads events and passes every one on.
@@ -158,7 +227,14 @@ define_class!(
     }
 );
 
-/// What a draft's web view may navigate to.
+/// What a draft's web view may navigate to, and how it reports that its page
+/// process died.
+pub(super) struct Guard {
+    policy: Policy,
+    died: Rc<std::cell::Cell<bool>>,
+    wake: async_channel::Sender<()>,
+}
+
 pub(super) enum Policy {
     /// The agent's own page: nothing loads but the page itself.
     Page(gpui::AsyncApp),
@@ -170,7 +246,7 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[name = "MonocodeDraftNavigation"]
     #[thread_kind = MainThreadOnly]
-    #[ivars = Policy]
+    #[ivars = Guard]
     struct Navigation;
     unsafe impl NSObjectProtocol for Navigation {}
     unsafe impl WKNavigationDelegate for Navigation {
@@ -184,27 +260,34 @@ define_class!(
             let url = unsafe { action.request().URL() }
                 .and_then(|url| url.absoluteString())
                 .map(|url| url.to_string());
-            let (Policy::Page(app) | Policy::Local(app)) = self.ivars();
+            let policy = &self.ivars().policy;
+            let (Policy::Page(app) | Policy::Local(app)) = policy;
             let web = url
                 .as_deref()
                 .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"));
             let local = url.as_deref().is_some_and(is_local);
             let link = unsafe { action.navigationType() } == WKNavigationType::LinkActivated;
             // Links to anywhere but the draft itself open in the user's browser.
-            if link && web && !(matches!(self.ivars(), Policy::Local(_)) && local) {
+            if link && web && !(matches!(policy, Policy::Local(_)) && local) {
                 let url = url.clone().unwrap_or_default();
                 app.clone().update(|cx| cx.open_url(&url));
             }
             let allowed = match url.as_deref() {
                 None => true,
                 Some(url) if url.starts_with("about:") => true,
-                Some(_) => matches!(self.ivars(), Policy::Local(_)) && local,
+                Some(_) => matches!(policy, Policy::Local(_)) && local,
             };
             reply.call((if allowed {
                 WKNavigationActionPolicy::Allow
             } else {
                 WKNavigationActionPolicy::Cancel
             },));
+        }
+
+        #[unsafe(method(webViewWebContentProcessDidTerminate:))]
+        fn terminated(&self, _: &WKWebView) {
+            self.ivars().died.set(true);
+            let _ = self.ivars().wake.try_send(());
         }
     }
 );
@@ -228,8 +311,67 @@ struct Hosted {
     loaded: Option<(u64, Load)>,
     /// Clip frame, web frame and zoom as last applied.
     placed: [f64; 9],
+    /// The clip view's top left, in the window's points from its top left.
+    origin: (f64, f64),
+    /// The clip view's size when its holes were last cut.
+    cut: (f64, f64),
     /// The page's opacity as last applied: 0 until it is ready to be seen.
     alpha: f64,
+    /// Whether the page had drawn anything when it was last hidden.
+    drew: bool,
+    /// When a page that had drawn came back into view, until it has drawn again.
+    returned: Option<std::time::Instant>,
+    /// Its page process is gone: WebKit leaves the view empty for good.
+    died: Rc<std::cell::Cell<bool>>,
+    wake: async_channel::Sender<()>,
+}
+
+/// Whether a page in view has anything on screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Blank {
+    /// It has, or it is out of sight and nothing is expected of it.
+    No,
+    /// It came back with nothing drawn and may yet draw.
+    Waiting,
+    /// It will not draw: open the page again.
+    Gone,
+}
+
+/// How long a page that came back empty gets to draw on its own.
+const BLANK_LIMIT: Duration = Duration::from_secs(3);
+/// How long a page that came back keeps being checked: WebKit may let go of
+/// its layers just after it is shown.
+const RETURN_WATCH: Duration = Duration::from_millis(1500);
+
+impl Blank {
+    /// What a page that came back `away` ago amounts to, drawn or not.
+    fn of(painted: bool, away: Duration) -> Option<Self> {
+        match (painted, away >= RETURN_WATCH, away >= BLANK_LIMIT) {
+            (true, true, _) => None,
+            (true, false, _) => Some(Self::No),
+            (false, _, false) => Some(Self::Waiting),
+            (false, _, true) => Some(Self::Gone),
+        }
+    }
+}
+
+/// Whether any layer under `layer` holds drawn content. WebKit keeps a page's
+/// tiles in the view's own layer tree, and after a long time hidden it empties
+/// that tree until the page process commits a new one. The page is clear over
+/// the thread, so until then nothing at all shows where it is.
+fn holds_content(layer: &CALayer) -> bool {
+    let contents: Option<Retained<objc2::runtime::AnyObject>> =
+        unsafe { msg_send![layer, contents] };
+    if contents.is_some() {
+        return true;
+    }
+    let sublayers: Option<Retained<NSArray<CALayer>>> = unsafe { msg_send![layer, sublayers] };
+    sublayers.is_some_and(|layers| layers.iter().any(|layer| holds_content(&layer)))
+}
+
+fn painted(web: &WKWebView) -> bool {
+    let layer: Option<Retained<CALayer>> = unsafe { msg_send![web, layer] };
+    layer.is_some_and(|layer| holds_content(&layer))
 }
 
 /// While a popover covers the panel, a still of the page is painted in its
@@ -268,7 +410,7 @@ struct Tracked {
 }
 type Leases = Rc<std::cell::Cell<u32>>;
 /// The window whose latest frame holds the draft's card, drawn anew or
-/// replayed from cache; set by `engine::surface`.
+/// replayed from cache; set by `presence::Presence`.
 type Shown = Rc<std::cell::Cell<Option<gpui::WindowId>>>;
 
 /// What a frame that replays the card from cache needs to keep the page
@@ -323,7 +465,8 @@ pub(crate) fn mark_painted(painted: &Painted, window: &Window) {
 /// not painted this time steps aside. That covers a row scrolled far away or
 /// dropped from the list, a conversation in the background, and a surface
 /// such as Settings drawn in the thread's place. Anything that floats over a
-/// thread has to be `deferred`, so the page can see it is covered.
+/// thread has to be `deferred`, so the page can see it is covered, or hold a
+/// `float`, so the page leaves a hole for it.
 pub(crate) fn sentinel() -> gpui::AnyElement {
     canvas(
         |_, _, _| EPOCH.with(|epoch| epoch.set(epoch.get() + 1)),
@@ -403,6 +546,8 @@ pub(super) struct Host {
     wakes: Wakes,
     leases: Leases,
     shown: Shown,
+    /// The frame that holds the card; see `presence::Presence`.
+    pub(super) claim: Rc<std::cell::Cell<Option<super::presence::Claim>>>,
     replay: Rc<RefCell<Option<Replay>>>,
 }
 
@@ -520,14 +665,6 @@ impl Host {
             let _ = send.try_send(());
         }
     }
-    /// The wake channel, for the Chromium engine to share.
-    pub(super) fn wake_sender(&self) -> async_channel::Sender<()> {
-        self.wakes.send.clone()
-    }
-    /// The record of the person's input, for the Chromium engine to share.
-    pub(super) fn input_cell(&self) -> Input {
-        self.input.clone()
-    }
     /// When the person last clicked or typed in the page, as AppKit saw it.
     pub(super) fn input(&self) -> Option<std::time::Instant> {
         self.input.get()
@@ -555,11 +692,43 @@ impl Host {
             ]
         })
     }
-    /// Whether the latest paint of `window` drew the draft. The sentinel hides
-    /// the page when it did not.
+    /// Each hole as x, y, width and height in the clip view, its radius, and
+    /// whether a press at its center still reaches the page.
+    #[cfg(debug_assertions)]
+    pub(super) fn holes(&self) -> Vec<[f64; 6]> {
+        let view = self.view.borrow();
+        let Some(view) = view.as_ref() else {
+            return Vec::new();
+        };
+        let holes = view.clip.ivars().holes.borrow().clone();
+        let parent = unsafe { view.clip.superview() };
+        holes
+            .iter()
+            .map(|hole| {
+                let center = NSPoint::new(hole.x + hole.width / 2., hole.y + hole.height / 2.);
+                let outside = view.clip.convertPoint_toView(center, parent.as_deref());
+                let hit: Option<Retained<NSView>> =
+                    unsafe { msg_send![&*view.clip, hitTest: outside] };
+                [
+                    hole.x,
+                    hole.y,
+                    hole.width,
+                    hole.height,
+                    hole.radius,
+                    f64::from(u8::from(hit.is_some())),
+                ]
+            })
+            .collect()
+    }
+    /// Whether the latest frame of `window` holds the card.
     #[cfg(test)]
     pub(super) fn painted_in(&self, window: gpui::WindowId) -> bool {
-        self.painted.get() == (window, EPOCH.with(std::cell::Cell::get))
+        self.claim.get().is_some_and(|claim| claim.window == window)
+    }
+    /// Whether an agent's lease is keeping the page running.
+    #[cfg(test)]
+    pub(super) fn leased(&self) -> bool {
+        self.leases.get() > 0
     }
     /// The width the thread gave the draft when it was last painted.
     pub(super) fn column(&self) -> Option<f32> {
@@ -575,6 +744,38 @@ impl Host {
     pub(super) fn hide(&self) {
         if let Some(view) = self.view.borrow_mut().as_mut() {
             view.step_aside(false);
+        }
+    }
+    /// The page's process and whether it has anything drawn, for the self-test.
+    #[cfg(debug_assertions)]
+    pub(super) fn page_process(&self) -> Option<(i32, bool)> {
+        let view = self.view.borrow();
+        let view = view.as_ref()?;
+        let pid: i32 = unsafe { msg_send![&*view.web, _webProcessIdentifier] };
+        Some((pid, painted(&view.web)))
+    }
+    /// Whether the page has anything on screen; see `Blank`.
+    pub(super) fn blank(&self) -> Blank {
+        let mut view = self.view.borrow_mut();
+        let Some(view) = view.as_mut() else {
+            return Blank::No;
+        };
+        if view.died.get() {
+            return Blank::Gone;
+        }
+        let Some(returned) = view.returned else {
+            return Blank::No;
+        };
+        if view.clip.isHidden() {
+            view.returned = None;
+            return Blank::No;
+        }
+        match Blank::of(painted(&view.web), returned.elapsed()) {
+            Some(blank) => blank,
+            None => {
+                view.returned = None;
+                Blank::No
+            }
         }
     }
     /// Says which window's frame holds the card, if any; see `Shown`.
@@ -673,15 +874,49 @@ impl Hosted {
         } else {
             parked.set(false);
             if !self.clip.isHidden() {
+                self.drew = painted(&self.web);
+                self.returned = None;
                 self.clip.setHidden(true);
             }
         }
     }
+    /// Cuts the page away under the controls floating over it. A native view
+    /// draws above all of GPUI, so a hole is the only way for them to show.
+    fn cut_out(&mut self, floats: &[(gpui::Bounds<gpui::Pixels>, gpui::Pixels)], zoom: f32) {
+        let holes: Vec<Hole> = floats
+            .iter()
+            .map(|(bounds, radius)| {
+                Hole::new(bounds.map(|v| v * zoom), *radius * zoom, self.origin)
+            })
+            .collect();
+        let frame = self.clip.frame().size;
+        let size = (frame.width, frame.height);
+        let same = *self.clip.ivars().holes.borrow() == holes;
+        if same && (holes.is_empty() || size == self.cut) {
+            return;
+        }
+        let layer: Option<Retained<CALayer>> = unsafe { msg_send![&*self.clip, layer] };
+        if let Some(layer) = layer {
+            // A shape layer's path otherwise eases to its new value.
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            let mask = mask_for(&holes, frame);
+            unsafe { layer.setMask(mask.as_deref()) };
+            CATransaction::commit();
+        }
+        self.cut = size;
+        *self.clip.ivars().holes.borrow_mut() = holes;
+    }
+
     /// Back in its card.
     fn step_in(&mut self) {
         self.clip.ivars().parked.set(false);
         if self.clip.isHidden() {
             self.clip.setHidden(false);
+            if self.drew {
+                self.returned = Some(std::time::Instant::now());
+                let _ = self.wake.try_send(());
+            }
         }
     }
 }
@@ -797,6 +1032,7 @@ pub(super) fn surface<T: 'static>(
                 return;
             }
             let (x, y) = (f64::from(clipped.origin.x), f64::from(clipped.origin.y));
+            let origin = (x, y);
             let (clip_width, clip_height) = (
                 f64::from(clipped.size.width),
                 f64::from(clipped.size.height),
@@ -875,6 +1111,7 @@ pub(super) fn surface<T: 'static>(
                 unsafe { hosted.web.setPageZoom(f64::from(scale * zoom)) };
                 hosted.placed = placed;
             }
+            hosted.origin = origin;
             let notify: Rc<dyn Fn()> = {
                 let app = placement.app.clone();
                 let this = this.clone();
@@ -926,6 +1163,7 @@ fn keep_clear(
     card: &Replay,
     window: &Window,
 ) -> bool {
+    hosted.cut_out(&window.floats_over(&card.hitbox), window.content_zoom());
     let mut state = cover.borrow_mut();
     let still = state.snapshot.is_some();
     if !covered {
@@ -952,6 +1190,34 @@ fn keep_clear(
     true
 }
 
+/// A mask for a view of `size` with `holes` cut out, or none without any. Each
+/// hole is a layer masking the next: holes that overlap would cancel out in a
+/// single even-odd path, and show the page again where they meet.
+fn mask_for(holes: &[Hole], size: NSSize) -> Option<Retained<CALayer>> {
+    let bounds = NSRect::new(NSPoint::new(0., 0.), size);
+    let mut mask: Option<Retained<CALayer>> = None;
+    for hole in holes.iter().rev() {
+        let path = CGMutablePath::new();
+        unsafe {
+            CGMutablePath::add_rect(Some(&path), std::ptr::null(), bounds);
+            CGMutablePath::add_rounded_rect(
+                Some(&path),
+                std::ptr::null(),
+                hole.rect(),
+                hole.radius,
+                hole.radius,
+            );
+        }
+        let layer = CAShapeLayer::new();
+        layer.setFrame(bounds);
+        layer.setFillRule(unsafe { kCAFillRuleEvenOdd });
+        layer.setPath(Some(&path));
+        unsafe { layer.setMask(mask.as_deref()) };
+        mask = Some(layer.into_super());
+    }
+    mask
+}
+
 /// # Safety
 /// Main thread only.
 unsafe fn create(
@@ -968,6 +1234,7 @@ unsafe fn create(
         scrolls: std::cell::Cell::new(matches!(placement.load, Load::Url(_))),
         input,
         parked: std::cell::Cell::new(false),
+        holes: RefCell::default(),
     });
     let clip: Retained<DraftClip> = unsafe { msg_send![super(clip), initWithFrame: rect] };
     clip.setWantsLayer(true);
@@ -1000,7 +1267,8 @@ unsafe fn create(
             Policy::Local(placement.app.clone())
         }
     };
-    let wake = Wake::alloc(mtm).set_ivars(wakes);
+    let died = Rc::new(std::cell::Cell::new(false));
+    let wake = Wake::alloc(mtm).set_ivars(wakes.clone());
     let wake: Retained<Wake> = unsafe { msg_send![super(wake), init] };
     unsafe {
         config.userContentController().addScriptMessageHandler_name(
@@ -1017,7 +1285,11 @@ unsafe fn create(
             msg_send![&web, setValue: &*NSNumber::new_bool(false), forKey: &*NSString::from_str("drawsBackground")]
         };
     }
-    let guard = Navigation::alloc(mtm).set_ivars(policy);
+    let guard = Navigation::alloc(mtm).set_ivars(Guard {
+        policy,
+        died: died.clone(),
+        wake: wakes.clone(),
+    });
     let guard: Retained<Navigation> = unsafe { msg_send![super(guard), init] };
     unsafe {
         web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*guard)));
@@ -1029,7 +1301,13 @@ unsafe fn create(
         _guard: guard,
         loaded: None,
         placed: [f64::NAN; 9],
+        origin: (0., 0.),
+        cut: (0., 0.),
         alpha: f64::NAN,
+        drew: false,
+        returned: None,
+        died,
+        wake: wakes,
     }
 }
 
@@ -1197,6 +1475,43 @@ mod tests {
         assert_eq!(fit(300, (600., 600.)).scale, 1.);
         // An absurdly small column stays drawable.
         assert!(fit(1600, (1., 1.)).scale > 0.);
+    }
+
+    #[test]
+    fn a_page_that_comes_back_empty_gets_a_moment_then_is_opened_again() {
+        let ms = Duration::from_millis;
+        assert_eq!(Blank::of(false, ms(0)), Some(Blank::Waiting));
+        assert_eq!(Blank::of(false, ms(2_999)), Some(Blank::Waiting));
+        assert_eq!(Blank::of(false, BLANK_LIMIT), Some(Blank::Gone));
+        // Drawn is not yet settled: WebKit can still let its layers go.
+        assert_eq!(Blank::of(true, ms(0)), Some(Blank::No));
+        assert_eq!(Blank::of(true, RETURN_WATCH), None);
+    }
+
+    #[test]
+    fn a_hole_follows_its_rounded_corners() {
+        let bounds = gpui::Bounds::new(
+            gpui::point(gpui::px(110.), gpui::px(220.)),
+            gpui::size(gpui::px(100.), gpui::px(30.)),
+        );
+        let pill = Hole::new(bounds, gpui::px(15.), (100., 200.));
+        assert_eq!((pill.x, pill.y), (10., 20.));
+        assert!(pill.contains(60., 35.), "the middle");
+        assert!(pill.contains(10., 35.), "the end of the pill");
+        assert!(!pill.contains(11., 21.), "a corner the pill rounds off");
+        assert!(!pill.contains(109., 49.), "the far corner");
+        assert!(!pill.contains(60., 19.), "just above it");
+    }
+
+    #[test]
+    fn a_hole_radius_never_exceeds_half_its_shortest_side() {
+        let sliver = gpui::Bounds::new(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(40.), gpui::px(3.)),
+        );
+        // Core Graphics aborts the app on a radius past half a side, and a
+        // content mask can leave a float that thin.
+        assert_eq!(Hole::new(sliver, gpui::px(15.), (0., 0.)).radius, 1.5);
     }
 
     #[test]

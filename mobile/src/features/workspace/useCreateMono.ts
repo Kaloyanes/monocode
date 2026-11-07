@@ -22,7 +22,7 @@ export function useCreateMono(projectId: string) {
       // A Mono with no project is listed in every one; this one starts in its own.
       await command("mono.update", { monoId, addProject: projectId });
       await refresh();
-      router.replace({ pathname: "/mono/[monoId]", params: { monoId } });
+      router.push({ pathname: "/mono/[monoId]", params: { monoId } });
       router.push({ pathname: "/mono-profile/[monoId]/edit", params: { monoId } });
     } catch (reason) {
       Alert.alert("Couldn’t create a Mono", reason instanceof Error ? reason.message : String(reason));

@@ -1,10 +1,18 @@
-import { act, forwardRef, useRef, type ReactNode } from "react";
+import {
+  act,
+  forwardRef,
+  useRef,
+  type ComponentProps,
+  type ReactNode,
+} from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Composer } from "@/features/sessions/Composer";
 
 const runtime = vi.hoisted(() => ({
   os: "android",
+  glass: false,
+  offline: false,
   values: [] as { get: () => unknown; set: (value: unknown) => void }[],
   photos: vi.fn(async () => []),
   files: vi.fn(async () => []),
@@ -54,7 +62,7 @@ vi.mock("react-native", () => {
       accessibilityLabel,
       disabled,
     }: {
-      children?: ReactNode;
+      children?: ReactNode | ((state: { pressed: boolean }) => ReactNode);
       onPress?: () => void;
       accessibilityLabel?: string;
       disabled?: boolean;
@@ -64,7 +72,7 @@ vi.mock("react-native", () => {
         onClick={onPress}
         disabled={disabled}
       >
-        {children}
+        {typeof children === "function" ? children({ pressed: false }) : children}
       </button>
     ),
     TextInput: forwardRef<
@@ -73,6 +81,7 @@ vi.mock("react-native", () => {
         value: string;
         placeholder: string;
         editable: boolean;
+        scrollEnabled?: boolean;
         onChangeText: (text: string) => void;
         onFocus: () => void;
         onBlur: () => void;
@@ -80,6 +89,7 @@ vi.mock("react-native", () => {
     >((props, ref) => (
       <textarea
         ref={ref}
+        data-scrolls={String(props.scrollEnabled ?? true)}
         value={props.value}
         placeholder={props.placeholder}
         disabled={!props.editable}
@@ -96,7 +106,7 @@ vi.mock("@/features/sessions/TypingPostureFocus", () => ({
   }) => <button aria-label="Enter typing posture" disabled={!enabled} onClick={onEnterTypingPosture} />,
 }));
 vi.mock("react-native-reanimated", () => {
-  const transition = { duration: () => ({}) };
+  const transition = { duration: () => ({}), delay: () => transition };
   return {
     default: {
       View: ({
@@ -112,7 +122,7 @@ vi.mock("react-native-reanimated", () => {
         return <div style={Object.assign({}, ...styles)}>{children}</div>;
       },
     },
-    Easing: { out: () => null, cubic: null },
+    Easing: { out: () => null, cubic: null, bezier: () => null },
     FadeIn: transition,
     FadeOut: transition,
     interpolate: (
@@ -127,6 +137,7 @@ vi.mock("react-native-reanimated", () => {
       );
     },
     useAnimatedStyle: (fn: () => object) => fn,
+    useDerivedValue: (fn: () => unknown) => ({ get: fn }),
     useSharedValue: (initial: unknown) => {
       const ref = useRef<{
         get: () => unknown;
@@ -144,9 +155,22 @@ vi.mock("react-native-reanimated", () => {
       }
       return ref.current;
     },
+    withSpring: (value: unknown) => value,
     withTiming: (value: unknown) => value,
   };
 });
+vi.mock("expo-glass-effect", () => ({
+  isLiquidGlassAvailable: () => runtime.glass,
+}));
+vi.mock("@/ui/GlassStretchButton", () => ({
+  GlassStretchButton: ({ label, onPress }: { label: string; onPress: () => void }) => (
+    <button aria-label={label} onClick={onPress} />
+  ),
+}));
+vi.mock("@/ui/GlassBacking", () => ({
+  ActionDisc: () => null,
+  GlassBacking: () => <i data-testid="glass" />,
+}));
 vi.mock("@expo/ui/swift-ui", () => ({
   Button: () => null,
   Divider: () => null,
@@ -168,8 +192,8 @@ vi.mock("react-native-safe-area-context", () => ({
   useSafeAreaInsets: () => ({ bottom: 24 }),
 }));
 vi.mock("@/features/connection/ConnectionNotice", () => ({
-  useOffline: () => false,
-  PulsingDot: () => null,
+  useOffline: () => runtime.offline,
+  PulsingDot: () => <i data-testid="pulsing-dot" />,
 }));
 vi.mock("@/features/files/FileTypeIcon", () => ({ FileTypeIcon: () => null }));
 vi.mock("@/features/sessions/SessionScreen", () => ({
@@ -187,7 +211,7 @@ vi.mock("@/features/sessions/dictation", () => ({
 }));
 vi.mock("@/features/sessions/attachments", () => ({
   MAX_ATTACHMENTS: 10,
-  pickPhotos: runtime.photos,
+  pickMedia: runtime.photos,
   pickFiles: runtime.files,
   merge: vi.fn(),
   isImage: () => false,
@@ -214,7 +238,15 @@ vi.mock("@/features/skills/useSlashCatalog", () => ({
     refresh: () => {},
   }),
 }));
-vi.mock("@/ui/LiquidView", () => ({ LiquidView: () => null }));
+vi.mock("@/ui/LiquidView", () => ({
+  LiquidView: ({
+    onPress,
+    accessibilityLabel,
+  }: {
+    onPress?: () => void;
+    accessibilityLabel?: string;
+  }) => (onPress ? <button aria-label={accessibilityLabel} onClick={onPress} /> : null),
+}));
 vi.mock("@/ui/theme", () => ({
   useColors: () => ({}),
   useScheme: () => "dark",
@@ -226,7 +258,10 @@ let root: ReturnType<typeof createRoot>;
 const model = vi.fn();
 const send = vi.fn();
 const stop = vi.fn(async () => {});
-const render = (active = true) =>
+const render = (
+  active = true,
+  props: Partial<ComponentProps<typeof Composer>> = {},
+) =>
   act(() =>
     root.render(
       <Composer
@@ -238,9 +273,18 @@ const render = (active = true) =>
         onSend={send}
         busy
         onStop={stop}
+        {...props}
       />,
     ),
   );
+const type = (text: string) => {
+  const input = container.querySelector("textarea")!;
+  act(() => {
+    input.value = text;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  return input;
+};
 const button = (label: string) =>
   container.querySelector<HTMLButtonElement>(`[aria-label="${label}"]`)!;
 const modelTouches = () =>
@@ -250,6 +294,8 @@ beforeEach(() => {
     globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
   ).IS_REACT_ACT_ENVIRONMENT = true;
   runtime.os = "android";
+  runtime.glass = false;
+  runtime.offline = false;
   runtime.values = [];
   vi.clearAllMocks();
   container = document.createElement("div");
@@ -289,6 +335,25 @@ it("excludes the hidden model from Android touches, then permits only its contro
   expect(modelTouches()).toBe("none");
 });
 
+it("draws the glass model out with the card, and takes it off screen once it's back", () => {
+  runtime.glass = true;
+  // The model's glass is the last piece, drawn over the chip's.
+  const display = () =>
+    [...container.querySelectorAll<HTMLElement>("[data-testid=glass]")].at(-1)!.parentElement!.style
+      .display;
+  render();
+  expect(display()).toBe("none");
+  const input = container.querySelector("textarea")!;
+  act(() => input.focus());
+  render();
+  expect(display()).toBe("flex");
+  act(() => button("Model: GPT").click());
+  expect(model).toHaveBeenCalledOnce();
+  act(() => input.blur());
+  render();
+  expect(display()).toBe("none");
+});
+
 it("sends the mode picked from the add menu with the next message only", async () => {
   act(() =>
     root.render(
@@ -300,16 +365,16 @@ it("sends the mode picked from the add menu with the next message only", async (
       (item) => item.textContent?.replace("✓  ", "") === label,
     )!;
   act(() => button("Add files or pick a mode").click());
-  act(() => menuItem("Operator").click());
-  expect(button("Operator, on")).not.toBeNull();
+  act(() => menuItem("Plan mode").click());
+  expect(button("Plan mode, on")).not.toBeNull();
   const input = container.querySelector("textarea")!;
   act(() => {
     input.value = "Open the logs";
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await act(async () => button("Send").click());
-  expect(send).toHaveBeenCalledWith("Open the logs", [], "operator", undefined);
-  expect(button("Operator, on")).toBeNull();
+  expect(send).toHaveBeenCalledWith("Open the logs", [], "plan", undefined);
+  expect(button("Plan mode, on")).toBeNull();
 });
 
 it("suggests skills and commands for a slash word and puts the pick in its place", async () => {
@@ -430,4 +495,80 @@ it("focuses the existing draft on typing posture only for the active route", () 
   act(() => button("Enter typing posture").click());
   expect(document.activeElement).not.toBe(input);
   expect(input.value).toBe("Unsent draft");
+});
+
+// A UITextView that can't scroll reports its own frame as its content size.
+// The card grows the field to that plus padding, which grows the report again,
+// until the cap lets it scroll and the height drops: the card bounces forever.
+it("keeps the field scrollable below the height cap, so its height can settle", () => {
+  render();
+  const input = container.querySelector("textarea")!;
+  expect(input.dataset.scrolls).toBe("true");
+  type("a short draft");
+  expect(input.dataset.scrolls).toBe("true");
+});
+
+it("keeps the field open while the desktop is away and holds the message until it is back", async () => {
+  runtime.offline = true;
+  render();
+  const input = container.querySelector("textarea")!;
+  expect(input.disabled).toBe(false);
+  expect(input.placeholder).toBe("Reconnecting to desktop…");
+  expect(container.querySelector('[data-testid="pulsing-dot"]')).toBeNull();
+
+  type("Written on the train");
+  expect(input.value).toBe("Written on the train");
+  expect(button("Send").disabled).toBe(true);
+  expect(container.querySelector('[data-testid="pulsing-dot"]')).not.toBeNull();
+  act(() => button("Send").click());
+  expect(send).not.toHaveBeenCalled();
+  expect(input.value).toBe("Written on the train");
+
+  runtime.offline = false;
+  render();
+  expect(button("Send").disabled).toBe(false);
+  expect(container.querySelector('[data-testid="pulsing-dot"]')).toBeNull();
+  await act(async () => button("Send").click());
+  expect(send).toHaveBeenCalledWith(
+    "Written on the train",
+    [],
+    undefined,
+    undefined,
+  );
+});
+
+it("can't stop a turn while the desktop is away, but dictation still works", () => {
+  runtime.offline = true;
+  render();
+  expect(button("Stop").disabled).toBe(true);
+  act(() => button("Stop").click());
+  expect(stop).not.toHaveBeenCalled();
+
+  render(true, { busy: false });
+  expect(button("Dictate").disabled).toBe(false);
+});
+
+it("leaves a session's error for when the desktop is back, so it can't lock the field", () => {
+  runtime.offline = true;
+  const notice = { text: "Turn failed", dismiss: vi.fn() };
+  render(true, { notice });
+  expect(container.querySelector("textarea")!.disabled).toBe(false);
+  expect(container.textContent).not.toContain("Turn failed");
+
+  runtime.offline = false;
+  render(true, { notice });
+  expect(container.querySelector("textarea")!.disabled).toBe(true);
+  expect(container.textContent).toContain("Turn failed");
+});
+
+it("can't stop a turn behind a session's error", () => {
+  render(true, { notice: { text: "Turn failed", dismiss: vi.fn() } });
+  expect(button("Stop").disabled).toBe(true);
+});
+
+it("keeps the mic round at rest, however wide the composer is", () => {
+  render(true, { busy: false });
+  const { width, minWidth } = button("Dictate").parentElement!.style;
+  expect(width).toBe("0%");
+  expect(minWidth).toBe("36px");
 });

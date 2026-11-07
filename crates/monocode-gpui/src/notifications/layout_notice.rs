@@ -7,6 +7,7 @@ pub(crate) enum LayoutNoticeEvent {
     Try,
     Dismiss,
 }
+#[derive(Clone)]
 pub(crate) struct LayoutNotice {
     inset_enabled: bool,
     dismissed: bool,
@@ -41,7 +42,7 @@ impl Render for LayoutNotice {
             return div().into_any_element();
         }
         super::surface::glass_frame()
-            .id("new-layout-notice").role(Role::Status).aria_label("Try the Focused layout")
+            .id("new-layout-notice").debug_selector(|| "new-layout-notice".into()).role(Role::Status).aria_label("Try the Focused layout")
             .child(div().relative().p(px(12.))
             .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Try the Focused layout"))
             .child(div().mt(px(4.)).text_size(px(12.)).line_height(px(19.5)).text_color(content(0.6))

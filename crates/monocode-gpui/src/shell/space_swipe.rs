@@ -5,7 +5,7 @@
 //! heading for. Switching spaces any other way slides the same strip.
 use super::*;
 use crate::pane_motion::PaneSlide;
-use gpui::{NavigationDirection, ScrollDelta, ScrollWheelEvent, Task, TouchPhase};
+use gpui::{ScrollDelta, ScrollWheelEvent, Task, TouchPhase};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -328,9 +328,6 @@ impl Shell {
         {
             return false;
         }
-        if self.menu.is_some() || self.space_swipe.dragging() {
-            return true;
-        }
         let wrapped = self.wraps(step);
         let Some(path) = adjacent(
             &self.workspace.projects,
@@ -609,30 +606,12 @@ impl Shell {
     }
 
     /// A transparent layer over the sidebar pages that sees wheel events
-    /// before the session list does, and the mouse's side buttons even while
-    /// a neighbour page is sliding past with its overlay on top.
+    /// before the session list does.
     fn space_swipe_layer(&self, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
         canvas(
             |_, _, _| {},
             move |bounds, _, window, _| {
-                let side_buttons = weak.clone();
-                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                    if phase != gpui::DispatchPhase::Capture || !bounds.contains(&event.position) {
-                        return;
-                    }
-                    let step = match event.button {
-                        MouseButton::Navigate(NavigationDirection::Back) => -1,
-                        MouseButton::Navigate(NavigationDirection::Forward) => 1,
-                        _ => return,
-                    };
-                    let took = side_buttons
-                        .update(cx, |this, cx| this.step_space(step, window, cx))
-                        .unwrap_or(false);
-                    if took {
-                        cx.stop_propagation();
-                    }
-                });
                 let weak = weak.clone();
                 window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                     if phase != gpui::DispatchPhase::Capture || !bounds.contains(&event.position) {
@@ -1064,5 +1043,131 @@ mod tests {
         visual.run_until_parked();
         press(visual, "main-pane-frame", forward);
         assert_eq!(active(window, visual), held);
+    }
+
+    fn forward_at(visual: &mut VisualTestContext, at: gpui::Point<Pixels>) {
+        let forward = gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward);
+        visual.simulate_mouse_down(at, forward, Default::default());
+        visual.simulate_mouse_up(at, forward, Default::default());
+        visual.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn side_buttons_step_spaces_from_the_title_strip_above_the_sidebar(cx: &mut TestAppContext) {
+        let (window, mut visual, _, width) = spaces(cx, true);
+        let visual = &mut visual;
+        forward_at(visual, point(px(width / 2.), px(20.)));
+        assert_eq!(project(window, visual), NEXT);
+    }
+
+    #[gpui::test]
+    fn a_side_button_press_inside_a_modal_over_the_sidebar_stays_in_the_modal(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, mut visual, _, _) = spaces(cx, true);
+        let visual = &mut visual;
+        window
+            .update(visual, |shell, window, cx| {
+                shell.workspace.sidebar_width = 1200.;
+                shell.open_quick_open(false, window, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        // The card hangs from 16% of the way down, centred in the window.
+        forward_at(visual, point(px(700.), px(170.)));
+        assert_eq!(project(window, visual), "/work/monocode");
+        window
+            .update(visual, |shell, _, _| assert!(shell.quick_open.is_some()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_side_button_press_outside_a_modal_closes_it_without_stepping(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = spaces(cx, true);
+        let visual = &mut visual;
+        let at = visual.debug_bounds("sidebar-pages").unwrap().center();
+        window
+            .update(visual, |shell, window, cx| {
+                shell.open_quick_open(false, window, cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        forward_at(visual, at);
+        assert_eq!(project(window, visual), "/work/monocode");
+        window
+            .update(visual, |shell, _, _| assert!(shell.quick_open.is_none()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_side_button_press_outside_a_popover_closes_it_before_any_step(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = spaces(cx, true);
+        let visual = &mut visual;
+        let at = visual.debug_bounds("sidebar-pages").unwrap().center();
+        let open = |window: WindowHandle<super::Shell>, visual: &mut VisualTestContext| {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.usage_footer.read(cx).details_open()
+                })
+                .unwrap()
+        };
+        window
+            .update(visual, |shell, _, cx| {
+                shell
+                    .usage_footer
+                    .update(cx, |footer, cx| footer.open_details(cx));
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(open(window, visual));
+
+        forward_at(visual, at);
+        assert!(!open(window, visual));
+        assert_eq!(project(window, visual), "/work/monocode");
+
+        forward_at(visual, at);
+        assert_eq!(project(window, visual), NEXT);
+    }
+
+    #[gpui::test]
+    fn side_buttons_step_spaces_over_the_peeked_sidebar(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = spaces(cx, true);
+        let visual = &mut visual;
+        window
+            .update(visual, |shell, _, cx| {
+                shell.set_sidebar_visible(false, cx);
+                shell.set_peek(true, cx);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let at = visual.debug_bounds("sidebar-peek").unwrap().center();
+        forward_at(visual, at);
+        assert_eq!(project(window, visual), NEXT);
+        window
+            .update(visual, |shell, _, _| assert!(shell.peek_open()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn side_buttons_keep_stepping_while_a_neighbour_page_slides_past(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = spaces(cx, false);
+        let visual = &mut visual;
+        let at = visual.debug_bounds("sidebar-pages").unwrap().center();
+        for expected in [NEXT, "/work/first", "/work/monocode", NEXT] {
+            forward_at(visual, at);
+            assert_eq!(project(window, visual), expected);
+            // One frame on, the pages are still mid-slide under the pointer.
+            visual
+                .executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            window
+                .update(visual, |shell, _, cx| {
+                    assert!(shell.space_swipe.moving());
+                    shell.invalidate_chrome(cx);
+                })
+                .unwrap();
+            visual.run_until_parked();
+        }
     }
 }

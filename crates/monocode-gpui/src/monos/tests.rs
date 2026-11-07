@@ -15,6 +15,7 @@ struct Setup {
 
 #[gpui::test]
 fn missing_document_uses_error_cards_without_moving_content(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
     let s = setup(cx);
     let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
     visual.run_until_parked();

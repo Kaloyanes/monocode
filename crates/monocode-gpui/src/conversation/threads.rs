@@ -1,9 +1,77 @@
 use super::*;
 
 impl Conversation {
-    pub(crate) fn driver_label(&self) -> String {
-        self.model_label().to_string()
+    /// Whether an agent may give this thread `model` and `effort`, judged
+    /// against the model it would end up on.
+    pub(crate) fn check_agent_change(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<(), String> {
+        if self.driven_by.is_some() {
+            return Err("A subagent follows its lead; change the lead instead.".into());
+        }
+        let catalog = self.agent_models();
+        let info = match model {
+            Some(id) => Some(catalog::find_model(&catalog, id).ok_or_else(|| {
+                let ids: Vec<_> = catalog.iter().take(12).map(|m| m.id.as_str()).collect();
+                format!("Unknown model for this harness. Try: {}", ids.join(", "))
+            })?),
+            None => self.model_info(),
+        };
+        match (effort, info) {
+            (Some(effort), Some(info))
+                if !info.efforts.is_empty() && !info.efforts.iter().any(|e| e == effort) =>
+            {
+                Err(format!(
+                    "Unknown effort for this model. Try: {}",
+                    info.efforts.join(", ")
+                ))
+            }
+            _ => Ok(()),
+        }
     }
+
+    /// The models an agent can pick from, before this thread's list has
+    /// loaded too.
+    fn agent_models(&self) -> Vec<catalog::Model> {
+        if self.catalog.is_empty() {
+            let kind = Kind::from_id(&self.summary.provider);
+            catalog::cached_models_for(kind, &self.settings.account).unwrap_or_default()
+        } else {
+            self.catalog.clone()
+        }
+    }
+
+    /// An agent's change to this thread, already checked. Unlike the pickers,
+    /// it leaves the person's defaults for new chats alone.
+    pub(crate) fn apply_agent_change(
+        &mut self,
+        model: Option<&str>,
+        effort: Option<&str>,
+        access: Option<AccessMode>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if let Some(model) = model {
+            let kind = Kind::from_id(&self.summary.provider);
+            let catalog = self.agent_models();
+            let model = catalog::find_model(&catalog, model).map_or(model, |m| m.id.as_str());
+            if !self.apply_model_pick(&ModelPicked(kind, Some(model.to_owned())), cx) {
+                return Err("This thread can't change model right now.".into());
+            }
+        }
+        if let Some(effort) = effort {
+            self.apply_effort(effort);
+        }
+        if let Some(access) = access {
+            self.settings.access = access;
+        }
+        self.save_settings(cx);
+        cx.emit(SessionChanged);
+        cx.notify();
+        Ok(())
+    }
+
     pub(crate) fn thread_outcome(&self, cx: &gpui::App) -> (bool, String) {
         let (success, fallback) = self.external_outcome(cx);
         let rows = self.transcript.read(cx).source_rows();
@@ -17,34 +85,7 @@ impl Conversation {
             monocode_core::response::limit(reply.as_deref().unwrap_or(&fallback), 12000),
         )
     }
-    /// How an orchestration worker's last turn ended: its outcome, its reply
-    /// and the files it edited.
-    pub(crate) fn worker_outcome(
-        &self,
-        cx: &gpui::App,
-    ) -> (monocode_core::orchestration::Outcome, String, Vec<String>) {
-        use monocode_core::orchestration::Outcome;
-        let rows = self.transcript.read(cx).source_rows();
-        let turn = rows
-            .iter()
-            .rposition(|row| row.first && row.role == "user")
-            .unwrap_or(0);
-        let reply = monocode_core::response::prose(&rows[turn..]);
-        let outcome = if self.notification_was_cancelled() {
-            Outcome::Stopped
-        } else if self.status == "Ready" {
-            Outcome::Completed
-        } else {
-            Outcome::Failed
-        };
-        let report = if outcome == Outcome::Failed {
-            format!("{}\n{reply}", self.status)
-        } else {
-            reply
-        };
-        (outcome, report, crate::runtime::edited_paths(&rows[turn..]))
-    }
-    /// Tool calls in the worker's current turn.
+    /// Tool calls in the subagent's current turn.
     pub(crate) fn turn_steps(&self, cx: &gpui::App) -> usize {
         let rows = self.transcript.read(cx).source_rows();
         let turn = rows
@@ -56,8 +97,51 @@ impl Conversation {
             .filter(|row| row.first && row.role == "tool")
             .count()
     }
+    #[cfg(test)]
+    pub(crate) fn set_loading(&mut self, loading: bool) {
+        self.loading = loading;
+    }
+    /// How a stop lands once the provider's turn has ended.
+    #[cfg(test)]
+    pub(crate) fn end_stopped_turn(&mut self) {
+        self.stopping = false;
+        self.notification_cancelled = true;
+    }
+    /// The tool call this thread ran last in its current turn.
+    pub(crate) fn turn_activity(&self, cx: &gpui::App) -> Option<String> {
+        let rows = self.transcript.read(cx).source_rows();
+        let turn = rows
+            .iter()
+            .rposition(|row| row.first && row.role == "user")
+            .unwrap_or(0);
+        let row = rows[turn..].iter().rev().find(|row| row.role == "tool")?;
+        let tool = serde_json::from_str::<monocode_core::tool::ToolCall>(&row.text).ok()?;
+        let shown = tool.presentation();
+        Some(match shown.file_path {
+            Some(path) => format!("{} {path}", shown.action),
+            None => shown.action,
+        })
+    }
+    /// Every file this thread's edit tools changed, in any turn.
+    pub(crate) fn edited_files(&self, cx: &gpui::App) -> Vec<String> {
+        crate::runtime::edited_paths(self.transcript.read(cx).source_rows())
+    }
+    /// Restoring an evicted history is housekeeping, not work: the thread
+    /// stays settled unless an action is waiting on the restore.
+    fn restoring_history(&self) -> bool {
+        self.loading
+            && self.history_unloaded
+            && self.history_actions.is_empty()
+            && !self.busy
+            && !self.stopping
+    }
+    /// Whether a turn is really under way. Opening a thread loads its history
+    /// and reads as pending, sometimes with work deferred, but nothing runs.
+    pub(crate) fn thread_turn_active(&self) -> bool {
+        self.busy || self.follow_ups.requested.is_some() || self.follow_ups.sending.is_some()
+    }
     pub(crate) fn thread_pending(&self) -> bool {
-        self.external_submission_pending()
+        (self.external_submission_pending() && !self.restoring_history())
             || self.follow_ups.requested.is_some()
             || self.follow_ups.sending.is_some()
             || (!self.follow_ups.state.paused
@@ -115,11 +199,6 @@ impl Conversation {
                 "0"
             }
             .into(),
-        );
-        // Lists the plan tool on the MonoCode MCP server for this turn only.
-        environment.insert(
-            monocode_core::orchestration::ENV.into(),
-            if settings.orchestrator { "1" } else { "0" }.into(),
         );
         environment
     }
@@ -197,7 +276,6 @@ mod tests {
                 v.send(cx);
                 v.quick_submit("Quick submit".into(), Settings::default(), cx);
                 let _ = v.mobile_submit("Mobile submit".into(), None, Vec::new(), cx);
-                v.save_app_draft("Operator draft".into(), cx);
                 v.submit_shell(cx);
                 let settings = v.settings.clone();
                 assert!(!v.apply_model_pick(&ModelPicked(Kind::Claude, Some("other".into())), cx));
@@ -226,74 +304,18 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_planning_turn_reads_its_submitted_plan_and_keeps_planning_on_the_next_message(
-        cx: &mut TestAppContext,
-    ) {
-        use monocode_core::tool::{ToolCall, ToolState};
-        use monocode_core::transcript::Row;
-        let window = window(cx);
-        window
-            .update(cx, |v, _, cx| {
-                v.install_transfer(Settings::default(), None, cx);
-                v.settings.orchestrator = true;
-                assert_eq!(
-                    v.provider_environment(&v.settings)[monocode_core::orchestration::ENV],
-                    "1"
-                );
-                v.settings.orchestrator = false;
-                let row = |role: &str, text: String| Row {
-                    role: role.into(),
-                    text,
-                    first: true,
-                    sent_at: None,
-                };
-                let mut call = ToolCall::new("plan-call", "mcp__monocode__orchestration_plan");
-                call.input = serde_json::json!({"title":"Split","tasks":[{"id":"a","title":"A","prompt":"Do","files":["./src/"]}]}).to_string();
-                call.state = ToolState::Completed;
-                v.transcript.update(cx, |t, cx| {
-                    t.patch(
-                        0,
-                        vec![
-                            row("user", "Plan it".into()),
-                            row("tool", serde_json::to_string(&call).unwrap()),
-                            // A tag mentioned in prose must not replace the submitted plan.
-                            row("assistant", "Submitted. <monocode_orchestration>".into()),
-                        ],
-                        cx,
-                    )
-                });
-                v.status = "Ready".into();
-                v.planning_orchestration = true;
-                v.finish_orchestration_plan(cx);
-                let (call, plan) = v.orchestration_plan.clone().expect("the submitted plan");
-                assert_eq!(call.as_deref(), Some("plan-call"));
-                assert_eq!(plan.tasks[0].files, vec!["src"]);
-                assert!(v.settings.orchestrator, "a reply revises the plan");
-                assert!(v.take_orchestration_plan(cx).is_some());
-                assert!(!v.settings.orchestrator, "starting releases the planning mode");
-                assert!(v.input.read(cx).content.is_empty());
-                // A failed turn is not read as a missing plan.
-                v.planning_orchestration = true;
-                v.status = "Provider error".into();
-                v.finish_orchestration_plan(cx);
-                assert!(v.orchestration_error.is_none());
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
     fn composer_modes_survive_a_deferred_launch(cx: &mut TestAppContext) {
         let window = window(cx);
         window
             .update(cx, |v, _, cx| {
                 v.install_transfer(Settings::default(), None, cx);
-                v.settings.orchestrator = true;
+                v.settings.plan = true;
                 let modes = v.turn_modes();
                 // Send resets the composer while compaction makes the chat busy.
                 v.clear_submitted_mode(cx);
-                let seen = v.with_modes(modes, |v| v.settings.orchestrator);
+                let seen = v.with_modes(modes, |v| v.settings.plan);
                 assert!(seen, "the deferred turn runs in its submitted mode");
-                assert!(!v.settings.orchestrator, "the composer keeps its own");
+                assert!(!v.settings.plan, "the composer keeps its own");
             })
             .unwrap();
     }

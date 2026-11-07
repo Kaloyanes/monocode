@@ -259,7 +259,6 @@ impl SettingsView {
                     | "quick-composer"
                     | "working-agents"
                     | "action-opens-terminal"
-                    | "terminal-in-panel"
                     | "keep-awake-auto"
                     | "keep-awake-display"
                     | "keep-awake-lid"
@@ -288,7 +287,6 @@ impl SettingsView {
                     | "monos-enabled"
                     | "rail-monos-pinned"
                     | "mono-menu-bar-icon"
-                    | "show-archived"
             )
         });
         let stacked = narrow && !toggle_only;

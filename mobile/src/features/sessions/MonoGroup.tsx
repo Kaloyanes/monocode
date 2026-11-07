@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, use, useEffect, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import Animated, {
   Easing,
@@ -16,6 +16,7 @@ import { monoDetail, when } from "@/features/workspace/monoRow";
 import type { Mono } from "@/features/workspace/types";
 import { Collapsible } from "@/ui/Collapsible";
 import { Icon } from "@/ui/Icon";
+import { AnimationsPaused } from "@/ui/AnimationsPaused";
 import { radii, themedStyles, useColors, withAlpha } from "@/ui/theme";
 
 import { groupSize, type MonoGroup as Group } from "./sessionMonos";
@@ -23,8 +24,9 @@ import { groupSize, type MonoGroup as Group } from "./sessionMonos";
 /**
  * The Monos pinned above a project's sessions: a header that folds the group,
  * with a plus to make a Mono, then a compact row for each, as a chat list
- * has them: mascot, name, last line, time and an unread dot. Monos with no
- * project sit under "Unassigned".
+ * has them: mascot, name, last line, time and an unread dot. A working Mono's
+ * line says so, as does the folded header in its place. Monos with no project
+ * sit under "Unassigned".
  */
 export function MonoGroup({
   group,
@@ -43,10 +45,14 @@ export function MonoGroup({
   /** Makes a Mono; absent where the desktop can't. */
   onNew?: () => void;
 }) {
+  // A folded group keeps its rows mounted, so their mascots need holding still.
+  const paused = use(AnimationsPaused);
   const colors = useColors();
   const styles = useStyles();
   const count = groupSize(group);
-  const anyUnread = [...group.assigned, ...group.unassigned].some((mono) => unread.has(mono.id));
+  const all = [...group.assigned, ...group.unassigned];
+  const anyUnread = all.some((mono) => unread.has(mono.id));
+  const anyWorking = all.some((mono) => mono.status === "working");
   // Rows already here at the first render don't fade in; ones that arrive
   // after it do, and the rest slide to make room.
   const [settled, setSettled] = useState(false);
@@ -74,7 +80,7 @@ export function MonoGroup({
       <View style={styles.header}>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`Monos, ${count}`}
+          accessibilityLabel={`Monos, ${count}${collapsed && anyWorking ? ", working" : ""}`}
           accessibilityState={{ expanded: !collapsed }}
           onPress={onToggle}
           style={({ pressed }) => [styles.toggle, pressed && styles.pressed]}
@@ -84,6 +90,7 @@ export function MonoGroup({
           </Animated.View>
           <Text style={styles.heading}>Monos</Text>
           <Text style={styles.count}>{count}</Text>
+          {collapsed && anyWorking ? <Text style={styles.folded}>Working…</Text> : null}
           {collapsed && anyUnread ? <View style={styles.dot} /> : null}
         </Pressable>
         {onNew ? (
@@ -98,15 +105,17 @@ export function MonoGroup({
           </Pressable>
         ) : null}
       </View>
-      <Collapsible open={!collapsed}>
-        {group.assigned.map(row)}
-        {group.unassigned.length ? (
-          <>
-            <Text style={styles.subheading}>Unassigned</Text>
-            {group.unassigned.map(row)}
-          </>
-        ) : null}
-      </Collapsible>
+      <AnimationsPaused value={paused || collapsed}>
+        <Collapsible open={!collapsed}>
+          {group.assigned.map(row)}
+          {group.unassigned.length ? (
+            <>
+              <Text style={styles.subheading}>Unassigned</Text>
+              {group.unassigned.map(row)}
+            </>
+          ) : null}
+        </Collapsible>
+      </AnimationsPaused>
       <View style={styles.rule} />
     </View>
   );
@@ -182,6 +191,10 @@ const useStyles = themedStyles((colors) => ({
     color: colors.faint,
     fontSize: 13,
     fontVariant: ["tabular-nums"],
+  },
+  folded: {
+    color: colors.muted,
+    fontSize: 13,
   },
   plus: {
     width: 32,

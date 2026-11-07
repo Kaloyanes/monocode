@@ -3,19 +3,20 @@
 //! answers them from its own state. No arbitrary app commands are exposed.
 use super::apns::{self, ApnsError, ApnsKey};
 use super::catalog::{recent_sessions, session_page};
-use super::notify::{self, LiveTarget, PushTarget, SendError};
+use super::notify::{self, Alert, LiveTarget, Notice, PushTarget, SendError};
+use super::presence::{self, Attendance, Held, Presence};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use monocode_mobile_link::{now, Address, Gate, Identity, WatchSink, PORT, VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
 
@@ -62,10 +63,9 @@ const APP_METHODS: &[&str] = &[
     "session.delete",
     "session.archive",
     "session.unarchive",
-    "orchestration.read",
-    "orchestration.action",
     "draft.read",
     "draft.frame",
+    "draft.poster",
     "draft.action",
     "composer.read",
     "composer.write",
@@ -82,6 +82,13 @@ const APP_METHODS: &[&str] = &[
     "inbox.diff",
     "inbox.checks",
     "inbox.mark",
+    "inbox.readAll",
+    "inbox.action",
+    "inbox.comment",
+    "inbox.review",
+    "inbox.reviewAdd",
+    "inbox.reviewRemove",
+    "inbox.reviewSubmit",
     "inbox.start",
     "inbox.media",
 ];
@@ -99,6 +106,9 @@ const REPLY_WAIT: Duration = Duration::from_secs(25);
 const MAX_PENDING: usize = 16;
 const MAX_WATCHES_PER_DEVICE: usize = 4;
 const MAX_TERMINALS_PER_DEVICE: usize = 2;
+/// A followed workspace is sent at most this often. Every frame wakes the
+/// phone's radio; the one held back goes with a later publish.
+const WORKSPACE_PUSH_GAP: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -267,6 +277,13 @@ struct Watcher {
     peer: String,
     sink: WatchSink,
     terminal: bool,
+    /// On a `workspace.watch`, which the host serves without the app.
+    workspace: Option<WorkspaceSent>,
+}
+/// What a followed workspace last sent, and when.
+struct WorkspaceSent {
+    rev: String,
+    at: Instant,
 }
 struct Inner {
     config: Config,
@@ -285,6 +302,121 @@ struct Inner {
     since: HashMap<String, u64>,
     /// Devices sent a start push, until their new activity checks in.
     starting: HashMap<String, std::time::Instant>,
+    /// Alerts kept back while the user is at the Mac.
+    presence: Presence,
+}
+
+/// The push tokens of phones that take `category`, less the devices in `skip`.
+fn category_tokens(inner: &Inner, category: &str, skip: &HashSet<String>) -> Vec<String> {
+    if !inner.config.enabled {
+        return Vec::new();
+    }
+    inner
+        .config
+        .devices
+        .iter()
+        .filter(|device| !skip.contains(&device.id))
+        .filter_map(|device| device.push.as_ref())
+        .filter(|push| push.categories.iter().any(|on| on == category))
+        .map(|push| push.token.clone())
+        .collect()
+}
+
+/// Whether an alert to this device also carries its Live Activity, as when
+/// Apple isn't redrawing the activity itself.
+fn activity_rides(inner: &Inner, device: &Device, target: &PushTarget) -> bool {
+    let pushed = inner.apns.is_some()
+        && device
+            .live
+            .as_ref()
+            .is_some_and(|live| live.activity_token.is_some() || live.start_token.is_some());
+    target.activity && !pushed
+}
+
+/// What each paired phone is sent for these alerts: the ones in categories it
+/// chose, and a silent push for its Live Activity when nothing else carries it.
+/// Devices in `skip` are being sent something else.
+fn device_messages(
+    inner: &Inner,
+    alerts: &[Alert],
+    activity: &Value,
+    changed: bool,
+    skip: &HashSet<String>,
+) -> Vec<(String, Vec<Value>)> {
+    inner
+        .config
+        .devices
+        .iter()
+        .filter(|device| !skip.contains(&device.id))
+        .filter_map(|device| {
+            let target = device.push.as_ref()?;
+            let rides = activity_rides(inner, device, target);
+            let mut messages: Vec<Value> = alerts
+                .iter()
+                .filter(|alert| target.categories.iter().any(|c| c == alert.category))
+                .map(|alert| {
+                    let mut message = notify::message(&target.token, alert);
+                    // An alert wakes the app too, so it carries the
+                    // activity rather than spending a silent push.
+                    if rides {
+                        message["_contentAvailable"] = json!(true);
+                        message["data"]["activity"] = activity.clone();
+                    }
+                    message
+                })
+                .collect();
+            if changed && messages.is_empty() && target.activity && rides {
+                messages.push(notify::silent(&target.token, activity));
+            }
+            (!messages.is_empty()).then(|| (device.id.clone(), messages))
+        })
+        .collect()
+}
+
+/// What to send when held alerts are freed: per phone, its alerts, or one
+/// summary when a crowd of them waits for it; and the notices, each with the
+/// tokens that take it.
+fn plan_release(
+    inner: &Inner,
+    released: Vec<Held>,
+    activity: &Value,
+) -> (Vec<(String, Vec<Value>)>, Vec<(Vec<String>, Notice)>) {
+    // A phone with a crowd of alerts waiting gets one summary instead.
+    let mut crowded = HashSet::new();
+    let mut summaries: Vec<(String, Vec<Value>)> = Vec::new();
+    for device in &inner.config.devices {
+        let Some(target) = device.push.as_ref() else {
+            continue;
+        };
+        let mine: Vec<&Held> = released
+            .iter()
+            .filter(|held| target.categories.iter().any(|c| c == held.category()))
+            .collect();
+        if mine.len() <= presence::DIGEST_AFTER {
+            continue;
+        }
+        let digest = presence::digest(&mine);
+        let mut message = notify::digest(&target.token, &digest.title, &digest.body, digest.urgent);
+        if activity_rides(inner, device, target) {
+            message["_contentAvailable"] = json!(true);
+            message["data"] = json!({ "activity": activity });
+        }
+        crowded.insert(device.id.clone());
+        summaries.push((device.id.clone(), vec![message]));
+    }
+    let mut alerts = Vec::new();
+    let mut notices = Vec::new();
+    for held in released {
+        match held {
+            Held::Alert(alert) => alerts.push(alert),
+            Held::Notice { category, notice } => {
+                notices.push((category_tokens(inner, &category, &crowded), notice));
+            }
+        }
+    }
+    let mut messages = device_messages(inner, &alerts, activity, false, &crowded);
+    messages.extend(summaries);
+    (messages, notices)
 }
 
 struct LivePush {
@@ -365,6 +497,7 @@ impl MobileHost {
                 apns_error,
                 since: HashMap::new(),
                 starting: HashMap::new(),
+                presence: Presence::default(),
             })),
             gate,
             path,
@@ -480,20 +613,10 @@ impl MobileHost {
 
     /// The push tokens of paired phones that take `category`.
     pub fn push_tokens(&self, category: &str) -> Vec<String> {
-        let Ok(inner) = self.inner.lock() else {
-            return Vec::new();
-        };
-        if !inner.config.enabled {
-            return Vec::new();
+        match self.inner.lock() {
+            Ok(inner) => category_tokens(&inner, category, &HashSet::new()),
+            Err(_) => Vec::new(),
         }
-        inner
-            .config
-            .devices
-            .iter()
-            .filter_map(|device| device.push.as_ref())
-            .filter(|push| push.categories.iter().any(|on| on == category))
-            .map(|push| push.token.clone())
-            .collect()
     }
 
     /// Drops tokens Expo says no longer reach a phone, as when the app was
@@ -606,6 +729,15 @@ impl MobileHost {
         let changed = notify::activity(&inner.catalog, &inner.catalog)
             != notify::activity(&catalog, &catalog);
         inner.catalog = catalog;
+        push_workspace(&mut inner);
+        // With the user at the Mac, alerts wait for them to leave.
+        let alerts: Vec<Alert> = alerts
+            .into_iter()
+            .filter_map(|alert| match inner.presence.hold(Held::Alert(alert)) {
+                Some(Held::Alert(alert)) => Some(alert),
+                _ => None,
+            })
+            .collect();
         if alerts.is_empty() && !changed {
             return Ok(());
         }
@@ -615,49 +747,12 @@ impl MobileHost {
             Vec::new()
         };
         let apns = inner.apns.clone();
-        let messages: Vec<(String, Vec<Value>)> = inner
-            .config
-            .devices
-            .iter()
-            .filter_map(|device| {
-                let target = device.push.as_ref()?;
-                // Apple redraws the activity itself; no need to wake the app.
-                let pushed = apns.is_some()
-                    && device.live.as_ref().is_some_and(|live| {
-                        live.activity_token.is_some() || live.start_token.is_some()
-                    });
-                let mut messages: Vec<Value> = alerts
-                    .iter()
-                    .filter(|alert| target.categories.iter().any(|c| c == alert.category))
-                    .map(|alert| {
-                        let mut message = notify::message(&target.token, alert);
-                        // An alert wakes the app too, so it carries the
-                        // activity rather than spending a silent push.
-                        if target.activity && !pushed {
-                            message["_contentAvailable"] = json!(true);
-                            message["data"]["activity"] = activity.clone();
-                        }
-                        message
-                    })
-                    .collect();
-                if target.activity && changed && messages.is_empty() && !pushed {
-                    messages.push(notify::silent(&target.token, &activity));
-                }
-                (!messages.is_empty()).then(|| (device.id.clone(), messages))
-            })
-            .collect();
+        let messages = device_messages(&inner, &alerts, &activity, changed, &HashSet::new());
         drop(inner);
+        self.send_alerts(messages);
         let Some(runtime) = self.runtime.get() else {
             return Ok(());
         };
-        for (device_id, messages) in messages {
-            let host = self.clone();
-            runtime.spawn_blocking(move || match notify::send(&messages) {
-                Ok(()) => {}
-                Err(SendError::Unregistered) => host.forget_push(&device_id),
-                Err(SendError::Other(error)) => eprintln!("Mobile alert failed: {error}"),
-            });
-        }
         if let Some(client) = apns {
             for push in live {
                 let (host, client) = (self.clone(), client.clone());
@@ -670,6 +765,97 @@ impl MobileHost {
             }
         }
         Ok(())
+    }
+
+    /// Whether a phone is following the workspace now: it is open on the
+    /// phone, so what only a phone's reading kept fresh should stay fresh.
+    pub fn followed(&self) -> bool {
+        self.inner.lock().is_ok_and(|inner| {
+            inner
+                .watches
+                .values()
+                .any(|watch| watch.workspace.is_some() && !watch.sink.is_closed())
+        })
+    }
+
+    /// Sends each device its messages, forgetting a phone Expo says is gone.
+    fn send_alerts(&self, messages: Vec<(String, Vec<Value>)>) {
+        let Some(runtime) = self.runtime.get() else {
+            return;
+        };
+        for (device_id, messages) in messages {
+            let host = self.clone();
+            runtime.spawn_blocking(move || match notify::send(&messages) {
+                Ok(()) => {}
+                Err(SendError::Unregistered) => host.forget_push(&device_id),
+                Err(SendError::Other(error)) => eprintln!("Mobile alert failed: {error}"),
+            });
+        }
+    }
+
+    /// Whether the user is at the Mac. Alerts wait while they are, and the
+    /// ones still worth hearing go out when they leave or the setting turns
+    /// off.
+    pub fn set_attendance(&self, attendance: Attendance) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if inner.presence.attendance() == attendance {
+            return;
+        }
+        let catalog = inner.catalog.clone();
+        let released = inner.presence.set(attendance, &catalog);
+        let activity = notify::activity(&inner.catalog, &inner.catalog);
+        let (messages, notices) = plan_release(&inner, released, &activity);
+        drop(inner);
+        self.send_alerts(messages);
+        for (tokens, notice) in notices {
+            self.send_notice_to(tokens, notice);
+        }
+    }
+
+    /// The user looked at `session` on the desktop, so a finish held for it
+    /// is no news.
+    pub fn seen(&self, session: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.presence.seen(session);
+        }
+    }
+
+    /// Tells paired phones that `category` took place: now, or once the user
+    /// is away from the Mac.
+    pub fn notice(&self, category: &str, notice: Notice) {
+        if self.push_tokens(category).is_empty() {
+            return;
+        }
+        let held = match self.inner.lock() {
+            Ok(mut inner) => inner.presence.hold(Held::Notice {
+                category: category.to_owned(),
+                notice,
+            }),
+            Err(_) => return,
+        };
+        if let Some(Held::Notice { category, notice }) = held {
+            self.send_notice_now(&category, notice);
+        }
+    }
+
+    fn send_notice_now(&self, category: &str, notice: Notice) {
+        self.send_notice_to(self.push_tokens(category), notice);
+    }
+
+    fn send_notice_to(&self, tokens: Vec<String>, notice: Notice) {
+        if tokens.is_empty() {
+            return;
+        }
+        let host = self.clone();
+        std::thread::spawn(move || match notify::send_notice(&tokens, &notice) {
+            Ok(gone) if !gone.is_empty() => {
+                let _ = host.forget_push_tokens(&gone);
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("Mobile notification not sent: {error}"),
+        });
     }
 
     /// The Live Activity pushes for this change: an update where an activity
@@ -1050,15 +1236,11 @@ impl MobileHost {
                     inner.config = config;
                     return Ok(Value::Null);
                 }
-                "workspace.list" => {
-                    let mut catalog = inner.catalog.clone();
-                    catalog["sessions"] = json!(recent_sessions(&catalog["sessions"]));
-                    catalog["addresses"] = json!(addresses(&inner));
-                    // So the phone offers a terminal only where it will open.
-                    catalog["terminal"] = json!(inner.config.terminal);
-                    return Ok(catalog);
+                "workspace.list" => return Ok(workspace_reply(&inner, &params)),
+                "sessions.list" => {
+                    let from = if params["archived"] == true { "archived" } else { "sessions" };
+                    return Ok(session_page(&inner.catalog[from], &params));
                 }
-                "sessions.list" => return Ok(session_page(&inner.catalog["sessions"], &params)),
                 "device.push" => {
                     let push = push_registration(&params)?;
                     let mut config = inner.config.clone();
@@ -1115,6 +1297,36 @@ impl MobileHost {
         response
     }
 
+    /// A phone follows the workspace: it is sent now, then again whenever it
+    /// moves on, so nothing polls for it. The host holds the catalog, so the
+    /// app plays no part, and the phone's budget of watches isn't touched.
+    fn watch_workspace(&self, peer: &str, params: &Value, sink: WatchSink) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(unavailable)?;
+        if !inner.config.enabled {
+            return Err("Mobile access disabled".into());
+        }
+        if !inner.config.devices.iter().any(|device| device.fingerprint == peer) {
+            return Err("Device revoked or not paired".into());
+        }
+        // A phone follows one workspace; a link it lost may still be here.
+        inner
+            .watches
+            .retain(|_, watch| watch.workspace.is_none() || watch.peer != peer);
+        let first = workspace_reply(&inner, params);
+        let rev = first["rev"].as_str().unwrap_or_default().to_owned();
+        sink.try_send(first).map_err(|_| "Desktop is busy; try again")?;
+        inner.watches.insert(
+            uuid::Uuid::new_v4().to_string(),
+            Watcher {
+                peer: peer.into(),
+                sink,
+                terminal: false,
+                workspace: Some(WorkspaceSent { rev, at: Instant::now() }),
+            },
+        );
+        Ok(())
+    }
+
     /// A phone starts watching a conversation, or opens a terminal. The app
     /// sends its state, then every change, until the phone goes or the watch
     /// is stopped.
@@ -1123,6 +1335,7 @@ impl MobileHost {
             return Err("Update MonoCode on both devices".into());
         }
         let terminal = match request["method"].as_str() {
+            Some("workspace.watch") => return self.watch_workspace(peer, &request["params"], sink),
             Some("conversation.watch") => false,
             Some("terminal.watch") => true,
             _ => return Err("Unsupported mobile operation".into()),
@@ -1163,7 +1376,12 @@ impl MobileHost {
                 .id
                 .clone();
             inner.watches.retain(|_, watch| !watch.sink.is_closed());
-            let own = || inner.watches.values().filter(|watch| watch.peer == peer);
+            let own = || {
+                inner
+                    .watches
+                    .values()
+                    .filter(|watch| watch.peer == peer && watch.workspace.is_none())
+            };
             if own().count() >= MAX_WATCHES_PER_DEVICE
                 || (terminal
                     && own().filter(|watch| watch.terminal).count() >= MAX_TERMINALS_PER_DEVICE)
@@ -1176,6 +1394,7 @@ impl MobileHost {
                     peer: peer.into(),
                     sink: sink.clone(),
                     terminal,
+                    workspace: None,
                 },
             );
         }
@@ -1264,6 +1483,72 @@ impl MobileHost {
 
 fn keyring_account(path: &Path) -> String {
     format!("desktop:{}", path.display())
+}
+
+/// The workspace as a phone reads it, and the name of its content.
+fn workspace_view(inner: &Inner) -> (Value, String) {
+    // The archived sessions are paged through `sessions.list`, so a phone's
+    // reads don't carry or copy them.
+    let mut catalog: Value = inner
+        .catalog
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| key.as_str() != "archived")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    catalog["sessions"] = json!(recent_sessions(&catalog["sessions"]));
+    catalog["addresses"] = json!(addresses(inner));
+    // So the phone offers a terminal only where it will open.
+    catalog["terminal"] = json!(inner.config.terminal);
+    let rev = catalog_rev(&catalog);
+    (catalog, rev)
+}
+
+/// The workspace for a phone holding `params["rev"]`: a phone that already has
+/// it gets a few bytes back rather than all of it.
+fn workspace_reply(inner: &Inner, params: &Value) -> Value {
+    let (mut catalog, rev) = workspace_view(inner);
+    if params["rev"].as_str() == Some(rev.as_str()) {
+        return json!({"unchanged": true, "rev": rev});
+    }
+    catalog["rev"] = json!(rev);
+    catalog
+}
+
+/// Sends the workspace to the phones following it, if it moved on.
+fn push_workspace(inner: &mut Inner) {
+    if !inner.watches.values().any(|watch| watch.workspace.is_some()) {
+        return;
+    }
+    let (mut catalog, rev) = workspace_view(inner);
+    catalog["rev"] = json!(rev);
+    let now = Instant::now();
+    inner.watches.retain(|_, watch| {
+        let Some(sent) = &mut watch.workspace else {
+            return true;
+        };
+        if sent.rev == rev || now.duration_since(sent.at) < WORKSPACE_PUSH_GAP {
+            return !watch.sink.is_closed();
+        }
+        match watch.sink.try_send(catalog.clone()) {
+            Ok(()) => {
+                *sent = WorkspaceSent { rev: rev.clone(), at: now };
+                true
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    });
+}
+
+/// Names a workspace's content, so a phone can ask whether it has moved on.
+fn catalog_rev(catalog: &Value) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    catalog.to_string().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn addresses(inner: &Inner) -> Vec<Address> {
@@ -1662,6 +1947,235 @@ mod tests {
         assert!(catalog["addresses"].is_array());
         assert!(host.publish(json!({"projects":[]})).is_err());
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    fn workspace_watch(rev: Option<&Value>) -> Value {
+        let params = rev.map_or(json!({}), |rev| json!({"rev": rev}));
+        json!({"version":VERSION,"id":"w","method":"workspace.watch","params":params})
+    }
+
+    fn workspace(id: &str) -> Value {
+        json!({"projects":[],"monos":[],"sessions":[{"id":id,"projectId":"p"}]})
+    }
+
+    /// As if the last frame went out long enough ago for the next to go.
+    fn let_a_frame_through(host: &MobileHost) {
+        let mut inner = host.inner.lock().unwrap();
+        for watch in inner.watches.values_mut() {
+            if let Some(sent) = &mut watch.workspace {
+                sent.at -= WORKSPACE_PUSH_GAP;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_followed_workspace_arrives_at_once_then_only_when_it_moves() {
+        let (host, events, peer) = paired();
+        host.publish(workspace("one")).unwrap();
+        let (sink, mut frames) = tokio::sync::mpsc::channel(4);
+        host.watch(&peer, workspace_watch(None), sink).await.unwrap();
+        assert!(host.followed());
+        // The host holds the catalog: the app is not asked.
+        assert!(events.is_empty());
+        let first = frames.try_recv().unwrap();
+        assert_eq!(first["sessions"][0]["id"], "one");
+        assert!(first["addresses"].is_array());
+
+        // The app publishes every few seconds, mostly with nothing new.
+        let_a_frame_through(&host);
+        host.publish(workspace("one")).unwrap();
+        assert!(frames.try_recv().is_err());
+
+        host.publish(workspace("two")).unwrap();
+        let moved = frames.try_recv().unwrap();
+        assert_eq!(moved["sessions"][0]["id"], "two");
+        assert_ne!(moved["rev"], first["rev"]);
+    }
+
+    #[tokio::test]
+    async fn a_followed_workspace_changing_fast_is_sent_at_most_once_per_gap() {
+        let (host, _events, peer) = paired();
+        host.publish(workspace("one")).unwrap();
+        let (sink, mut frames) = tokio::sync::mpsc::channel(4);
+        host.watch(&peer, workspace_watch(None), sink).await.unwrap();
+        frames.try_recv().unwrap();
+
+        host.publish(workspace("two")).unwrap();
+        host.publish(workspace("three")).unwrap();
+        assert!(frames.try_recv().is_err());
+
+        // What was held back goes with the next publish, nothing lost.
+        let_a_frame_through(&host);
+        host.publish(workspace("three")).unwrap();
+        assert_eq!(frames.try_recv().unwrap()["sessions"][0]["id"], "three");
+    }
+
+    #[tokio::test]
+    async fn a_phone_coming_back_to_the_same_workspace_gets_only_its_rev() {
+        let (host, _events, peer) = paired();
+        host.publish(workspace("one")).unwrap();
+        let (sink, mut frames) = tokio::sync::mpsc::channel(4);
+        host.watch(&peer, workspace_watch(None), sink).await.unwrap();
+        let rev = frames.try_recv().unwrap()["rev"].clone();
+
+        let (sink, mut again) = tokio::sync::mpsc::channel(4);
+        host.watch(&peer, workspace_watch(Some(&rev)), sink).await.unwrap();
+        assert_eq!(again.try_recv().unwrap(), json!({"unchanged": true, "rev": rev}));
+        // Only the newer watch is kept: the older link is ended.
+        assert!(frames.recv().await.is_none());
+        assert_eq!(host.inner.lock().unwrap().watches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn following_the_workspace_leaves_the_phones_watches_alone() {
+        let (host, events, peer) = paired();
+        let (sink, _frames) = tokio::sync::mpsc::channel(4);
+        host.watch(&peer, workspace_watch(None), sink).await.unwrap();
+        let app = tokio::spawn(async move {
+            for _ in 0..MAX_WATCHES_PER_DEVICE {
+                let Ok(Event::Watch(start)) = events.recv().await else {
+                    panic!("expected a watch");
+                };
+                start.accept(Ok(()));
+            }
+        });
+        let mut held = Vec::new();
+        for _ in 0..MAX_WATCHES_PER_DEVICE {
+            let (sink, updates) = tokio::sync::mpsc::channel(4);
+            let request = json!({"version":VERSION,"id":"c","method":"conversation.watch","params":{"conversationId":"s"}});
+            host.watch(&peer, request, sink).await.unwrap();
+            held.push(updates);
+        }
+        app.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_phone_gone_from_the_workspace_is_forgotten() {
+        let (host, _events, peer) = paired();
+        let (sink, frames) = tokio::sync::mpsc::channel(4);
+        host.watch(&peer, workspace_watch(None), sink).await.unwrap();
+        drop(frames);
+        assert!(!host.followed());
+        host.publish(workspace("one")).unwrap();
+        assert!(host.inner.lock().unwrap().watches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_already_holds_the_workspace_gets_only_its_rev() {
+        let (host, _events, peer) = paired();
+        let publish = |title: &str| {
+            host.publish(json!({"projects":[{"id":"p"}],"monos":[],
+                "sessions":[{"id":"s","projectId":"p","title":title}]}))
+                .unwrap()
+        };
+        let poll = |rev: Value| {
+            host.handle(
+                &peer,
+                json!({"version":VERSION,"id":"c","method":"workspace.list","params":{"rev":rev}}),
+            )
+        };
+        publish("First");
+        let first = poll(Value::Null).await.unwrap();
+        let rev = first["rev"].clone();
+        assert!(rev.is_string());
+        assert_eq!(first["sessions"][0]["title"], "First");
+
+        let same = poll(rev.clone()).await.unwrap();
+        assert_eq!(same, json!({"unchanged": true, "rev": rev}));
+
+        publish("Second");
+        let moved = poll(rev.clone()).await.unwrap();
+        assert_ne!(moved["rev"], rev);
+        assert_eq!(moved["sessions"][0]["title"], "Second");
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn archived_sessions_are_paged_not_polled() {
+        let (host, _events, peer) = paired();
+        host.publish(json!({
+            "projects":[{"id":"p"}],"monos":[],
+            "sessions":[{"id":"s","projectId":"p","title":"Live"}],
+            "archived":[
+                {"id":"a1","projectId":"p","title":"Old one"},
+                {"id":"a2","projectId":"p","title":"Older"},
+            ],
+        }))
+        .unwrap();
+        let ask = |method: &str, params: Value| {
+            json!({"version":VERSION,"id":"c","method":method,"params":params})
+        };
+        let polled = host.handle(&peer, ask("workspace.list", json!({}))).await.unwrap();
+        assert!(polled["archived"].is_null(), "the poll doesn't carry the archive");
+        assert_eq!(polled["sessions"][0]["id"], "s");
+        let page = host
+            .handle(&peer, ask("sessions.list", json!({"projectId":"p","archived":true,"limit":1})))
+            .await
+            .unwrap();
+        assert_eq!(page["sessions"][0]["id"], "a1");
+        assert_eq!(page["hasMore"], true);
+        assert_eq!(page["total"], 2);
+        let live = host
+            .handle(&peer, ask("sessions.list", json!({"projectId":"p"})))
+            .await
+            .unwrap();
+        assert_eq!(live["sessions"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_crowd_of_held_alerts_reaches_a_phone_as_one_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mobile-access.json");
+        let phone = |id: &str, categories: Value| json!({"id":id,"name":id,"fingerprint":id,"push":{"token":format!("ExponentPushToken[{id}]"),"categories":categories}});
+        std::fs::write(
+            &path,
+            json!({"enabled":false,"devices":[
+                phone("a", json!(["agentInput","agentFinished"])),
+                phone("b", json!(["agentInput"])),
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let (host, _events) = MobileHost::open(path).unwrap();
+        let mut inner = host.inner.lock().unwrap();
+        inner.config.enabled = true;
+        let alert = |category: &'static str, id: &str| {
+            Held::Alert(Alert {
+                category,
+                session_id: id.into(),
+                project_id: "p".into(),
+                title: format!("Session {id}"),
+                subtitle: None,
+                body: "Finished".into(),
+                urgent: false,
+            })
+        };
+        let mono = |text: &str| Held::Notice {
+            category: "agentFinished".into(),
+            notice: Notice {
+                title: "Scout".into(),
+                subtitle: None,
+                body: text.into(),
+                data: json!({"monoId":text}),
+            },
+        };
+        let crowd = vec![
+            alert("agentInput", "1"),
+            alert("agentFinished", "2"),
+            alert("agentFinished", "3"),
+            mono("x"),
+        ];
+        let (messages, notices) = plan_release(&inner, crowd, &json!([]));
+        let by_device: HashMap<_, _> = messages.into_iter().collect();
+        // Phone a would hear four: one summary. Phone b hears one: its own.
+        assert_eq!(by_device["a"].len(), 1);
+        assert_eq!(by_device["a"][0]["title"], "4 updates while you were away");
+        assert_eq!(by_device["b"].len(), 1);
+        assert_eq!(by_device["b"][0]["title"], "Session 1");
+        // The Mono notice is in the summary for a, so only phones not
+        // summarised get it; none of these take that category as well.
+        assert!(notices[0].0.is_empty());
     }
 
     #[test]

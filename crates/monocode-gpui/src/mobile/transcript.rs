@@ -5,8 +5,8 @@
 //!
 //! Known gaps against the React port, because native rows do not carry them:
 //! approvals are not persisted, so no "Waiting for approval on desktop" notice
-//! (the live header still says `waiting`); there are no Mono habits, operator
-//! prompts or background-task labels; and assignment wrappers stay in user
+//! (the live header still says `waiting`); there are no Mono habits or
+//! background-task labels; and assignment wrappers stay in user
 //! text, as the desktop shows them.
 use crate::transcript::{self as desk, attachments, dates, phases};
 use monocode_core::{
@@ -204,6 +204,16 @@ pub(crate) fn messages(rows: &[Row]) -> Vec<Value> {
     out
 }
 
+/// The last message's text. While `writing`, a reply changes on every read, so
+/// it is the last prompt instead, which holds still until the turn ends.
+pub(crate) fn last_message(rows: &[Row], writing: bool) -> String {
+    messages_in(rows, 0, rows.len())
+        .filter(|&(at, _)| rows[at].role == "user" || (!writing && rows[at].role == "assistant"))
+        .last()
+        .map(|(at, end)| joined(&rows[at..end]))
+        .unwrap_or_default()
+}
+
 fn object(value: Value) -> Map<String, Value> {
     match value {
         Value::Object(map) => map,
@@ -375,44 +385,63 @@ fn notice(rows: &[Row], at: usize, end: usize) -> Option<Value> {
             let mut notice = json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to interact")});
             if let Some(document) = &document {
                 notice["visual"] = json!({"title": document.title, "source": document.source});
+                // For a phone that cannot run the program: its first render.
+                if let Some(tree) = visual_tree(&document.source) {
+                    notice["tree"] = tree;
+                }
             }
             Some(notice)
         }
-        // The phone opens a draft's page itself, live with the desktop's.
+        // A phone that draws drafts opens the page in the thread, live with
+        // the desktop's; an older one shows the notice.
         monocode_core::visual_bridge::DRAFT_ROLE => {
             let card =
                 serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(&text).ok()?;
             let title = Some(card.title)
                 .filter(|title| !title.is_empty())
                 .unwrap_or_else(|| "Draft".into());
-            Some(json!({"type": "draft", "id": id, "draft": card.draft, "title": title}))
+            let mut notice = json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to view")});
+            notice["draft"] = json!({"draft": card.draft, "title": title});
+            Some(notice)
         }
         monocode_core::transcript::images::ROLE => {
             let document =
                 serde_json::from_str::<monocode_core::transcript::images::ImageDocument>(&text)
                     .ok()
                     .filter(|document| document.validate().is_ok());
-            let kept = document.as_ref().and_then(|document| {
-                let page = document.draft()?;
-                Some(format!("{}{}", KEPT_DRAFT, page.file_name()?.to_str()?))
-            });
+            let kept = document.as_ref().and_then(kept_name);
             let title = document
                 .map(|document| document.title)
                 .unwrap_or_else(|| "Image".into());
-            Some(match kept {
-                Some(draft) => {
-                    json!({"type": "draft", "id": id, "draft": draft, "title": title, "kept": true})
-                }
-                None => {
-                    json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to view")})
-                }
-            })
+            let mut notice = json!({"type": "notice", "id": id, "text": format!("{title} · Open on desktop to view")});
+            if let Some(kept) = kept {
+                notice["draft"] = json!({"draft": kept, "kept": kept, "title": title});
+            }
+            Some(notice)
         }
         "system" if !text.trim().is_empty() => {
             Some(json!({"type": "notice", "id": id, "text": text}))
         }
         _ => None,
     }
+}
+
+/// How the phone names a kept picture's page.
+fn kept_name(document: &monocode_core::transcript::images::ImageDocument) -> Option<String> {
+    let page = document.draft()?;
+    Some(format!("{}{}", KEPT_DRAFT, page.file_name()?.to_str()?))
+}
+
+/// A picture kept of a draft belongs to that draft's card, as on the desktop:
+/// `at` is a card that has one, and the page's name for it.
+fn kept_on_card(rows: &[Row], pairs: &[(usize, usize)], at: usize, to: usize) -> Option<String> {
+    let (_, picture) = pairs.iter().find(|(card, _)| *card == at)?;
+    let (from, end) = messages_in(rows, *picture, to).next()?;
+    let document = serde_json::from_str::<monocode_core::transcript::images::ImageDocument>(
+        &joined(&rows[from..end]),
+    )
+    .ok()?;
+    kept_name(&document)
 }
 
 /// A visual's first render, kept by its source: the phone's transcript is
@@ -456,6 +485,10 @@ fn tool_label(call: &ToolCall, cwd: &str) -> String {
 
 /// toolCategory, by the action `activity::summary` sorts calls by.
 fn work_kind(call: &ToolCall) -> &'static str {
+    if call.visual_step().is_some() {
+        // Charts and draft pages carry MonoCode's own logo, as on the desktop.
+        return "visual";
+    }
     match call.summary().0.as_str() {
         "Read" | "List" | "Search" | "Find" => "research",
         "Edit" | "Write" => "edit",
@@ -468,7 +501,7 @@ fn work_kind(call: &ToolCall) -> &'static str {
 /// dominantCountedWorkKind: ties go to the kind that changed the most.
 fn dominant_kind(calls: &[ToolCall]) -> &'static str {
     let mut best = ("think", 0);
-    for kind in ["edit", "run", "agent", "research", "other"] {
+    for kind in ["edit", "run", "agent", "research", "visual", "other"] {
         let count = calls.iter().filter(|call| work_kind(call) == kind).count();
         if count > best.1 {
             best = (kind, count);
@@ -620,6 +653,10 @@ fn agent_turn(source: &Source, turn: &Turn, live: bool) -> Value {
             );
         }
     };
+    let kept: Vec<_> = monocode_core::visual_bridge::kept_upgrades(&rows[run.key..run.end])
+        .into_iter()
+        .map(|(card, picture)| (card + run.key, picture + run.key))
+        .collect();
     for (at, end) in messages_in(rows, run.key, run.end) {
         let role = rows[at].role.as_str();
         if matches!(
@@ -627,6 +664,7 @@ fn agent_turn(source: &Source, turn: &Turn, live: bool) -> Value {
             "mono-card" | "mono-document" | "mono-note" | "mono-launch"
         ) || role == ATTACHMENTS
             || activity.hidden.contains(&at)
+            || kept.iter().any(|(_, picture)| *picture == at)
         {
             continue;
         }
@@ -636,7 +674,10 @@ fn agent_turn(source: &Source, turn: &Turn, live: bool) -> Value {
             || role == monocode_core::visual_bridge::DRAFT_ROLE
         {
             close(&mut work, &mut items);
-            if let Some(notice) = notice(rows, at, end) {
+            if let Some(mut notice) = notice(rows, at, end) {
+                if let Some(picture) = kept_on_card(rows, &kept, at, run.end) {
+                    notice["draft"]["kept"] = picture.into();
+                }
                 items.push(notice);
             }
             continue;
@@ -937,6 +978,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chart_and_draft_steps_are_the_visual_kind_for_the_phone_logo() {
+        let call = |name: &str| ToolCall::new("1", name);
+        for name in [
+            "mcp__monocode__visual_show",
+            "mcp__monocode__visual_docs",
+            "mcp__monocode__draft_preview",
+            "monocode:draft_keep",
+        ] {
+            assert_eq!(work_kind(&call(name)), "visual", "{name}");
+        }
+        assert_eq!(work_kind(&call("other_server:draft_preview")), "other");
+        assert_eq!(
+            dominant_kind(&[call("mcp__monocode__draft_preview")]),
+            "visual"
+        );
+    }
+
+    #[test]
     fn waiting_approvals_and_questions_end_the_latest_turn() {
         let rows = [row("user", "fix it"), row("assistant", "on it")];
         let turns = HashMap::new();
@@ -981,6 +1040,17 @@ mod tests {
             ..row(role, text)
         }
     }
+    #[test]
+    fn a_reply_being_written_leaves_the_last_message_alone() {
+        let mut rows = vec![row("user", "Hi"), row("assistant", "He")];
+        let held = last_message(&rows, true);
+        rows[1].text.push_str("llo there");
+        assert_eq!(held, "Hi");
+        assert_eq!(last_message(&rows, true), held);
+        assert_eq!(last_message(&rows, false), "Hello there");
+        assert_eq!(last_message(&[], false), "");
+    }
+
     fn tool(name: &str, input: Value, state: ToolState) -> Row {
         let mut call = ToolCall::new("call", name);
         call.input = input.to_string();
@@ -1036,9 +1106,59 @@ mod tests {
             notice["visual"]["source"],
             "return () => visual.text('Example');"
         );
+        // A phone that cannot run it draws its first render.
+        assert_eq!(notice["tree"]["kind"], "text");
     }
     #[test]
-    fn drafts_are_cards_the_phone_opens_and_kept_ones_go_by_their_pages_name() {
+    fn a_picture_kept_of_a_draft_rides_on_its_card_instead_of_a_second_one() {
+        let dir = std::env::temp_dir().join(format!("monocode-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (png, page) = (dir.join("k.png"), dir.join("k.html"));
+        std::fs::write(&page, "<p>kept</p>").unwrap();
+        let picture = monocode_core::transcript::images::ImageDocument {
+            title: "Kept pricing".into(),
+            path: png,
+            mime_type: "image/png".into(),
+            width: 2,
+            height: 2,
+        };
+        let card = monocode_core::visual_bridge::DraftCard {
+            draft: "draft-1-a".into(),
+            title: "Pricing".into(),
+        };
+        let rows = vec![
+            row("user", "Mock it"),
+            row(
+                monocode_core::visual_bridge::DRAFT_ROLE,
+                &serde_json::to_string(&card).unwrap(),
+            ),
+            tool(
+                "mcp__monocode__draft_keep",
+                json!({"draft": "draft-1-a", "title": "Kept pricing"}),
+                ToolState::Completed,
+            ),
+            row(
+                monocode_core::transcript::images::ROLE,
+                &serde_json::to_string(&picture).unwrap(),
+            ),
+            row("assistant", "Ready"),
+        ];
+        let info = HashMap::new();
+        let turns = all(&source(&rows, &info, false));
+        let cards: Vec<_> = turns[0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["draft"].is_object())
+            .collect();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["draft"]["draft"], "draft-1-a");
+        assert_eq!(cards[0]["draft"]["kept"], "kept:k.html");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drafts_and_kept_pages_say_they_open_on_the_desktop() {
         let dir = std::env::temp_dir().join(format!("monocode-kept-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (png, page, plain) = (dir.join("k.png"), dir.join("k.html"), dir.join("p.png"));
@@ -1076,21 +1196,28 @@ mod tests {
         let info = HashMap::new();
         let turns = all(&source(&rows, &info, false));
         let items = turns[0]["items"].as_array().unwrap();
-        let drafts: Vec<_> = items.iter().filter(|i| i["type"] == "draft").collect();
-        assert_eq!(drafts.len(), 2);
-        assert_eq!(drafts[0]["draft"], "draft-1-a");
-        assert_eq!(drafts[0]["title"], "Pricing");
-        assert_eq!(drafts[1]["draft"], "kept:k.html");
-        assert_eq!(drafts[1]["kept"], true);
+        let notices: Vec<_> = items
+            .iter()
+            .filter(|i| i["type"] == "notice")
+            .map(|i| i["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "Pricing · Open on desktop to view",
+                "Kept pricing · Open on desktop to view",
+                "Screenshot · Open on desktop to view",
+            ]
+        );
+        // Each page is a card for a phone that draws them; a plain image is not.
+        let cards: Vec<_> = items
+            .iter()
+            .filter(|i| i["draft"].is_object())
+            .map(|i| i["draft"]["draft"].as_str().unwrap())
+            .collect();
+        assert_eq!(cards, ["draft-1-a", "kept:k.html"]);
         // Nothing of the desktop's paths goes to the phone.
         assert!(!turns[0].to_string().contains(dir.to_str().unwrap()));
-        // A plain image is still a line saying where to see it.
-        assert!(
-            items
-                .iter()
-                .any(|i| i["type"] == "notice"
-                    && i["text"] == "Screenshot · Open on desktop to view")
-        );
         std::fs::remove_dir_all(&dir).ok();
     }
     fn types(turn: &Value) -> Vec<&str> {
@@ -1202,6 +1329,25 @@ mod tests {
         // Legacy turns without timing still settle, without an invented duration.
         assert!(header.get("durationMs").is_none());
         assert_eq!(turn["footer"], true);
+    }
+
+    #[test]
+    fn a_running_command_is_the_live_turn() {
+        let run = monocode_core::shell_run::ShellRun::new("sleep 5", "/repo");
+        let rows = vec![
+            row("user", "Go"),
+            row("assistant", "Done"),
+            row(
+                monocode_core::shell_run::ROLE,
+                &serde_json::to_string(&run).unwrap(),
+            ),
+        ];
+        let infos = HashMap::new();
+        let turns = all(&source(&rows, &infos, true));
+        let turn = turns.last().unwrap();
+        assert_eq!(types(turn), ["user", "header"]);
+        assert_eq!(turn["items"][0]["text"], "$ sleep 5");
+        assert_eq!(turn["items"][1]["live"], true);
     }
 
     #[test]

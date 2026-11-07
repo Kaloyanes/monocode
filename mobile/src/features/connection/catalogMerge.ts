@@ -27,7 +27,8 @@ export function mergeCatalog(previous: Catalog, next: Catalog): Catalog {
     sessions === previous.sessions &&
     previous.monoTools === next.monoTools &&
     previous.push === next.push &&
-    previous.monoFiles === next.monoFiles
+    previous.monoFiles === next.monoFiles &&
+    previous.inboxRev === next.inboxRev
   )
     return previous;
   return { ...next, projects, monos, sessions };

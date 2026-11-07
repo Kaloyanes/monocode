@@ -21,7 +21,7 @@ pub fn launch_origins<'a>(
 
 /// The workspace poll's sessions: each project's most recent, every busy one,
 /// and every Mono's. `sessions` is newest first, as the catalog is sorted.
-/// Orchestrator workers (with a `leadId`) ride along with their lead and don't
+/// Subagents (with a `leadId`) ride along with their lead and don't
 /// count toward the project's recent ones.
 pub fn recent_sessions(sessions: &Value) -> Vec<Value> {
     let mut per_project: HashMap<&str, usize> = HashMap::new();
@@ -90,6 +90,8 @@ pub fn session_page(sessions: &Value, params: &Value) -> Value {
     json!({
         "sessions": page,
         "hasMore": offset + page.len() < matches.len(),
+        // How many match in all, for the count beside a list's title.
+        "total": matches.len(),
     })
 }
 
@@ -125,6 +127,7 @@ mod tests {
         let page = session_page(&sessions, &json!({"projectId":"p","offset":28,"limit":10}));
         assert_eq!(page["sessions"].as_array().unwrap().len(), 3);
         assert_eq!(page["hasMore"], false);
+        assert_eq!(page["total"], 31);
         let page = session_page(&sessions, &json!({"projectId":"p","limit":2}));
         assert_eq!(page["hasMore"], true);
         let found = session_page(&sessions, &json!({"projectId":"p","query":"task 2"}));

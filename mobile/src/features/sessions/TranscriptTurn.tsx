@@ -1,10 +1,8 @@
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { createContext, memo, use, useEffect, useRef, useState } from "react";
-import { useLocalSearchParams } from "expo-router";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Image, Pressable, StyleSheet, Text, View } from "react-native";
 
-import { openDraft } from "@/features/drafts/openDraft";
 import { PixelMascot } from "@/features/mascots/PixelMascot";
 import { leadingCommand } from "@/features/skills/slash";
 import { useCollapsedToolCalls } from "@/features/settings/toolCalls";
@@ -14,6 +12,7 @@ import type {
   WorkKind,
   WorkPhase,
 } from "@/features/workspace/types";
+import { MONOCODE_MARK } from "@/ui/brand";
 import { Collapsible } from "@/ui/Collapsible";
 import { Icon, type IconName } from "@/ui/Icon";
 import { Shimmer } from "@/ui/Shimmer";
@@ -23,6 +22,9 @@ import { LaunchedSessions } from "./LaunchedSessionCard";
 import { DocumentCard, MonoChoices } from "./MonoCards";
 import { Markdown } from "./Markdown";
 import { ProviderLogo } from "./ProviderLogo";
+import { DraftCard } from "@/features/drafts/DraftCard";
+import { VisualTree } from "@/features/visuals/VisualTree";
+
 import { sessionErrorContent, type SessionErrorNotice } from "./sessionError";
 import {
   dayStamp,
@@ -65,10 +67,12 @@ const CONTENT_X = GUTTER + FOLD_MARK + 6;
  */
 export const TranscriptTurn = memo(function TranscriptTurn({
   turn,
+  conversationId,
   agent,
   onError,
 }: {
   turn: Turn;
+  conversationId: string;
   agent?: TranscriptAgent;
   onError: (notice: SessionErrorNotice) => void;
 }) {
@@ -114,6 +118,18 @@ export const TranscriptTurn = memo(function TranscriptTurn({
           case "document":
             return <DocumentCard key={item.id} document={item} />;
           case "notice":
+            if (item.draft)
+              return (
+                <DraftCard key={item.id} conversationId={conversationId} card={item.draft} />
+              );
+            // A visual runs on the desktop; here it is the picture it last was.
+            if (item.tree)
+              return (
+                <View key={item.id} style={styles.visual}>
+                  <Text style={styles.visualTitle}>{item.text}</Text>
+                  <VisualTree node={item.tree} />
+                </View>
+              );
             return item.error ? (
               <ErrorNotice key={item.id} item={item} onPress={() => onError(item)} />
             ) : (
@@ -121,8 +137,6 @@ export const TranscriptTurn = memo(function TranscriptTurn({
                 {item.text}
               </Text>
             );
-          case "draft":
-            return <DraftCard key={item.id} item={item} />;
         }
       })}
       {turn.footer ? <TurnFooter turn={turn} /> : null}
@@ -145,31 +159,6 @@ function ErrorNotice({ item, onPress }: { item: SessionErrorNotice; onPress: () 
       <View style={styles.errorNoticeText}>
         <Text style={styles.errorNoticeTitle}>{title}</Text>
         <Text style={styles.errorNoticeHint}>View details</Text>
-      </View>
-      <Icon name="chevronRight" size={16} color={colors.faint} />
-    </Pressable>
-  );
-}
-
-/** A page the agent built, opened live on the phone; drawn as the error card is. */
-function DraftCard({ item }: { item: Extract<TurnItem, { type: "draft" }> }) {
-  const colors = useColors();
-  const styles = useStyles();
-  const { sessionId } = useLocalSearchParams<{ sessionId?: string }>();
-  return (
-    <Pressable
-      onPress={() => sessionId && openDraft(sessionId, item.draft, item.title)}
-      disabled={!sessionId}
-      accessibilityRole="button"
-      accessibilityLabel={`${item.title}. Open draft`}
-      style={({ pressed }) => [styles.errorNotice, pressed && styles.pressed]}
-    >
-      <Icon name="edit" size={18} color={colors.muted} />
-      <View style={styles.errorNoticeText}>
-        <Text style={styles.errorNoticeTitle} numberOfLines={2}>
-          {item.title}
-        </Text>
-        <Text style={styles.errorNoticeHint}>{item.kept ? "Kept draft · Open" : "Draft · Open"}</Text>
       </View>
       <Icon name="chevronRight" size={16} color={colors.faint} />
     </Pressable>
@@ -525,7 +514,15 @@ function Phase({ phase, active }: { phase: WorkPhase; active: boolean }) {
         accessibilityState={expandable ? { expanded: open } : undefined}
         style={styles.phaseRow}
       >
-        {icon ? <Icon name={icon} size={PHASE_ICON} color={withAlpha(colors.content, 0.45)} /> : null}
+        {phase.kind === "visual" ? (
+          <Image
+            source={MONOCODE_MARK}
+            style={{ width: PHASE_ICON, height: PHASE_ICON }}
+            tintColor={withAlpha(colors.content, 0.45)}
+          />
+        ) : icon ? (
+          <Icon name={icon} size={PHASE_ICON} color={withAlpha(colors.content, 0.45)} />
+        ) : null}
         {active ? (
           <Shimmer style={styles.phaseTitle}>{phase.title}</Shimmer>
         ) : (
@@ -845,6 +842,8 @@ const useStyles = themedStyles((colors) => ({
   replyUnderLine: {
     paddingTop: 4,
   },
+  visual: { marginHorizontal: 20, marginVertical: 8, gap: 12 },
+  visualTitle: { fontSize: 15, lineHeight: 20, fontWeight: "500", color: colors.content },
   notice: {
     paddingHorizontal: GUTTER,
     paddingVertical: 8,

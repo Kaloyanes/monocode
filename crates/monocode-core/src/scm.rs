@@ -1407,16 +1407,18 @@ fn resolve_repo_path(root: &Path, relative: &str) -> Result<String, String> {
 /// Any git can start a filter (git-lfs), which a Finder launch's bare PATH
 /// lacks. The cached search path finds it without waiting on the login shell.
 pub(crate) fn git_cmd() -> Command {
-    let mut cmd = Command::new("git");
-    crate::process::configure_child(&mut cmd);
+    with_git_env(crate::process::git_for(&[]))
+}
+
+fn with_git_env(mut cmd: Command) -> Command {
     cmd.env("PATH", shell::cached_gui_search_path())
         .env("GIT_TERMINAL_PROMPT", "0");
     cmd
 }
 
 fn git_cmd_for_args_with_path(args: &[&str], gui_path: impl FnOnce() -> String) -> Command {
-    let mut cmd = git_cmd();
     let args = args.strip_prefix(&["--literal-pathspecs"]).unwrap_or(args);
+    let mut cmd = with_git_env(crate::process::git_for(args));
     if matches!(
         args.first().copied(),
         Some("commit" | "push" | "pull" | "fetch" | "clone")
@@ -1427,7 +1429,7 @@ fn git_cmd_for_args_with_path(args: &[&str], gui_path: impl FnOnce() -> String) 
     cmd
 }
 
-fn git_cmd_for_args(args: &[&str]) -> Command {
+pub(crate) fn git_cmd_for_args(args: &[&str]) -> Command {
     git_cmd_for_args_with_path(args, shell::gui_search_path)
 }
 
@@ -1634,7 +1636,12 @@ pub fn git_dirs(root: &Path) -> Vec<std::path::PathBuf> {
 }
 
 fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
-    let output = git_cmd().arg("-C").arg(root).args(args).output().ok()?;
+    let output = git_cmd_for_args(args)
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

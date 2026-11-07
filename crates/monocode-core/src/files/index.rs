@@ -1,7 +1,7 @@
 //! Bounded, cancellable project listing shared by mentions and Quick Open.
 //! Ported from the retired Tauri filesystem service.
 use super::Ignore;
-use crate::scm::{expand_home, git_cmd, path_to_js, shell::dirs_home};
+use crate::scm::{expand_home, git_cmd_for_args, path_to_js, shell::dirs_home};
 use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
@@ -134,7 +134,7 @@ pub(crate) fn git_output_capped(
     max_bytes: usize,
     cancel: Option<&AtomicBool>,
 ) -> Option<(Vec<u8>, bool)> {
-    let mut child = git_cmd()
+    let mut child = git_cmd_for_args(args)
         .arg("--no-pager")
         .arg("-C")
         .arg(root)
@@ -430,7 +430,7 @@ mod tests {
     fn indexes_untracked_files_respects_ignores_and_cancels() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        assert!(git_cmd()
+        assert!(crate::scm::git_cmd()
             .arg("init")
             .arg("-q")
             .arg(root)

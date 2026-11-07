@@ -479,8 +479,8 @@ pub struct Diagnostics {
     pub failed_images: u32,
 }
 
-/// The page runs under a strict CSP, so network and external resources fail
-/// silently in the view. Say so before showing it instead.
+/// The page runs under a strict CSP, so unlisted code and unembedded images
+/// fail silently in the view. Say so before showing it instead.
 pub fn check_html(html: &str) -> Result<(), String> {
     // Embedded images count against their own budget, not the page's.
     let images: usize = embedded_images()
@@ -549,17 +549,6 @@ pub fn check_html(html: &str) -> Result<(), String> {
             "This image was not embedded; give it as an https URL or an absolute file path to an image file"
                 .into(),
         );
-    }
-    for api in [
-        "fetch(",
-        "xmlhttprequest",
-        "websocket",
-        "eventsource",
-        "sendbeacon",
-    ] {
-        if lower.contains(api) {
-            return Err(format!("The page has no network access ({api} is blocked)"));
-        }
     }
     Ok(())
 }
@@ -715,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn pages_may_only_reach_listed_hosts_and_have_no_network_apis() {
+    fn pages_may_only_load_code_from_listed_hosts() {
         assert!(check_html("<p>See https://example.com for more</p>").is_ok());
         assert!(check_html(
             r#"<script src="https://cdn.jsdelivr.net/npm/chart.js"></script><link rel=stylesheet href="https://fonts.googleapis.com/css2?family=Inter">"#
@@ -727,11 +716,21 @@ mod tests {
             r#"<link rel=stylesheet href="https://evil.example/x.css">"#,
             r#"<style>@import url("https://evil.example/x.css")</style>"#,
             r#"<img src="https://example.com/a.png">"#,
-            "<script>fetch('/x')</script>",
-            "<script>new WebSocket('ws://x')</script>",
             "   ",
         ] {
             assert!(check_html(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn pages_may_call_network_apis_and_write_about_them() {
+        for page in [
+            "<script>fetch('https://api.example.com/x')</script>",
+            "<script>new WebSocket('wss://example.com')</script>",
+            "<script>new XMLHttpRequest()</script>",
+            "<p>The fetch() call and the WebSocket API</p>",
+        ] {
+            assert!(check_html(page).is_ok(), "{page}");
         }
     }
 

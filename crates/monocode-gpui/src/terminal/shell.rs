@@ -1,7 +1,7 @@
 //! Platform shell selection, independent of the terminal renderer.
 
 #[cfg(windows)]
-pub(super) fn default_shell(search_path: &str) -> (String, Vec<String>) {
+pub(crate) fn default_shell(search_path: &str) -> (String, Vec<String>) {
     windows_shell(
         std::env::var("SHELL").ok().as_deref(),
         std::env::var("COMSPEC").ok().as_deref(),
@@ -93,7 +93,7 @@ pub(super) fn pty_program(program: &str) -> String {
 }
 
 #[cfg(not(windows))]
-pub(super) fn default_shell(_search_path: &str) -> (String, Vec<String>) {
+pub(crate) fn default_shell(_search_path: &str) -> (String, Vec<String>) {
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.is_empty())

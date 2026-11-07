@@ -255,6 +255,13 @@ impl FilenameIndex {
                 .collect(),
         }
     }
+    /// The indexed file at `path`, if the project has it.
+    pub fn get(&self, path: &str) -> Option<&ProjectFile> {
+        self.files
+            .iter()
+            .map(|indexed| &indexed.file)
+            .find(|file| file.path == path)
+    }
     pub fn rank(&self, query: &str, recent: &[String]) -> Vec<Hit> {
         let tokens = query_tokens(query);
         let mut hits: Vec<_> = self

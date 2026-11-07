@@ -38,9 +38,39 @@ pub(crate) struct SessionReview {
     /// Another session is running in this project.
     undo_locked: bool,
     generation: u64,
+    reads: Reads,
     _load: Option<Task<()>>,
+    _settle: Option<Task<()>>,
 }
 impl EventEmitter<SessionReviewEvent> for SessionReview {}
+
+/// How long Git changes gather before a view rereads its turn. An agent's
+/// edits arrive in bursts, and every open chat in the checkout hears them.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One read of the recorded turn at a time: each runs several Git commands,
+/// and reads started during one would only queue for the same lock.
+#[derive(Default)]
+struct Reads {
+    running: bool,
+    again: bool,
+}
+impl Reads {
+    /// Whether a read may start now; if not, one follows the current read.
+    fn start(&mut self) -> bool {
+        self.again = self.running;
+        !std::mem::replace(&mut self.running, true)
+    }
+    /// The read ended. Whether another was asked for meanwhile.
+    fn finish(&mut self) -> bool {
+        self.running = false;
+        std::mem::take(&mut self.again)
+    }
+    /// The running read's result no longer matters.
+    fn abandon(&mut self) {
+        *self = Self::default();
+    }
+}
 
 impl SessionReview {
     pub(crate) fn new(session: i64, cwd: String) -> Self {
@@ -54,7 +84,9 @@ impl SessionReview {
             busy: false,
             undo_locked: false,
             generation: 0,
+            reads: Reads::default(),
             _load: None,
+            _settle: None,
         }
     }
     pub(crate) fn session(&self) -> (i64, &str) {
@@ -67,6 +99,7 @@ impl SessionReview {
     pub(crate) fn set_cwd(&mut self, cwd: String, cx: &mut Context<Self>) {
         if self.cwd != cwd {
             self.cwd = cwd;
+            self.generation += 1;
             self.publish(Ok(CheckpointStatus::default()), cx);
             self.refresh(cx);
         }
@@ -81,6 +114,7 @@ impl SessionReview {
         if busy {
             self.generation += 1;
             self._load = None;
+            self.reads.abandon();
             self.publish(Ok(CheckpointStatus::default()), cx);
         }
         cx.notify();
@@ -103,6 +137,9 @@ impl SessionReview {
         let Some(store) = monocode_core::checkpoint::store() else {
             return;
         };
+        if !self.reads.start() {
+            return;
+        }
         self.generation += 1;
         let generation = self.generation;
         let (session, cwd) = (self.session.to_string(), self.cwd.clone());
@@ -115,6 +152,22 @@ impl SessionReview {
                 if this.generation == generation && !this.busy {
                     this.publish(status, cx);
                 }
+                if this.reads.finish() {
+                    this.refresh(cx);
+                }
+            });
+        }));
+    }
+    /// Rereads the turn once the current burst of Git changes has passed.
+    pub(crate) fn refresh_soon(&mut self, cx: &mut Context<Self>) {
+        if self._settle.is_some() {
+            return;
+        }
+        self._settle = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SETTLE).await;
+            let _ = this.update(cx, |this, cx| {
+                this._settle = None;
+                this.refresh(cx);
             });
         }));
     }
@@ -141,6 +194,7 @@ impl SessionReview {
         };
         self.acting = Some(action);
         cx.notify();
+        self.reads.abandon();
         self.generation += 1;
         let generation = self.generation;
         let (session, cwd) = (self.session.to_string(), self.cwd.clone());
@@ -492,5 +546,47 @@ impl SessionReview {
 impl Render for SessionReview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.contents(card(), cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asks_during_a_read_become_one_more_read() {
+        let mut reads = Reads::default();
+        assert!(reads.start());
+        assert!(!reads.start());
+        assert!(!reads.start());
+        assert!(reads.finish());
+        assert!(reads.start());
+        assert!(!reads.finish());
+    }
+
+    #[test]
+    fn an_abandoned_read_does_not_block_the_next() {
+        let mut reads = Reads::default();
+        assert!(reads.start());
+        assert!(!reads.start());
+        reads.abandon();
+        assert!(reads.start());
+        assert!(!reads.finish());
+    }
+
+    #[gpui::test]
+    fn git_changes_in_one_burst_share_a_single_wait(cx: &mut gpui::TestAppContext) {
+        let review = cx.new(|_| SessionReview::new(1, "/work".into()));
+        review.update(cx, |review, cx| {
+            review.refresh_soon(cx);
+            review.refresh_soon(cx);
+            assert!(review._settle.is_some());
+        });
+        cx.executor().advance_clock(SETTLE / 2);
+        cx.run_until_parked();
+        assert!(review.read_with(cx, |review, _| review._settle.is_some()));
+        cx.executor().advance_clock(SETTLE);
+        cx.run_until_parked();
+        assert!(review.read_with(cx, |review, _| review._settle.is_none()));
     }
 }

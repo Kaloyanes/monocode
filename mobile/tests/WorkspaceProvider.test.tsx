@@ -23,7 +23,7 @@ const link = vi.hoisted(() => ({
     projects: [{ id: "project" }],
     monos: [] as object[],
     sessions: [] as object[],
-  } as { projects: object[]; monos: object[]; sessions: object[]; sessionUnarchive?: boolean },
+  } as { projects: object[]; monos: object[]; sessions: object[]; sessionUnarchive?: boolean; archivedList?: boolean },
 }));
 vi.mock("react-native", () => ({
   AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
@@ -456,6 +456,42 @@ describe("starting mobile sessions", () => {
       expect(listed()).toEqual(["b"]);
     });
 
+    it("keeps what was archived here in the archive until it is restored or deleted", async () => {
+      link.command.mockResolvedValue({});
+      render();
+      const archive = (id: string) =>
+        workspace.editedArchived(row(id) as unknown as Parameters<typeof workspace.editedArchived>[0]);
+      // Archived on the desktop: the archive lists it.
+      expect(archive("old")?.id).toBe("old");
+      await act(async () => { await workspace.archiveSession("a"); });
+      expect(listed()).toEqual(["b"]);
+      expect(archive("a")?.id).toBe("a");
+      await act(async () => { await workspace.unarchiveSession("a"); });
+      expect(archive("a")).toBeNull();
+      await act(async () => { await workspace.archiveSession("a"); });
+      await act(async () => { await workspace.deleteSession("a"); });
+      expect(archive("a")).toBeNull();
+      link.command.mockRejectedValue(new Error("Unknown method"));
+      await act(async () => {
+        await expect(workspace.unarchiveSession("old")).rejects.toThrow("Unknown method");
+      });
+      expect(archive("old")?.id).toBe("old");
+    });
+
+    it("pages the archive through sessions.list, only where the desktop serves it", async () => {
+      link.command.mockResolvedValue({ sessions: [], hasMore: false, total: 0 });
+      render();
+      expect(workspace.canListArchived).toBe(false);
+      link.catalog = { ...link.catalog, archivedList: true };
+      render();
+      expect(workspace.canListArchived).toBe(true);
+      await act(async () => { await workspace.listArchived("project", "bug", 30); });
+      expect(link.command).toHaveBeenLastCalledWith(
+        "sessions.list",
+        { projectId: "project", query: "bug", offset: 30, limit: 30, archived: true },
+      );
+    });
+
     it("offers an Undo only where the desktop says it can unarchive", () => {
       render();
       expect(workspace.canUnarchive).toBe(false);
@@ -470,6 +506,44 @@ describe("starting mobile sessions", () => {
       expect(workspace.monos.map((mono) => mono.id)).toEqual(["here"]);
       expect(workspace.allMonos.map((mono) => mono.id)).toEqual(["elsewhere", "here"]);
     });
+  });
+
+  const usage = { token: "paused", resetsAt: 123456, resumeAtReset: false, canResume: true,
+    canAutoResume: true, resetLabel: "Limit has reset", limitation: "Keep desktop running" };
+  it("synchronizes usage preferences and resume state from JavaScript watch frames", async () => {
+    link.command.mockResolvedValue({ sessionId: "existing" });
+    await act(async () => { render("existing"); });
+    await frame([{ order: [], turns: [], usageLimit: usage }]);
+    expect(conversation.usageLimit).toEqual(usage);
+    await act(async () => { await workspace.recoverUsage("existing", usage, true); });
+    expect(link.command).toHaveBeenCalledWith("session.resumeUsageAtReset", { conversationId: "existing", token: usage.token, enabled: true }, "request-id");
+    await frame([{ usageLimit: { ...usage, resumeAtReset: true } }]);
+    expect(conversation.usageLimit?.resumeAtReset).toBe(true);
+    await act(async () => { await workspace.recoverUsage("existing", usage, false); });
+    expect(link.command).toHaveBeenCalledWith("session.resumeUsageAtReset", { conversationId: "existing", token: usage.token, enabled: false }, "request-id");
+    await frame([{ usageLimit: null }]);
+    expect(conversation.usageLimit).toBeNull();
+  });
+  it("passes native transcript usage state, suppresses duplicate actions, and retries a failed continuation", async () => {
+    link.nativeTranscript = true;
+    render("session");
+    const status = { busy: false, error: null, hasTurns: true, userCount: 1, pendingId: null };
+    act(() => workspace.nativeTranscriptStatus("session", { ...status, usageLimit: usage }));
+    expect(conversation.usageLimit).toEqual(usage);
+    const pending = deferred<object>();
+    link.command.mockReturnValueOnce(pending.promise);
+    let first!: Promise<void>;
+    act(() => { first = workspace.recoverUsage("session", usage); });
+    await workspace.recoverUsage("session", usage);
+    expect(link.command).toHaveBeenCalledTimes(1);
+    await act(async () => { pending.resolve({}); await first; });
+    link.command.mockRejectedValueOnce(new Error("Desktop busy"));
+    await act(async () => { await expect(workspace.recoverUsage("session", usage)).rejects.toThrow("Desktop busy"); });
+    link.command.mockResolvedValueOnce({});
+    await act(async () => { await workspace.recoverUsage("session", usage); });
+    expect(link.command).toHaveBeenLastCalledWith("session.resumeUsage", { conversationId: "session", token: usage.token }, "request-id");
+    act(() => workspace.nativeTranscriptStatus("session", { ...status, usageLimit: null }));
+    expect(conversation.usageLimit).toBeNull();
   });
 
 });

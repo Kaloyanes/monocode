@@ -2,13 +2,23 @@ import { act, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { InboxRow, snoozedLabel, whyLabel, type RowHandlers } from "@/features/inbox/InboxRow";
+import {
+  InboxRow,
+  itemRef,
+  rowFit,
+  snoozedLabel,
+  whyLabel,
+  type RowHandlers,
+} from "@/features/inbox/InboxRow";
+import { itemState } from "@/features/inbox/ItemMark";
 import type { InboxItem } from "@/features/inbox/protocol";
 
 const NOW = new Date("2026-11-01T14:00:00").getTime();
 
 const captured = vi.hoisted(() => ({
   accessibility: undefined as undefined | ((event: { nativeEvent: { actionName: string } }) => void),
+  fontScale: 1,
+  startDrag: undefined as undefined | (() => void),
 }));
 
 vi.mock("react-native", () => ({
@@ -33,16 +43,20 @@ vi.mock("react-native", () => ({
     );
   },
   StyleSheet: { create: (styles: unknown) => styles },
+  useWindowDimensions: () => ({ fontScale: captured.fontScale }),
 }));
 vi.mock("react-native-gesture-handler/ReanimatedSwipeable", () => ({
   default: ({
     children,
     renderRightActions,
+    onSwipeableOpenStartDrag,
   }: {
     children?: ReactNode;
     renderRightActions: (progress: unknown, translation: unknown) => ReactNode;
+    onSwipeableOpenStartDrag: () => void;
   }) => {
     const value = { get: () => 0, set: () => {} };
+    captured.startDrag = onSwipeableOpenStartDrag;
     return (
       <div>
         {children}
@@ -91,6 +105,7 @@ vi.mock("@/ui/theme", () => {
     caution: "amber",
     deletions: "red",
     additions: "green",
+    merged: "violet",
     surfaceRaised: "gray",
     background: "black",
   };
@@ -140,6 +155,7 @@ describe("an inbox row", () => {
   };
   const render = (value: InboxItem = item) =>
     act(() => root.render(<InboxRow item={value} handlers={handlers} now={NOW} />));
+  const swipe = () => act(() => captured.startDrag?.());
   const button = (label: string) => {
     const found = Array.from(container.querySelectorAll("button")).find(
       (entry) => entry.getAttribute("aria-label") === label,
@@ -151,6 +167,7 @@ describe("an inbox row", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     captured.accessibility = undefined;
+    captured.fontScale = 1;
     container = document.createElement("div");
     root = createRoot(container);
   });
@@ -160,12 +177,24 @@ describe("an inbox row", () => {
     render();
     const text = container.textContent ?? "";
     expect(text).toContain("Stream tool output");
-    expect(text).toContain("Review requested by maren-k");
-    expect(text).toContain("acme/app · #12");
+    expect(text).toContain("PR #12 · Review requested by maren-k · acme/app");
     expect(text).toContain("12m");
     expect(text).toContain("+312");
     expect(text).toContain("−48");
     expect(text).toContain("4");
+  });
+
+  it("keeps everything it says at every text size", () => {
+    for (const fontScale of [0.82, 1, 1.35, 1.79, 3.57]) {
+      captured.fontScale = fontScale;
+      render({ ...item, key: `size-${fontScale}` });
+      const text = container.textContent ?? "";
+      expect(text, `at ${fontScale}`).toContain("Stream tool output");
+      expect(text, `at ${fontScale}`).toContain("12m");
+      expect(text, `at ${fontScale}`).toContain("PR #12 · Review requested by maren-k · acme/app");
+      expect(text, `at ${fontScale}`).toContain("+312");
+      expect(text, `at ${fontScale}`).toContain("−48");
+    }
   });
 
   it("says unread in its label, and not once read", () => {
@@ -177,12 +206,20 @@ describe("an inbox row", () => {
 
   it("opens on a tap", () => {
     render();
-    act(() => button(`Unread, Stream tool output, Review requested by maren-k, acme/app`).click());
+    act(() => button(`Unread, Stream tool output, PR #12, Review requested by maren-k, acme/app`).click());
     expect(handlers.open).toHaveBeenCalledWith(item);
+  });
+
+  it("leaves its buttons unmounted until it is first swiped", () => {
+    render();
+    expect(container.querySelector("button[aria-label='Done']")).toBeNull();
+    swipe();
+    expect(container.querySelector("button[aria-label='Done']")).not.toBeNull();
   });
 
   it("offers Snooze, Start agent and Done behind it", () => {
     render();
+    swipe();
     act(() => button("Done").click());
     expect(handlers.done).toHaveBeenCalledWith(item);
     act(() => button("Start agent").click());
@@ -195,6 +232,7 @@ describe("an inbox row", () => {
 
   it("offers a way back instead of Done in the Done list", () => {
     render({ ...item, done: true });
+    swipe();
     expect(container.querySelector("button[aria-label='Done']")).toBeNull();
     act(() => button("Back to inbox").click());
     expect(handlers.undone).toHaveBeenCalled();
@@ -214,9 +252,66 @@ describe("an inbox row", () => {
     expect(snoozedLabel(NOW + 3_600_000, NOW)).toMatch(/3:00/);
   });
 
+  it("names a GitHub item's kind and drops the reason that only repeats it", () => {
+    render({ ...item, attention: undefined, attentionLabel: undefined });
+    expect(container.textContent).toContain("PR #12");
+    expect(container.textContent).not.toContain("Open pull request");
+    expect(itemRef({ ...item, kind: "issue" })).toBe("Issue #12");
+  });
+
+  it("keeps a reason that says something new", () => {
+    render(item);
+    expect(container.textContent).toContain(`PR #12 · ${item.attentionLabel}`);
+    render({ ...item, attention: undefined, attentionLabel: undefined, status: "draft" });
+    expect(container.textContent).toContain("PR #12 · Draft");
+  });
+
+  it("leaves other sources' identifiers and reasons as they are", () => {
+    const linear: InboxItem = {
+      ...item,
+      source: "linear",
+      kind: "issue",
+      number: "ENG-42",
+      attention: undefined,
+      attentionLabel: undefined,
+    };
+    render(linear);
+    expect(container.textContent).toContain("ENG-42 · Open issue");
+  });
+
+  it("tells pull requests from issues by shape in every state", () => {
+    const colors = { additions: "green", deletions: "red", muted: "gray", merged: "violet" };
+    const state = (kind: InboxItem["kind"], status: InboxItem["status"]) =>
+      itemState({ kind, status }, colors as never);
+    expect(state("pr", "open")).toEqual({ icon: "pullRequest", tint: "green" });
+    expect(state("pr", "draft")).toEqual({ icon: "pullRequestDraft", tint: "gray" });
+    expect(state("pr", "merged")).toEqual({ icon: "merge", tint: "violet" });
+    expect(state("pr", "closed")).toEqual({ icon: "pullRequestClosed", tint: "red" });
+    expect(state("issue", "open")).toEqual({ icon: "issue", tint: "green" });
+    expect(state("issue", "closed")).toEqual({ icon: "passing", tint: "violet" });
+  });
+
   it("falls back to the status when the desktop gave no reason", () => {
     expect(whyLabel({ ...item, attentionLabel: undefined, status: "merged" })).toBe("Merged");
     expect(whyLabel({ ...item, attentionLabel: undefined })).toBe("Open pull request");
     expect(whyLabel({ ...item, attentionLabel: undefined, kind: "issue" })).toBe("Open issue");
+  });
+});
+
+describe("how a row fits the text size", () => {
+  it("keeps one line of details up to XL", () => {
+    expect(rowFit(0.82)).toBe("regular");
+    expect(rowFit(1)).toBe("regular");
+    expect(rowFit(1.118)).toBe("regular");
+  });
+
+  it("gives the details their own lines at XXL and XXXL", () => {
+    expect(rowFit(1.235)).toBe("roomy");
+    expect(rowFit(1.353)).toBe("roomy");
+  });
+
+  it("gives the title the full width at every accessibility size", () => {
+    expect(rowFit(1.786)).toBe("stacked");
+    expect(rowFit(3.571)).toBe("stacked");
   });
 });

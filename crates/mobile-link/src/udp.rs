@@ -7,16 +7,26 @@
 //! runtime thread at full speed in `recvmsg` for good: the task can't even be
 //! aborted. Returning the error stops the endpoint's driver instead; its
 //! connections then time out, and the next request opens a fresh socket.
+//!
+//! Quinn retries `ConnectionReset` itself, outside its work limit, so that
+//! error alone would still spin. A stray one is passed over here, and a run
+//! of them ends the endpoint as any other error does.
 
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use std::{
     fmt, io,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     task::{ready, Context, Poll},
 };
 use tokio::io::Interest;
+
+/// Resets in a row that mean the socket is gone rather than a stray packet.
+const MAX_RESETS: u32 = 16;
 
 /// A client endpoint, as `quinn::Endpoint::client`, on this socket.
 pub fn endpoint(bind: std::net::SocketAddr) -> io::Result<quinn::Endpoint> {
@@ -42,6 +52,7 @@ pub fn endpoint(bind: std::net::SocketAddr) -> io::Result<quinn::Endpoint> {
 struct Socket {
     io: tokio::net::UdpSocket,
     state: UdpSocketState,
+    resets: AtomicU32,
 }
 
 impl Socket {
@@ -49,7 +60,24 @@ impl Socket {
         Ok(Arc::new(Self {
             state: UdpSocketState::new((&socket).into())?,
             io: tokio::net::UdpSocket::from_std(socket)?,
+            resets: AtomicU32::new(0),
         }))
+    }
+
+    /// What a receive that wasn't `WouldBlock` comes to: `None` to read again,
+    /// past a stray reset. The error returned is never one Quinn retries.
+    fn settle(&self, result: io::Result<usize>) -> Option<io::Result<usize>> {
+        let error = match result {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => error,
+            result => {
+                self.resets.store(0, Ordering::Relaxed);
+                return Some(result);
+            }
+        };
+        if self.resets.fetch_add(1, Ordering::Relaxed) + 1 < MAX_RESETS {
+            return None;
+        }
+        Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, error)))
     }
 }
 
@@ -83,7 +111,11 @@ impl AsyncUdpSocket for Socket {
             }) {
                 // Readiness was cleared: wait for the next datagram.
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                result => return Poll::Ready(result),
+                result => {
+                    if let Some(result) = self.settle(result) {
+                        return Poll::Ready(result);
+                    }
+                }
             }
         }
     }
@@ -158,6 +190,22 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("the receive spun instead of returning");
         assert!(failed);
+    }
+
+    #[tokio::test]
+    async fn a_stray_reset_is_passed_over_and_a_run_of_them_ends_the_endpoint() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = Socket::wrap(socket).unwrap();
+        let reset = || Err(io::Error::from(io::ErrorKind::ConnectionReset));
+        assert!(socket.settle(reset()).is_none());
+        // A good read starts the count again.
+        assert!(matches!(socket.settle(Ok(1)), Some(Ok(1))));
+        for _ in 1..MAX_RESETS {
+            assert!(socket.settle(reset()).is_none());
+        }
+        let ended = socket.settle(reset()).unwrap().unwrap_err();
+        assert_ne!(ended.kind(), io::ErrorKind::ConnectionReset);
     }
 
     extern "C" {

@@ -53,6 +53,8 @@ use std::{
     time::Duration,
 };
 pub(crate) struct Changed;
+/// The heading of the sidebar section was clicked.
+pub(crate) struct RailToggled;
 /// Asks the shell to choose a project for a copy of this Mono.
 pub(crate) struct DuplicateRequested(pub String);
 pub(crate) struct TabOpened(pub String);
@@ -164,6 +166,7 @@ pub(crate) struct Monos {
     app_pending: HashSet<(i64, String)>,
 }
 impl EventEmitter<Changed> for Monos {}
+impl EventEmitter<RailToggled> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
 impl EventEmitter<ShowDetails> for Monos {}
 impl EventEmitter<DuplicateRequested> for Monos {}
@@ -182,6 +185,10 @@ fn default_chat(prefs: &crate::settings::Preferences) -> (Kind, Settings) {
     let settings = Settings {
         access: AccessMode::Auto,
         model: prefs.stable_model(provider.id(), &home()),
+        // A Mono's chat is conversation: it answers quickly at low effort and
+        // hands heavy work to background sessions. Only new chats get this;
+        // existing Monos keep whatever effort they already have.
+        effort: Some("low".into()),
         ..Default::default()
     };
     (provider, settings)
@@ -1314,25 +1321,34 @@ impl Monos {
         })
         .detach();
     }
-    pub(crate) fn rail(&mut self, project: Option<String>, cx: &mut Context<Self>) -> AnyElement {
-        self.rail_impl(project, false, false, cx)
+    pub(crate) fn rail(
+        &mut self,
+        project: Option<String>,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.rail_impl(project, false, false, collapsed, cx)
     }
     /// Original navigation lists every Mono, before the projects; the inset
     /// layout continues to list only the current project's Monos.
     pub(crate) fn project_navigation_rail(
         &mut self,
         compact: bool,
+        collapsed: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.rail_impl(None, true, compact, cx)
+        self.rail_impl(None, true, compact, collapsed, cx)
     }
     fn rail_impl(
         &mut self,
         project: Option<String>,
         original: bool,
         compact: bool,
+        collapsed: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The compact rail has no heading to fold behind.
+        let collapsed = collapsed && !compact;
         if !self.prefs.monos {
             return div().into_any_element();
         }
@@ -1343,7 +1359,11 @@ impl Monos {
             .filter(|m| project.as_ref().is_none_or(|p| m.works_on(p)))
             .cloned()
             .collect();
-        self.rail_ids = roster.iter().map(|m| m.id.clone()).collect();
+        self.rail_ids = if collapsed {
+            Vec::new()
+        } else {
+            roster.iter().map(|m| m.id.clone()).collect()
+        };
         for mono in &roster {
             self.rail_bounds.entry(mono.id.clone()).or_default();
         }
@@ -1353,6 +1373,42 @@ impl Monos {
             return div().into_any_element();
         }
         let add_project = project.clone();
+        let fold = div()
+            .id("mono-rail-fold")
+            .debug_selector(|| "mono-rail-fold".into())
+            .role(Role::Button)
+            .aria_label(if collapsed {
+                "Show Monos"
+            } else {
+                "Hide Monos"
+            })
+            .group("mono-rail-heading")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child("Monos")
+            .when(collapsed && has, |d| {
+                d.child(div().text_color(content(0.3)).child(count.to_string()))
+            })
+            .child(
+                div()
+                    .when(!collapsed, |d| {
+                        d.invisible()
+                            .group_hover("mono-rail-heading", |s| s.visible())
+                    })
+                    .child(icon(
+                        if collapsed {
+                            "chevron-right"
+                        } else {
+                            "chevron-down"
+                        },
+                        12.,
+                    )),
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(RailToggled)));
         let heading = if original {
             div()
                 .h(px(30.))
@@ -1369,17 +1425,29 @@ impl Monos {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .h_full()
                             .px_1()
+                            .flex()
                             .text_size(px(12.))
                             .line_height(px(20.))
                             .text_color(content(0.5))
-                            .child("Monos"),
+                            .child(fold),
                     )
                 })
         } else {
-            section_label("Monos")
+            div()
+                .h(px(28.))
+                .px_2()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(px(12.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(content(0.5))
+                .child(fold)
         }
-        .when(has, |d| {
+        .when(has && !collapsed, |d| {
             d.child(
                 icon_button("new-mono", "New mono", "plus")
                     .debug_selector(|| "sidebar-mono-button".into())
@@ -1397,7 +1465,7 @@ impl Monos {
                 d.w_full().flex().flex_col().items_center().gap(px(6.))
             })
             .when(!compact, |d| d.child(heading))
-            .when(!has, |d| {
+            .when(!has && !collapsed, |d| {
                 d.child(
                     div()
                         .id("new-mono-row")
@@ -1423,190 +1491,212 @@ impl Monos {
                         })),
                 )
             })
-            .children(roster.into_iter().enumerate().map(|(index, mono)| {
-                let active = self.active.as_deref() == Some(&mono.id);
-                let state = self
-                    .chats
-                    .get(&mono.id)
-                    .map(|v| v.read(cx).mono_status())
-                    .unwrap_or("idle");
-                let unread = self
-                    .chats
-                    .get(&mono.id)
-                    .map(|v| {
-                        v.read(cx)
-                            .mono_rows(cx)
-                            .iter()
-                            .skip(mono.seen_rows)
-                            .filter(|r| {
-                                r.role == "assistant" && r.first && !r.text.trim().is_empty()
+            .children(
+                roster
+                    .into_iter()
+                    .filter(|_| !collapsed)
+                    .enumerate()
+                    .map(|(index, mono)| {
+                        let active = self.active.as_deref() == Some(&mono.id);
+                        let state = self
+                            .chats
+                            .get(&mono.id)
+                            .map(|v| v.read(cx).mono_status())
+                            .unwrap_or("idle");
+                        let unread = self
+                            .chats
+                            .get(&mono.id)
+                            .map(|v| {
+                                v.read(cx)
+                                    .mono_rows(cx)
+                                    .iter()
+                                    .skip(mono.seen_rows)
+                                    .filter(|r| {
+                                        r.role == "assistant"
+                                            && r.first
+                                            && !r.text.trim().is_empty()
+                                    })
+                                    .count()
                             })
-                            .count()
-                    })
-                    .unwrap_or(0);
-                // Like MonoRailSection, an open Mono has already been seen.
-                // Activity belongs on the mascot, rather than an idle dot at
-                // the end of every row.
-                let unread = if active { 0 } else { unread };
-                let label = if unread == 0 {
-                    format!("{}, {state}", mono.label())
-                } else {
-                    format!(
-                        "{}, {state}, {unread} new {}",
-                        mono.label(),
-                        if unread == 1 { "reply" } else { "replies" }
-                    )
-                };
-                let id = mono.id.clone();
-                let options = id.clone();
-                let context = id.clone();
-                let drag = id.clone();
-                let slot = self.rail_bounds[&id].clone();
-                div()
-                    .id(SharedString::from(format!("mono-rail-{id}")))
-                    .debug_selector({
-                        let id = id.clone();
-                        move || format!("mono-rail-{id}")
-                    })
-                    .group("mono-rail-row")
-                    .role(Role::Button)
-                    .aria_label(label)
-                    .h(px(32.))
-                    .when(original && !compact, |d| d.ml(px(6.)).mr_2())
-                    .when(original && !compact && index + 1 < count, |d| d.mb_px())
-                    .when(compact, |d| d.w(px(32.)))
-                    .px_2()
-                    .rounded_md()
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .opacity(if active { 1. } else { 0.65 })
-                    .when(active, |d| d.bg(content(0.1)))
-                    .hover(|s| s.bg(content(0.08)).opacity(1.))
-                    .child(
+                            .unwrap_or(0);
+                        // Like MonoRailSection, an open Mono has already been seen.
+                        // Activity belongs on the mascot, rather than an idle dot at
+                        // the end of every row.
+                        let unread = if active { 0 } else { unread };
+                        let label = if unread == 0 {
+                            format!("{}, {state}", mono.label())
+                        } else {
+                            format!(
+                                "{}, {state}, {unread} new {}",
+                                mono.label(),
+                                if unread == 1 { "reply" } else { "replies" }
+                            )
+                        };
+                        let id = mono.id.clone();
+                        let options = id.clone();
+                        let context = id.clone();
+                        let drag = id.clone();
+                        let slot = self.rail_bounds[&id].clone();
                         div()
-                            .size(px(16.))
+                            .id(SharedString::from(format!("mono-rail-{id}")))
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("mono-rail-{id}")
+                            })
+                            .group("mono-rail-row")
+                            .role(Role::Button)
+                            .aria_label(label)
+                            .h(px(32.))
+                            .when(original && !compact, |d| d.ml(px(6.)).mr_2())
+                            .when(original && !compact && index + 1 < count, |d| d.mb_px())
+                            .when(compact, |d| d.w(px(32.)))
+                            .px_2()
+                            .rounded_md()
                             .relative()
-                            .flex_shrink_0()
-                            .child(avatar::avatar(&mono.mascot, mono.color, state, 16., true))
-                            .when(original, |d| {
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .opacity(if active { 1. } else { 0.65 })
+                            .when(active, |d| d.bg(content(0.1)))
+                            .hover(|s| s.bg(content(0.08)).opacity(1.))
+                            .child(
+                                div()
+                                    .size(px(16.))
+                                    .relative()
+                                    .flex_shrink_0()
+                                    .child(avatar::avatar(
+                                        &mono.mascot,
+                                        mono.color,
+                                        state,
+                                        16.,
+                                        true,
+                                    ))
+                                    .when(original, |d| {
+                                        d.child(
+                                            div()
+                                                .absolute()
+                                                .right(px(-2.))
+                                                .top(px(-2.))
+                                                .size(px(6.))
+                                                .rounded_full()
+                                                .border_1()
+                                                .border_color(rgb(
+                                                    crate::right_panel::BACKGROUND_BASE,
+                                                ))
+                                                .bg(if state == "working" {
+                                                    rgb(mono.color).into()
+                                                } else if state == "needs-you" {
+                                                    accent_color()
+                                                } else {
+                                                    content(0.3)
+                                                }),
+                                        )
+                                    }),
+                            )
+                            .when(!compact, |d| {
+                                d.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .when(unread > 0, |d| d.pr(px(24.)))
+                                        .group_hover("mono-rail-row", |s| s.pr(px(24.)))
+                                        .text_size(px(14.))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .child(mono.label()),
+                                )
+                            })
+                            .when(unread > 0 && !compact, |d| {
                                 d.child(
                                     div()
                                         .absolute()
-                                        .right(px(-2.))
-                                        .top(px(-2.))
-                                        .size(px(6.))
-                                        .rounded_full()
-                                        .border_1()
-                                        .border_color(rgb(crate::right_panel::BACKGROUND_BASE))
-                                        .bg(if state == "working" {
-                                            rgb(mono.color).into()
-                                        } else if state == "needs-you" {
-                                            accent_color()
-                                        } else {
-                                            content(0.3)
-                                        }),
-                                )
-                            }),
-                    )
-                    .when(!compact, |d| {
-                        d.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .when(unread > 0, |d| d.pr(px(24.)))
-                                .group_hover("mono-rail-row", |s| s.pr(px(24.)))
-                                .text_size(px(14.))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(mono.label()),
-                        )
-                    })
-                    .when(unread > 0 && !compact, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .right_1()
-                                .top(px(4.))
-                                .size(px(24.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .group_hover("mono-rail-row", |s| s.invisible())
-                                .child(
-                                    div()
-                                        .debug_selector({
-                                            let id = mono.id.clone();
-                                            move || format!("mono-rail-unread-{id}")
-                                        })
-                                        .when(!original, |d| d.size(px(6.)))
-                                        .when(original, |d| {
-                                            d.h(px(16.))
-                                                .min_w(px(16.))
-                                                .px_1()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_size(px(10.))
-                                                .font_weight(gpui::FontWeight::MEDIUM)
-                                                .text_color(rgb(0xffffff))
-                                                .child(if unread > 99 {
-                                                    "99+".into()
-                                                } else {
-                                                    unread.to_string()
+                                        .right_1()
+                                        .top(px(4.))
+                                        .size(px(24.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .group_hover("mono-rail-row", |s| s.invisible())
+                                        .child(
+                                            div()
+                                                .debug_selector({
+                                                    let id = mono.id.clone();
+                                                    move || format!("mono-rail-unread-{id}")
                                                 })
-                                        })
-                                        .rounded_full()
-                                        .bg(accent_color()),
-                                ),
-                        )
-                    })
-                    .when(!compact, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .right_1()
-                                .top(px(4.))
-                                .invisible()
-                                .group_hover("mono-rail-row", |s| s.visible())
-                                .child(
-                                    icon_button("mono-options", "Mono options", "more-horizontal")
-                                        .debug_selector({
-                                            let id = mono.id.clone();
-                                            move || format!("mono-rail-options-{id}")
-                                        })
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation()
-                                        })
-                                        .on_click(cx.listener(move |this, _, w, cx| {
-                                            cx.stop_propagation();
-                                            this.open_options(&options, None, w, cx);
-                                        })),
-                                ),
-                        )
-                    })
-                    .child(slot.probe())
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        if std::mem::take(&mut this.skip_click) {
-                            return;
-                        }
-                        this.open(&id, w, cx);
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, w, cx| {
-                            this.open_options(&context, Some(event.position), w, cx)
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
-                            this.skip_click = false;
-                            this.drag = Some((drag.clone(), event.position, None));
-                        }),
-                    )
-            }))
+                                                .when(!original, |d| d.size(px(6.)))
+                                                .when(original, |d| {
+                                                    d.h(px(16.))
+                                                        .min_w(px(16.))
+                                                        .px_1()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_size(px(10.))
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                        .text_color(rgb(0xffffff))
+                                                        .child(if unread > 99 {
+                                                            "99+".into()
+                                                        } else {
+                                                            unread.to_string()
+                                                        })
+                                                })
+                                                .rounded_full()
+                                                .bg(accent_color()),
+                                        ),
+                                )
+                            })
+                            .when(!compact, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .right_1()
+                                        .top(px(4.))
+                                        .invisible()
+                                        .group_hover("mono-rail-row", |s| s.visible())
+                                        .child(
+                                            icon_button(
+                                                "mono-options",
+                                                "Mono options",
+                                                "more-horizontal",
+                                            )
+                                            .debug_selector({
+                                                let id = mono.id.clone();
+                                                move || format!("mono-rail-options-{id}")
+                                            })
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .on_click(
+                                                cx.listener(move |this, _, w, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_options(&options, None, w, cx);
+                                                }),
+                                            ),
+                                        ),
+                                )
+                            })
+                            .child(slot.probe())
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                if std::mem::take(&mut this.skip_click) {
+                                    return;
+                                }
+                                this.open(&id, w, cx);
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, w, cx| {
+                                    this.open_options(&context, Some(event.position), w, cx)
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                                    this.skip_click = false;
+                                    this.drag = Some((drag.clone(), event.position, None));
+                                }),
+                            )
+                    }),
+            )
             // MonoRailSection owns its menu and background dialog; the Mono
             // view paints them instead while it is open.
             .when(self.current().is_none(), |d| {

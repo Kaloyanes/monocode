@@ -94,6 +94,15 @@ pub(crate) enum DiffEvent {
     StageHunk(SharedString, usize),
     /// Text for the active chat's composer.
     Comment(String),
+    /// A question about a line, for an agent that reads the change.
+    Ask(String),
+    /// A comment on a line, for the reviewer's pending review.
+    Review {
+        path: String,
+        line: u32,
+        side: monocode_core::inbox::review::Side,
+        text: String,
+    },
 }
 
 #[derive(Clone, PartialEq)]
@@ -319,6 +328,12 @@ pub(crate) struct DiffView {
     /// The axis this wheel gesture scrolls, and when it last moved.
     wheel_axis: Option<(bool, std::time::Instant)>,
     comment: Option<Comment>,
+    /// Offers "Ask agent" beside "Add to chat" on a line's comment.
+    pub(crate) can_ask: bool,
+    /// The line an answer cited: its file and new-side line number.
+    cited: Option<(SharedString, u32)>,
+    /// Lines with a pending review comment: path, number, and which side.
+    marks: Vec<(String, u32, monocode_core::inbox::review::Side)>,
     action_slots: HashMap<usize, AnchorSlot>,
     focus: FocusHandle,
 }
@@ -372,6 +387,9 @@ impl DiffView {
             overview_hovered: false,
             wheel_axis: None,
             comment: None,
+            can_ask: false,
+            cited: None,
+            marks: Vec::new(),
             action_slots: HashMap::new(),
             focus: cx.focus_handle(),
         }
@@ -394,6 +412,7 @@ impl DiffView {
             }
             return;
         }
+        self.cited = None;
         let ids: HashSet<SharedString> = files.iter().map(|f| f.id.clone()).collect();
         self.open.retain(|id| ids.contains(id));
         for id in &ids {
@@ -442,6 +461,42 @@ impl DiffView {
                 self.apply_pending(cx);
             }
         }
+    }
+
+    /// Shows the line an answer cited: opens its file, scrolls to the line and
+    /// marks it. False when no file in the diff is `path`.
+    pub(crate) fn reveal(&mut self, path: &str, line: Option<u32>, cx: &mut Context<Self>) -> bool {
+        let Some(file_ix) = self
+            .files
+            .iter()
+            .position(|file| monocode_core::inbox::ask::same_file(path, &file.path))
+        else {
+            return false;
+        };
+        let id = self.files[file_ix].id.clone();
+        if self.open.insert(id.clone()) {
+            self.rebuild(cx);
+        }
+        let file = &self.files[file_ix];
+        let row = line.and_then(|wanted| {
+            self.rows.iter().position(|row| {
+                row.file == file_ix
+                    && matches!(&row.kind, RowKind::Line { block, line, .. }
+                        if file.blocks.get(*block).and_then(|b| b.lines().get(*line)).is_some_and(
+                            |l| l.kind != LineKind::Del && l.new_number == Some(wanted)))
+            })
+        });
+        self.cited = row.and(line).map(|line| (id, line));
+        let (item_ix, context) = match row {
+            Some(row) => (row, 3),
+            None => (self.file_rows.get(file_ix).copied().unwrap_or(0), 0),
+        };
+        self.list.scroll_to(ListOffset {
+            item_ix: item_ix.saturating_sub(context),
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+        true
     }
 
     fn row_key(&self, ix: usize) -> Option<RowKey> {
@@ -998,6 +1053,58 @@ impl DiffView {
         cx.emit(DiffEvent::Comment(text));
         cx.notify();
     }
+    fn ask_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(comment) = &self.comment else {
+            return;
+        };
+        let text = diff::format_comment(
+            &comment.path,
+            &comment.line,
+            &comment.input.read(cx).content,
+        );
+        if text.is_empty() {
+            return;
+        }
+        self.comment = None;
+        window.focus(&self.focus, cx);
+        cx.emit(DiffEvent::Ask(text));
+        cx.notify();
+    }
+    fn review_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use monocode_core::inbox::review::Side;
+        let Some(comment) = &self.comment else {
+            return;
+        };
+        let text = comment.input.read(cx).content.trim().to_string();
+        let (side, number) = match comment.line.kind {
+            LineKind::Del => (Side::Left, comment.line.old_number),
+            _ => (Side::Right, comment.line.new_number),
+        };
+        let Some(line) = number.filter(|_| !text.is_empty()) else {
+            return;
+        };
+        let path = comment.path.clone();
+        self.comment = None;
+        window.focus(&self.focus, cx);
+        cx.emit(DiffEvent::Review {
+            path,
+            line,
+            side,
+            text,
+        });
+        cx.notify();
+    }
+    /// Marks the lines that have a pending review comment.
+    pub(crate) fn set_marks(
+        &mut self,
+        marks: Vec<(String, u32, monocode_core::inbox::review::Side)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.marks != marks {
+            self.marks = marks;
+            cx.notify();
+        }
+    }
     fn dismiss_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.comment.take().is_some() {
             window.focus(&self.focus, cx);
@@ -1298,6 +1405,16 @@ impl DiffView {
                     })
                     .collect();
                 let number = if removed { l.old_number } else { l.new_number };
+                let cited = !removed
+                    && self
+                        .cited
+                        .as_ref()
+                        .is_some_and(|(id, line)| *id == file.id && l.new_number == Some(*line));
+                let marked = self.marks.iter().any(|(path, n, side)| {
+                    *path == file.path
+                        && Some(*n) == number
+                        && (*side == monocode_core::inbox::review::Side::Left) == removed
+                });
                 let comment_line = l.clone();
                 let file_ix = row.file;
                 let file_id = file.id.clone();
@@ -1323,6 +1440,8 @@ impl DiffView {
                     .flex()
                     .line_height(px(LINE))
                     .when_some(ink, |d, ink| d.bg(ink.opacity(0.06)))
+                    .when(cited, |d| d.bg(Hsla::from(rgb(ACCENT)).opacity(0.22)))
+                    .when(marked, |d| d.bg(Hsla::from(rgb(ACCENT)).opacity(0.1)))
                     .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
                         let next = if *hovering {
                             Some(ix)
@@ -1347,7 +1466,8 @@ impl DiffView {
                                 div()
                                     .w(px(3.))
                                     .flex_shrink_0()
-                                    .when_some(ink, |d, ink| d.bg(ink.opacity(0.55))),
+                                    .when_some(ink, |d, ink| d.bg(ink.opacity(0.55)))
+                                    .when(marked, |d| d.bg(rgb(ACCENT))),
                             )
                             .child(numbers(l.old_number, hovered))
                             .child(numbers(l.new_number, false))
@@ -1656,6 +1776,7 @@ impl Render for DiffView {
         let comment = self.comment.as_ref().map(|c| {
             let location = diff::comment_location(&c.path, &c.line);
             let can_add = !c.input.read(cx).content.trim().is_empty();
+            let can_ask = self.can_ask;
             popover(
                 "diff-comment",
                 crate::popover::Anchor::Slot(c.anchor.clone()),
@@ -1720,12 +1841,72 @@ impl Render for DiffView {
                             .justify_between()
                             .gap_3()
                             .child(div().text_size(px(10.)).text_color(content(0.35)).child(
-                                if cfg!(target_os = "macos") {
+                                if can_ask {
+                                    ""
+                                } else if cfg!(target_os = "macos") {
                                     "⌘↩ to add"
                                 } else {
                                     "Ctrl+↩ to add"
                                 },
                             ))
+                            .when(can_ask, |d| {
+                                d.child(
+                                    div()
+                                        .id("review-comment")
+                                        .role(Role::Button)
+                                        .aria_label("Add to review")
+                                        .h(px(28.))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .px(px(10.))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(content(0.16))
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(content(1.))
+                                        .when(!can_add, |d| d.opacity(0.4))
+                                        .when(can_add, |d| {
+                                            d.hover(|s| s.bg(content(0.08))).on_click(cx.listener(
+                                                |this, _, window, cx| {
+                                                    this.review_comment(window, cx)
+                                                },
+                                            ))
+                                        })
+                                        .child(
+                                            icon("git-pull-request", 14.).text_color(content(1.)),
+                                        )
+                                        .child("Add to review"),
+                                )
+                            })
+                            .when(can_ask, |d| {
+                                d.child(
+                                    div()
+                                        .id("ask-comment")
+                                        .role(Role::Button)
+                                        .aria_label("Ask agent")
+                                        .h(px(28.))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .px(px(10.))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(content(0.16))
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(content(1.))
+                                        .when(!can_add, |d| d.opacity(0.4))
+                                        .when(can_add, |d| {
+                                            d.hover(|s| s.bg(content(0.08))).on_click(cx.listener(
+                                                |this, _, window, cx| this.ask_comment(window, cx),
+                                            ))
+                                        })
+                                        .child(icon("sparkles", 14.).text_color(content(1.)))
+                                        .child("Ask agent"),
+                                )
+                            })
                             .child(
                                 div()
                                     .id("add-comment")
@@ -2098,6 +2279,24 @@ mod tests {
             can_stage_hunk: true,
         }
     }
+    #[gpui::test]
+    fn revealing_a_cited_line_marks_it_and_unknown_files_are_left_alone(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = cx.new(DiffView::new);
+        view.update(cx, |view, cx| {
+            let text: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+            let edited = text.replace("line 20\n", "changed 20\n");
+            view.set_files(vec![file("a.rs", &text, &edited)], cx);
+            assert!(view.reveal("/r/a.rs", Some(20), cx));
+            assert_eq!(view.cited, Some(("a.rs".into(), 20)));
+            // A line the diff does not show: the file opens, nothing is marked.
+            assert!(view.reveal("a.rs", Some(1), cx));
+            assert_eq!(view.cited, None);
+            assert!(!view.reveal("src/other.rs", Some(3), cx));
+        });
+    }
+
     #[gpui::test]
     fn sideways_swipes_end_jumps_and_never_scroll_the_list(cx: &mut gpui::TestAppContext) {
         use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase, point};

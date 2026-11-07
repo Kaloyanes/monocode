@@ -855,9 +855,21 @@ impl Shell {
                     .clone()
                     .cached(StyleRefinement::default().flex_1().min_w_0().h(px(height))),
             )
-            .children(self.pressure_chip(cx))
-            .children(self.keep_awake_pill())
-            .children(self.terminal_footer(cx))
+            .map(|d| {
+                let pressure = self.pressure_chip(cx);
+                let terminal = self.terminal_footer(cx);
+                let between = pressure.is_some() && terminal.is_some();
+                d.children(pressure)
+                    .children(self.keep_awake_pill())
+                    .when(between, |d| {
+                        d.child(
+                            super::terminal_dock::footer_separator()
+                                .mr(px(super::terminal_dock::FOOTER_GAP + 3.))
+                                .when(!self.workspace.boxy_layout(), |d| d.mb(px(2.))),
+                        )
+                    })
+                    .children(terminal)
+            })
     }
     /// The keep-awake pill, just before the terminal controls (macOS only).
     fn keep_awake_pill(&self) -> Option<AnyElement> {

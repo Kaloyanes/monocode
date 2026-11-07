@@ -118,7 +118,7 @@ describe("transcript anchoring", () => {
   let frameId: number;
   let mounted = false;
   const render = (turns: Turn[], busy = false) => {
-    act(() => root.render(<Transcript turns={turns} busy={busy} />));
+    act(() => root.render(<Transcript conversationId="c" turns={turns} busy={busy} />));
     if (mounted) return;
     mounted = true;
     // The turns are drawn a frame after the list mounts.

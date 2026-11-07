@@ -10,6 +10,10 @@ pub(crate) struct Preferences {
     // General
     pub sounds: bool,
     pub notifications: bool,
+    /// Alerts to paired phones wait until this Mac has sat idle, or locked.
+    pub phone_alerts_when_away: bool,
+    /// How long the Mac sits idle before it counts as away, in minutes.
+    pub phone_away_minutes: u32,
     pub project_notifications: serde_json::Value,
     pub notification_projects: serde_json::Value,
     pub file_tabs: String,
@@ -36,6 +40,10 @@ pub(crate) struct Preferences {
     pub keep_awake: KeepAwakePrefs,
     /// Legacy "Hide tab bar", read when `title_bar` is unset.
     pub hide_tab_bar: bool,
+    /// Where terminals open: "bottom" (the dock), "panel" (the right panel's
+    /// Terminal tab) or "title" (their own title bar tabs). Empty falls back
+    /// to `terminal_in_panel`.
+    pub terminal_placement: String,
     // Appearance
     pub theme: String,
     pub wayland_window_decorations: bool,
@@ -76,9 +84,6 @@ pub(crate) struct Preferences {
     pub autosave: bool,
     pub diff_view: String,
     pub composer_mascot: bool,
-    // Visualizations
-    /// What draws drafts: "webkit", built in, or "chromium", downloaded.
-    pub page_engine: String,
     // Devices
     /// iOS Simulators and Android Emulators in the right panel. Off until
     /// chosen: it installs and runs the device hub with the user's Node.
@@ -91,6 +96,9 @@ pub(crate) struct Preferences {
     pub show_remaining_usage: bool,
     /// Which limit the footer's usage bar follows: "shortest" or "most-used".
     pub usage_bar_window: String,
+    /// Working and Archived sit at the bottom of the sidebar and open in place,
+    /// rather than Working leading the list and Archived opening its own view.
+    pub docked_sections: bool,
     /// Writes commit messages, pull requests and session titles with this model instead of the session's.
     pub text_model: Option<ModelChoice>,
     /// Per-action overrides of `text_model`.
@@ -129,6 +137,9 @@ pub(crate) struct Preferences {
     pub default_access: Option<String>,
     /// Last explicit effort choice for each provider, shared across projects.
     pub provider_efforts: HashMap<String, String>,
+    /// Last explicit effort choice for each model, keyed by `effort_key`. A
+    /// model without an entry starts from its provider's choice.
+    pub model_efforts: HashMap<String, String>,
     /// The model for session titles, branch names, commit messages and pull
     /// requests; `None` lets each use its own harness's quick model.
     pub background_model: Option<ModelChoice>,
@@ -137,7 +148,6 @@ pub(crate) struct Preferences {
     pub rail_monos_pinned: bool,
     pub mono_menu_bar_icon: bool,
     // Archive
-    pub show_archived: bool,
     /// Archive conversations idle this many days; 0 never does.
     pub auto_archive_days: u32,
     // Keybindings: a changed shortcut, or `None` for a disabled one.
@@ -153,6 +163,8 @@ impl Default for Preferences {
         Self {
             sounds: true,
             notifications: false,
+            phone_alerts_when_away: true,
+            phone_away_minutes: 3,
             project_notifications: serde_json::json!({}),
             notification_projects: serde_json::json!([]),
             file_tabs: "pane".into(),
@@ -170,6 +182,7 @@ impl Default for Preferences {
             terminal_in_panel: false,
             keep_awake: KeepAwakePrefs::default(),
             hide_tab_bar: false,
+            terminal_placement: String::new(),
             theme: "dark".into(),
             wayland_window_decorations: true,
             workspace_theme: "default".into(),
@@ -202,12 +215,12 @@ impl Default for Preferences {
             autosave: false,
             diff_view: "editor".into(),
             composer_mascot: true,
-            page_engine: "webkit".into(),
             devices: false,
             device_agents: false,
             empty_session: "ink".into(),
             show_remaining_usage: false,
             usage_bar_window: "shortest".into(),
+            docked_sections: false,
             text_model: None,
             commit_model: None,
             pr_model: None,
@@ -233,11 +246,11 @@ impl Default for Preferences {
             model_picker_tab: None,
             default_access: None,
             provider_efforts: HashMap::new(),
+            model_efforts: HashMap::new(),
             background_model: None,
             monos: true,
             rail_monos_pinned: false,
             mono_menu_bar_icon: true,
-            show_archived: false,
             auto_archive_days: 0,
             keybindings: HashMap::new(),
         }
@@ -387,6 +400,20 @@ impl Preferences {
         .or(self.text_model.as_ref())
     }
 
+    /// "bottom", "panel" or "title".
+    pub(crate) fn terminal_placement(&self) -> &str {
+        match self.terminal_placement.as_str() {
+            placement @ ("bottom" | "panel" | "title") => placement,
+            _ if self.terminal_in_panel => "panel",
+            _ => "bottom",
+        }
+    }
+
+    pub(crate) fn set_terminal_placement(&mut self, placement: &str) {
+        self.terminal_placement = placement.to_owned();
+        self.terminal_in_panel = placement == "panel";
+    }
+
     pub(crate) fn apply_workspace_theme(&mut self, id: String) {
         let color: gpui::Hsla = gpui::rgb(super::palette(&id, false).surface).into();
         self.theme_hue = (color.h * 360.).round() as u32;
@@ -527,6 +554,26 @@ impl Preferences {
             }
         }
     }
+    /// The effort last chosen for this model, else for its provider.
+    pub(crate) fn effort_for(&self, provider: &str, model: Option<&str>) -> Option<String> {
+        self.model_efforts
+            .get(&effort_key(provider, model))
+            .or_else(|| self.provider_efforts.get(provider))
+            .cloned()
+    }
+    /// An explicit effort pick is remembered for the model and its provider;
+    /// an empty one forgets the model's choice.
+    pub(crate) fn remember_effort(&mut self, provider: &str, model: Option<&str>, effort: &str) {
+        let key = effort_key(provider, model);
+        if effort.is_empty() {
+            self.model_efforts.remove(&key);
+            self.provider_efforts.remove(provider);
+        } else {
+            self.model_efforts.insert(key, effort.to_owned());
+            self.provider_efforts
+                .insert(provider.to_owned(), effort.to_owned());
+        }
+    }
     /// The model for unattended runs (automations, Monos), which should not
     /// drift with whatever was last tried in a chat.
     pub(crate) fn stable_model(&self, provider: &str, project: &str) -> Option<String> {
@@ -544,9 +591,51 @@ impl Preferences {
     }
 }
 
+/// A model's slot in `model_efforts`; `None` is the provider's default model.
+fn effort_key(provider: &str, model: Option<&str>) -> String {
+    format!("{provider}:{}", model.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_is_remembered_per_model_with_the_provider_as_fallback() {
+        let mut prefs = Preferences::default();
+        prefs.remember_effort("claude", Some("opus"), "max");
+        prefs.remember_effort("claude", Some("sonnet"), "low");
+        assert_eq!(
+            prefs.effort_for("claude", Some("opus")).as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            prefs.effort_for("claude", Some("sonnet")).as_deref(),
+            Some("low")
+        );
+        // A model never picked for starts from the provider's last choice.
+        assert_eq!(
+            prefs.effort_for("claude", Some("haiku")).as_deref(),
+            Some("low")
+        );
+        assert_eq!(prefs.effort_for("codex", None), None);
+        // The provider's default model is its own slot.
+        prefs.remember_effort("claude", None, "medium");
+        assert_eq!(
+            prefs.effort_for("claude", Some("opus")).as_deref(),
+            Some("max")
+        );
+        assert_eq!(prefs.effort_for("claude", None).as_deref(), Some("medium"));
+        prefs.remember_effort("claude", Some("opus"), "");
+        assert_eq!(prefs.effort_for("claude", Some("opus")).as_deref(), None);
+        // Saved state from before per-model efforts still loads.
+        let old: Preferences =
+            serde_json::from_str(r#"{"provider_efforts":{"codex":"high"}}"#).unwrap();
+        assert_eq!(
+            old.effort_for("codex", Some("gpt-6")).as_deref(),
+            Some("high")
+        );
+    }
 
     fn choice(provider: &str, model: &str) -> ModelChoice {
         ModelChoice {

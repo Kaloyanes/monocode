@@ -1,4 +1,4 @@
-import { act, useState, type ReactNode } from "react";
+import { act, useEffect, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -9,6 +9,8 @@ import type { Workspace } from "@/features/workspace/WorkspaceMenu";
 import { GlassBlurTarget } from "@/ui/LiquidView";
 
 const desktop = vi.hoisted(() => ({
+  back: vi.fn(),
+  replace: vi.fn(),
   startSession: vi.fn(),
   sendMessage: vi.fn(),
   offline: false,
@@ -18,6 +20,7 @@ const desktop = vi.hoisted(() => ({
   usageLimit: undefined as UsageLimitState | undefined,
   cardMounts: 0,
   monoId: "first",
+  monoTools: false,
   watched: null as string | null,
   headerTarget: undefined as unknown,
   header: {} as {
@@ -44,7 +47,8 @@ vi.mock("@/ui/useNativeHeaderHeight", () => ({ useNativeHeaderHeight: () => 0 })
 vi.mock("@/features/settings/monoOnly", () => ({ useMonoOnlyLayout: () => [false] }));
 vi.mock("@/features/connection/ConnectionProvider", () => ({
   useConnection: () => ({}),
-  useMonoTools: () => false,
+  useConnectionActions: () => ({ command: vi.fn(), refresh: vi.fn() }),
+  useMonoTools: () => desktop.monoTools,
 }));
 vi.mock("@/features/models/useMonoModel", () => ({ useMonoModel: () => ({}) }));
 vi.mock("@/features/workspace/monoAccent", () => ({ useMonoAccent: () => "theme" }));
@@ -54,7 +58,7 @@ vi.mock("@/features/sessions/MonoCards", () => ({
   MonoChoose: ({ children }: { children: ReactNode }) => children,
   MonoMessageActions: ({ children }: { children: ReactNode }) => children,
 }));
-vi.mock("@/features/sessions/MonoMenu", () => ({ MonoMenu: () => null }));
+vi.mock("@/features/sessions/MonoMenu", () => ({ MonoMenu: () => <button data-mono-menu /> }));
 vi.mock("@/ui/Timed", () => ({ Timed: ({ children }: { children: ReactNode }) => children }));
 vi.mock("react-native-svg", () => ({ default: () => <svg />, Path: () => null }));
 vi.mock("react-native", () => ({
@@ -116,8 +120,9 @@ vi.mock("react-native-reanimated", () => ({
 }));
 vi.mock("react-native-worklets", () => ({ scheduleOnRN: vi.fn() }));
 vi.mock("expo-router", () => ({
-  router: { push: vi.fn() },
+  router: { push: vi.fn(), back: desktop.back, replace: desktop.replace, canGoBack: () => true },
   Redirect: () => null,
+  useFocusEffect: (effect: () => void) => useEffect(effect, [effect]),
   useLocalSearchParams: () => ({ monoId: desktop.monoId }),
   Stack: {
     Screen: ({ options }: { options: typeof desktop.header }) => {
@@ -215,7 +220,9 @@ vi.mock("@/features/sessions/activityStore", () => ({
   markViewing: () => () => {},
 }));
 vi.mock("@/features/sessions/SessionScreen", () => ({
+  HEADER_HEIGHT: 44,
   SessionContent: ({ children }: { children?: ReactNode }) => <>{children}</>,
+  SessionFrame: ({ children }: { children?: ReactNode }) => <>{children}</>,
   SessionScreen: ({
     below,
     composer,
@@ -248,14 +255,19 @@ vi.mock("@/features/terminal/TerminalActionsSheet", () => ({
 }));
 vi.mock("@/features/connection/ConnectionProvider", () => ({
   useConnection: () => ({ catalog: { terminal: desktop.terminal } }),
+  useConnectionActions: () => ({ command: vi.fn(), refresh: vi.fn() }),
+  useMonoTools: () => desktop.monoTools,
+  usePairing: () => null,
 }));
 vi.mock("@/features/sessions/Transcript", () => ({
   Transcript: () => null,
   TranscriptLoading: () => null,
 }));
 vi.mock("@/features/workspace/useCreateMono", () => ({ useCreateMono: () => undefined }));
-vi.mock("@/features/inbox/InboxPage", () => ({ InboxPage: () => null }));
-vi.mock("@/features/inbox/InboxProvider", () => ({ useInboxSupported: () => false }));
+vi.mock("@/features/inbox/InboxProvider", () => ({
+  useInboxBadge: () => 0,
+  useInboxSupported: () => false,
+}));
 vi.mock("@/features/workspace/ProjectPages", () => ({
   useProjectPages: () => ({ progress: { get: () => 0 }, view: desktop.page }),
   ProjectPages: () => null,
@@ -316,6 +328,7 @@ vi.mock("@/features/workspace/useCreateMono", () => ({
   useCreateMono: () => undefined,
 }));
 vi.mock("@/features/workspace/UnreadDot", () => ({
+  menuLabel: () => "Projects",
   UnreadDot: () => null,
   useAnyUnread: () => false,
 }));
@@ -415,10 +428,75 @@ describe("new session composer workspace", () => {
     desktop.os = "ios";
     desktop.terminal = undefined;
     desktop.toolbar = [];
+    desktop.usageLimit = undefined;
+    desktop.cardMounts = 0;
+    desktop.monoId = "first";
+    desktop.monoTools = false;
     container = document.createElement("div");
     root = createRoot(container);
   });
   afterEach(() => act(() => root.unmount()));
+
+  const usageLimit: UsageLimitState = { token: "paused", canResume: true, canAutoResume: false, resumeAtReset: false,
+    resetLabel: "Reset time unknown", limitation: "Keep desktop running" };
+  it("wires usage cards into project sessions and remounts them when the session changes", () => {
+    desktop.usageLimit = usageLimit;
+    render("first");
+    expect(container.querySelector("[data-usage-card]")?.textContent).toBe("first:paused");
+    expect(desktop.watched).toBe("first");
+    render("second");
+    expect(container.querySelector("[data-usage-card]")?.textContent).toBe("second:paused");
+    expect(desktop.cardMounts).toBe(2);
+    desktop.usageLimit = undefined;
+    render("second");
+    expect(container.querySelector("[data-usage-card]")).toBeNull();
+  });
+  it("wires usage cards into Mono sessions and remounts them when the Mono changes", () => {
+    desktop.usageLimit = usageLimit;
+    act(() => root.render(<MonoScreen />));
+    expect(container.querySelector("[data-usage-card]")?.textContent).toBe("mono:first:paused");
+    expect(desktop.watched).toBe("mono:first");
+    desktop.monoId = "second";
+    act(() => root.render(<MonoScreen />));
+    expect(container.querySelector("[data-usage-card]")?.textContent).toBe("mono:second:paused");
+    expect(desktop.cardMounts).toBe(2);
+  });
+
+  it("keeps a Mono's menu in the pushed header on Android", () => {
+    desktop.os = "android";
+    desktop.monoTools = true;
+    act(() => root.render(<MonoScreen />));
+    expect(container.querySelector("[data-mono-menu]")).not.toBeNull();
+  });
+
+  it("offers settings in a Mono's Android header without its tools", () => {
+    desktop.os = "android";
+    act(() => root.render(<MonoScreen />));
+    expect(container.querySelector("[data-mono-menu]")).toBeNull();
+    expect(container.querySelector('[aria-label="Settings"]')).not.toBeNull();
+  });
+
+  it("goes back to the list under a Mono that is gone, not over it", () => {
+    desktop.back.mockClear();
+    desktop.monoId = "deleted";
+    act(() => root.render(<MonoScreen />));
+    expect(desktop.back).toHaveBeenCalledOnce();
+    expect(desktop.replace).not.toHaveBeenCalled();
+  });
+
+  it("permits posture focus only for a visible chat composer", () => {
+    const active = () => container.querySelector("[data-composer]")!.getAttribute("data-active");
+    render();
+    expect(active()).toBe("true");
+    desktop.page = "sessions";
+    render();
+    expect(active()).toBe("false");
+    render("existing-session");
+    expect(active()).toBe("true");
+    desktop.focused = false;
+    render("existing-session");
+    expect(active()).toBe("false");
+  });
 
   it("keeps the circular Android drawer button after switching projects", () => {
     desktop.os = "android";

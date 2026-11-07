@@ -1,31 +1,30 @@
 import { UsageLimitCard } from "@/features/sessions/UsageLimitCard";
 import {
-  Redirect,
   router,
   Stack,
+  useFocusEffect,
   useIsFocused,
   useLocalSearchParams,
 } from "expo-router";
 import * as Haptics from "expo-haptics";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Text } from "react-native";
+import { use, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Alert, Platform, Text } from "react-native";
 import { ConnectionNotice } from "@/features/connection/ConnectionNotice";
 import { hasNativeTranscript } from "@/features/connection/nativeLink";
 
 import { PixelMascot } from "@/features/mascots/PixelMascot";
 import { useMonoModel } from "@/features/models/useMonoModel";
-import { useDrawerActions, useDrawerSwipe } from "@/ui/ScenePager";
+import { androidBackHeader } from "@/ui/AndroidHeader";
+import { Icon } from "@/ui/Icon";
 import { Timed } from "@/ui/Timed";
 import { useMonoTools, useConnectionActions, usePairing } from "@/features/connection/ConnectionProvider";
-import { rememberPlace } from "@/features/workspace/lastPlace";
 import { markMonoSeen, markMonoUnread } from "@/features/workspace/monoSeen";
 import { Composer } from "@/features/sessions/Composer";
 import { MonoChoose, MonoMessageActions } from "@/features/sessions/MonoCards";
 import { MonoMenu } from "@/features/sessions/MonoMenu";
-import { homeProjectId, readLastPlace } from "@/features/workspace/lastPlace";
 import { useMonoAccent } from "@/features/workspace/monoAccent";
 import { AccentOverride, ACCENTS, mix, themedStyles, useAccent, useScheme } from "@/ui/theme";
-import { LiquidView } from "@/ui/LiquidView";
+import { GlassBlurTarget, LiquidView } from "@/ui/LiquidView";
 import { useNativeHeaderHeight } from "@/ui/useNativeHeaderHeight";
 import type { Mono } from "@/features/workspace/types";
 import { QuestionCard } from "@/features/sessions/QuestionCard";
@@ -48,40 +47,44 @@ import {
 } from "@/features/workspace/WorkspaceProvider";
 
 // A mono has one long-lived conversation, so its screen is that conversation.
-// Monos only, it is pushed over the list as a session is over its project:
+// It is pushed over the list it opened from as a session is over its project:
 // under the stack's native header, with back on the left and its ⋯ on the
-// right as native items, and a frame of its own for its composer, so the
-// whole screen slides in and out with the push.
+// right, and a frame of its own for its composer, so the whole screen slides
+// in and out with the push and swipes back to that list.
 export default function MonoRoute() {
-  const [monoOnly] = useMonoOnlyLayout();
-  return monoOnly ? <PushedMono /> : <MonoScreen monoOnly={false} />;
-}
-
-function PushedMono() {
   const headerHeight = useNativeHeaderHeight();
   return (
     <SessionFrame nativeHeaderHeight={headerHeight}>
-      <MonoScreen monoOnly />
+      <MonoScreen />
     </SessionFrame>
   );
 }
 
-function MonoScreen({ monoOnly }: { monoOnly: boolean }) {
+/** Off the stack, to the list under it, or the start with nothing there. */
+function leave() {
+  if (router.canGoBack()) router.back();
+  else router.replace("/");
+}
+
+/** A Mono that's gone, say deleted: its screen leaves once it is in front,
+ *  rather than replacing itself and stacking the list on the list. */
+function MonoGone() {
+  useFocusEffect(leave);
+  return null;
+}
+
+function MonoScreen() {
+  const [monoOnly] = useMonoOnlyLayout();
   const { monoId } = useLocalSearchParams<{ monoId: string }>();
-  const { monos, projects, sendMessage, stop } = useWorkspace();
-  useDrawerSwipe();
+  const { monos, sendMessage, stop } = useWorkspace();
+  const blurTarget = use(GlassBlurTarget);
   const mono = monos.find((m) => m.id === monoId);
   const conversationId = mono ? monoConversationId(mono.id) : null;
   const conversation = useConversation(conversationId);
-  // Where the app opens next time.
   const { command, refresh } = useConnectionActions();
   // The older desktop app has no profile, reset or delete for a Mono.
   const tools = useMonoTools();
   const desktop = usePairing()?.desktop.fingerprint;
-  const placeId = mono?.id;
-  useEffect(() => {
-    if (placeId) rememberPlace(desktop, { kind: "mono", id: placeId });
-  }, [desktop, placeId]);
   // Its replies are seen as they arrive while its chat is in front, unless
   // it was just marked unread: that holds until the chat is left.
   const focused = useIsFocused();
@@ -92,7 +95,6 @@ function MonoScreen({ monoOnly }: { monoOnly: boolean }) {
   }, [focused, desktop, mono]);
   // A Mono's message being replied to, quoted over the next one sent.
   const [reply, setReply] = useState<string | null>(null);
-  const drawer = useDrawerActions();
   const messageActions = useMemo(
     () => ({
       reply: setReply,
@@ -101,12 +103,10 @@ function MonoScreen({ monoOnly }: { monoOnly: boolean }) {
         if (!mono) return;
         keptUnread.current = true;
         markMonoUnread(desktop, mono);
-        // Monos only, the list is the one back.
-        if (monoOnly) router.back();
-        else drawer.open();
+        leave();
       },
     }),
-    [desktop, mono, drawer, monoOnly],
+    [desktop, mono],
   );
   // Stable, so the memoized turns keep their rows across polls.
   const name = mono?.name ?? "";
@@ -143,18 +143,7 @@ function MonoScreen({ monoOnly }: { monoOnly: boolean }) {
       Alert.alert("Couldn’t do that", reason instanceof Error ? reason.message : String(reason));
     }
   };
-  // Back to the project it was opened from, as a session goes back to its
-  // own; the drawer still opens with a swipe from the left edge.
-  const leave = () => {
-    if (!mono) return;
-    const mine = projects.filter((project) => mono.projectIds.includes(project.id));
-    const last = readLastPlace(desktop);
-    const target = homeProjectId(mine.length ? mine : projects, [], last);
-    if (target) router.replace({ pathname: "/project/[projectId]", params: { projectId: target } });
-    else if (router.canGoBack()) router.back();
-    else router.replace("/");
-  };
-  if (!mono || !conversationId) return <Redirect href="/" />;
+  if (!mono || !conversationId) return <MonoGone />;
 
   const openDetails = () =>
     router.push({ pathname: "/mono-profile/[monoId]", params: { monoId: mono.id } });
@@ -185,38 +174,16 @@ function MonoScreen({ monoOnly }: { monoOnly: boolean }) {
         },
       ],
     );
-  const transcript = (
-    <AccentOverride value={chatAccent}>
-      <MonoChoose value={choose}>
-        <MonoMessageActions value={messageActions}>
-          {hasNativeTranscript
-            ? <NativeTranscript key={mono.id} conversationId={conversationId} agent={agent} />
-            : <MonoTranscript key={mono.id} conversationId={conversationId} agent={agent} />}
-        </MonoMessageActions>
-      </MonoChoose>
-    </AccentOverride>
+  const openSettings = () => router.push("/settings");
+  const title = <MonoTitle mono={mono} onPress={tools ? openDetails : undefined} />;
+  // The native header's buttons render outside this tree.
+  const headerSurface = (content: ReactNode) => (
+    <GlassBlurTarget value={blurTarget}>{content}</GlassBlurTarget>
   );
 
   return (
     <Timed id="mono screen">
     <SessionScreen
-      pill={{
-        icon: <PixelMascot name={mono.mascot} color={mono.color} status={headerStatus(mono)} size={28} />,
-        label: mono.name,
-        // Its profile: the desktop's details, and its look to edit.
-        onPress: tools
-          ? () => router.push({ pathname: "/mono-profile/[monoId]", params: { monoId: mono.id } })
-          : undefined,
-      }}
-      back={{ label: "Back", onPress: leave }}
-      // Without them, settings on the right, as on a project.
-      action={tools ? undefined : { icon: "settings", label: "Settings", onPress: () => router.push("/settings") }}
-      // Its details, a fresh start or deleting it, from ⋯ on the right.
-      trailing={
-        tools ? (
-          <MonoMenu onDetails={openDetails} onReset={confirmReset} onDelete={confirmDelete} />
-        ) : undefined
-      }
       composer={
         <AccentOverride value={chatAccent}>
           {conversation.question ? (
@@ -261,44 +228,66 @@ function MonoScreen({ monoOnly }: { monoOnly: boolean }) {
       }
     >
       <ConnectionNotice error={conversation.error} />
-      {monoOnly ? (
-        <>
-          {/* The stack's native header: back from the stack, the Mono's
-              pill for a title, and its ⋯ as a native menu. */}
-          <Stack.Screen
-            options={{
-              headerTitle: () => (
-                <MonoTitle mono={mono} onPress={tools ? openDetails : undefined} />
-              ),
-            }}
-          />
-          <Stack.Toolbar placement="right">
-            {tools ? (
-              <Stack.Toolbar.Menu icon="ellipsis" accessibilityLabel="More">
-                <Stack.Toolbar.MenuAction icon="info.circle" onPress={openDetails}>
-                  View details
-                </Stack.Toolbar.MenuAction>
-                <Stack.Toolbar.MenuAction icon="arrow.counterclockwise" onPress={confirmReset}>
-                  Reset conversation
-                </Stack.Toolbar.MenuAction>
-                <Stack.Toolbar.MenuAction icon="trash" destructive onPress={confirmDelete}>
-                  Delete Mono
-                </Stack.Toolbar.MenuAction>
-              </Stack.Toolbar.Menu>
-            ) : (
-              <Stack.Toolbar.Button
-                icon="gearshape"
-                accessibilityLabel="Settings"
-                onPress={() => router.push("/settings")}
-              />
-            )}
-          </Stack.Toolbar>
-          <SessionContent>{transcript}</SessionContent>
-        </>
-      ) : (
-        // A suggested reply it offers is sent as the user's message.
-        transcript
+      {/* The stack's native header: back from the stack, the Mono's pill for
+          a title, and on the right its details, a fresh start or deleting it
+          from ⋯, or without them settings, as on a project. */}
+      <Stack.Screen
+        options={
+          Platform.OS === "android"
+            ? {
+                ...androidBackHeader(headerSurface(title)),
+                headerTitleAlign: "left",
+                headerRight: () =>
+                  headerSurface(
+                    tools ? (
+                      <MonoMenu
+                        onDetails={openDetails}
+                        onReset={confirmReset}
+                        onDelete={confirmDelete}
+                      />
+                    ) : (
+                      <SettingsButton onPress={openSettings} />
+                    ),
+                  ),
+              }
+            : { headerTitle: () => title }
+        }
+      />
+      {Platform.OS === "android" ? null : (
+        <Stack.Toolbar placement="right">
+          {tools ? (
+            <Stack.Toolbar.Menu icon="ellipsis" accessibilityLabel="More">
+              <Stack.Toolbar.MenuAction icon="info.circle" onPress={openDetails}>
+                View details
+              </Stack.Toolbar.MenuAction>
+              <Stack.Toolbar.MenuAction icon="arrow.counterclockwise" onPress={confirmReset}>
+                Reset conversation
+              </Stack.Toolbar.MenuAction>
+              <Stack.Toolbar.MenuAction icon="trash" destructive onPress={confirmDelete}>
+                Delete Mono
+              </Stack.Toolbar.MenuAction>
+            </Stack.Toolbar.Menu>
+          ) : (
+            <Stack.Toolbar.Button
+              icon="gearshape"
+              accessibilityLabel="Settings"
+              onPress={openSettings}
+            />
+          )}
+        </Stack.Toolbar>
       )}
+      <SessionContent>
+        {/* A suggested reply it offers is sent as the user's message. */}
+        <AccentOverride value={chatAccent}>
+          <MonoChoose value={choose}>
+            <MonoMessageActions value={messageActions}>
+              {hasNativeTranscript
+                ? <NativeTranscript key={mono.id} conversationId={conversationId} agent={agent} />
+                : <MonoTranscript key={mono.id} conversationId={conversationId} agent={agent} />}
+            </MonoMessageActions>
+          </MonoChoose>
+        </AccentOverride>
+      </SessionContent>
     </SessionScreen>
     </Timed>
   );
@@ -308,6 +297,21 @@ function MonoScreen({ monoOnly }: { monoOnly: boolean }) {
  *  beside the "Thinking…" line. The bulb still asks for you. */
 function headerStatus(mono: Mono) {
   return mono.status === "working" ? "idle" : mono.status;
+}
+
+/** Android's settings button in the header, for an older desktop's Mono. */
+function SettingsButton({ onPress }: { onPress: () => void }) {
+  const styles = useTitleStyles();
+  return (
+    <LiquidView
+      borderRadius={HEADER_HEIGHT / 2}
+      innerStyle={styles.button}
+      onPress={onPress}
+      accessibilityLabel="Settings"
+    >
+      <Icon name="settings" size={20} />
+    </LiquidView>
+  );
 }
 
 /** A pushed Mono's title: its mascot and name in a glass pill, which opens
@@ -350,6 +354,12 @@ const useTitleStyles = themedStyles((colors) => ({
     fontSize: 17,
     fontWeight: "600",
   },
+  button: {
+    width: HEADER_HEIGHT,
+    height: HEADER_HEIGHT,
+    alignItems: "center",
+    justifyContent: "center",
+  },
 }));
 
 /** The mono's turns, read here so a streaming reply re-renders only the transcript. */
@@ -362,7 +372,13 @@ function MonoTranscript({
 }) {
   const { turns, hasOlder, loadOlder } = useConversationTurns(conversationId);
   return turns.length > 0 ? (
-    <Transcript turns={turns} agent={agent} hasOlder={hasOlder} loadOlder={loadOlder} />
+    <Transcript
+      turns={turns}
+      conversationId={conversationId}
+      agent={agent}
+      hasOlder={hasOlder}
+      loadOlder={loadOlder}
+    />
   ) : (
     <EmptySession mono={agent} />
   );

@@ -9,7 +9,7 @@ import { useConnection } from "@/features/connection/ConnectionProvider";
 import { hasNativeTranscript } from "@/features/connection/nativeLink";
 import { useProjectChanges } from "@/features/connection/useProjectChanges";
 import { useProjectWorktrees } from "@/features/connection/useProjectWorktrees";
-import type { ChangeSummary, Project, SessionSummary } from "@/features/workspace/types";
+import type { ChangeSummary, ComposerMode, Project, SessionSummary } from "@/features/workspace/types";
 import { use, useCallback, useEffect, useState, type ReactNode } from "react";
 import { Platform, Pressable, StyleSheet } from "react-native";
 import Animated, {
@@ -40,7 +40,6 @@ import {
   useReportSessionError,
   useSessionErrorNotice,
 } from "@/features/sessions/sessionError";
-import { OrchestrationStrip } from "@/features/orchestration/OrchestrationStrip";
 import { LiveSessions } from "@/features/sessions/LiveSessions";
 import { NativeTranscript } from "@/features/sessions/NativeTranscript";
 import { FileOpener } from "@/features/sessions/Markdown";
@@ -57,6 +56,7 @@ import {
   SessionToolbar,
 } from "@/features/sessions/SessionToolbar";
 import { ShipCard } from "@/features/changes/ShipCard";
+import { LeadLink } from "@/features/sessions/LeadLink";
 import { Transcript, TranscriptLoading } from "@/features/sessions/Transcript";
 import {
   ProjectPages,
@@ -74,9 +74,9 @@ import {
   type Workspace,
 } from "@/features/workspace/WorkspaceMenu";
 import { ComposerWorkspace } from "@/features/workspace/ComposerWorkspace";
-import { UnreadDot, useAnyUnread } from "@/features/workspace/UnreadDot";
-import { InboxPage } from "@/features/inbox/InboxPage";
-import { useInboxSupported } from "@/features/inbox/InboxProvider";
+import { menuLabel, UnreadDot, useAnyUnread } from "@/features/workspace/UnreadDot";
+import { useInboxBadge } from "@/features/inbox/InboxProvider";
+import { AnimationsPaused } from "@/ui/AnimationsPaused";
 import { Icon } from "@/ui/Icon";
 import { androidBackHeader } from "@/ui/AndroidHeader";
 import { GlassBlurTarget, LiquidView } from "@/ui/LiquidView";
@@ -91,7 +91,9 @@ import { usePushedIn, usePushStarted } from "@/ui/usePushedIn";
  * swiping left slides the sessions in (and the composer out with the new
  * session), the header switch following the finger; a swipe right from the
  * new session opens the drawer. The project's mascot opens it too; a session's
- * right has its changes and a menu of its actions. A session, or
+ * right has its changes and a menu of its actions. The Inbox comes in from the
+ * right edge: a button on the project's header and, as a session's header has
+ * no room for one, a swipe from that edge on either. A session, or
  * one just started, is pushed over it as a screen of its own: its chat under
  * the stack's native header (see the session route). With `sheet`, a session
  * is presented over a Mono's chat instead, and closes rather than goes back.
@@ -111,9 +113,12 @@ export function ProjectScreen({
   title?: string;
 }) {
   const { startSession, sendMessage, stop, sessions } = useWorkspace();
+  // Whether the desktop lets this phone open a terminal.
+  const terminal = useConnection().catalog.terminal === true;
+  const [terminalSheet, setTerminalSheet] = useState<{ run?: string; opened: number } | null>(null);
+  const [actionsSheet, setActionsSheet] = useState(false);
   const [openAfterStarting] = useOpenSessionAfterStarting();
   const createMono = useCreateMono(project.id);
-  const colors = useColors();
   const drawer = useDrawerActions();
   // Read here: the native header's buttons render outside this tree.
   const unread = useAnyUnread();
@@ -152,8 +157,7 @@ export function ProjectScreen({
     sessionId,
   );
   // Only a new session has pages; a session is the chat alone.
-  const inboxOn = useInboxSupported();
-  const pages = useProjectPages(project.id, !sessionId, inboxOn);
+  const pages = useProjectPages(project.id, !sessionId);
   // Between pages, mid-swipe or springing to one.
   const swiping = useDerivedValue(() => {
     const at = pages.progress.get();
@@ -298,32 +302,20 @@ export function ProjectScreen({
   const headerSurface = (content: ReactNode) => (
     <GlassBlurTarget value={blurTarget}>{content}</GlassBlurTarget>
   );
-  const menuButton = (
-    <ProjectHeaderButton
-      label={unread ? "Projects, new replies" : "Projects"}
-      onPress={drawer.open}
-    >
-      {/* The drawer's button, as on every screen it opens from. */}
-      <Icon name="sidebar" size={22} color={colors.content} />
-      {unread ? <UnreadDot /> : null}
-    </ProjectHeaderButton>
-  );
+  const menuButton = <MenuButton replies={unread} onPress={drawer.open} />;
 
   const sessionTitle = sessionId ? (
     <SessionTitle
       title={session?.title ?? title ?? "Session"}
       subtitle={[project.name, branch].filter(Boolean).join(" · ")}
+      onClose={sheet ? () => router.back() : undefined}
       terminal={terminal}
     />
   ) : null;
-  // A lead's agents, or a worker's way back to its lead.
+  // A subagent's way back to its lead.
   const lead = session?.leadId
     ? sessions.find((entry) => entry.id === session.leadId)
     : undefined;
-  const orchestrationStrip =
-    session && (lead || session.orchestration) ? (
-      <OrchestrationStrip session={session} lead={lead} />
-    ) : undefined;
   const sessionToolbar = sessionId ? (
     <SessionToolbar
       projectId={project.id}
@@ -331,7 +323,7 @@ export function ProjectScreen({
       session={session}
       worktreePath={worktreePath}
       harness={harness}
-      changed={changes.length}
+      changed={changes.files}
       terminal={terminal}
       onTerminal={(run) => setTerminalSheet({ run, opened: Date.now() })}
       onEditActions={() => setActionsSheet(true)}
@@ -345,7 +337,7 @@ export function ProjectScreen({
       // pages; a session's composer shows where it does.
       below={
         sessionId ? (
-          orchestrationStrip
+          lead ? <LeadLink lead={lead} /> : undefined
         ) : offline ? (
           // Nothing to pick from while the desktop can't be reached.
           <ReconnectingStatus />
@@ -396,6 +388,7 @@ export function ProjectScreen({
             key={sessionId ?? project.id}
             // A worker's thread is driven by its lead and has no draft of its own.
             conversationId={session?.leadId ? undefined : sessionId}
+            active={focused && (sessionId != null || pages.view === "chat")}
             notice={sessionNotice}
             context={project.name}
             branch={sessionId ? (session?.branch ?? project.branch) : branch}
@@ -469,7 +462,7 @@ export function ProjectScreen({
                 }
               : { headerTitle: "", headerBackVisible: !sheet }
             : {
-                headerTitle: () => <ProjectSwitch pages={pages} projectId={project.id} />,
+                headerTitle: () => <ProjectSwitch pages={pages} />,
                 ...(Platform.OS === "android"
                   ? {
                       headerTitleAlign: "center" as const,
@@ -501,44 +494,36 @@ export function ProjectScreen({
             failed={!!conversation.error}
           />
         ) : (
-          <ProjectPages
-            pages={pages}
-            chat={
-              <Animated.View style={[styles.chat, emptyStyle]}>
-                <Timed id="project new-session page">
-                  <ProjectEmptySession
-                    project={project}
-                    inView={focused && pages.view === "chat"}
-                    swiping={swiping}
+          // A session pushes over this page and leaves it mounted.
+          <AnimationsPaused value={!focused}>
+            <ProjectPages
+              pages={pages}
+              chat={
+                <Animated.View style={[styles.chat, emptyStyle]}>
+                  <Timed id="project new-session page">
+                    <ProjectEmptySession
+                      project={project}
+                      inView={focused && pages.view === "chat"}
+                      swiping={swiping}
+                      onOpen={(session) => openSession(session.id)}
+                    />
+                  </Timed>
+                </Animated.View>
+              }
+              sessions={
+                <Timed id="project sessions page">
+                  <SessionsPage
+                    projectId={project.id}
+                    active={focused && pages.view === "sessions"}
+                    worktree={
+                      workspace.mode === "existing" ? workspace.worktree : undefined
+                    }
                     onOpen={(session) => openSession(session.id)}
                   />
                 </Timed>
-              </Animated.View>
-            }
-            sessions={
-              <Timed id="project sessions page">
-                <SessionsPage
-                  projectId={project.id}
-                  active={pages.view === "sessions"}
-                  worktree={
-                    workspace.mode === "existing" ? workspace.worktree : undefined
-                  }
-                  onOpen={(session) => openSession(session.id)}
-                />
-              </Timed>
-            }
-            inbox={
-              inboxOn ? (
-                <Timed id="project inbox page">
-                  <InboxPage
-                    projectId={project.id}
-                    projectName={project.name}
-                    active={focused && pages.view === "inbox"}
-                  />
-                </Timed>
-              ) : undefined
-            }
-          />
+              }
+            />
+          </AnimationsPaused>
         )}
       </SessionContent>
       {/* After the content: iOS blurs under the header the scroll view it
@@ -641,6 +626,7 @@ function SessionTranscript({
     <FileOpener value={openFile}>
       {hasNativeTranscript ? <NativeTranscript key={sessionId} conversationId={sessionId} pushed /> : <Transcript
         key={sessionId}
+        conversationId={sessionId}
         pushed
         busy={busy}
         turns={turns}
@@ -651,6 +637,19 @@ function SessionTranscript({
         <TranscriptLoading key={`loading:${sessionId}`} />
       ) : null}
     </FileOpener>
+  );
+}
+
+/** The drawer's button, as on every screen it opens from. Reads the Inbox's
+ *  count itself, so a new one doesn't re-render the screen. */
+function MenuButton({ replies, onPress }: { replies: boolean; onPress: () => void }) {
+  const colors = useColors();
+  const inbox = useInboxBadge() > 0;
+  return (
+    <ProjectHeaderButton label={menuLabel(replies, inbox)} onPress={onPress}>
+      <Icon name="sidebar" size={22} color={colors.content} />
+      {replies || inbox ? <UnreadDot /> : null}
+    </ProjectHeaderButton>
   );
 }
 

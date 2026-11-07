@@ -120,6 +120,33 @@ export function useSessionActions(
       void archiveMany(sessions, { archive: archiveSession }, toast);
     });
   };
+  /** Takes a session out of the archive; there is nothing to undo, so it only says so. */
+  const unarchive = (session: SessionSummary) => {
+    if (!toast) return;
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    unarchiveSession(session.id).then(
+      () => toast.show(`Restored “${session.title}”`),
+      failed("Could not unarchive the session"),
+    );
+  };
+  /** The long press on an archived row: rename, restore or delete. */
+  const showArchivedActions = (session: SessionSummary) => {
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    ActionSheetIOS.showActionSheetWithOptions(
+      {
+        title: session.title,
+        options: ["Rename", "Unarchive", "Delete", "Cancel"],
+        destructiveButtonIndex: 2,
+        cancelButtonIndex: 3,
+        userInterfaceStyle: scheme,
+      },
+      (index) => {
+        if (index === 0) rename(session);
+        else if (index === 1) unarchive(session);
+        else if (index === 2) remove(session);
+      },
+    );
+  };
   const showActions = (session: SessionSummary) => {
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     ActionSheetIOS.showActionSheetWithOptions(
@@ -144,7 +171,9 @@ export function useSessionActions(
     remove,
     archive,
     archiveFinished,
+    unarchive,
     showActions,
+    showArchivedActions,
     swipeOpened,
     closeOpenRow,
   };

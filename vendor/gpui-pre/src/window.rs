@@ -918,6 +918,11 @@ pub enum HitboxBehavior {
     #[default]
     Normal,
 
+    /// Behaves as `Normal`, and marks a control floating over the content
+    /// beneath it, with its corner radius. Native views draw above all of
+    /// GPUI's content, so their hosts cut these out; see [`Window::floats_over`].
+    Float(Pixels),
+
     /// All hitboxes behind this hitbox will be ignored and so will have `hitbox.is_hovered() ==
     /// false` and `hitbox.should_handle_scroll() == false`. Typically for elements this causes
     /// skipping of all mouse events, hover styles, and tooltips. This flag is set by
@@ -5418,6 +5423,32 @@ impl Window {
                     .intersect(&later.content_mask.bounds);
                 overlap.size.width > Pixels::ZERO && overlap.size.height > Pixels::ZERO
             })
+    }
+
+    /// Returns the visible bounds and corner radius of each
+    /// [`HitboxBehavior::Float`] hitbox inserted after `hitbox` that overlaps
+    /// its visible part. Unlike the overlays [`Window::is_hitbox_covered`] finds,
+    /// these sit in the normal paint order, so a native view has to leave a
+    /// hole for them.
+    ///
+    /// This method should only be called as part of the paint phase, once every
+    /// hitbox of the frame has been inserted.
+    pub fn floats_over(&self, hitbox: &Hitbox) -> Vec<(Bounds<Pixels>, Pixels)> {
+        let frame = &self.next_frame;
+        let Some(index) = frame.hitboxes.iter().position(|h| h.id == hitbox.id) else {
+            return Vec::new();
+        };
+        let visible = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+        frame.hitboxes[index + 1..]
+            .iter()
+            .filter_map(|later| {
+                let HitboxBehavior::Float(radius) = later.behavior else {
+                    return None;
+                };
+                let shown = later.bounds.intersect(&later.content_mask.bounds);
+                (!visible.intersect(&shown).is_empty()).then_some((shown, radius))
+            })
+            .collect()
     }
 
     /// Set a hitbox which will act as a control area of the platform window.

@@ -961,7 +961,7 @@ impl Btw {
     fn apply_model_pick(&mut self, picked: &ModelPicked, cx: &mut Context<Self>) {
         let (kind, model) = (picked.0, picked.1.clone());
         let account = crate::accounts::get(cx);
-        let preferred = preferred_effort(kind.id(), cx);
+        let preferred = preferred_effort(kind.id(), model.as_deref(), cx);
         let Some(thread) = self.active_mut() else {
             return;
         };
@@ -1692,6 +1692,7 @@ impl Render for Btw {
                 d.occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             })
+            .child(crate::draft::float(px(SHEET_RADIUS)))
             .child(body_in(self.header(cx)))
             .child(body_in(div().flex_1().min_h_0()).child(
                 if self.transcript.read(cx).holds_live_draft(cx) {

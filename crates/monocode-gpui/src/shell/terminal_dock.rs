@@ -1,7 +1,7 @@
 // The dock's tab strip (ProjectTerminalDock.tsx over SurfaceTabs.tsx) and the
 // footer's terminal controls (UsageFooter.tsx's Terminal button and
 // RunningTerminalChip).
-use super::{MenuTarget, Shell, TabShift};
+use super::{DragSource, MenuTarget, PaneDrag, Shell, TabShift};
 use crate::tooltip::Tip;
 use crate::{
     popover::{Anchor, MenuAction, MenuItem, MenuStyle},

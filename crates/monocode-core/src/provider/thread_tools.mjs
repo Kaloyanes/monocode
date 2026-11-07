@@ -31,6 +31,7 @@ export default async function (pi) {
       return Type.Object(Object.fromEntries(Object.entries(value.properties ?? {}).map(([key, child]) =>
         [key, (value.required ?? []).includes(key) ? schema(child) : Type.Optional(schema(child))])), { additionalProperties: false });
     }
+    if (value.type === "array") return Type.Array(schema(value.items), value);
     if (value.type === "integer") return Type.Integer(value);
     return Type.String(value);
   };

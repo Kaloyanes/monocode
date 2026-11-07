@@ -1,6 +1,10 @@
 import { File } from "expo-file-system";
 import { ImageManipulator, SaveFormat } from "expo-image-manipulator";
-import { launchImageLibraryAsync, type ImagePickerAsset } from "expo-image-picker";
+import {
+  launchImageLibraryAsync,
+  VideoExportPreset,
+  type ImagePickerAsset,
+} from "expo-image-picker";
 
 /** A file or photo held in the composer until it's sent. */
 export type Attachment = {
@@ -22,6 +26,8 @@ export const MAX_ATTACHMENTS = 10;
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
 /** The whole message's, under the link's request limit with room for the text. */
 const MAX_TOTAL_BASE64 = 24 * 1024 * 1024;
+/** A video can take the whole message: the most bytes that fit as base64. */
+const MAX_VIDEO_BYTES = (MAX_TOTAL_BASE64 / 4) * 3;
 /** A photo's longer side; larger ones are scaled down, as vision models do anyway. */
 const MAX_IMAGE_SIDE = 2048;
 /** Sent as picked when already small and in a format every provider reads. */
@@ -35,6 +41,8 @@ const MIME_BY_EXT: Record<string, string> = {
   gif: "image/gif",
   webp: "image/webp",
   heic: "image/heic",
+  mp4: "video/mp4",
+  mov: "video/quicktime",
   pdf: "application/pdf",
   txt: "text/plain",
   md: "text/markdown",
@@ -50,16 +58,26 @@ export const isImage = (attachment: Pick<Attachment, "mimeType">) =>
 export const toWire = (attachments: Attachment[]): WireAttachment[] =>
   attachments.map(({ name, mimeType, data }) => ({ name, mimeType, data }));
 
-/** Photos from the library, scaled down and re-encoded where they need it. */
-export async function pickPhotos(room: number): Promise<Attachment[]> {
+/**
+ * Photos and videos from the library. Photos are scaled down and re-encoded
+ * where they need it. iOS exports videos at 540p, which keeps a screen
+ * recording readable and fits about half a minute of busy footage in a
+ * message; Android hands over the original.
+ */
+export async function pickMedia(room: number): Promise<Attachment[]> {
   const result = await launchImageLibraryAsync({
-    mediaTypes: ["images"],
+    mediaTypes: ["images", "videos"],
     allowsMultipleSelection: true,
     selectionLimit: room,
     quality: 1,
+    videoExportPreset: VideoExportPreset.H264_960x540,
   });
   if (result.canceled) return [];
-  return Promise.all(result.assets.slice(0, room).map(fromPhoto));
+  return Promise.all(
+    result.assets
+      .slice(0, room)
+      .map((asset) => (asset.type === "video" ? fromVideo(asset) : fromPhoto(asset))),
+  );
 }
 
 /** Any files, from Files and its providers. */
@@ -88,6 +106,26 @@ export function merge(existing: Attachment[], added: Attachment[]): Attachment[]
   if (total > MAX_TOTAL_BASE64)
     throw new Error("These attachments are too large to send together. Remove some and try again.");
   return next;
+}
+
+async function fromVideo(asset: ImagePickerAsset): Promise<Attachment> {
+  const file = new File(asset.uri);
+  const name = asset.fileName ?? file.name;
+  // Checked before reading: an Android original can be gigabytes.
+  if (file.size > MAX_VIDEO_BYTES) {
+    const limit = MAX_VIDEO_BYTES / (1024 * 1024);
+    throw new Error(
+      `${name} is too long to send. A video can be up to ${limit} MB, so trim it and try again.`,
+    );
+  }
+  return {
+    id: makeId(),
+    name,
+    mimeType: asset.mimeType ?? mimeFor(name, null),
+    size: file.size,
+    uri: asset.uri,
+    data: await file.base64(),
+  };
 }
 
 async function fromPhoto(asset: ImagePickerAsset): Promise<Attachment> {

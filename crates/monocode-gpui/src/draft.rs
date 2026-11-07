@@ -7,15 +7,9 @@
 //! Those are untrusted events, so they cannot move the person's focus or type
 //! into the composer, and a real click or keystroke in the page is how the app
 //! knows the person took over.
-#[cfg(target_os = "macos")]
-mod cdp;
-#[cfg(target_os = "macos")]
-mod chrome;
-#[cfg(all(test, target_os = "macos"))]
-mod chrome_shots;
-#[cfg(target_os = "macos")]
-mod engine;
 mod page;
+#[cfg(target_os = "macos")]
+mod presence;
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub(crate) mod selftest;
 #[cfg(target_os = "macos")]
@@ -196,10 +190,18 @@ pub(crate) fn watch<T: 'static>(
     cx.observe_global::<Registry>(change)
 }
 
+/// Deletes the Chromium that earlier builds downloaded for drafts.
+pub(crate) fn remove_old_chromium() {
+    let database = monocode_core::store::monocode_database();
+    for name in ["cef", "chromium"] {
+        let _ = std::fs::remove_dir_all(database.with_file_name(name));
+    }
+}
+
 /// Put last in a window's root: hides pages whose cards were not painted.
 #[cfg(target_os = "macos")]
 pub(crate) fn sentinel() -> gpui::AnyElement {
-    engine::sentinel()
+    web::sentinel()
 }
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn sentinel() -> gpui::AnyElement {
@@ -292,7 +294,7 @@ pub(crate) struct Draft {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     vouched: Option<std::time::Instant>,
     #[cfg(target_os = "macos")]
-    host: engine::Host,
+    host: web::Host,
     #[cfg(target_os = "macos")]
     appearance: Option<bool>,
     /// The version of the page the person can see. Until it matches
@@ -308,6 +310,9 @@ pub(crate) struct Draft {
     /// Asleep: another draft of the conversation is the one running, and the
     /// card shows a picture of this page until the person clicks it.
     asleep: bool,
+    /// The page came back into view with nothing drawn; the card's placeholder
+    /// shows through it.
+    blank: bool,
     poster: Option<Arc<gpui::RenderImage>>,
     _sleep: Option<gpui::Task<()>>,
     /// The agent sent the draft's first version: lay it out at other widths
@@ -330,8 +335,6 @@ pub(crate) struct Draft {
     save_due: bool,
     _save: Option<gpui::Task<()>>,
     /// Moving the page to the engine chosen in Settings.
-    _switch: Option<gpui::Task<()>>,
-    _engine: Vec<gpui::Subscription>,
     _reveal: Option<gpui::Task<()>>,
     _refit: Option<gpui::Task<()>>,
     _watch: Option<gpui::Task<()>>,
@@ -526,7 +529,7 @@ impl Draft {
             sync: PageSync::default(),
             vouched: None,
             #[cfg(target_os = "macos")]
-            host: engine::Host::new(engine::chromium_chosen(cx)),
+            host: web::Host::default(),
             #[cfg(target_os = "macos")]
             appearance: None,
             shown: 0,
@@ -534,6 +537,7 @@ impl Draft {
             outline: Vec::new(),
             still: None,
             asleep: false,
+            blank: false,
             poster: None,
             _sleep: None,
             measure: false,
@@ -546,68 +550,13 @@ impl Draft {
             saved: None,
             save_due: false,
             _save: None,
-            _switch: None,
-            _engine: Vec::new(),
             _reveal: None,
             _refit: None,
             _watch: None,
         };
         this._watch = this.watch(cx);
-        #[cfg(target_os = "macos")]
-        {
-            this._engine = vec![
-                cx.observe_global::<crate::settings::Preferences>(Self::follow_engine),
-                cx.observe_global::<crate::chromium::Installer>(Self::follow_engine),
-            ];
-        }
         this.reveal(cx);
         this
-    }
-
-    /// Moves the page to the engine chosen in Settings, if that changed. The
-    /// card shows a picture of the page until the other engine has loaded
-    /// it; `mc.state` and the pins come back from the shared record, as
-    /// after any reload.
-    #[cfg(target_os = "macos")]
-    fn follow_engine(&mut self, cx: &mut Context<Self>) {
-        if self._switch.is_some() || self.host.made_for_chromium() == engine::chromium_chosen(cx) {
-            return;
-        }
-        let current = (self.shown == self.shared.generation() && self.host.visible())
-            .then(|| self.host.web())
-            .flatten();
-        self._switch = Some(cx.spawn(async move |this, cx| {
-            let still = match current {
-                Some(web) => engine::picture(&web, cx).await,
-                None => None,
-            };
-            let _ = this.update(cx, |this, cx| {
-                this._switch = None;
-                let chromium = engine::chromium_chosen(cx);
-                if this.host.made_for_chromium() == chromium {
-                    if let Some(still) = still {
-                        cx.drop_image(still, None);
-                    }
-                    return;
-                }
-                this.host.hide();
-                this.host = engine::Host::new(chromium);
-                this.host.set_scrolls(this.expanded);
-                if let Some(old) = std::mem::replace(&mut this.still, still) {
-                    cx.drop_image(old, None);
-                }
-                // Nothing of the old page carries over but the record.
-                this.shown = 0;
-                this.sync = PageSync::default();
-                this.commenting = false;
-                this.retheme = None;
-                this._watch = this.watch(cx);
-                this.reveal(cx);
-                cx.notify();
-                let app: &mut App = cx;
-                changed(app);
-            });
-        }));
     }
 
     /// The draft saved at `path`, opened again under its own id so the agent
@@ -785,10 +734,10 @@ impl Draft {
         self.shared.set_waiting(waiting);
     }
 
-    /// Whether an agent's lease is asking for a page no card shows.
+    /// Whether an agent's lease is keeping the page running.
     #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn leased_without_page_for_test(&self) -> bool {
-        self.host.leased_without_page().is_some()
+    pub(crate) fn leased_for_test(&self) -> bool {
+        self.host.leased()
     }
 
     pub(crate) fn shared(&self) -> &SharedDraft {
@@ -948,7 +897,7 @@ impl Draft {
 
     /// Stops running the page and shows a picture of it instead, unless the
     /// person or the agent is using it. The card's page leaves the frame,
-    /// which pauses it; see `engine::Presence`.
+    /// which pauses it; see `presence::Presence`.
     pub(crate) fn sleep(&mut self, cx: &mut Context<Self>) {
         if self.asleep
             || self._sleep.is_some()
@@ -959,14 +908,16 @@ impl Draft {
         {
             return;
         }
+        // A hidden page can still be pictured, and a card put to sleep out of
+        // sight needs one as much as any other.
         #[cfg(target_os = "macos")]
-        let current = (self.shown == self.shared.generation() && self.host.visible())
+        let current = (self.shown == self.shared.generation())
             .then(|| self.host.web())
             .flatten();
         self._sleep = Some(cx.spawn(async move |this, cx| {
             #[cfg(target_os = "macos")]
             let poster = match current {
-                Some(web) => engine::picture(&web, cx).await,
+                Some(web) => web::picture(&web).await,
                 None => None,
             };
             #[cfg(not(target_os = "macos"))]
@@ -1027,8 +978,11 @@ impl Draft {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .opacity(0.)
-                    .group_hover("draft-asleep", |style| style.opacity(1.))
+                    // With no picture, the note is all that says why.
+                    .when(self.poster.is_some(), |note| {
+                        note.opacity(0.)
+                            .group_hover("draft-asleep", |style| style.opacity(1.))
+                    })
                     .child(
                         div()
                             .px_2()
@@ -1095,17 +1049,17 @@ impl Draft {
     }
 
     #[cfg(target_os = "macos")]
-    fn load(&mut self) -> engine::Load {
+    fn load(&mut self) -> web::Load {
         match self.shared.content() {
             DraftContent::Html(html) => {
                 let palette = self.palette;
-                engine::Load::Html(
+                web::Load::Html(
                     self.markup
                         .get_or_insert_with(|| page::sandbox(html, palette).into())
                         .clone(),
                 )
             }
-            DraftContent::Url(url) => engine::Load::Url(url.as_str().into()),
+            DraftContent::Url(url) => web::Load::Url(url.as_str().into()),
         }
     }
 
@@ -1135,6 +1089,22 @@ impl Draft {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(16))
                     .await;
+                let Ok(blank) = this.update(cx, |this, cx| this.mind_blank(cx)) else {
+                    return;
+                };
+                match blank {
+                    web::Blank::No => {}
+                    // A page with nothing drawn may not answer either.
+                    web::Blank::Waiting => {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(100))
+                            .await;
+                        let _ = this.read_with(cx, |this, _| this.host.wake());
+                        continue;
+                    }
+                    // This task went with the page.
+                    web::Blank::Gone => return,
+                }
                 let Ok(web) = this.read_with(cx, |this, _| {
                     this.host.web().filter(|_| this.host.visible())
                 }) else {
@@ -1262,6 +1232,43 @@ impl Draft {
         None
     }
 
+    /// Keeps a page with nothing on screen from reading as an empty card: the
+    /// placeholder shows through it, and one that will not draw opens again.
+    #[cfg(target_os = "macos")]
+    fn mind_blank(&mut self, cx: &mut Context<Self>) -> web::Blank {
+        let blank = self.host.blank();
+        if blank == web::Blank::Gone {
+            self.open_page_again(cx);
+            return blank;
+        }
+        let waiting = blank == web::Blank::Waiting;
+        if waiting != self.blank {
+            self.blank = waiting;
+            cx.notify();
+        }
+        blank
+    }
+
+    /// Replaces the page with a new one. Nothing of the old page carries over
+    /// but the shared record, so `mc.state` and the pins come back, as after
+    /// any reload.
+    #[cfg(target_os = "macos")]
+    fn open_page_again(&mut self, cx: &mut Context<Self>) {
+        self.host.hide();
+        self.host = web::Host::default();
+        self.host.set_scrolls(self.expanded);
+        self.blank = false;
+        self.shown = 0;
+        self.sync = PageSync::default();
+        self.commenting = false;
+        self.retheme = None;
+        self._watch = self.watch(cx);
+        self.reveal(cx);
+        cx.notify();
+        let app: &mut App = cx;
+        changed(app);
+    }
+
     /// What this card's page needs to match the shared record: state and pins
     /// from the phone. The page's own report of its state goes into the
     /// record first, unless the page has not caught up with values it was
@@ -1372,7 +1379,8 @@ impl Render for Draft {
         } else {
             self.surface(window, cx)
         };
-        let loading = self.shown != self.shared.generation()
+        let loading = self.blank
+            || self.shown != self.shared.generation()
             || self.revealed.is_some_and(|at| at.elapsed() < FADE);
         div()
             .py_2()
@@ -1756,20 +1764,13 @@ impl Draft {
 #[cfg(target_os = "macos")]
 impl Draft {
     /// Keeps the page running while the agent works with it, even with its
-    /// card out of sight; see `engine::Lease`.
-    pub(crate) fn lease(&mut self, window: &Window, cx: &mut Context<Self>) -> engine::Lease {
+    /// card out of sight; see `web::Lease`.
+    pub(crate) fn lease(&mut self, window: &Window, cx: &mut Context<Self>) -> web::Lease {
         let placement = self.page_placement(None, cx);
         self.host.lease(&placement, window)
     }
 
-    /// While the agent waits on a page no card shows, starts Chromium again
-    /// or moves the page to WebKit; see `engine::Host::keep_leased`.
-    fn keep_leased(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let placement = self.page_placement(None, cx);
-        self.host.keep_leased(&placement, window);
-    }
-
-    fn placement_for_paint(&mut self, cx: &mut Context<Self>) -> engine::Placement {
+    fn placement_for_paint(&mut self, cx: &mut Context<Self>) -> web::Placement {
         let retheme = self.retheme.take().filter(|_| self.is_html());
         self.page_placement(retheme, cx)
     }
@@ -1778,9 +1779,9 @@ impl Draft {
         &mut self,
         retheme: Option<String>,
         cx: &mut Context<Self>,
-    ) -> engine::Placement {
+    ) -> web::Placement {
         let (width, height) = self.viewport();
-        engine::Placement {
+        web::Placement {
             load: self.load(),
             generation: self.shared.generation(),
             width,
@@ -1801,7 +1802,7 @@ impl Draft {
             self.host.set_appearance(Some(light));
             self.appearance = Some(light);
         }
-        engine::surface(&self.host, &self.id, placement, window, cx)
+        presence::surface(&self.host, &self.id, placement, window, cx)
     }
 }
 #[cfg(not(target_os = "macos"))]
@@ -1851,20 +1852,20 @@ pub(crate) fn jpeg(png: &[u8]) -> Option<Vec<u8>> {
 
 /// The wrapper's state as JSON.
 #[cfg(target_os = "macos")]
-async fn state(web: &engine::Page, cx: &gpui::AsyncApp) -> Option<serde_json::Value> {
+async fn state(web: &web::Page, cx: &gpui::AsyncApp) -> Option<serde_json::Value> {
     let text = evaluate(web, "window.__mc ? JSON.stringify(window.__mc) : ''", cx).await?;
     serde_json::from_str(&text).ok()
 }
 
 #[cfg(target_os = "macos")]
-async fn evaluate(web: &engine::Page, script: &str, cx: &gpui::AsyncApp) -> Option<String> {
-    engine::evaluate(web, script, cx).await
+async fn evaluate(web: &web::Page, script: &str, cx: &gpui::AsyncApp) -> Option<String> {
+    web::evaluate(web, script, cx).await
 }
 
 /// Posts reports to the wrapper the way the page's probe does, so they take
 /// the same path, wake included.
 #[cfg(all(target_os = "macos", debug_assertions))]
-async fn report(web: &engine::Page, reports: &str, cx: &gpui::AsyncApp) {
+async fn report(web: &web::Page, reports: &str, cx: &gpui::AsyncApp) {
     let script =
         format!("[{reports}].forEach(m=>window.postMessage(Object.assign({{__mc:1}},m),'*'));'ok'");
     evaluate(web, &script, cx).await;
@@ -1916,7 +1917,7 @@ impl Draft {
                 })
                 .map_err(gone)?;
             if let Some(web) = current {
-                let still = engine::picture(&web, cx).await;
+                let still = web::picture(&web).await;
                 this.update(cx, |this, cx| {
                     if let Some(old) = std::mem::replace(&mut this.still, still) {
                         cx.drop_image(old, None);
@@ -2122,32 +2123,61 @@ impl Draft {
             // it is shown at; the self-test divides by the window's scale.
             "density" => {
                 let web = Self::ready(this, cx).await?;
-                let (chromium, frame, (viewport, _)) = this
-                    .read_with(cx, |this, _| {
-                        (
-                            this.host.is_chromium(),
-                            this.host.density(),
-                            this.viewport(),
-                        )
-                    })
+                let (viewport, _) = this
+                    .read_with(cx, |this, _| this.viewport())
                     .map_err(gone)?;
-                let still = engine::picture(&web, cx).await.map(|image| {
+                let still = web::picture(&web).await.map(|image| {
                     let size = image.size(0);
                     (size.width.0, size.height.0)
                 });
-                let agent = engine::png(&web, f64::from(viewport.min(MAX_PICTURE_WIDTH)), cx)
+                let agent = web::png(&web, f64::from(viewport.min(MAX_PICTURE_WIDTH)), cx)
                     .await
                     .ok()
                     .map(|(_, size)| size);
                 Ok(serde_json::json!({
-                    "engine": if chromium { "chromium" } else { "webkit" },
                     "viewport": viewport,
-                    "frame": frame.map(|(pixels, points, scale)| serde_json::json!({
-                        "pixels": pixels, "points": points, "renderScale": scale,
-                    })),
                     "still": still,
                     "agentPicture": agent,
                 }))
+            }
+            // Plays the page process dying, or stalling as a swapped-out one
+            // does, and says what the card has made of it.
+            "kill_page" | "stop_page" => {
+                let (pid, _) = this
+                    .read_with(cx, |this, _| this.host.page_process())
+                    .map_err(gone)?
+                    .ok_or("The draft has no page")?;
+                let signal = if what == "kill_page" {
+                    libc::SIGKILL
+                } else {
+                    libc::SIGSTOP
+                };
+                unsafe { libc::kill(pid, signal) };
+                Ok(serde_json::json!({"pid": pid}))
+            }
+            "page" => {
+                let (page, blank, shown) = this
+                    .read_with(cx, |this, _| {
+                        (
+                            this.host.page_process(),
+                            this.blank,
+                            this.shown == this.shared.generation(),
+                        )
+                    })
+                    .map_err(gone)?;
+                Ok(serde_json::json!({
+                    "pid": page.map(|page| page.0),
+                    "painted": page.map(|page| page.1),
+                    "blank": blank,
+                    "shown": shown,
+                }))
+            }
+            what if what.starts_with("hold:") => {
+                let seconds = what[5..].parse().map_err(|_| "A hold needs seconds")?;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(seconds))
+                    .await;
+                Ok(serde_json::json!({"held": seconds}))
             }
             "send_later" => {
                 let weak = this.clone();
@@ -2382,7 +2412,7 @@ impl Draft {
     /// about half a second while the new version waits to be shown.
     async fn measure_layouts(
         this: &gpui::WeakEntity<Self>,
-        web: &engine::Page,
+        web: &web::Page,
         cx: &mut gpui::AsyncApp,
     ) -> Vec<DraftLayout> {
         let Ok(own) = this.read_with(cx, |this, _| (this.width, this.height)) else {
@@ -2402,14 +2432,14 @@ impl Draft {
     /// report the new layout, and returns it.
     async fn lay_out(
         this: &gpui::WeakEntity<Self>,
-        web: &engine::Page,
+        web: &web::Page,
         viewport: Option<(u32, u32)>,
         own: (u32, u32),
         cx: &mut gpui::AsyncApp,
     ) -> Option<DraftLayout> {
         let width = viewport.map_or(own.0, |viewport| viewport.0);
-        // A page already at this width reports nothing new: Chromium only
-        // renders it at another scale, which fires no resize.
+        // A page already at this width reports nothing new: it is only
+        // drawn at another scale, which fires no resize.
         let before = state(web, cx).await?;
         let same = before["vw"].as_u64() == Some(u64::from(width))
             && before["h"].as_u64().is_some_and(|h| h > 0);
@@ -2453,7 +2483,7 @@ impl Draft {
     /// A page the agent gave no height to is as tall as its content.
     async fn fit_height(
         this: &gpui::WeakEntity<Self>,
-        web: &engine::Page,
+        web: &web::Page,
         cx: &mut gpui::AsyncApp,
     ) {
         let Ok(open) = this.read_with(cx, |this, _| this.expanded) else {
@@ -2477,7 +2507,7 @@ impl Draft {
     async fn ready(
         this: &gpui::WeakEntity<Self>,
         cx: &mut gpui::AsyncApp,
-    ) -> Result<engine::Page, String> {
+    ) -> Result<web::Page, String> {
         let started = std::time::Instant::now();
         let web = loop {
             let found = this
@@ -2491,24 +2521,8 @@ impl Draft {
             if let Some(web) = found {
                 break web;
             }
-            let window = this
-                .read_with(cx, |this, _| this.host.leased_without_page())
-                .ok()
-                .flatten();
-            if let Some(window) = window {
-                let _ = window.update(cx, |_, window, cx| {
-                    let _ = this.update(cx, |this, cx| this.keep_leased(window, cx));
-                });
-            }
             if started.elapsed() > std::time::Duration::from_secs(10) {
-                let failure = this
-                    .read_with(cx, |this, _| this.host.failure())
-                    .ok()
-                    .flatten();
-                return Err(match failure {
-                    Some(failure) => format!("The draft's page did not open: Chromium could not run it ({failure}) and WebKit did not take over in time. Try again."),
-                    None => "The draft's page did not open in time. Its card may be out of sight while you wait for the person, who has to see it: ask them to scroll to it and try again.".into(),
-                });
+                return Err("The draft's page did not open in time. Its card may be out of sight while you wait for the person, who has to see it: ask them to scroll to it and try again.".into());
             }
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(40))
@@ -2545,7 +2559,7 @@ impl Draft {
         let (viewport, _) = this
             .read_with(cx, |this, _| this.viewport())
             .map_err(|_| "The draft was closed".to_string())?;
-        let (png, size) = engine::png(&web, f64::from(viewport.min(width)), cx).await?;
+        let (png, size) = web::png(&web, f64::from(viewport.min(width)), cx).await?;
         let jpeg = cx
             .background_executor()
             .spawn(async move { jpeg(&png) })
@@ -2556,7 +2570,7 @@ impl Draft {
 
     async fn capture(
         this: &gpui::WeakEntity<Self>,
-        web: &engine::Page,
+        web: &web::Page,
         settle: std::time::Duration,
         widest: u32,
         cx: &mut gpui::AsyncApp,
@@ -2593,7 +2607,7 @@ impl Draft {
         cx.background_executor()
             .timer(std::time::Duration::from_millis(150))
             .await;
-        let (png, size) = engine::png(web, f64::from(width.min(widest)), cx).await?;
+        let (png, size) = web::png(web, f64::from(width.min(widest)), cx).await?;
         // The page is clear over the thread; give the agent's picture the
         // thread's color under it.
         let (html, palette) = this
@@ -2730,7 +2744,7 @@ impl Draft {
 /// Sends a click or typing into the page and waits for it to say it is done.
 #[cfg(target_os = "macos")]
 async fn act(
-    web: &engine::Page,
+    web: &web::Page,
     mut action: serde_json::Value,
     cx: &mut gpui::AsyncApp,
 ) -> Result<(), String> {
@@ -2818,54 +2832,6 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[gpui::test]
-    fn an_open_draft_moves_when_the_page_engine_changes(cx: &mut TestAppContext) {
-        crate::chromium::INSTALLED_IN_TEST.set(true);
-        let engine = |cx: &mut TestAppContext, name: &str| {
-            cx.update(|cx| {
-                cx.set_global(crate::settings::Preferences {
-                    page_engine: name.into(),
-                    ..Default::default()
-                })
-            })
-        };
-        engine(cx, "webkit");
-        let draft = cx.new(|cx| {
-            Draft::new(
-                Some("draft-1-e".into()),
-                1,
-                DraftContent::Html("<p>Hi</p>".into()),
-                (None, None),
-                None,
-                None,
-                cx,
-            )
-        });
-        let chromium = |cx: &mut TestAppContext| {
-            draft.read_with(cx, |draft, _| draft.host.made_for_chromium())
-        };
-        assert!(!chromium(cx));
-
-        engine(cx, "chromium");
-        cx.run_until_parked();
-        assert!(chromium(cx), "the open draft moved to Chromium");
-
-        // Other settings changing leave it where it is.
-        cx.update(|cx| {
-            cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
-                prefs.page_engine = "chromium".into()
-            })
-        });
-        cx.run_until_parked();
-        assert!(chromium(cx));
-
-        engine(cx, "webkit");
-        cx.run_until_parked();
-        assert!(!chromium(cx), "and back to WebKit");
-        crate::chromium::INSTALLED_IN_TEST.set(false);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[gpui::test]
     fn a_page_that_has_not_reported_its_height_keeps_its_card(cx: &mut TestAppContext) {
         let draft = cx.new(|cx| {
             Draft::new(
@@ -2884,64 +2850,6 @@ mod tests {
             assert!(draft.fit_content(420));
             assert_eq!(draft.height, 420);
         });
-    }
-
-    #[gpui::test]
-    fn the_agents_lease_moves_to_webkit_when_chromium_cannot_start(cx: &mut TestAppContext) {
-        crate::chromium::INSTALLED_IN_TEST.set(true);
-        cx.update(|cx| {
-            cx.set_global(crate::settings::Preferences {
-                page_engine: "chromium".into(),
-                ..Default::default()
-            })
-        });
-        let draft = cx.new(|cx| {
-            Draft::new(
-                Some("draft-1-f".into()),
-                1,
-                DraftContent::Html("<p>Hi</p>".into()),
-                (None, None),
-                None,
-                None,
-                cx,
-            )
-        });
-        let window = cx.add_window(|_, _| gpui::Empty);
-        // No card ever paints it: the agent's lease alone asks for the page,
-        // and this build ships no Chromium host, so the start fails.
-        let lease = window
-            .update(cx, |_, window, cx| {
-                draft.update(cx, |draft, cx| draft.lease(window, cx))
-            })
-            .unwrap();
-        let waiting = |cx: &mut TestAppContext| {
-            draft.read_with(cx, |draft, _| draft.host.leased_without_page())
-        };
-        assert_eq!(
-            waiting(cx),
-            Some(window.into()),
-            "the lease waits for a page"
-        );
-        assert!(
-            draft
-                .read_with(cx, |draft, _| draft.host.failure())
-                .is_some()
-        );
-
-        window
-            .update(cx, |_, window, cx| {
-                draft.update(cx, |draft, cx| draft.keep_leased(window, cx))
-            })
-            .unwrap();
-        assert_eq!(waiting(cx), None, "WebKit took the page");
-        assert!(draft.read_with(cx, |draft, _| draft.host.standing_in()));
-
-        drop(lease);
-        assert!(
-            !draft.read_with(cx, |draft, _| draft.host.standing_in()),
-            "the stand-in goes with the agent's last lease"
-        );
-        crate::chromium::INSTALLED_IN_TEST.set(false);
     }
 
     fn note(text: &str) -> DraftFeedback {

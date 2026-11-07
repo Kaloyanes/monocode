@@ -311,7 +311,7 @@ impl Shell {
                     .overflow_hidden()
                     .child(rows),
             )
-            .children(self.live_agents_preview(cx))
+            .children(self.docked_live_agents(cx))
             .child(self.app_update_footer(cx))
             .child(self.project_rail_footer(compact, cx))
             .into_any_element()
@@ -406,7 +406,15 @@ impl Shell {
             ProjectRailRow::Monos => self
                 .monos
                 .clone()
-                .map(|m| m.update(cx, |m, cx| m.project_navigation_rail(compact, cx)))
+                .map(|m| {
+                    m.update(cx, |m, cx| {
+                        m.project_navigation_rail(
+                            compact,
+                            self.workspace.sidebar_monos_collapsed,
+                            cx,
+                        )
+                    })
+                })
                 .unwrap_or_else(|| div().into_any()),
             ProjectRailRow::Heading(label) => self.project_rail_heading(label, compact, cx),
             ProjectRailRow::Project { path, grouped } => {
@@ -684,7 +692,7 @@ impl Shell {
                 self.monos
                     .clone()
                     .filter(|m| !m.read(cx).roster.monos.is_empty())
-                    .map(|m| m.update(cx, |m, cx| m.project_navigation_rail(true, cx)))
+                    .map(|m| m.update(cx, |m, cx| m.project_navigation_rail(true, false, cx)))
             } else {
                 None
             };

@@ -226,7 +226,6 @@ final class TranscriptRowModel {
   private(set) var mascotRect: CGRect?
   private(set) var reactionBadge: TranscriptReaction?
   /// A visual's dithered cells and lines, drawn by the row's canvas.
-  private(set) var visualPaints: [TranscriptVisualPaint] = []
   private(set) var userExpandable = false
   private(set) var userExpanded = false
   private(set) var height: CGFloat = 0
@@ -320,6 +319,10 @@ final class TranscriptRowModel {
         visualError = error
         height = 8 + 32 + theme.measure(error, font: .systemFont(ofSize: 13 * s), width: width).height + 20
       }
+    case "draft":
+      // The card and its page are views of the transcript's own, so they
+      // outlive this row; the row only keeps their place.
+      height = 8 + (action["cardHeight"] as? CGFloat ?? TranscriptDraftCard.estimate) + 16
     case "user":
       let compact = action["compact"] as? Bool == true
       let reaction = action["reaction"] as? String
@@ -556,7 +559,7 @@ final class TranscriptRowModel {
       let step = kind != "phase"
       let icons = [
         "edit": "edit", "research": "search", "run": "terminal", "agent": "robot",
-        "other": "wrench", "note": "minus",
+        "visual": "monocode", "other": "wrench", "note": "minus",
       ]
       let icon = icons[action["kind"] as? String ?? ""]
       let x = base + (step || icons[action["kind"] as? String ?? ""] != nil ? 22 : 0)
@@ -622,42 +625,6 @@ final class TranscriptRowModel {
         TranscriptHit(
           rect: rect, action: ["type": "error", "notice": action], label: title + ". View details"))
       height = h + 16
-    case "draft":
-      // The agent's page; tapping it opens the live page on the phone.
-      let kept = action["kept"] as? Bool == true
-      let titleText = string(
-        plain.isEmpty ? "Draft" : plain, size: 14, line: 20,
-        color: UIColor.transcriptHex(style.muted), medium: true)
-      let hint = string(
-        kept ? "Kept draft · Open" : "Draft · Open", size: 12, line: 17,
-        color: UIColor.transcriptHex(style.faint))
-      let textWidth = max(1, style.width - 126)
-      let titleSize = TranscriptTypography.measure(
-        titleText, width: textWidth, line: style.line(20))
-      let titleHeight = min(titleSize.height, style.line(20) * 2)
-      let bodyHeight = titleHeight + style.line(17)
-      let h = max(64, bodyHeight + 28)
-      let rect = CGRect(x: 20, y: 8, width: style.width - 40, height: h)
-      surfaces.append(
-        TranscriptSurface(
-          rect: rect, color: contentColor.withAlphaComponent(0.04), radius: 16,
-          border: UIColor.transcriptHex(style.stroke)))
-      mark("icon:edit", x: 34, y: rect.midY - 9, size: 18)
-      add(
-        titleText, x: 64, y: rect.midY - bodyHeight / 2, width: textWidth, height: titleHeight,
-        lines: 2)
-      add(
-        hint, x: 64, y: rect.midY - bodyHeight / 2 + titleHeight, width: textWidth,
-        height: style.line(17))
-      marks.append(
-        TranscriptMark(
-          rect: CGRect(x: rect.maxX - 30, y: rect.midY - 8, width: 16, height: 16),
-          image: TranscriptArtwork.shared.image("icon:chevronRight"),
-          tint: UIColor.transcriptHex(style.faint)))
-      var event = action
-      event["type"] = "draft"
-      hits.append(TranscriptHit(rect: rect, action: event, label: plain + ". Open draft"))
-      height = h + 16
     case "divider":
       // A Mono's replies are bubbles of their own, so nothing breaks them.
       height = 0
@@ -711,31 +678,6 @@ final class TranscriptRowModel {
           rect: card, color: contentColor.withAlphaComponent(0.03), radius: 20,
           border: UIColor.transcriptHex(style.stroke)),
         at: 0)
-      height = card.maxY + bottom
-    case "visual":
-      // A chart or dashboard the agent drew, in an outlined bubble, laid out
-      // natively from the tree the desktop rendered.
-      let pad: CGFloat = 16
-      let width = max(1, style.width - base - 20)
-      let inner = max(1, width - pad * 2)
-      var cursor = top + pad
-      let title = string(plain, size: 15, line: 20, color: contentColor, medium: true)
-      add(title, x: base + pad, y: cursor, width: inner, height: style.line(20), lines: 1)
-      cursor += style.line(20) + 12
-      if let tree = action["tree"] as? [String: Any] {
-        let layout = TranscriptVisualLayout(style: style)
-        cursor += layout.layout(tree, x: base + pad, y: cursor, width: inner)
-        for text in layout.texts {
-          add(
-            text.text, x: text.rect.minX, y: text.rect.minY, width: text.rect.width,
-            height: text.rect.height, lines: text.lines)
-        }
-        visualPaints = layout.paints
-      }
-      let card = CGRect(x: base, y: top, width: width, height: cursor + pad - top)
-      surfaces.append(
-        TranscriptSurface(
-          rect: card, color: .clear, radius: 20, border: contentColor.withAlphaComponent(0.16)))
       height = card.maxY + bottom
     case "document":
       // ArtifactCard: the document's mark and title; a tap opens the reader.

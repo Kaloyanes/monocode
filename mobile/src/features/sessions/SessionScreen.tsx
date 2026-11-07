@@ -1,5 +1,6 @@
 import { useIsFocused, usePathname } from "expo-router";
 import { BlurTargetView } from "expo-blur";
+import { LinearGradient } from "expo-linear-gradient";
 import {
   createContext,
   useCallback,
@@ -54,8 +55,9 @@ import {
 import { GlassBlurTarget, GlassPresence, LiquidView } from "@/ui/LiquidView";
 import { DitherLoading } from "@/ui/DitherLoading";
 import { useDrawerActions, useSceneSwapping, useSceneSwitching } from "@/ui/ScenePager";
-import { UnreadDot, useAnyUnread } from "@/features/workspace/UnreadDot";
-import { themedStyles, useColors } from "@/ui/theme";
+import { useInboxBadge } from "@/features/inbox/InboxProvider";
+import { menuLabel, UnreadDot, useAnyUnread } from "@/features/workspace/UnreadDot";
+import { themedStyles, useColors, withAlpha } from "@/ui/theme";
 
 export const HEADER_HEIGHT = 44;
 /** The frame's own header (a mono's) below the status bar: flush with it, so
@@ -162,9 +164,12 @@ export function useSessionLayout() {
  */
 export function SheetLayout({
   top,
+  keyboardOffset = 0,
   children,
 }: {
   top: number;
+  /** As the layout's own, for a bar that rests nearer the keyboard. */
+  keyboardOffset?: number;
   children: ReactNode;
 }) {
   const insets = useSafeAreaInsets();
@@ -176,12 +181,12 @@ export function SheetLayout({
       bottom: dockBottom,
       bareBottom: dockBottom + PAGE_FADE,
       dockBottom,
-      keyboardOffset: 0,
+      keyboardOffset,
       extraContentPadding: undefined,
       composerGrowth: 0,
       settled: true,
     }),
-    [top, dockBottom],
+    [top, dockBottom, keyboardOffset],
   );
   return <SessionLayoutContext value={layout}>{children}</SessionLayoutContext>;
 }
@@ -309,6 +314,18 @@ export function SessionScreen({
     ],
   );
   return children;
+}
+
+/** The drawer's button in the frame's header. Reads the Inbox's count itself,
+ *  so a new one doesn't re-render the frame. */
+function FrameMenuButton({ replies, onPress }: { replies: boolean; onPress: () => void }) {
+  const inbox = useInboxBadge() > 0;
+  return (
+    <>
+      <CircleButton icon="sidebar" label={menuLabel(replies, inbox)} onPress={onPress} />
+      {replies || inbox ? <UnreadDot /> : null}
+    </>
+  );
 }
 
 // Persistent frame around every main-pane screen, mounted once in the root
@@ -653,14 +670,7 @@ export function SessionFrame({
                       onPress={chrome.back.onPress}
                     />
                   ) : (
-                    <>
-                      <CircleButton
-                        icon="menu"
-                        label={unread ? "Projects, new replies" : "Projects"}
-                        onPress={drawer.open}
-                      />
-                      {unread ? <UnreadDot /> : null}
-                    </>
+                    <FrameMenuButton replies={unread} onPress={drawer.open} />
                   )}
                 </View>
                 <View style={styles.titleBlock}>
@@ -714,10 +724,13 @@ export function SessionFrame({
             >
               {/* Its own view, since its lift and a screen's dockStyle each set a transform. */}
               <Animated.View style={keyboardLift}>
-                <GradualBlur
-                  edge="bottom"
-                  height={composerHeight + composerBottom + FADE}
-                  color={colors.background}
+                {/* Solid behind the composer: its glass shows what's under it, so
+                    with the transcript there the add button and mic turn different greys. */}
+                <LinearGradient
+                  pointerEvents="none"
+                  colors={[withAlpha(colors.background, 0), colors.background]}
+                  locations={[0, FADE / (composerHeight + composerBottom + FADE)]}
+                  style={[styles.composerFade, { height: composerHeight + composerBottom + FADE }]}
                 />
                 <View style={{ paddingBottom: composerBottom }}>
                   <View onLayout={onComposerLayout}>
@@ -1099,5 +1112,11 @@ const useStyles = themedStyles((colors) => ({
     right: 0,
     bottom: 0,
     justifyContent: "flex-end",
+  },
+  composerFade: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
   },
 }));

@@ -56,8 +56,6 @@ pub(crate) struct LiveSession {
     pub waiting: Option<&'static str>,
     /// The draft the agent is waiting on, when `waiting` is "draft".
     pub waiting_draft: Option<String>,
-    /// The newest Orchestrator card of a lead (`orchestration::summary`).
-    pub orchestration: Option<Value>,
 }
 
 /// The phone keeps model choices across desktop versions. Keep Tauri's
@@ -149,8 +147,8 @@ pub(crate) fn session(
     if let Some(draft) = live.and_then(|live| live.waiting_draft.as_deref()) {
         value["waitingDraft"] = json!(draft);
     }
-    if let Some(orchestration) = live.and_then(|live| live.orchestration.clone()) {
-        value["orchestration"] = orchestration;
+    if let Some(item) = &summary.work_item {
+        value["workItem"] = json!({"kind": item.kind, "number": item.number});
     }
     value
 }
@@ -220,7 +218,6 @@ mod tests {
             busy: false,
             waiting: None,
             waiting_draft: None,
-            orchestration: None,
         };
         let mut opening = session(
             &summary,
@@ -267,6 +264,34 @@ mod tests {
         assert_eq!(changed["runtimeMode"], "full-access");
         assert_eq!(changed["waiting"], "approval");
         assert_eq!(changed["busy"], true);
+    }
+
+    #[test]
+    fn a_linked_pull_request_reaches_the_phone_row() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut summary = store.create("claude", "/project").unwrap();
+        let card = |summary: &Session| {
+            let saved = MobileSessionMetadata::default();
+            session(
+                summary,
+                "id",
+                "project",
+                &metadata(&saved, None),
+                None,
+                "main",
+            )
+        };
+        assert!(card(&summary).get("workItem").is_none());
+        summary.work_item = Some(monocode_core::session_groups::WorkItem {
+            kind: "pr".into(),
+            repo: "owner/repo".into(),
+            number: 1330,
+            url: "https://github.com/owner/repo/pull/1330".into(),
+        });
+        assert_eq!(
+            card(&summary)["workItem"],
+            json!({"kind":"pr","number":1330})
+        );
     }
 
     #[test]

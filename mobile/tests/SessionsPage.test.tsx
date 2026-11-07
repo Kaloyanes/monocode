@@ -3,10 +3,11 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const app = vi.hoisted(() => ({
-  replace: vi.fn(),
+  push: vi.fn(),
   archive: vi.fn(async (_id: string) => {}),
   unarchive: vi.fn(async (_id: string) => {}),
   canUnarchive: false,
+  archivedTotal: 0,
   alert: vi.fn(),
   newMono: vi.fn(),
   store: new Map<string, string>(),
@@ -19,7 +20,7 @@ vi.mock("expo-sqlite/kv-store", () => ({
     setItem: async (key: string, value: string) => void app.store.set(key, value),
   },
 }));
-vi.mock("expo-router", () => ({ router: { replace: app.replace } }));
+vi.mock("expo-router", () => ({ router: { push: app.push } }));
 vi.mock("expo-haptics", () => ({
   impactAsync: vi.fn(),
   selectionAsync: vi.fn(),
@@ -45,15 +46,17 @@ function animation() {
 }
 vi.mock("react-native-reanimated", () => ({
   default: {
-    FlatList: ({ data, renderItem, ListHeaderComponent, ListEmptyComponent }: {
+    FlatList: ({ data, renderItem, ListHeaderComponent, ListEmptyComponent, ListFooterComponent }: {
       data: unknown[];
       renderItem: (info: { item: unknown }) => ReactNode;
       ListHeaderComponent?: ReactNode;
       ListEmptyComponent?: ReactNode;
+      ListFooterComponent?: ReactNode;
     }) => (
       <section>
         {ListHeaderComponent}
         {data.length ? data.map((item, index) => <div key={index}>{renderItem({ item })}</div>) : ListEmptyComponent}
+        {ListFooterComponent}
       </section>
     ),
     View: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
@@ -87,12 +90,25 @@ vi.mock("@/features/mascots/PixelMascot", () => ({
   PixelMascot: ({ name }: { name: string }) => <i data-mascot={name} />,
 }));
 vi.mock("@/ui/Icon", () => ({ Icon: ({ name }: { name: string }) => <i data-icon={name} /> }));
-vi.mock("@/ui/AnimationsPaused", () => ({ AnimationsPaused: ({ children }: { children: ReactNode }) => <>{children}</> }));
 vi.mock("@/ui/GradualBlur", () => ({ GradualBlur: () => null }));
-vi.mock("@/ui/Collapsible", () => ({
-  Collapsible: ({ open, children }: { open: boolean; children: ReactNode }) =>
-    open ? <>{children}</> : null,
-}));
+vi.mock("@/ui/LiquidView", async () => {
+  const { createContext } = await import("react");
+  return {
+    GlassPresence: createContext(null),
+    LiquidView: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+    useGlassEntrance: (shown: boolean) => ({ mounted: shown, visible: shown, presence: null }),
+    usePopStyle: () => ({}),
+  };
+});
+vi.mock("@/ui/Collapsible", async () => {
+  const { use } = await import("react");
+  const { AnimationsPaused } = await import("@/ui/AnimationsPaused");
+  const Folded = () => <i data-paused={String(use(AnimationsPaused))} />;
+  return {
+    Collapsible: ({ open, children }: { open: boolean; children: ReactNode }) =>
+      open ? <>{children}</> : <Folded />,
+  };
+});
 vi.mock("@/ui/theme", () => ({
   themedStyles: (create: (colors: object) => object) => () => create({}),
   useColors: () => ({ muted: "gray" }),
@@ -103,8 +119,16 @@ vi.mock("@/ui/theme", () => ({
 vi.mock("@/features/sessions/SessionScreen", () => ({
   useSessionLayout: () => ({ pageTop: 0, dockBottom: 0 }),
 }));
+vi.mock("@/features/sessions/ArchivedSessions", () => ({
+  ArchivedSessions: ({ onBack }: { onBack: () => void }) => (
+    <aside data-archive>
+      <button aria-label="Back to sessions" onClick={onBack} />
+    </aside>
+  ),
+}));
 vi.mock("@/features/sessions/useSessionPages", () => ({
-  useSessionPages: () => null,
+  useSessionPages: (_project: string, _query: string, active: boolean, archived?: boolean) =>
+    archived && active ? { sessions: [], hasMore: false, total: app.archivedTotal, loadMore: () => {} } : null,
   visibleSessions: (_pages: unknown, recent: unknown[]) => recent,
 }));
 vi.mock("@/features/sessions/useArrivals", () => ({
@@ -168,6 +192,7 @@ beforeEach(() => {
   app.store.clear();
   resetMonoGroupPrefs();
   app.canUnarchive = false;
+  app.archivedTotal = 0;
   const taskGiver = mono("TaskGiver", ["p1"]);
   const away = mono("Away", ["p9"]);
   app.workspace = {
@@ -181,7 +206,11 @@ beforeEach(() => {
       row("by-hand"),
       row("other-project", { projectId: "p2" }),
     ],
+    get polled() {
+      return new Set((this.sessions as { id: string }[]).map((session) => session.id));
+    },
     edited: (session: unknown) => session,
+    canListArchived: false,
     rememberSession: vi.fn(),
     archiveSession: app.archive,
     unarchiveSession: app.unarchive,
@@ -212,7 +241,7 @@ describe("a project's Sessions page", () => {
   it("opens a Mono's chat from its row", () => {
     render("p1");
     click(byLabel("Unread, unread, unread last line"));
-    expect(app.replace).toHaveBeenCalledWith({ pathname: "/mono/[monoId]", params: { monoId: "unread" } });
+    expect(app.push).toHaveBeenCalledWith({ pathname: "/mono/[monoId]", params: { monoId: "unread" } });
   });
 
   it("marks unread Monos on their rows", () => {
@@ -231,6 +260,34 @@ describe("a project's Sessions page", () => {
     expect(page.textContent).not.toContain("TaskGiver last line");
     click(byLabel("Monos, 4"));
     expect(page.textContent).toContain("TaskGiver last line");
+  });
+
+  it("says a Mono is working on its own line and leaves the others alone", () => {
+    app.workspace.monos = [mono("Busy", ["p1"], { status: "working" }), mono("Calm", ["p1"])];
+    render("p1");
+    expect(byLabel("Busy, Working…").textContent).toContain("Working…");
+    expect(byLabel("Calm, Calm last line").textContent).not.toContain("Working…");
+  });
+
+  it("says a Mono is working on the folded header, and only there once folded", () => {
+    app.workspace.monos = [mono("Busy", ["p1"], { status: "working" }), mono("Calm", ["p1"])];
+    render("p1");
+    click(byLabel("Monos, 2"));
+    expect(byLabel("Monos, 2, working")).not.toBeNull();
+    expect(byLabel("Monos, 2, working").textContent).toContain("Working…");
+  });
+
+  it("holds a folded group's mascots still", () => {
+    app.workspace.monos = [mono("Busy", ["p1"], { status: "working" })];
+    render("p1");
+    click(byLabel("Monos, 1"));
+    expect(page.querySelector<HTMLElement>("[data-paused]")?.dataset.paused).toBe("true");
+  });
+
+  it("keeps a folded header quiet when no Mono is working", () => {
+    render("p1");
+    click(byLabel("Monos, 4"));
+    expect(byLabel("Monos, 4").textContent).not.toContain("Working…");
   });
 
   it("hides and shows the group from the filter, and remembers it per desktop", () => {
@@ -267,7 +324,7 @@ describe("a project's Sessions page", () => {
   it("opens the Mono's chat from a session's chip", () => {
     render("p1");
     click(byLabel("chip by-tg"));
-    expect(app.replace).toHaveBeenCalledWith({ pathname: "/mono/[monoId]", params: { monoId: "TaskGiver" } });
+    expect(app.push).toHaveBeenCalledWith({ pathname: "/mono/[monoId]", params: { monoId: "TaskGiver" } });
   });
 
   it("archives from the swipe with an Undo toast where the desktop can unarchive", async () => {
@@ -293,5 +350,78 @@ describe("a project's Sessions page", () => {
     expect(app.archive).toHaveBeenCalledWith("by-hand");
     expect(page.textContent).toContain("Archived “by-hand”");
     expect(byLabel("Undo")).toBeNull();
+  });
+});
+
+describe("the list", () => {
+  it("heads each day's run as the desktop does, below the working ones", () => {
+    const today = Date.now();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    app.workspace.sessions = [
+      row("busy", { busy: true, updatedAt: today }),
+      row("today", { updatedAt: today }),
+      row("yesterday", { updatedAt: yesterday.getTime() }),
+      row("old", { updatedAt: 1 }),
+    ];
+    render("p1");
+    const shown = Array.from(page.querySelectorAll("[data-session], span"))
+      .map((el) => (el as HTMLElement).dataset.session ?? el.textContent)
+      .filter((text) => /^(Working|Today|Yesterday|Older|Sessions|old|yesterday|today|busy)$/.test(text ?? ""));
+    expect(shown).toEqual(["Working", "busy", "Today", "today", "Yesterday", "yesterday", "Older", "old"]);
+  });
+});
+
+describe("the sessions working now", () => {
+  it("lead the list under their own label and leave the rows below", () => {
+    (app.workspace.sessions as unknown[]).push(row("busy-one", { busy: true }), row("busy-two", { busy: true }));
+    render("p1");
+    const labels = Array.from(page.querySelectorAll("span")).map((el) => el.textContent);
+    expect(labels).toContain("Working");
+    expect(labels).toContain("2");
+    expect(page.querySelectorAll("[data-session='busy-one']")).toHaveLength(1);
+    expect(page.querySelectorAll("[data-session='busy-two']")).toHaveLength(1);
+    const order = Array.from(page.querySelectorAll("[data-session]")).map((el) => (el as HTMLElement).dataset.session);
+    expect(order.slice(0, 2)).toEqual(["busy-one", "busy-two"]);
+    expect(order).toContain("by-hand");
+  });
+
+  it("show no label when nothing is working", () => {
+    render("p1");
+    expect(Array.from(page.querySelectorAll("span")).map((el) => el.textContent)).not.toContain("Working");
+  });
+
+  it("stay in their own project", () => {
+    (app.workspace.sessions as unknown[]).push(row("busy-away", { busy: true, projectId: "p2" }));
+    render("p1");
+    expect(page.querySelector("[data-session='busy-away']")).toBeNull();
+  });
+});
+
+describe("the archive", () => {
+  it("ends the list with a row that opens it, and Back returns to the list", () => {
+    app.workspace.canListArchived = true;
+    app.archivedTotal = 3;
+    render("p1");
+    expect(page.querySelector("[data-archive]")).toBeNull();
+    click(byLabel("Archived, 3 sessions"));
+    expect(page.querySelector("[data-archive]")).not.toBeNull();
+    expect(page.querySelector("[data-session='by-hand']")).toBeNull();
+    click(byLabel("Back to sessions"));
+    expect(page.querySelector("[data-archive]")).toBeNull();
+    expect(page.querySelector("[data-session='by-hand']")).not.toBeNull();
+  });
+
+  it("has no row when nothing is archived or the desktop can't list it", () => {
+    app.workspace.canListArchived = true;
+    app.archivedTotal = 0;
+    render("p1");
+    expect(page.querySelector("[aria-label^='Archived']")).toBeNull();
+  });
+
+  it("is left out for a desktop that can't list it", () => {
+    app.archivedTotal = 5;
+    render("p1");
+    expect(page.querySelector("[aria-label^='Archived']")).toBeNull();
   });
 });

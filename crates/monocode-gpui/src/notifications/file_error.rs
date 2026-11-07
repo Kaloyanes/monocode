@@ -5,7 +5,7 @@ use gpui::{Context, EventEmitter, Render, Window, div, prelude::*};
 pub(crate) enum FileActionErrorEvent {
     Dismiss,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct FileActionError {
     message: Option<String>,
 }

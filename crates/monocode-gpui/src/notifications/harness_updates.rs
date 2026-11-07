@@ -19,6 +19,7 @@ enum RowState {
     Updated(String),
     Failed(String),
 }
+#[derive(Clone)]
 pub(crate) struct HarnessUpdates {
     updates: Vec<Update>,
     rows: HashMap<Kind, RowState>,

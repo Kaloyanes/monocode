@@ -6,6 +6,7 @@ mod keymap;
 #[cfg(test)]
 mod layout_tests;
 mod management;
+mod mcp_form;
 mod model;
 mod notification_preferences;
 mod pages;
@@ -1031,77 +1032,17 @@ impl SettingsView {
                                     .gap_2()
                                     .rounded_lg()
                                     .px_2()
-                                    .child(icon("search-01", 14.).text_color(content(0.45)))
-                                    .child(div().min_w_0().flex_1().child(self.search.clone()))
-                                    .when(!self.search_query.is_empty(), |d| {
-                                        d.child(
-                                            div()
-                                                .id("clear-settings-search")
-                                                .role(Role::Button)
-                                                .aria_label("Clear settings search")
-                                                .tip("Clear settings search")
-                                                .size_4()
-                                                .flex_shrink_0()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_sm()
-                                                .cursor_pointer()
-                                                .child(icon("x", 12.).text_color(content(0.45)))
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.search.update(cx, |i, cx| {
-                                                        i.set_text(String::new(), cx)
-                                                    });
-                                                    this.search_query.clear();
-                                                    window.focus(&this.search.focus_handle(cx), cx);
-                                                    cx.notify();
-                                                })),
-                                        )
-                                    }),
-                            )
-                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                                if this.search_query.trim().is_empty() {
-                                    return;
-                                }
-                                let count =
-                                    model::search(&this.search_query, cx.compositor_name()).len();
-                                match event.keystroke.key.as_str() {
-                                    "down" => {
-                                        this.search_active =
-                                            (this.search_active + 1).min(count.saturating_sub(1))
-                                    }
-                                    "up" => {
-                                        this.search_active = this.search_active.saturating_sub(1)
-                                    }
-                                    "escape" => {
-                                        this.search_query.clear();
-                                        this.search
-                                            .update(cx, |i, cx| i.set_text(String::new(), cx));
-                                    }
-                                    _ => return,
-                                }
-                                cx.stop_propagation();
-                                cx.notify();
-                            }))
-                            .when(open, |d| {
-                                let active = self.search_active;
-                                d.child(
-                                    popover(
-                                        "settings-search-results",
-                                        Anchor::Slot(self.search_anchor.clone()),
-                                    )
-                                    .side(Side::Bottom)
-                                    .align(Align::End)
-                                    .width(300.)
-                                    .max_height(320.)
-                                    .padding(4.)
-                                    .on_dismiss(move |_, cx| {
-                                        let _ = weak.update(cx, |this, cx| {
-                                            this.search_query.clear();
-                                            this.search
-                                                .update(cx, |i, cx| i.set_text(String::new(), cx));
-                                            cx.notify();
-                                        });
+                                    .py(px(6.))
+                                    .text_size(px(12.))
+                                    .line_height(px(16.))
+                                    .text_color(content(1.))
+                                    .cursor_pointer()
+                                    .map(|d| {
+                                        if ix == active {
+                                            d.bg(content(0.1))
+                                        } else {
+                                            d.hover(|s| s.bg(content(0.05)))
+                                        }
                                     })
                                     .child(div().min_w_0().flex_1().truncate().child(label))
                                     .child(

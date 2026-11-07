@@ -72,11 +72,9 @@ from the page itself:
   draft appear in its card as they come. A draft the agent never shows
   stays out of the thread (it was added when the turn ended before 2026-11-03);
   its card stays held in the bridge, so a later turn can still publish it. Each agent request, `draft_wait` included, holds a lease on the page, so it opens
-  and runs whether or not the card is on screen: WebKit parks the view clear
-  and out of the pointer's way in the window, Chromium runs its tab off
-  screen. If Chromium gives up while the agent waits (it is tried three
-  times), the lease moves to WebKit and the page opens there. Without a lease
-  an unseen page pauses.
+  and runs whether or not the card is on screen: the view is parked clear and
+  out of the pointer's way in the window. Without a lease an unseen page
+  pauses.
 - The card is as wide as the column (up to the page's width, scaled down when
   the page is wider) and as tall as the page content unless the agent sets a
   height. Up to three drafts stay live per conversation; the oldest is retired
@@ -106,53 +104,6 @@ from the page itself:
   the thread's visible area, and hidden when its row is not painted. A popover
   over it swaps in a still.
 
-## Page engine
-
-**Settings › Visualizations › Page engine** picks what draws drafts. Open
-drafts move when it changes: the card shows a picture of the page while the
-other engine loads it, and `mc.state` and pins come back from the shared
-record. Anything else the page kept (scroll, focus, typed text outside
-`mc.state`) starts over.
-
-- **WebKit** (default) is built into macOS: the native view described above.
-- **Chromium** is the Chromium Embedded Framework (CEF), downloaded the first
-  time it is chosen (about 135 MB, 330 MB unpacked) into
-  `~/Library/Application Support/<app>/cef/<version>`. One version is pinned
-  in `src/chromium.rs` and the archive must match its SHA-256 before it is
-  unpacked. Until it is here, and for any draft whose Chromium fails to start
-  three times, drafts use WebKit. Settings › Visualizations then says why,
-  from the host's last `FATAL` log line or panic, until a page opens in
-  Chromium again.
-- CEF runs in its own process, `monocode-cef-host`
-  (`crates/monocode-cef-host`), which ships beside the app's executable and
-  is the only code that loads the framework: the download is not signed by
-  this team, so the host is signed to allow that (`Entitlements.plist`) and
-  the app keeps its strict signing. The app lays out a small `MonoCode
-  CEF.app` around the download with copies of the host it ships, replaced
-  when the app's copy changes, because CEF needs its helper app and framework
-  in fixed places. Copies, not links: Chromium starts each helper by its
-  resolved path, and a linked helper looks for the framework beside the app
-  and quits.
-- One host serves every Chromium draft and quits with the last. Each draft is
-  a browser there with in-memory storage of its own, driven over DevTools
-  (commands on fd 3, events on fd 4). Frames never leave the GPU: CEF renders
-  off screen into an IOSurface, the host copies it into one of three
-  surfaces of its own and sends that over Mach, and the card draws it with
-  GPUI's `paint_surface`. So the card is ordinary GPUI content: popovers and
-  scrims cover it with no still and no sentinel. A static page sends one
-  frame and stops; a card out of sight hides its browser, and a page out of
-  sight is frozen, as WebKit pauses a hidden one, unless the agent is working
-  with it. The person's mouse and keys reach the page as DevTools input; copy
-  and paste go through the app's clipboard.
-- The same guards apply: the agent's page is served from a fixed origin by
-  request interception and may navigate nowhere else, a `url` draft may load
-  only local addresses, other links (and new windows the person opens) go to
-  your browser, downloads and file pickers are refused, and dialogs are
-  dismissed.
-- Not drawn: `<select>` dropdown lists, tooltips and context menus. Text input
-  takes typed characters; IME composition is not passed through. A page more
-  than 8,192 points tall is drawn at a lower scale.
-
 ## On the phone
 
 A draft runs inside the thread on a paired phone too, at its place in the
@@ -180,7 +131,7 @@ them; on Android it is a React view (`DraftCard.tsx`). Both are driven by
   real touch, and a touch that became a scroll does not count: the input it
   reported is dropped, so scrolling past a card does not take control of it.
   While a finger is on a page, the screen's own pans sit out the touch (iOS 26's
-  swipe back from anywhere, the drawer on a Mono's chat). The edge swipe stays.
+  swipe back from anywhere). The edge swipe stays.
 - **Touch events.** WebKit on iOS sends touches only where the outer document
   listens, and the sandboxed page's listeners do not count, so the phone bridge
   adds passive ones. Without them a tap arrives as a bare click, with no
@@ -216,7 +167,7 @@ To check on a real phone paired to a desktop built from this source:
 - With the desktop on another conversation, answer a `draft_wait` on the phone:
   the agent gets the answer, not an error.
 - Keep a picture of a draft, and open the page again from its card.
-- Drag a slider in a Mono's chat: the drawer must stay shut.
+- Drag a slider in a Mono's chat: the chat must not swipe back.
 - On Android, repeat these with a card in a long thread.
 
 ## Verifying
@@ -233,20 +184,3 @@ checks what the agent would receive. For ad hoc pages set
 `MONOCODE_DRAFT_SELFTEST_THREAD=1` to draw it in a thread); `MONOCODE_DRAFT_ACTIONS`
 takes a JSON array of further `draft_preview` inputs, and it writes
 `page.html.N.png` and `.json` for each step.
-
-To run the same checks in Chromium, build the host and lay out a bundle
-around the CEF SDK its build downloaded, then point the self-test at it
-(debug builds):
-
-```sh
-cd crates/monocode-cef-host
-CEF_PATH=~/Library/Caches/monocode-cef cargo build
-../../scripts/cef-host-bundle.sh target/debug/monocode-cef-host \
-  ~/Library/Caches/monocode-cef/156.0.14/cef_macos_aarch64/"Chromium Embedded Framework.framework" /tmp/mc-cef
-cd ../.. && MONOCODE_DRAFT_ENGINE=chromium MONOCODE_CEF_APP="/tmp/mc-cef/MonoCode CEF.app" \
-  python3 scripts/verify-native-draft.py
-```
-
-`target/debug/cef-smoke "/tmp/mc-cef/MonoCode CEF.app" frame.tga` drives the
-host on its own and saves a frame. Release builds (`npm run native:build`)
-build the host and sign it into the app bundle; that needs cmake and ninja.

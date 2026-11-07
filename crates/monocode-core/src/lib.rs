@@ -2,6 +2,7 @@
 pub mod accounts;
 pub mod agent;
 pub mod app_access;
+pub mod app_control;
 pub mod app_update;
 pub mod automations;
 pub mod catalog;
@@ -35,6 +36,7 @@ pub mod session_groups;
 pub mod session_title;
 pub mod shell_run;
 pub mod store;
+pub mod subagents;
 pub mod time;
 pub mod tool;
 pub mod transcript;
@@ -45,7 +47,6 @@ pub mod visual_bridge;
 
 pub mod composer;
 pub mod contributions;
-pub mod orchestration;
 pub mod skills;
 
 pub mod search;

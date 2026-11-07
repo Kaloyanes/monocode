@@ -109,6 +109,7 @@ pub(super) fn present(call: &ToolCall, fallback_cwd: Option<&str>) -> ToolPresen
         let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
         let title = string(&input, &["title"]).unwrap_or_else(|| "a chart".into());
         let (action, target) = match step {
+            VisualStep::Draft => draft_activity(&call.name, &input, running),
             VisualStep::Docs => (
                 if running { "Planning" } else { "Planned" },
                 "a chart".into(),
@@ -189,17 +190,6 @@ pub(super) fn present(call: &ToolCall, fallback_cwd: Option<&str>) -> ToolPresen
         .or_else(|| string(preview, &["kind"]))
         .unwrap_or_default();
     let name = call.name.to_lowercase();
-    if let Some(target) = draft_target(&name, &input) {
-        return ToolPresentation {
-            action: "Draft".into(),
-            target,
-            file_path: None,
-            start_line: None,
-            command: None,
-            description: None,
-            steps: Vec::new(),
-        };
-    }
     let execute = matches!(
         name.as_str(),
         "bash" | "commandexecution" | "shell" | "execute" | "exec_command"
@@ -349,39 +339,36 @@ pub(super) fn present(call: &ToolCall, fallback_cwd: Option<&str>) -> ToolPresen
     shown.target = shown.target.lines().next().unwrap_or("").into();
     shown
 }
-/// What the agent is doing in the Draft panel, in words: the tool names
-/// `draft_preview` and `draft_keep` arrive as `mcp__monocode__…` or
-/// `monocode:…` depending on the provider.
-fn draft_target(name: &str, input: &Value) -> Option<String> {
-    let tool = name
-        .rsplit(['_', ':'])
-        .next()
-        .filter(|_| name.ends_with("draft_preview") || name.ends_with("draft_keep"))?;
-    if tool == "keep" {
+/// What the agent is doing with a draft page, in the same voice as the
+/// native chart rows: `Drafted Sign-up`, `Checked the page`.
+fn draft_activity(name: &str, input: &Value, running: bool) -> (&'static str, String) {
+    let pick = |live: &'static str, done: &'static str| if running { live } else { done };
+    if name.ends_with("draft_keep") {
         let title = input["title"].as_str().unwrap_or("").trim();
-        return Some(if title.is_empty() {
-            "keep the page".into()
-        } else {
-            format!("keep \u{201c}{title}\u{201d}")
-        });
+        let target = if title.is_empty() { "the page" } else { title };
+        return (pick("Keeping", "Kept"), target.into());
     }
-    let action = input["action"]["kind"].as_str().unwrap_or("snapshot");
-    Some(match action {
-        "click" => "click a control".into(),
-        "type" => "type into the page".into(),
-        "resume" => "take control back".into(),
-        "close" => "close".into(),
-        _ if input["url"].as_str().is_some_and(|url| !url.is_empty()) => {
-            format!("open {}", input["url"].as_str().unwrap_or_default())
-        }
-        _ if input["html"].is_string() => "show a page".into(),
-        _ if input["publish"] == true => "show the draft".into(),
-        _ if input["width"].is_number() || input["height"].is_number() => {
-            "change the viewport".into()
-        }
-        _ if input["appearance"].is_string() => "change the theme".into(),
-        _ => "look again".into(),
-    })
+    if name.ends_with("draft_wait") {
+        return (pick("Waiting on", "Heard back on"), "the page".into());
+    }
+    let url = input["url"].as_str().filter(|url| !url.is_empty());
+    let title = input["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if let Some(url) = url {
+        return (pick("Opening", "Opened"), title.unwrap_or(url).into());
+    }
+    if input["html"].is_string() {
+        return (
+            pick("Drafting", "Drafted"),
+            title.unwrap_or("a page").into(),
+        );
+    }
+    if input["publish"] == true {
+        return (pick("Showing", "Showed"), "the draft".into());
+    }
+    (pick("Checking", "Checked"), "the page".into())
 }
 
 /// A step of Monocode's own visual tools.
@@ -390,6 +377,8 @@ pub enum VisualStep {
     Docs,
     Check,
     Show,
+    /// `draft_preview`, `draft_keep` and `draft_wait`: a live page.
+    Draft,
 }
 
 /// Recognizes Monocode's visual tools however a provider names an MCP tool:
@@ -408,6 +397,7 @@ pub fn visual_tool(name: &str) -> Option<VisualStep> {
         "visual_docs" => Some(VisualStep::Docs),
         "visual_check" => Some(VisualStep::Check),
         "visual_show" => Some(VisualStep::Show),
+        "draft_preview" | "draft_keep" | "draft_wait" => Some(VisualStep::Draft),
         _ => None,
     }
 }
@@ -888,44 +878,90 @@ mod tests {
     }
 
     #[test]
-    fn draft_tools_read_as_what_the_agent_is_doing() {
-        let shown = |name: &str, input: Value| {
-            let shown = call(name, input).presentation();
+    fn draft_tools_read_like_the_chart_rows() {
+        let shown = |name: &str, input: Value, state: ToolState| {
+            let mut call = call(name, input);
+            call.state = state;
+            let shown = call.presentation();
             (shown.action, shown.target)
         };
+        let done = || ToolState::Completed;
         for name in ["mcp__monocode__draft_preview", "monocode:draft_preview"] {
-            assert_eq!(
-                shown(name, json!({"html": "<p>Hi</p>"})),
-                ("Draft".into(), "show a page".into())
-            );
+            assert_eq!(visual_tool(name), Some(VisualStep::Draft));
             assert_eq!(
                 shown(
                     name,
-                    json!({"draft": "d", "action": {"kind": "click", "reference": "1-1-0"}})
-                )
-                .1,
-                "click a control"
+                    json!({"html": "<p>Hi</p>", "title": "Sign-up"}),
+                    done()
+                ),
+                ("Drafted".into(), "Sign-up".into())
             );
             assert_eq!(
-                shown(name, json!({"draft": "d", "width": 375})).1,
-                "change the viewport"
+                shown(name, json!({"html": "<p>Hi</p>"}), ToolState::Running),
+                ("Drafting".into(), "a page".into())
             );
-            assert_eq!(shown(name, json!({"draft": "d"})).1, "look again");
+            for input in [
+                json!({"draft": "d", "action": {"kind": "click", "reference": "1-1-0"}}),
+                json!({"draft": "d", "width": 375}),
+                json!({"draft": "d"}),
+            ] {
+                assert_eq!(
+                    shown(name, input, done()),
+                    ("Checked".into(), "the page".into())
+                );
+            }
             assert_eq!(
-                shown(name, json!({"draft": "d", "publish": true})).1,
-                "show the draft"
+                shown(name, json!({"draft": "d", "publish": true}), done()),
+                ("Showed".into(), "the draft".into())
             );
             assert_eq!(
-                shown(name, json!({"url": "http://localhost:5173"})).1,
-                "open http://localhost:5173"
+                shown(name, json!({"url": "http://localhost:5173"}), done()),
+                ("Opened".into(), "http://localhost:5173".into())
             );
         }
         assert_eq!(
             shown(
                 "mcp__monocode__draft_keep",
-                json!({"draft": "d", "title": "Sign-up"})
+                json!({"draft": "d", "title": "Sign-up"}),
+                done()
             ),
-            ("Draft".into(), "keep \u{201c}Sign-up\u{201d}".into())
+            ("Kept".into(), "Sign-up".into())
+        );
+        assert_eq!(visual_tool("other_server:draft_preview"), None);
+    }
+    #[test]
+    fn mono_app_calls_read_as_what_they_do() {
+        assert!(app_tool("mcp__monocode_app__app"));
+        assert!(app_tool("monocode_app.app"));
+        assert!(!app_tool("mcp__other__app"));
+        assert!(!app_tool("mcp__monocode_visual__visual_show"));
+        assert_eq!(
+            app_cli_action(
+                r#"'/Applications/Monocode.app/Contents/MacOS/monocode-gpui' app memory.add --json '{"fact":"x"}'"#
+            ),
+            Some("memory.add")
+        );
+        assert_eq!(app_cli_action("git log app memory.add"), None);
+        assert_eq!(app_cli_action("monocode-gpui app help"), None);
+
+        let running = call(
+            "mcp__monocode_app__app",
+            json!({"action":"sessions.start","input":{"prompt":"x"}}),
+        );
+        let shown = running.presentation();
+        assert_eq!(
+            (shown.action.as_str(), shown.target.as_str()),
+            ("Starting", "a session")
+        );
+        let mut done = call(
+            "Bash",
+            json!({"command":"/opt/monocode-gpui app memory.add --json '{\"fact\":\"x\"}'"}),
+        );
+        done.state = ToolState::Completed;
+        let shown = done.presentation();
+        assert_eq!(
+            (shown.action.as_str(), shown.target.as_str()),
+            ("Remembered", "that")
         );
     }
 

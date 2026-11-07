@@ -230,8 +230,8 @@ impl Shell {
                     window,
                     cx,
                 ),
-                SettingsEvent::NewSessionInWorktree { cwd, path, branch } => this
-                    .new_session_in_worktree(
+                SettingsEvent::NewSessionInWorktree { cwd, path, branch } => {
+                    this.new_session_in_worktree(
                         cwd.clone(),
                         crate::worktree_switcher::WorktreeFocus {
                             path: path.clone(),
@@ -239,7 +239,8 @@ impl Shell {
                         },
                         window,
                         cx,
-                    ),
+                    )
+                }
                 SettingsEvent::RemoveWorktrees {
                     cwd,
                     paths,
@@ -489,7 +490,11 @@ impl Shell {
         })
         .detach();
     }
-    pub(super) fn finish_worktree_action(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+    pub(super) fn finish_worktree_action(
+        &mut self,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(view) = &self.settings {
             view.update(cx, |v, cx| v.management_finished(result, cx));
         }
@@ -769,7 +774,6 @@ mod tests {
             "settings-nav-appearance",
             "settings-nav-keybindings",
             "settings-nav-chat",
-            "settings-nav-visualizations",
             "settings-nav-devices",
             "settings-nav-providers",
             "settings-nav-mcp",

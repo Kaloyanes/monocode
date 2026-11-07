@@ -190,6 +190,9 @@ final class TranscriptSession {
     var firstWatch = true
     var from: String?
     var retryAt = Date.distantPast
+    // Failed watches in a row, for waiting longer between them: each retry
+    // reads the whole conversation and lays it out again.
+    var failures = 0
     var saved = false
     var published = false
     var opening: TranscriptRequest?
@@ -292,7 +295,8 @@ final class TranscriptSession {
           conversation["type"] = "replace"
           latest = try update(conversation)
         } catch { latest = try? update(["type": "error", "error": error.localizedDescription]) }
-        retryAt = Date().addingTimeInterval(1)
+        retryAt = Date().addingTimeInterval(min(15, pow(2, Double(min(failures, 4)))))
+        failures += 1
         changed = true
       }
       for command in queued {
@@ -308,6 +312,11 @@ final class TranscriptSession {
                   "conversation.older",
                   params)
               }
+            }
+          } else if command["type"] as? String == "draftHeight" {
+            if let id = command["id"] as? String, let height = command["height"] as? CGFloat {
+              engine.setDraftHeight(id, height)
+              changed = true
             }
           } else if command["type"] as? String == "selection" {
             let selected = try update(command)
@@ -336,6 +345,9 @@ final class TranscriptSession {
           setWatch(nil)
         }
         receiving = nil
+        // Back on screen, it should try at once.
+        failures = 0
+        retryAt = .distantPast
         if !saved {
           save()
           saved = true
@@ -400,6 +412,7 @@ final class TranscriptSession {
                 "timeoutMs": 0,
               ]) as? [String: Any]
             if response?["idle"] as? Bool != true {
+              failures = 0
               latest = response
               if let latest { engine.accept(latest) }
               if let cursor = from {

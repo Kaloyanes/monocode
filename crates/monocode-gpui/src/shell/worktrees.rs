@@ -221,7 +221,7 @@ impl Shell {
         if let Some(monos) = self.monos.clone() {
             monos.update(cx, |m, cx| m.close(cx));
         }
-        self.create_session(self.default_kind(), false, cx);
+        self.create_session(self.default_choice(), false, cx);
     }
     pub(super) fn seed_worktree(
         &mut self,

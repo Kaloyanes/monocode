@@ -23,13 +23,10 @@ fn model() -> Model {
 }
 
 #[test]
-fn operator_launch_applies_validated_overrides_without_transferring_app_access() {
+fn a_launch_applies_validated_overrides_without_transferring_app_access() {
     let mut inherited = Settings {
         model: Some("test-model".into()),
         effort: Some("low".into()),
-        operator: true,
-        operator_enabled: true,
-        orchestrator: true,
         plan: true,
         worktree_cwd: Some("/existing".into()),
         ..Default::default()
@@ -45,8 +42,7 @@ fn operator_launch_applies_validated_overrides_without_transferring_app_access()
     assert_eq!(settings.service_tier.as_deref(), Some("fast"));
     assert_eq!(settings.model_settings["custom"], "b");
     assert_eq!(settings.worktree_cwd.as_deref(), Some("/existing"));
-    assert!(!settings.operator && !settings.orchestrator && !settings.plan);
-    assert!(!settings.operator_enabled);
+    assert!(!settings.plan);
     assert!(settings.environment.is_empty());
     for bad in [
         json!({"model":"unknown"}),
@@ -60,89 +56,73 @@ fn operator_launch_applies_validated_overrides_without_transferring_app_access()
         );
     }
     let descriptor = model_description(Kind::Codex, &model());
-    assert!(descriptor["settings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|s| s["id"] == "reasoningEffort"));
+    assert!(
+        descriptor["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "reasoningEffort")
+    );
 }
 
 #[test]
-fn operator_thread_access_survives_reopen_without_enabling_other_sessions() {
-    let dir = tempfile::tempdir().unwrap();
-    for shared in [false, true] {
-        let path = dir
-            .path()
-            .join(if shared { "shared.db" } else { "native.db" });
-        let open = || {
-            if shared {
-                Store::open_monocode(&path).unwrap()
-            } else {
-                Store::open(&path).unwrap()
-            }
-        };
-        let store = open();
-        let caller = store.create("codex", "/project").unwrap();
-        let other = store.create("codex", "/project").unwrap();
-        store
-            .save_agent_settings(
-                caller.id,
-                &Settings {
-                    operator_enabled: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        drop(store);
-        let store = open();
-        let restored = store.agent_settings(caller.id).unwrap().unwrap();
-        assert!(restored.operator_enabled);
-        assert!(!restored.operator);
-        assert!(
-            !store
-                .agent_settings(other.id)
-                .unwrap()
-                .unwrap_or_default()
-                .operator_enabled
-        );
+fn a_launch_accepts_the_full_id_behind_a_model_alias() {
+    let alias = |id: &str, target: &str| Model {
+        id: id.into(),
+        alias_target: Some(target.into()),
+        ..model()
+    };
+    let models = [
+        alias("opus", "claude-opus-5-5"),
+        alias("sonnet", "claude-sonnet-5-5"),
+    ];
+    let launch = |model: &str| {
+        launch_settings(
+            &json!({"prompt":"x","model":model,"effort":"high"}),
+            "claude",
+            Settings::default(),
+            Kind::Claude,
+            &models,
+        )
+    };
+    for id in [
+        "sonnet",
+        "claude-sonnet-5-5",
+        "sonnet-5.5",
+        "claude:claude-sonnet-5-5",
+    ] {
+        let settings = launch(id).unwrap();
+        assert_eq!(settings.model.as_deref(), Some("sonnet"), "{id}");
+        assert_eq!(settings.effort.as_deref(), Some("high"), "{id}");
     }
+    assert!(launch("claude-sonnet-4-6").is_err());
 }
 
 #[test]
-fn operator_rejects_unknown_fields_and_mono_only_capabilities() {
+fn project_actions_reject_unknown_fields_and_anything_only_monos_may_do() {
     for (action, input) in [
-        ("sessions.start", json!({"prompt":"x","sidebarHidden":true})),
-        ("sessions.start", json!({"prompt":"x","reveal":"false"})),
-        (
-            "sessions.start",
-            json!({"prompt":"x","runtimeMode":"unsafe"}),
-        ),
-        ("sessions.start", json!({"prompt":"x","placement":"left"})),
-        ("sessions.start", json!({"prompt":"x","besideSessionId":1})),
-        (
-            "sessions.send",
-            json!({"sessionId":1,"prompt":"x","notifyOnComplete":true}),
-        ),
+        ("sessions.start", json!({"prompt":"x"})),
+        ("sessions.send", json!({"sessionId":1,"prompt":"x"})),
+        ("sessions.delete", json!({"sessionId":1})),
+        ("sessions.list", json!({})),
+        ("sessions.stop", json!({"sessionId":1,"typo":true})),
         ("artifacts.write", json!({"body":"x"})),
     ] {
         assert!(
-            validate_operator(action, &input).is_err(),
+            validate_project_action(action, &input).is_err(),
             "{action}: {input}"
         );
     }
-    assert!(prompt(&json!({"prompt":"/operator do something"})).is_err());
-    assert!(validate_operator("sessions.archive", &json!({"sessionId":"desktop-uuid"})).is_ok());
-    assert!(validate_operator(
-        "sessions.start",
-        &json!({"prompt":"x","placement":"down","besideSessionId":"uuid","effort":"high"})
-    )
-    .is_ok());
+    assert!(
+        validate_project_action("sessions.archive", &json!({"sessionId":"desktop-uuid"})).is_ok()
+    );
+    assert!(validate_project_action("notes.list", &json!({"limit":1})).is_ok());
 }
 
 #[test]
 fn conversation_pages_keep_source_cursors_prose_boundaries_and_character_caps() {
     let blocks = vec![
-        json!({"id":"u1","role":"user","text":"/operator First"}),
+        json!({"id":"u1","role":"user","text":"First"}),
         json!({"id":"tool","role":"tool","text":"private tool output"}),
         json!({"id":"a1","role":"assistant","text":"Earlier answer"}),
         json!({"id":"a2","role":"assistant","text":"🙂".repeat(205)}),
@@ -175,7 +155,7 @@ fn conversation_pages_keep_source_cursors_prose_boundaries_and_character_caps() 
 }
 
 #[test]
-fn operator_notes_support_desktop_ids_partial_updates_empty_bodies_and_pagination() {
+fn notes_support_desktop_ids_partial_updates_empty_bodies_and_pagination() {
     let store = Store::open_monocode(Path::new(":memory:")).unwrap();
     let caller = store.create("codex", "/project").unwrap();
     let original = store
@@ -265,15 +245,17 @@ fn operator_notes_support_desktop_ids_partial_updates_empty_bodies_and_paginatio
     )
     .unwrap();
     assert!(edited["sourceCwd"].is_null());
-    assert!(notes_action(
-        &store,
-        caller.id,
-        "read",
-        "notes.read",
-        &json!({"id":original.id}),
-        &["/other".into()]
-    )
-    .is_err());
+    assert!(
+        notes_action(
+            &store,
+            caller.id,
+            "read",
+            "notes.read",
+            &json!({"id":original.id}),
+            &["/other".into()]
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -301,10 +283,12 @@ fn launch_identity_and_unsent_prompt_survive_reopen_without_duplicate_sessions()
             .prepare_app_prompt(child.id, "start", "Saved request")
             .unwrap();
         assert!(store.draft_sessions().unwrap().contains(&child.id));
-        assert!(!store
-            .session_sidebar_metadata(&["/project".into()])
-            .sidebar_hidden
-            .contains(&child.id));
+        assert!(
+            !store
+                .session_sidebar_metadata(&["/project".into()])
+                .sidebar_hidden
+                .contains(&child.id)
+        );
         drop(store);
         let store = open();
         let (retried, fresh) = store
@@ -317,9 +301,11 @@ fn launch_identity_and_unsent_prompt_survive_reopen_without_duplicate_sessions()
             store.follow_ups(child.id).unwrap().draft.unwrap().text,
             "Saved request"
         );
-        assert!(store
-            .create_app_session(caller.id, "start", "different", "codex", "/project")
-            .is_err());
+        assert!(
+            store
+                .create_app_session(caller.id, "start", "different", "codex", "/project")
+                .is_err()
+        );
         let page = store
             .app_conversation(child.id, &json!({}), false, true)
             .unwrap();
@@ -365,7 +351,6 @@ fn thread_actions_validate_prompts_targets_and_bounded_waits() {
     }
     for (action, input) in [
         ("threads.start", json!({"prompt":" "})),
-        ("threads.start", json!({"prompt":"/operator do it"})),
         (
             "threads.start",
             json!({"prompt":"x","workspaceMode":"invalid"}),
@@ -395,4 +380,52 @@ fn thread_actions_validate_prompts_targets_and_bounded_waits() {
             "{action}: {input}"
         );
     }
+}
+
+#[test]
+fn no_thread_starts_as_an_orchestrator() {
+    for action in ["threads.new", "threads.start"] {
+        let launch = validate_threads(action, &json!({"prompt":"x","orchestrator":true}));
+        assert!(launch.unwrap_err().contains("does not take"), "{action}");
+    }
+}
+
+#[test]
+fn thread_wait_takes_one_id_or_a_bounded_list() {
+    let check = |input| validate_threads("threads.wait", &input);
+    assert!(check(json!({"threadId":1})).is_ok());
+    assert!(check(json!({"threadIds":[1,2]})).is_ok());
+    assert!(check(json!({})).is_err());
+    assert!(check(json!({"threadIds":[]})).is_err());
+    assert!(check(json!({"threadIds":[0]})).is_err());
+    assert!(check(json!({"threadIds":["1"]})).is_err());
+    assert!(check(json!({"threadId":1,"threadIds":[2]})).is_err());
+    assert!(check(json!({"threadIds":vec![1; MAX_WAITED_THREADS + 1]})).is_err());
+    assert!(validate_threads("threads.read", &json!({"threadIds":[1]})).is_err());
+}
+
+#[test]
+fn only_thread_start_takes_a_known_access_level() {
+    let check = |action, input| validate_threads(action, &input);
+    assert!(check("threads.start", json!({"prompt":"x","access":"read-only"})).is_ok());
+    assert!(check("threads.start", json!({"prompt":"x","access":"root"})).is_err());
+    assert!(check("threads.start", json!({"prompt":"x","access":1})).is_err());
+    assert!(check("threads.new", json!({"prompt":"x","access":"read-only"})).is_err());
+}
+
+#[test]
+fn a_wrong_model_or_setting_names_the_valid_ones() {
+    let named = |id: &str| Model {
+        id: id.into(),
+        ..model()
+    };
+    let models = [named("alpha"), named("beta")];
+    let launch =
+        |input| launch_settings(&input, "claude", Settings::default(), Kind::Claude, &models);
+    let error = launch(json!({"prompt":"x","model":"gamma"})).unwrap_err();
+    assert!(error.contains("alpha, beta"), "{error}");
+    assert!(!error.contains("models.list"), "{error}");
+    let error = launch(json!({"prompt":"x","modelSettings":{"nope":"1"}})).unwrap_err();
+    assert!(error.starts_with("Unknown model setting nope"), "{error}");
+    assert!(!error.contains("models.list"), "{error}");
 }

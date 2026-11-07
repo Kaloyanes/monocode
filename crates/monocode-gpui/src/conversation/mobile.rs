@@ -99,8 +99,8 @@ impl Conversation {
 
     /// A phone's message, as if typed: it starts a turn, or while one runs it
     /// steers or queues. The desktop composer's own draft and files stay put.
-    /// `mode` is the phone's Plan, Operator or Orchestrator pick; without one,
-    /// a leading `/plan`, `/operator` or `/orchestrator` in the text picks it.
+    /// `mode` is the phone's Plan pick; without one, a leading `/plan` in the
+    /// text picks it.
     pub(crate) fn mobile_submit(
         &mut self,
         prompt: String,
@@ -115,9 +115,6 @@ impl Conversation {
             Some(mode) => (Some(mode), prompt),
             None => split_mode_command(prompt),
         };
-        if self.is_remote() && matches!(mode, Some("operator" | "orchestrator")) {
-            return Err("This mode is not available on remote projects.".into());
-        }
         if !self.history_ready() {
             self.defer_history_action(
                 move |this, cx| {
@@ -138,11 +135,6 @@ impl Conversation {
             || self.settings.pending_provider_switch.is_some()
             || (!self.follow_ups.state.messages.is_empty() && !self.follow_ups.state.paused)
         {
-            let prompt = if prompt.is_empty() && mode == Some("operator") {
-                composer_features::OPERATOR_INTRO.into()
-            } else {
-                prompt
-            };
             let composer = std::mem::replace(&mut self.attachments, attachments);
             self.enqueue_follow_up(prompt, mode.map(str::to_owned), cx);
             self.attachments = composer;
@@ -439,7 +431,7 @@ pub(crate) fn mobile_access_modes()
 }
 
 /// The composer modes a phone can send a message in.
-pub(crate) const MOBILE_MODES: [&str; 3] = ["plan", "operator", "orchestrator"];
+pub(crate) const MOBILE_MODES: [&str; 1] = ["plan"];
 
 /// A message's leading mode command, and the message without it.
 fn split_mode_command(prompt: String) -> (Option<&'static str>, String) {
@@ -459,17 +451,283 @@ mod tests {
     #[test]
     fn a_leading_mode_command_picks_the_mode() {
         assert_eq!(
-            split_mode_command("/Operator  open the logs".into()),
-            (Some("operator"), "open the logs".into())
+            split_mode_command("/Plan  open the logs".into()),
+            (Some("plan"), "open the logs".into())
         );
         assert_eq!(
-            split_mode_command("/orchestrator".into()),
-            (Some("orchestrator"), String::new())
+            split_mode_command("/plan".into()),
+            (Some("plan"), String::new())
         );
         assert_eq!(
             split_mode_command("/planet is not a mode".into()),
             (None, "/planet is not a mode".into())
         );
+    }
+}
+
+/// Saved and live watches use the same desktop-owned state and reset wording.
+pub(crate) fn usage_state(
+    session_id: i64,
+    provider: &str,
+    model: Option<&str>,
+    settings: &Settings,
+    limit: Option<&monocode_core::usage::Limit>,
+    busy: bool,
+    remote: bool,
+) -> serde_json::Value {
+    let Some(limit) = limit else {
+        return serde_json::Value::Null;
+    };
+    let now = monocode_core::usage::now_ms();
+    let waiting = limit.waiting(now);
+    let supported = !remote && !settings.worktree_removed;
+    // Match the desktop notice: automatic controls while waiting, manual
+    // continuation after a known reset or when its time is unknown.
+    // Use persisted turn metadata, not the paged transcript's row count, so
+    // opening or paging an unchanged saved conversation cannot invalidate it.
+    serde_json::json!({
+        "token": serde_json::json!([
+            session_id, provider, model, settings.account.id,
+            settings.turns.len(), settings.turns.keys().max(), limit
+        ]).to_string(),
+        "resetsAt": limit.resets_at,
+        "resumeAtReset": limit.resume_at_reset,
+        "canResume": supported && !busy && !waiting,
+        "canAutoResume": supported && !busy && waiting,
+        "resetLabel": super::accounts::usage_reset_label(limit, now).unwrap_or_else(|| "Reset time unknown".into()),
+        "limitation": if settings.worktree_removed {
+            "This session’s working copy was removed. Select a branch or worktree on desktop to continue."
+        } else if remote {
+            "Continue this session on its remote desktop. Mobile usage-limit recovery is unavailable for this session."
+        } else {
+            "Automatic continuation requires Monocode running with this session loaded. Your preference is saved, but scheduling resumes only when the session loads again."
+        },
+    })
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use monocode_core::usage::{self, Limit};
+
+    #[test]
+    fn usage_capabilities_use_actual_reset_and_desktop_wording() {
+        let reset = usage::now_ms() + 7 * 24 * 3_600_000;
+        let limit = Limit {
+            resets_at: Some(reset),
+            resume_at_reset: false,
+        };
+        let state = usage_state(
+            1,
+            "codex",
+            None,
+            &Settings::default(),
+            Some(&limit),
+            false,
+            false,
+        );
+        assert_eq!(state["resetsAt"], reset);
+        assert_eq!(state["canResume"], false);
+        assert_eq!(state["canAutoResume"], true);
+        assert!(state["resetLabel"].as_str().unwrap().starts_with("Resets "));
+        let unknown = usage_state(
+            1,
+            "codex",
+            None,
+            &Settings::default(),
+            Some(&Limit::default()),
+            false,
+            false,
+        );
+        assert_eq!(unknown["resetLabel"], "Reset time unknown");
+        assert_eq!(unknown["canResume"], true);
+        assert_eq!(unknown["canAutoResume"], false);
+        for (busy, remote) in [(true, false), (false, true)] {
+            let blocked = usage_state(
+                1,
+                "codex",
+                None,
+                &Settings::default(),
+                Some(&limit),
+                busy,
+                remote,
+            );
+            assert_eq!(blocked["canResume"], false);
+            assert_eq!(blocked["canAutoResume"], false);
+        }
+        assert_ne!(
+            state["token"],
+            usage_state(
+                2,
+                "codex",
+                None,
+                &Settings::default(),
+                Some(&limit),
+                false,
+                false
+            )["token"]
+        );
+        assert!(usage_state(1, "codex", None, &Settings::default(), None, false, false).is_null());
+    }
+
+    #[test]
+    fn automatic_controls_exist_only_while_waiting_even_if_already_armed() {
+        let now = usage::now_ms();
+        for reset in [None, Some(now - 60_000), Some(now + 60_000)] {
+            for armed in [false, true] {
+                let limit = Limit {
+                    resets_at: reset,
+                    resume_at_reset: armed,
+                };
+                let state = usage_state(
+                    1,
+                    "codex",
+                    None,
+                    &Settings::default(),
+                    Some(&limit),
+                    false,
+                    false,
+                );
+                assert_eq!(state["canAutoResume"], limit.waiting(now));
+                assert_eq!(state["canResume"], !limit.waiting(now));
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn mobile_usage_rejects_removed_worktrees_and_changed_model_account_or_desktop_resume(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let summary = locked(&store).unwrap().create("codex", "/fixture").unwrap();
+        let view = cx.new(|cx| Conversation::new(summary, store, cx));
+        cx.run_until_parked();
+        view.update(cx, |v, cx| {
+            v.loaded = true;
+            v.settings.usage_limit = Some(Limit::default());
+            let token = v.mobile_usage_limit(cx)["token"].clone();
+            v.model = Some("different-model".into());
+            assert!(
+                v.mobile_resume_usage(&token, None, cx)
+                    .unwrap_err()
+                    .contains("changed")
+            );
+            v.model = None;
+            v.settings.account.id = "different-account".into();
+            assert!(v.mobile_resume_usage(&token, None, cx).is_err());
+            v.settings.account = Default::default();
+            v.settings.worktree_removed = true;
+            assert_eq!(v.mobile_usage_limit(cx)["canResume"], false);
+            assert_eq!(v.mobile_usage_limit(cx)["canAutoResume"], false);
+            assert!(
+                v.mobile_resume_usage(&token, None, cx)
+                    .unwrap_err()
+                    .contains("working copy was removed")
+            );
+            assert!(v.settings.usage_limit.is_some());
+            v.settings.worktree_removed = false;
+            // A desktop dismissal/resume invalidates every phone's old action.
+            v.settings.usage_limit = None;
+            assert!(
+                v.mobile_resume_usage(&token, None, cx)
+                    .unwrap_err()
+                    .contains("no longer paused")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn mobile_controls_persist_the_desktop_preference_and_use_its_mono_resume_and_scheduler(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let summary = locked(&store).unwrap().create("codex", "/fixture").unwrap();
+        let id = summary.id;
+        let view = cx.new(|cx| Conversation::new(summary, store.clone(), cx));
+        cx.run_until_parked();
+        let resumed = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.update(|cx| {
+            let count = resumed.clone();
+            cx.subscribe(&view, move |_, _: &crate::conversation::UsageResumed, _| {
+                count.set(count.get() + 1)
+            })
+            .detach();
+        });
+        view.update(cx, |v, cx| {
+            v.loaded = true;
+            v.settings.mono = Some(monocode_core::agent::MonoContext {
+                mono: Default::default(),
+                root: "/fixture".into(),
+                executable: "/fixture/binary".into(),
+            });
+            v.settings.usage_limit = Some(Limit {
+                resets_at: Some(usage::now_ms() + 60_000),
+                resume_at_reset: false,
+            });
+            let token = v.mobile_usage_limit(cx)["token"].clone();
+            assert!(v.mobile_resume_usage(&token, None, cx).is_err());
+            assert!(v.mobile_resume_usage(&token, Some(true), cx).is_ok());
+            assert!(v.mobile_resume_usage(&token, Some(false), cx).is_err()); // stale preference
+            assert!(v.settings.usage_limit.as_ref().unwrap().resume_at_reset);
+        });
+        cx.run_until_parked();
+        assert!(
+            locked(&store)
+                .unwrap()
+                .agent_settings(id)
+                .unwrap()
+                .unwrap()
+                .usage_limit
+                .unwrap()
+                .resume_at_reset
+        );
+        // A new desktop conversation restores the same persisted preference;
+        // the phone does not own a timer or a second preference store.
+        let summary = locked(&store)
+            .unwrap()
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        let reopened = cx.new(|cx| Conversation::new(summary, store.clone(), cx));
+        reopened.update(cx, |v, cx| v.load(cx));
+        cx.run_until_parked();
+        reopened.update(cx, |v, cx| {
+            assert_eq!(v.mobile_usage_limit(cx)["resumeAtReset"], true)
+        });
+
+        view.update(cx, |v, cx| {
+            let token = v.mobile_usage_limit(cx)["token"].clone();
+            v.mobile_resume_usage(&token, Some(false), cx).unwrap();
+            v.settings.usage_limit.as_mut().unwrap().resets_at = Some(usage::now_ms() - 31_000);
+            v.tick_usage(cx);
+            assert!(v.settings.usage_limit.is_some()); // disabling cancels the real scheduler
+            let token = v.mobile_usage_limit(cx)["token"].clone();
+            v.mobile_resume_usage(&token, None, cx).unwrap();
+            assert!(v.mobile_resume_usage(&token, None, cx).is_err()); // duplicate/another device
+            assert!(v.settings.usage_limit.is_none());
+        });
+        cx.run_until_parked();
+        assert_eq!(resumed.get(), 1);
+        view.update(cx, |v, cx| {
+            v.settings.usage_limit = Some(Limit {
+                resets_at: Some(usage::now_ms() + 60_000),
+                resume_at_reset: false,
+            });
+            let token = v.mobile_usage_limit(cx)["token"].clone();
+            v.mobile_resume_usage(&token, Some(true), cx).unwrap();
+            v.settings.usage_limit.as_mut().unwrap().resets_at = Some(usage::now_ms() - 31_000);
+            v.tick_usage(cx); // the existing desktop clock, without a phone
+            assert!(v.settings.usage_limit.is_none());
+            v.tick_usage(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(resumed.get(), 2);
     }
 }
 

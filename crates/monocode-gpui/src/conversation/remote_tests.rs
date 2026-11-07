@@ -77,8 +77,7 @@ fn remote_capability_and_command_guards_keep_composer_and_attachments(cx: &mut T
             assert!(view.remote_send_guard(true, cx));
             assert!(view.status.contains("save drafts"));
             for command in [
-                "/operator delegate this",
-                "/orchestrate a task",
+                "/review this",
                 "/add-to-folder name",
             ] {
                 view.input

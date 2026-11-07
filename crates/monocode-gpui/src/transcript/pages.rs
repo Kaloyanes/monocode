@@ -45,9 +45,10 @@ impl TranscriptView {
         turn: usize,
         turn_end: usize,
     ) -> Option<Arc<ImageDocument>> {
-        let (_, picture) = monocode_core::visual_bridge::kept_upgrades(&self.source[turn..turn_end])
-            .into_iter()
-            .find(|&(card, _)| turn + card == at)?;
+        let (_, picture) =
+            monocode_core::visual_bridge::kept_upgrades(&self.source[turn..turn_end])
+                .into_iter()
+                .find(|&(card, _)| turn + card == at)?;
         let start = turn + picture;
         let end = (start + 1..turn_end)
             .find(|&i| self.source[i].first)
@@ -64,9 +65,9 @@ impl TranscriptView {
 
     /// Whether a card above already carries this kept picture.
     pub(super) fn card_holds(&self, picture: &ImageDocument) -> bool {
-        self.rows.iter().any(|row| {
-            matches!(&row.body, Body::Draft(_, Some(kept)) if kept.path == picture.path)
-        })
+        self.rows
+            .iter()
+            .any(|row| matches!(&row.body, Body::Draft(_, Some(kept)) if kept.path == picture.path))
     }
 
     /// A draft's card: its live page, else the picture kept of it, else a
@@ -280,8 +281,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("monocode-keep-gone-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let window = cx.update(|cx| {
-            cx.open_window(Default::default(), |_, cx| cx.new(|_| TranscriptView::new()))
-                .unwrap()
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| TranscriptView::new())
+            })
+            .unwrap()
         });
         window
             .update(cx, |view, _, cx| {
@@ -328,7 +331,10 @@ mod tests {
             );
             assert_eq!(
                 drafts(view),
-                [("draft-1-a".to_string(), true), ("draft-1-b".to_string(), false)]
+                [
+                    ("draft-1-a".to_string(), true),
+                    ("draft-1-b".to_string(), false)
+                ]
             );
         });
         let _ = std::fs::remove_dir_all(&dir);
@@ -352,7 +358,10 @@ mod tests {
             );
             assert_eq!(
                 drafts(view),
-                [("draft-1-a".to_string(), false), ("draft-1-b".to_string(), false)]
+                [
+                    ("draft-1-a".to_string(), false),
+                    ("draft-1-b".to_string(), false)
+                ]
             );
         });
     }

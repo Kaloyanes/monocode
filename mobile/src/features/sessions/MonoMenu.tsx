@@ -1,6 +1,10 @@
 import { Button } from "@expo/ui/swift-ui";
+import { Platform } from "react-native";
 
+import { ChoiceMenu } from "@/ui/ChoiceMenu";
 import { GlassMenuButton } from "@/ui/GlassMenuButton";
+import { Icon } from "@/ui/Icon";
+import { LiquidView } from "@/ui/LiquidView";
 
 const SIZE = 44;
 
@@ -25,7 +29,7 @@ export function MonoMenu({
       { label: "Reset conversation", icon: "refresh", onPress: onReset },
       { label: "Delete Mono", icon: "trash", destructive: true, onPress: onDelete },
     ]}>
-      <LiquidView borderRadius={SIZE / 2} innerStyle={styles.round}>
+      <LiquidView borderRadius={SIZE / 2} innerStyle={{ width: SIZE, height: SIZE, alignItems: "center", justifyContent: "center" }}>
         <Icon name="more" size={20} />
       </LiquidView>
     </ChoiceMenu>

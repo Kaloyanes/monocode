@@ -69,7 +69,7 @@ def run(actions, source=page, start=None):
                     'tell application "System Events" to set frontmost of '
                     f"(first process whose unix id is {app.pid}) to true"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if app.wait(timeout=120) != 0:
+    if app.wait(timeout=420) != 0:
         sys.exit(f"The self-test exited with {app.returncode}")
     results = []
     n = 0
@@ -91,9 +91,15 @@ def check(condition, message):
 
 
 opening = steps[0]
+# A picture has the pixels of the display the window is on at that moment, and
+# the window can change displays during a run.
+def scale(step):
+    return step["width"] / step["diagnostics"]["viewportWidth"]
+
+
 check(opening.get("loaded") is True, "the page loads")
 check(opening["diagnostics"]["ready"] is True, "diagnostics report ready")
-check(opening["width"] >= 1000 and (out / "page.html.0.png").stat().st_size > 5000, "a real picture comes back")
+check(opening["diagnostics"]["viewportWidth"] >= 500 and scale(opening) in (1, 2) and (out / "page.html.0.png").stat().st_size > 5000, "a real picture comes back")
 check("ready" in [c["text"] for c in opening["console"]], "console output is captured")
 check("Add one" in refs and "Your name" in refs, "controls are listed with refs")
 placed = opening.get("placed") or [0, 0, 0, 0, 1]
@@ -106,9 +112,9 @@ check(steps[4].get("takeover") is True, "the test person takes over")
 check("error" in steps[5] and "hand" in steps[5]["error"].lower(), "the agent is gated while the person drives")
 check(steps[6].get("userControl") is False, "resume hands the page back")
 resized = steps[7]
-check(resized["diagnostics"]["viewportWidth"] == 375 and resized["width"] == 750, "a resize relays the page out")
+check(resized["diagnostics"]["viewportWidth"] == 375 and scale(resized) in (1, 2), "a resize relays the page out")
 # A height only sets where the card starts; the card then follows the page.
-check(resized["height"] == 2 * resized["contentHeight"], "the card follows the page's height after a resize")
+check(resized["height"] == scale(resized) * resized["contentHeight"], "the card follows the page's height after a resize")
 check(steps[8].get("pending") == 1, "a note pinned in the page is collected, not yet sent")
 timed_out = steps[9]
 check(timed_out.get("event") == "timeout" and timed_out["feedback"] == [], "a wait with nothing sent times out and carries no notes")
@@ -152,12 +158,36 @@ check(forged[1].get("signal") is None, "a page cannot message the agent for the 
 away = run([{"debug": "away"}, {"debug": "back"}, {"debug": "cover"}, {"debug": "back"}])
 check((away[1].get("placed") or [0] * 5)[4] == 1, "the page hides when the thread is replaced")
 check(away[2].get("placed") == away[0].get("placed"), "the page comes back where it was")
-if os.environ.get("MONOCODE_DRAFT_ENGINE") == "chromium":
-    # Chromium's frames are GPUI images, so the scrim simply paints over them.
-    check(away[3].get("placed") == away[0].get("placed"), "a modal's scrim draws over the page in place")
-else:
-    check((away[3].get("placed") or [0] * 5)[4] == 1, "a modal's scrim covers the page")
+check((away[3].get("placed") or [0] * 5)[4] == 1, "a modal's scrim covers the page")
 check(away[4].get("placed") == away[0].get("placed"), "the page comes back after the modal")
+
+# Controls floating over the thread stay in front of the page, and take the
+# pointer there.
+floats = run([{"debug": "float"}, {"debug": "back"}])
+holes = floats[1].get("holes") or []
+check(len(holes) == 2, "the page has a hole for each control floating over it")
+check(all(hole[5] == 0 for hole in holes), "a press on a floating control does not reach the page")
+check(floats[2].get("holes") == [], "the page closes up once the controls go")
+check((floats[1].get("placed") or [1] * 5)[4] == 0, "the page stays up around floating controls")
+
+# A page whose process dies leaves an empty view for good: the card opens it again.
+crashed = run([{"debug": "page"}, {"debug": "kill_page"}, {"debug": "hold:5"}, {"debug": "page"}])
+check(crashed[1].get("painted") is True, "the page has drawn before its process goes")
+check(crashed[4].get("pid") not in (None, crashed[2].get("pid")), "a page whose process died opens in a new one")
+check(crashed[4].get("painted") is True and crashed[4].get("shown") is True, "the new page draws and shows")
+
+# After minutes hidden WebKit empties the page's layers until its process
+# commits new ones. A stalled process never does, as a swapped-out one may not
+# for seconds: the card shows its placeholder, then opens the page again.
+if os.environ.get("MONOCODE_VERIFY_LONG_HIDE"):
+    stalled = run([
+        {"debug": "page"}, {"debug": "away"}, {"debug": "hold:270"}, {"debug": "stop_page"},
+        {"debug": "back"}, {"debug": "hold:1"}, {"debug": "page"}, {"debug": "hold:6"}, {"debug": "page"},
+    ])
+    check(stalled[7].get("painted") is False and stalled[7].get("blank") is True, "a page that comes back empty shows the placeholder")
+    check(stalled[9].get("pid") != stalled[1].get("pid"), "a page that stays empty opens in a new process")
+    check(stalled[9].get("painted") is True and stalled[9].get("blank") is False, "the new page draws")
+    subprocess.run(["kill", "-CONT", str(stalled[4].get("pid"))], check=False)
 
 # The agent keeps working on a draft whose conversation is in the background:
 # the page runs out of sight for each request, then pauses again.

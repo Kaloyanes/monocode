@@ -282,6 +282,8 @@ pub(crate) struct RightPanel {
     terminal_tab: bool,
     /// Whether the Device tab follows the others.
     device_tab: bool,
+    /// The tab the Device tab replaced, for a project that doesn't have one.
+    before_device: RightTab,
     /// The open work item's tab label, such as "PR #7". Ends the strip.
     issue_tab: Option<SharedString>,
     /// Classic reserves the title bar's height; rounded content starts at
@@ -335,6 +337,7 @@ impl RightPanel {
             sidebar_tab: None,
             terminal_tab: false,
             device_tab: false,
+            before_device: RightTab::Files,
             issue_tab: None,
             top_inset: 0.,
             tab_width: tabs_width(3),
@@ -432,11 +435,28 @@ impl RightPanel {
     pub(crate) fn select(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.reveal = Some(TabReveal::new(tab, self.tab));
+            if tab == RightTab::Device {
+                self.before_device = self.tab;
+            }
         }
         self.tab = tab;
         self.sync_panes(cx);
         cx.emit(PanelEvent::Tab(tab));
         cx.notify();
+    }
+    /// Goes back to the tab the Device tab replaced, or Explorer if it's gone.
+    pub(crate) fn leave_device(&mut self, cx: &mut Context<Self>) {
+        let gone = match self.before_device {
+            RightTab::Terminal => !self.terminal_tab,
+            RightTab::Issue => self.issue_tab.is_none(),
+            _ => false,
+        };
+        let tab = if gone {
+            RightTab::Files
+        } else {
+            self.before_device
+        };
+        self.select(tab, cx);
     }
     pub(crate) fn set_sidebar_tab(&mut self, tab: Option<RightTab>, cx: &mut Context<Self>) {
         if self.sidebar_tab != tab {

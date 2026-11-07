@@ -296,6 +296,22 @@ impl Shell {
                     inbox::Event::StartSession { item, prompt } => {
                         this.start_inbox_session(item.as_ref().clone(), prompt.clone(), cx);
                     }
+                    inbox::Event::FindAsk(item) => {
+                        this.find_pr_ask_session(item.as_ref().clone(), cx)
+                    }
+                    inbox::Event::AskPr {
+                        item,
+                        question,
+                        prompt,
+                        title,
+                    } => this.start_pr_ask_session(
+                        item.as_ref().clone(),
+                        question.clone(),
+                        prompt.clone(),
+                        title.clone(),
+                        cx,
+                    ),
+                    inbox::Event::ArchiveThreads(ids) => this.archive_linked_threads(ids, cx),
                     inbox::Event::ItemsChanged(items) => {
                         this.notify_mobile_inbox(items.clone(), cx);
                         this.inbox_automation_events(items.clone(), cx)
@@ -405,11 +421,8 @@ impl Shell {
         let kind = choice.kind;
         let store = self.store.clone();
         let settings = monocode_core::agent::Settings {
-            model: self
-                .workspace
-                .preferences
-                .model_for_new_chat(kind.id(), &cwd),
-            effort: crate::conversation::preferred_effort(kind.id(), cx),
+            effort: crate::conversation::preferred_effort(kind.id(), choice.model.as_deref(), cx),
+            model: choice.model,
             access: self
                 .workspace
                 .preferences
@@ -477,11 +490,8 @@ impl Shell {
         let choice = self.new_chat_choice(&cwd);
         let kind = choice.kind;
         let settings = monocode_core::agent::Settings {
-            model: self
-                .workspace
-                .preferences
-                .model_for_new_chat(kind.id(), &cwd),
-            effort: crate::conversation::preferred_effort(kind.id(), cx),
+            effort: crate::conversation::preferred_effort(kind.id(), choice.model.as_deref(), cx),
+            model: choice.model,
             access: self
                 .workspace
                 .preferences

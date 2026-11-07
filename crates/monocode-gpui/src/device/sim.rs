@@ -178,7 +178,7 @@ impl Setting {
             Self::Appearance => &["light", "dark"],
             Self::TextSize => &TEXT_SIZES,
             Self::ColorFilter => &COLOR_FILTERS,
-            Self::LiquidGlass => &["clear", "tinted"],
+            Self::LiquidGlass => &["clear", "default", "tinted"],
             _ => &["on", "off"],
         }
     }
@@ -210,7 +210,7 @@ impl Setting {
             Self::Appearance => "light",
             Self::TextSize => "large",
             Self::ColorFilter => "none",
-            Self::LiquidGlass => "clear",
+            Self::LiquidGlass => "default",
             _ => "off",
         }
     }
@@ -297,15 +297,89 @@ impl Settings {
     }
 }
 
+/// iOS 27 replaced Liquid Glass's Clear and Tinted with a Tint Amount slider,
+/// kept in this preference: 0 is clearest, 1 most tinted, and without it iOS
+/// uses 0.5. serve-sim only writes the older `UIViewGlassLegibilitySetting`,
+/// which iOS 27 ignores. Open apps redraw on the notification, not the write.
+const GLASS_DOMAIN: &str = "com.apple.UIKit";
+const GLASS_TINT: &str = "UIViewGlassTintAmount";
+const GLASS_TINT_CHANGED: &str = "UIViewGlassTintAmountUpdateNotification";
+const GLASS_TINT_DEFAULT: f32 = 0.5;
+
+/// Runs a tool inside the simulator.
+fn spawn(udid: &str, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("/usr/bin/xcrun")
+        .args(["simctl", "spawn", udid])
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(stderr.trim().chars().take(600).collect())
+    }
+}
+
+/// The look a simulator is in. An amount set on iOS 27's slider between the
+/// ends counts as the nearer end, so it still shows as an override. `older` is
+/// serve-sim's reading, all a simulator before iOS 27 has.
+fn glass_look(tint: Option<f32>, older: &str) -> &'static str {
+    match tint {
+        Some(tint) if tint < GLASS_TINT_DEFAULT => "clear",
+        Some(tint) if tint > GLASS_TINT_DEFAULT => "tinted",
+        None if older == "tinted" => "tinted",
+        _ => "default",
+    }
+}
+
 /// Every setting at once; it takes a second or two.
 pub(crate) fn settings(udid: &str) -> Result<Settings, String> {
-    Settings::parse(&hub::serve_sim_cli(&[
+    let mut settings = Settings::parse(&hub::serve_sim_cli(&[
         "ui", "status", "--json", "-d", udid,
-    ])?)
+    ])?)?;
+    if let Some(older) = settings.get(Setting::LiquidGlass) {
+        // `defaults read` fails when the preference was never set.
+        let tint = spawn(udid, &["defaults", "read", GLASS_DOMAIN, GLASS_TINT])
+            .ok()
+            .and_then(|tint| tint.trim().parse().ok());
+        let look = glass_look(tint, older);
+        settings.0.insert(Setting::LiquidGlass, look.to_owned());
+    }
+    Ok(settings)
 }
 
 pub(crate) fn set(udid: &str, setting: Setting, value: &str) -> Result<(), String> {
+    if setting == Setting::LiquidGlass {
+        return set_glass(udid, value);
+    }
     hub::serve_sim_cli(&["ui", setting.key(), value, "-d", udid]).map(|_| ())
+}
+
+/// Sets both the older preference and iOS 27's, since each ignores the other.
+fn set_glass(udid: &str, look: &str) -> Result<(), String> {
+    let older = if look == "tinted" { "tinted" } else { "clear" };
+    hub::serve_sim_cli(&["ui", Setting::LiquidGlass.key(), older, "-d", udid])?;
+    let write = |tint| {
+        spawn(
+            udid,
+            &[
+                "defaults",
+                "write",
+                GLASS_DOMAIN,
+                GLASS_TINT,
+                "-float",
+                tint,
+            ],
+        )
+    };
+    match look {
+        "clear" => write("0")?,
+        "tinted" => write("1")?,
+        // Fails when there is nothing to delete, which is fine.
+        _ => spawn(udid, &["defaults", "delete", GLASS_DOMAIN, GLASS_TINT]).unwrap_or_default(),
+    };
+    spawn(udid, &["notifyutil", "-p", GLASS_TINT_CHANGED]).map(|_| ())
 }
 
 pub(crate) fn set_location(
@@ -756,6 +830,30 @@ mod tests {
     }
 
     #[test]
+    fn glass_look_follows_the_tint_amount_first() {
+        assert_eq!(glass_look(Some(0.), "clear"), "clear");
+        assert_eq!(glass_look(Some(0.3), "tinted"), "clear");
+        assert_eq!(glass_look(Some(0.5), "tinted"), "default");
+        assert_eq!(glass_look(Some(1.), "clear"), "tinted");
+        assert_eq!(glass_look(None, "clear"), "default");
+        assert_eq!(glass_look(None, "tinted"), "tinted");
+    }
+
+    /// Against a real simulator: `DEVICE_GLASS_UDID=… cargo test live_glass -- --ignored`.
+    /// It leaves the simulator on iOS's default look.
+    #[test]
+    #[ignore]
+    fn live_glass() {
+        let udid = std::env::var("DEVICE_GLASS_UDID").unwrap();
+        for look in ["tinted", "clear", "default"] {
+            set(&udid, Setting::LiquidGlass, look).unwrap();
+            let read = settings(&udid).unwrap();
+            assert_eq!(read.get(Setting::LiquidGlass), Some(look));
+            assert_eq!(read.changed(Setting::LiquidGlass), look != "default");
+        }
+    }
+
+    #[test]
     fn settings_describe_reads_like_the_strip() {
         assert_eq!(Setting::Appearance.describe("dark"), "Dark");
         assert_eq!(
@@ -784,6 +882,7 @@ mod tests {
                 .contains("light, dark")
         );
         assert!(Setting::LiquidGlass.accept("on").is_err());
+        assert_eq!(Setting::LiquidGlass.accept("Default"), Ok("default"));
         assert_eq!(
             Setting::from_key("show-borders"),
             Some(Setting::ButtonShapes)

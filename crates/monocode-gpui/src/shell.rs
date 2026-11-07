@@ -1,6 +1,7 @@
 mod accounts;
 mod actions;
 mod app_commands;
+mod app_control;
 mod app_views;
 mod archive_motion;
 mod auto_archive;
@@ -12,6 +13,7 @@ mod classic_surfaces;
 mod devices;
 mod drafts;
 mod file_panes;
+mod github_star;
 #[cfg(all(test, target_os = "macos"))]
 mod home_shots;
 mod idle_agents;
@@ -23,6 +25,7 @@ mod keep_awake_shots;
 mod layout;
 mod list_cascade;
 mod live_agents;
+mod sidebar_sections;
 mod mobile_host;
 pub(crate) mod mobile_terminal;
 mod mono_origin;
@@ -32,10 +35,13 @@ mod new_chat_choice;
 #[cfg(test)]
 mod new_chat_choice_tests;
 mod notifications;
-mod orchestration;
 mod picker_preferences;
+mod pinned_tabs;
 #[cfg(all(test, target_os = "macos"))]
 mod plan_rail_shots;
+#[cfg(all(test, target_os = "macos"))]
+mod sidebar_sections_shots;
+mod pr_ask;
 mod project_picker;
 mod project_rail;
 mod project_removal;
@@ -59,14 +65,14 @@ mod sidebar_peek;
 mod space_reorder;
 mod space_swipe;
 mod terminal_dock;
+mod terminal_panes;
 mod threads;
+use terminal_panes::terminal_drag_ghost;
 mod title_tabs;
-#[cfg(all(test, target_os = "macos"))]
-mod visualizations_shots;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
-mod worktree_sweep;
 mod work_item_panel;
+mod worktree_sweep;
 mod worktrees;
 
 use crate::settings::TitleBarMode;
@@ -79,8 +85,8 @@ use crate::{
     pane_motion::PaneSlide,
     pickers::{ProjectPicked, ProjectPicker},
     popover::{
-        Align, Anchor, AnchorSlot, Flyout, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, Side,
-        menu_popover, popover,
+        Align, Anchor, AnchorSlot, Flyout, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle,
+        POPOVER_LAYER, Side, menu_popover, popover,
     },
     resource_pressure::{ResourceMonitor, StopSession},
     response_actions::Transfer,
@@ -639,19 +645,24 @@ pub(crate) struct Shell {
     quick_open: Option<quick_open::Open>,
     project_picker: Option<project_picker::Open>,
     image_lightbox: Option<(Entity<crate::image_lightbox::ImageLightbox>, Subscription)>,
+    /// A modal was on screen in the last frame.
+    modal_open: bool,
     app_bridge: Option<monocode_core::mono::bridge::Server>,
     /// The live pages behind the agent's draft cards, by conversation.
     drafts: HashMap<i64, Vec<Entity<crate::draft::Draft>>>,
     mobile: mobile_host::Mobile,
     app_results: HashMap<(i64, String), (String, Result<serde_json::Value, String>)>,
     app_pending: HashSet<(i64, String)>,
-    orchestrations: orchestration::Runs,
-    /// Each lead's last orchestration, whose agents hang under it in the sidebar.
-    orchestration_summaries: HashMap<i64, monocode_core::orchestration::Summary>,
-    /// Sessions an /operator thread started, by the session that started them.
+    /// Each lead's subagents, summed up on its row and strip.
+    agent_summaries: HashMap<i64, monocode_core::subagents::Summary>,
+    /// Sessions another thread started, by the session that started them.
     started_by: HashMap<i64, i64>,
     thread_parents: HashMap<i64, i64>,
-    thread_waiters: HashMap<i64, Vec<monocode_core::mono::bridge::Call>>,
+    thread_waiters: Vec<monocode_core::mono::bridge::Call>,
+    /// When each subagent's latest turn ran, as this launch of the app saw it.
+    thread_turns: HashMap<i64, threads::ThreadTurn>,
+    /// Per lead, finished subagents whose results it hasn't seen yet.
+    thread_news: HashMap<i64, std::collections::BTreeMap<i64, serde_json::Value>>,
     agent_summary_writes: HashMap<i64, gpui::Task<()>>,
     usage_footer: Entity<UsageFooter>,
     /// The footer's high-usage chip and its running-work dialog.
@@ -712,7 +723,10 @@ pub(crate) struct Shell {
     tab_marks: HashMap<i64, Entity<SessionMark>>,
     /// The live agents card's spinners, apart from the sidebar rows' marks.
     live_marks: HashMap<i64, Entity<SessionMark>>,
-    live_agents_expanded: bool,
+    /// The project whose list shows its archive instead of its sessions.
+    archive_view: Option<String>,
+    /// The docked Archived section is open.
+    archive_dock_open: bool,
     /// The live agents card's list folding open and shut.
     live_fold: live_agents::Fold,
     /// How far each lead's subagent tree is open in the sidebar.
@@ -806,6 +820,8 @@ pub(crate) struct Shell {
     /// The project whose colors were last painted; leaving it blends colors.
     theme_project: Option<String>,
     quit_prompted: bool,
+    /// An agent's request to raise a thread's access is waiting on the person.
+    access_prompted: bool,
     /// Set by a first Cmd-Q; a second press before it clears quits.
     quit_armed: Option<gpui::Task<()>>,
     pub(crate) menu: Option<ShellMenu>,
@@ -851,6 +867,7 @@ pub(crate) struct Shell {
     resize: Option<(Pixels, f32)>,
     pub(crate) git: Entity<crate::git_status::ProjectGit>,
     pub(crate) right_panel: Option<Entity<RightPanel>>,
+    device_scope: devices::DeviceScope,
     right_resize: Option<(Pixels, f32)>,
     /// Either right-panel handle is hovered; both of its hairlines light up.
     right_resize_hovered: bool,
@@ -1061,7 +1078,7 @@ impl Shell {
             for view in this.sessions.values() {
                 if view.read(cx).review.read(cx).session().1 == cwd {
                     view.update(cx, |view, cx| {
-                        view.review.update(cx, |review, cx| review.refresh(cx))
+                        view.review.update(cx, |review, cx| review.refresh_soon(cx))
                     });
                 }
             }
@@ -1089,11 +1106,12 @@ impl Shell {
         );
         let worktree_focus = workspace.worktree_focus.clone();
         let session_worktrees = sidebar_metadata.worktrees;
-        let mut orchestration_summaries = sidebar_metadata.orchestrations;
-        let orchestrations = orchestration::Runs::restore(
-            sidebar_metadata.orchestration_runs,
-            &mut orchestration_summaries,
-        );
+        let mut agent_summaries = sidebar_metadata.agent_summaries;
+        // Nothing ran while the app was closed; children recompute theirs on
+        // their next event.
+        for summary in agent_summaries.values_mut() {
+            summary.live = false;
+        }
         let notification_state = notifications::State::new(&workspace, store.clone(), cx);
         let classic_session_search = classic_sidebar::session_search(cx);
         let classic_search_subscription =
@@ -1110,16 +1128,18 @@ impl Shell {
             quick_open: None,
             project_picker: None,
             image_lightbox: None,
+            modal_open: false,
             app_bridge: None,
             drafts: HashMap::new(),
             mobile: mobile_host::Mobile::default(),
             app_results: HashMap::new(),
             app_pending: HashSet::new(),
-            orchestrations,
-            orchestration_summaries,
+            agent_summaries,
             started_by: sidebar_metadata.started_by,
             thread_parents: sidebar_metadata.thread_parents,
-            thread_waiters: HashMap::new(),
+            thread_waiters: Vec::new(),
+            thread_turns: HashMap::new(),
+            thread_news: HashMap::new(),
             agent_summary_writes: HashMap::new(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
@@ -1167,7 +1187,8 @@ impl Shell {
             session_marks: HashMap::new(),
             tab_marks: HashMap::new(),
             live_marks: HashMap::new(),
-            live_agents_expanded: false,
+            archive_view: None,
+            archive_dock_open: false,
             live_fold: Default::default(),
             rails: Default::default(),
             live_tick: None,
@@ -1243,6 +1264,7 @@ impl Shell {
             window_glass: None,
             theme_project: None,
             quit_prompted: false,
+            access_prompted: false,
             quit_armed: None,
             menu: None,
             background_dialog: None,
@@ -1277,6 +1299,7 @@ impl Shell {
             resize: None,
             git,
             right_panel: None,
+            device_scope: Default::default(),
             right_resize: None,
             right_resize_hovered: false,
             right_slide: None,
@@ -1363,6 +1386,16 @@ impl Shell {
             &monos,
             |this, _, opened: &crate::monos::TabOpened, cx| {
                 this.mono_opened(opened.0.clone(), cx);
+            },
+        ));
+        this.observations.push(cx.subscribe(
+            &monos,
+            |this, _, _: &crate::monos::RailToggled, cx| {
+                this.workspace.sidebar_monos_collapsed = !this.workspace.sidebar_monos_collapsed;
+                this.sidebar_list.remeasure();
+                this.persist(cx);
+                this.notify_sidebar(cx);
+                cx.notify();
             },
         ));
         this.observations.push(cx.subscribe(
@@ -1494,6 +1527,14 @@ impl Shell {
             }
             _ => HashSet::new(),
         };
+        // The chat beside a pull request in the Inbox is on screen too.
+        if self.active_app_view == Some(app_views::AppView::Inbox)
+            && self.settings.is_none()
+            && self.app_search.is_none()
+            && let Some(inbox) = &self.inbox
+        {
+            shown.extend(inbox.read(cx).ask_session());
+        }
         // A session opened in the Mono details panel is on screen too. Left
         // out, it was trimmed as inactive and the panel showed it empty.
         if self.mono_active(cx)
@@ -1603,7 +1644,6 @@ impl Shell {
                     this.git.update(cx, |git, cx| git.reload(cx));
                 }
                 this.sync_search_session(id, cx);
-                this.orchestration_session_changed(id, cx);
                 this.thread_session_changed(id, cx);
                 // A subagent waiting on an approval shows on its lead's strip.
                 if let Some(lead) = this.subagent_lead(id) {
@@ -1668,14 +1708,10 @@ impl Shell {
                     this.sidebar_frame.update(cx, |_, cx| cx.notify());
                 }
             }));
-        self.observe_orchestration(&view, id, cx);
         self.observe_session_folders(&view, id, cx);
         self.sessions.insert(id, view);
         if !self.order.contains(&id) {
             self.order.push(id);
-        }
-        if self.orchestrations.has_runs(id) {
-            self.push_orchestration_views(id, cx);
         }
     }
     /// SessionPane's reviewUndoLocked: another running session shares the checkout.
@@ -1701,7 +1737,7 @@ impl Shell {
             return;
         };
         let session = view.read(cx);
-        let busy = session.responding();
+        let busy = session.working();
         let was_busy = self.busy_sessions.contains(&id);
         let focused = !self.app_view_open() && self.workspace.active == Some(id);
         if busy {
@@ -1745,7 +1781,7 @@ impl Shell {
         let mut agents: Vec<(i64, SharedString)> = self
             .sessions
             .iter()
-            .filter(|(_, view)| view.read(cx).responding())
+            .filter(|(_, view)| view.read(cx).working())
             .map(|(id, view)| (*id, view.read(cx).display_title().into()))
             .collect();
         if let Some(monos) = &self.monos {
@@ -1794,11 +1830,7 @@ impl Shell {
                             this.thread_session_changed(id, cx);
                         }
                         // Subagents never outlive their lead: archiving it
-                        // stops its run and archives them, and restoring it
-                        // brings them back.
-                        if archived && this.orchestrations.active(id) {
-                            this.stop_orchestration(id, cx);
-                        }
+                        // archives them, and restoring it brings them back.
                         for sub in this.subagents(id) {
                             if this
                                 .session_summaries
@@ -1942,11 +1974,13 @@ impl Shell {
             Some((cwd, kind)) => (cwd, Some(kind)),
             None => (self.working_copy().to_owned(), None),
         };
+        let panel_was_shown = self.right_panel_shown(cx);
         self.git.update(cx, |git, cx| git.set_project(project, cx));
         if let (Some(panel), Some(kind)) = (&self.right_panel, provider) {
             let changes = panel.read(cx).changes.clone();
             changes.update(cx, |c, _| c.text_provider = kind);
         }
+        self.sync_device_scope(panel_was_shown, cx);
         self.sync_right_panel(cx);
     }
     /// App.tsx's `insetRightPanelShown`: open (or sliding shut), over a
@@ -1965,7 +1999,7 @@ impl Shell {
                 }))
             && !self.app_view_open()
             && self.settings.is_none()
-            && self.app_search.is_none()
+            && !self.search_page()
             && self.right_panel_usable(cx)
     }
     /// A Mono, a git project, or a work item followed from any thread. The
@@ -1973,9 +2007,10 @@ impl Shell {
     fn right_panel_usable(&self, cx: &App) -> bool {
         self.mono_active(cx)
             || self.git.read(cx).available()
-            || self.right_panel.as_ref().is_some_and(|panel| {
-                panel.read(cx).tab() == crate::right_panel::RightTab::Issue
-            })
+            || self
+                .right_panel
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).tab() == crate::right_panel::RightTab::Issue)
     }
     fn sync_right_panel(&mut self, cx: &mut Context<Self>) {
         let opening = self.right_slide.as_ref().is_some_and(PaneSlide::opening);
@@ -2084,15 +2119,7 @@ impl Shell {
         {
             self.focus_active(window, cx);
         }
-        let full = self.right_panel_width();
-        let to = if open { full } else { 0. };
-        self.workspace.right_panel_open = open;
-        let previous = self.right_slide.take();
-        self.right_slide = (!cx.reduce_motion()).then(|| match previous {
-            Some(slide) => slide.retarget(to, std::time::Instant::now()),
-            None => PaneSlide::new(if open { 0. } else { full }, to, full),
-        });
-        self.sync_right_panel(cx);
+        self.slide_right_panel(open, cx);
         if open
             && !self.mono_active(cx)
             && let Some(panel) = self.right_panel.clone()
@@ -2102,6 +2129,17 @@ impl Shell {
         self.fit_sidebar(cx);
         self.persist(cx);
         cx.notify();
+    }
+    fn slide_right_panel(&mut self, open: bool, cx: &mut Context<Self>) {
+        let full = self.right_panel_width();
+        let to = if open { full } else { 0. };
+        self.workspace.right_panel_open = open;
+        let previous = self.right_slide.take();
+        self.right_slide = (!cx.reduce_motion()).then(|| match previous {
+            Some(slide) => slide.retarget(to, std::time::Instant::now()),
+            None => PaneSlide::new(if open { 0. } else { full }, to, full),
+        });
+        self.sync_right_panel(cx);
     }
     fn ensure_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_panel.is_some() {
@@ -2194,8 +2232,10 @@ impl Shell {
         ));
         let changes = panel.read(cx).changes.clone();
         changes.update(cx, |c, cx| c.set_view(view, cx));
-        self.observations
-            .push(cx.subscribe_in(&panel, window, |this, _, event: &PanelEvent, window, cx| {
+        self.observations.push(cx.subscribe_in(
+            &panel,
+            window,
+            |this, _, event: &PanelEvent, window, cx| {
                 match event {
                     PanelEvent::Tab(tab) => {
                         // A work item is not restored on the next launch.
@@ -2208,6 +2248,8 @@ impl Shell {
                         // Classic shows the panel for a device too.
                         if *tab == crate::right_panel::RightTab::Device {
                             this.sync_right_panel(cx);
+                        } else {
+                            this.device_scope.opened_panel = false;
                         }
                     }
                     PanelEvent::CloseIssue => {
@@ -2217,7 +2259,8 @@ impl Shell {
                     PanelEvent::Reordered(order) => this.workspace.right_panel_tabs = order.clone(),
                 }
                 this.persist(cx);
-            }));
+            },
+        ));
         self.observations.push(cx.subscribe_in(
             &changes,
             window,
@@ -4634,8 +4677,9 @@ impl Shell {
             .map(TitleTab::Session);
         self.close_title_tabs(&tabs, preferred, window, cx);
     }
-    /// A mouse's side buttons that nothing under the pointer took walk the
-    /// visit history, as a browser's do and as `Tab: Back` / `Tab: Forward`.
+    /// A mouse's side buttons that nothing under the pointer took. Over the
+    /// sidebar they step between spaces. Elsewhere they walk the visit
+    /// history, as a browser's do and as `Tab: Back` / `Tab: Forward`.
     fn history_buttons_watch(&self, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
         canvas(
@@ -4663,7 +4707,12 @@ impl Shell {
                                 if blocked { "blocked" } else { "stepping" }
                             );
                         }
-                        if !blocked {
+                        if blocked {
+                            return;
+                        }
+                        let stepped = this.over_sidebar(event.position, cx)
+                            && this.step_space(step, window, cx);
+                        if !stepped {
                             this.visit(step, window, cx);
                         }
                     });
@@ -4678,12 +4727,16 @@ impl Shell {
     /// Overlays that own the pointer leave the side buttons alone.
     fn history_buttons_blocked(&self) -> bool {
         self.menu.is_some()
-            || self.quick_open.is_some()
-            || self.project_picker.is_some()
-            || self.link_dialog.is_some()
-            || self.action_dialog.is_some()
-            || self.remote_project_picker.is_some()
+            || self.modal_open
+            || self.image_lightbox.is_some()
             || self.space_swipe.dragging()
+    }
+
+    /// The sidebar's whole column, up through the title strip above it, or
+    /// the panel it peeks in while hidden.
+    fn over_sidebar(&self, position: Point<Pixels>, cx: &App) -> bool {
+        position.x.as_f32() < self.left_sidebar_width(cx)
+            || (self.peek_open() && self.peek_contains(position))
     }
 
     fn visit(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -4978,16 +5031,13 @@ impl Shell {
         if only_if_empty && !self.pending_project_blanks.insert(blank_key.clone()) {
             return;
         }
-        let model = self
-            .workspace
-            .preferences
-            .model_for_new_chat(kind.id(), &cwd);
+        let new_chat_choice::NewChatChoice { kind, model } = choice;
         let navigation_revision = self.navigation_revision;
         let account = crate::accounts::get(cx)
             .map(|center| center.read(cx).selected(kind, &cwd))
             .unwrap_or_default();
         let access = crate::conversation::default_access(cx);
-        let effort = crate::conversation::preferred_effort(kind.id(), cx);
+        let effort = crate::conversation::preferred_effort(kind.id(), model.as_deref(), cx);
         let work = cx.background_executor().spawn({
             let cwd = cwd.clone();
             let worktree_cwd = copy.as_ref().map(|f| f.path.clone());
@@ -5449,6 +5499,13 @@ impl Shell {
                             .h(px(TITLE_BAR_HEIGHT)),
                     )
                     .into_any_element(),
+                // A Mono has no plan of its own, so its chat leaves the strip
+                // an empty drag area.
+                TitleBarMode::Plan
+                    if matches!(self.active_title_tab(cx), Some(TitleTab::Mono { .. })) =>
+                {
+                    self.hidden_strip(tabs_width, cx)
+                }
                 TitleBarMode::Plan => self.plan_strip(tabs_width.as_f32(), cx),
                 TitleBarMode::SessionTitle => self.hidden_strip(tabs_width, cx),
             })
@@ -6753,7 +6810,7 @@ impl Shell {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(content(1.))
             })
-            .child(crate::particle_text::particle_text(session.display_title()));
+            .child(self.session_title_text(id, session.display_title()));
         let badges =
             div()
                 .flex()
@@ -7061,7 +7118,7 @@ impl Shell {
     ) -> AnyElement {
         let detailed = !compact;
         if !session.needs_approval()
-            && !session.responding()
+            && !session.working()
             && let Some(limit) = session.usage_limit()
         {
             return crate::usage_limit::sidebar_status(
@@ -7091,7 +7148,7 @@ impl Shell {
                     .child(icon("circle-alert", 14.))
                     .when(detailed, |d| d.child("Needs approval"))
                     .into_any()
-            } else if detailed && session.responding() {
+            } else if detailed && session.working() {
                 div()
                     .flex()
                     .items_center()
@@ -7199,6 +7256,11 @@ impl Shell {
 
     /// The project's sessions as the sidebar lists them, top to bottom.
     fn sidebar_session_ids(&self, cx: &App) -> Vec<i64> {
+        self.listed_sessions(self.archive_view_open(), cx)
+    }
+
+    /// The live sessions of the project, or its archived ones, newest first.
+    fn listed_sessions(&self, archived: bool, cx: &App) -> Vec<i64> {
         let start = self
             .workspace
             .session_filters
@@ -7237,7 +7299,8 @@ impl Shell {
                             .started_by
                             .get(id)
                             .is_some_and(|caller| shown.contains(caller)))
-                    && (self.filter_session(*id, start, cx) || self.archive_exits.listed(*id))
+                    && ((s.summary.archived == archived && self.filter_session(*id, start, cx))
+                        || self.archive_exits.listed(*id))
                     && (self.query.is_empty()
                         || if self.workspace.classic_layout {
                             self.classic_session_matches_query(*id, cx)
@@ -7248,14 +7311,9 @@ impl Shell {
                         })
             })
             .collect();
-        // With archived threads shown they sit last, under their own heading.
-        let archived_last = self.workspace.preferences.show_archived;
         ids.sort_by_key(|id| {
             let summary = self.session_metadata(*id, cx).summary;
-            (
-                archived_last && summary.archived,
-                std::cmp::Reverse((summary.updated_at, *id)),
-            )
+            std::cmp::Reverse((summary.updated_at, *id))
         });
         ids
     }
@@ -7385,29 +7443,12 @@ impl Shell {
             return self.classic_sidebar(cx);
         }
         self.refresh_sidebar_structure(cx);
-        let live_agents = self.live_agents_preview(cx);
+        let dock = self.sidebar_dock(true, cx);
         div()
             .id("monocode-sidebar")
             .debug_selector(|| "sidebar-content".into())
             .track_focus(&self.sidebar_focus)
             .key_context("SessionSidebar")
-            // A mouse's side buttons step between spaces, as a swipe does.
-            .on_mouse_down(
-                MouseButton::Navigate(gpui::NavigationDirection::Back),
-                cx.listener(|this, _, window, cx| {
-                    if this.step_space(-1, window, cx) {
-                        cx.stop_propagation();
-                    }
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Navigate(gpui::NavigationDirection::Forward),
-                cx.listener(|this, _, window, cx| {
-                    if this.step_space(1, window, cx) {
-                        cx.stop_propagation();
-                    }
-                }),
-            )
             .on_action(
                 cx.listener(|this, _: &session_groups::RenameSidebarItem, window, cx| {
                     this.rename_sidebar_item(window, cx)
@@ -7423,11 +7464,18 @@ impl Shell {
             .h_full()
             .flex()
             .flex_col()
-            // The spaces' pages. Live agents and updates aren't any one
-            // space's, so they stay put beneath while the pages move.
+            // The spaces' pages. Docked sections and updates stay put beneath
+            // while the pages move.
             .child(self.space_pager(cx))
-            .children(live_agents)
+            .children(dock)
             .child(self.app_update_footer(cx))
+            // The Focused layout has no project rail footer to hold it.
+            .when(!self.workspace.classic_layout, |d| {
+                d.children(
+                    self.github_star_prompt(cx)
+                        .map(|prompt| div().mx_2().my_2().child(prompt)),
+                )
+            })
             .when(!self.workspace.classic_layout, |d| {
                 d.child(self.project_spaces(cx))
             })
@@ -7494,6 +7542,7 @@ impl Shell {
             .flex()
             .flex_col()
             .child(self.sidebar_header(live, cx))
+            .children(self.archive_view_header(cx))
             .child(self.virtual_sidebar_page(page, cx))
             .into_any()
     }
@@ -7964,7 +8013,7 @@ impl Shell {
             }
             if sessions.contains(&id) {
                 let session = self.session_metadata(id, cx);
-                let lit = session.responding()
+                let lit = session.working()
                     || session.needs_approval()
                     || self.unseen_finished.contains(&id);
                 let title = title(&id);
@@ -8427,7 +8476,7 @@ impl Shell {
                 self.cancel_pane_drag(cx);
                 // Each tab glides from where it is drawn into its new slot.
                 let now = self.tab_now();
-                let visible = self.visible_tabs(cx);
+                let visible = self.strip_tabs(cx);
                 let drawn: Vec<(TitleTab, f32)> = visible
                     .iter()
                     .enumerate()
@@ -8829,6 +8878,17 @@ impl Shell {
                             })
                             .gap(px(TAB_TILE_GAP))
                             .group_hover("title-tab", |s| s.bg(title_tab_fill(active, true)))
+                            .children(
+                                copy.panes
+                                    .get(copy.focus)
+                                    .map(|pane| self.workspace.session_for_pane(pane.key.0))
+                                    .filter(|_| {
+                                        tab_width(&TitleTab::Session(id)) >= TAB_CLOSE_MIN_WIDTH
+                                    })
+                                    .and_then(|session| {
+                                        self.origin_tile_in("tab-origin", session, 14., cx)
+                                    }),
+                            )
                             .child(self.pane_tile_stack(&copy, leaving, shuffle))
                             .child(self.pane_headline(
                                 &copy,
@@ -9478,6 +9538,23 @@ impl Render for Shell {
             });
         }
         self.sync_notices(window, cx);
+        let modals: Vec<_> = [
+            self.background_modal(window, cx),
+            self.link_modal(window, cx),
+            self.action_modal(window, cx),
+            self.resource_modal(window, cx),
+            self.quick_open_modal(window, cx),
+            self.project_picker_modal(window, cx),
+            self.search_modal(window, cx),
+            self.remote_project_modal(window, cx),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.notice_modals(window, cx))
+        .collect();
+        let modal_open = !modals.is_empty()
+            || crate::accounts::get(cx).is_some_and(|accounts| accounts.read(cx).has_modal_auth());
+        self.modal_open = modal_open;
         div()
             .id("monocode-workspace")
             .relative()
@@ -9958,7 +10035,7 @@ impl Render for Shell {
             .child(self.history_buttons_watch(cx))
             .child(self.right_panel_resize_watch(cx))
             .children(self.layout_body(sidebar_width, right_shown, right_width, full, window, cx))
-            .children(self.peek_watch(window, cx))
+            .children(self.peek_watch(modal_open, window, cx))
             .child(self.notices_overlay(cx))
             .children(self.menu.as_ref().map(|open| {
                 let point = matches!(open.anchor, Anchor::Point(_));
@@ -9982,15 +10059,12 @@ impl Render for Shell {
                         p.side(Side::Top).align(crate::popover::Align::End)
                     })
             }))
-            .children(self.drag_ghost(cx))
-            .children(self.background_modal(window, cx))
-            .children(self.link_modal(window, cx))
-            .children(self.action_modal(window, cx))
-            .children(self.resource_modal(window, cx))
-            .children(self.quick_open_modal(window, cx))
-            .children(self.project_picker_modal(window, cx))
-            .children(self.remote_project_modal(window, cx))
-            .children(self.notice_modals(window, cx))
+            // Over the peek a row is dragged out of.
+            .children(
+                self.drag_ghost(cx)
+                    .map(|ghost| gpui::deferred(ghost).with_priority(POPOVER_LAYER)),
+            )
+            .children(modals)
             .children(self.folder_picker_popover(window, cx))
             .children(self.quit_hint())
             .children(crate::accounts::get(cx))
@@ -10112,7 +10186,7 @@ mod tests {
                 );
                 assert!(!shell.workspace.tabs.contains(&a));
                 assert!(shell.sessions[&a].read(cx).summary.archived);
-                // The row stays listed while it slides and folds away.
+                // The row stays listed while it dissolves and folds away.
                 assert!(shell.archive_exits.exiting(a));
                 assert!(shell.sidebar_session_ids(cx).contains(&a));
                 shell.archive_exits.finish();
@@ -10135,14 +10209,8 @@ mod tests {
                         .rows
                         .is_empty()
                 );
-                shell.run_menu(MenuTarget::SessionFilter, "archived", None, window, cx);
-                let listed = shell.sidebar_session_ids(cx);
-                assert!(listed.contains(&a));
-                assert_eq!(
-                    listed.last(),
-                    Some(&a),
-                    "archived threads sort after active ones when shown"
-                );
+                shell.archive_view = Some(shell.workspace.project.clone());
+                assert_eq!(shell.sidebar_session_ids(cx), vec![a]);
                 shell.toggle_archive(a, cx);
             })
             .unwrap();
@@ -10150,7 +10218,7 @@ mod tests {
         window
             .update(visual, |shell, window, cx| {
                 assert!(!shell.sessions[&a].read(cx).summary.archived);
-                shell.run_menu(MenuTarget::SessionFilter, "clear", None, window, cx);
+                shell.archive_view = None;
                 assert!(shell.sidebar_session_ids(cx).contains(&a));
                 assert_eq!(shell.workspace.active, Some(b));
             })
@@ -11865,6 +11933,46 @@ mod tests {
         cx.simulate_mouse_move(gpui::point(px(2.), px(300.)), None, Default::default());
         cx.run_until_parked();
         assert!(!open(cx));
+    }
+    #[gpui::test]
+    fn peeked_sidebar_covers_a_workspace_popover(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, id) = window(cx);
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.new_layout_boxy = false;
+                shell.layout_changed(cx);
+                shell.toggle_sidebar(window, cx);
+                shell.open(id, window, cx);
+                shell.sessions[&id].update(cx, |view, cx| {
+                    window.focus(&view.input.focus_handle(cx), cx);
+                    view.input
+                        .update(cx, |input, cx| input.set_text("/".into(), cx));
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let menu = cx.debug_bounds("composer-completion-list").unwrap();
+        cx.simulate_mouse_move(gpui::point(px(2.), px(300.)), None, Default::default());
+        cx.run_until_parked();
+        let panel = cx.debug_bounds("sidebar-peek").unwrap();
+        assert!(menu.left() < panel.right(), "the two must overlap");
+        // The panel takes a press where it lies over the menu, so no row is
+        // picked and the composer keeps what was typed.
+        let overlap = gpui::point((menu.left() + panel.right()) / 2., menu.top() + px(60.));
+        cx.simulate_click(overlap, Default::default());
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.peek_open());
+                let view = shell.sessions[&id].read(cx);
+                assert_eq!(view.input.read(cx).content, "/");
+            })
+            .unwrap();
     }
     #[gpui::test]
     fn original_sidebar_geometry_matches_tauri_chrome(cx: &mut TestAppContext) {

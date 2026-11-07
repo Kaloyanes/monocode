@@ -1,7 +1,9 @@
 // Trimmed-down versions of the desktop shapes (RecentProject, Mono, SessionSummary).
 // These will be filled from the paired desktop once sync exists.
 
+import type { DraftCardItem } from "@/features/drafts/DraftController";
 import type { MascotStatus } from "@/features/mascots/PixelMascot";
+import type { VisualNode } from "@/features/visuals/types";
 
 // The desktop's HarnessId (src/features/sessions/model/session.ts).
 export type Harness =
@@ -137,7 +139,7 @@ export type MonoSubsessions = {
 
 // The desktop composer's one-shot modes, from its + menu. A message is sent
 // in at most one.
-export type ComposerMode = "plan" | "operator" | "orchestrator";
+export type ComposerMode = "plan";
 
 // The desktop's RuntimeMode (src/features/sessions/model/session.ts).
 export type RuntimeMode = "supervised" | "auto-accept-edits" | "auto" | "full-access";
@@ -146,6 +148,8 @@ export type SessionSummary = {
   id: string;
   projectId: string;
   monoId?: string;
+  /** Unsent composer text or a saved draft; absent from an older desktop. */
+  draft?: boolean;
   title: string;
   harness: Harness;
   model: string;
@@ -157,93 +161,17 @@ export type SessionSummary = {
   /** Its permission mode, as the desktop's access picker sets it. */
   runtimeMode?: RuntimeMode;
   updatedAt: number;
+  /** The pull request or issue linked to it; absent from an older desktop. */
+  workItem?: { kind: "pr" | "issue"; number: number };
   busy?: boolean;
   /** What it waits on the user for; absent from an older desktop. */
-  waiting?: "approval" | "question";
-  /** An Orchestrator worker's lead; workers open from its Agents sheet, not lists. */
+  waiting?: "approval" | "question" | "draft";
+  /** The draft the agent is waiting on, when `waiting` is "draft". */
+  waitingDraft?: string;
+  /** A subagent's lead; subagents stay out of lists. */
   leadId?: string;
-  /** A lead's newest Orchestrator plan or run. */
-  orchestration?: OrchestrationSummary;
-};
-
-// The desktop's Orchestrator card (crates/monocode-gpui/src/mobile/orchestration.rs).
-export type OrchestrationPhase =
-  | "review"
-  | "running"
-  | "paused"
-  | "stopped"
-  | "finished"
-  | "inactive";
-
-/** Picks an assignment's colour; its label is the desktop's. */
-export type OrchestrationTone =
-  | "queued"
-  | "starting"
-  | "working"
-  | "done"
-  | "failed"
-  | "stopped"
-  | "blocked"
-  | "interrupted"
-  | "input";
-
-export type OrchestrationSummary = {
-  title: string;
-  phase: OrchestrationPhase;
-  /** "2 of 4 done · 1 working · running", as the desktop card's. */
-  headline: string;
-  tones: OrchestrationTone[];
-};
-
-export type OrchestrationActionName =
-  | "start"
-  | "dismiss"
-  | "remove"
-  | "stop"
-  | "resume"
-  | "retry"
-  | "sendReport";
-
-export type OrchestrationTask = {
-  id: string;
-  index: number;
-  title: string;
-  prompt: string;
-  files: string[];
-  dependsOn: string[];
-  tone: OrchestrationTone;
-  label: string;
-  harness: string;
-  model: string;
-  steps: number;
-  /** Why it waits, or what went wrong. */
-  note?: string;
-  outsideScope: string[];
-  /** The end of its report. */
-  report: string;
-  /** Its worker's chat, once it has one. */
-  sessionId?: string;
-  canRetry: boolean;
-  canRemove: boolean;
-};
-
-export type OrchestrationRun = {
-  /** The tool call that submitted the plan; actions name it. */
-  call: string;
-  title: string;
-  summary: string;
-  phase: OrchestrationPhase;
-  headline: string;
-  /** The card's buttons, main one first. */
-  actions: {
-    action: OrchestrationActionName;
-    label: string;
-    primary: boolean;
-    disabled: boolean;
-  }[];
-  /** Why the main button can't be used yet. */
-  reason?: string;
-  tasks: OrchestrationTask[];
+  /** What it waits on: the first approval (or question), and how many. */
+  request?: { id: string; label: string; count: number };
 };
 
 // The desktop's UserQuestionPrompt (src/features/sessions/model/userQuestion.ts):
@@ -279,7 +207,15 @@ export type Message = {
 
 // The desktop's MobileTurn (src/features/mobile/model/mobileTranscript.ts): a
 // transcript the desktop has already grouped and folded as AgentTranscript does.
-export type WorkKind = "research" | "edit" | "run" | "agent" | "other" | "think" | "note";
+export type WorkKind =
+  | "research"
+  | "edit"
+  | "run"
+  | "agent"
+  | "visual"
+  | "other"
+  | "think"
+  | "note";
 
 export type WorkStep = { id: string; label: string; failed?: boolean };
 
@@ -317,9 +253,16 @@ export type TurnItem =
       entries: FoldEntry[];
     }
   | { type: "work"; id: string; live: boolean; phases: WorkPhase[] }
-  | { type: "notice"; id: string; text: string; error?: boolean }
-  /** A page the agent built; the phone opens it live with the desktop's. */
-  | { type: "draft"; id: string; draft: string; title: string; kept?: boolean }
+  | {
+      type: "notice";
+      id: string;
+      text: string;
+      error?: boolean;
+      /** A page the agent built, drawn live in the thread. */
+      draft?: DraftCardItem;
+      /** A chart's first render, for a phone that can't run its program. */
+      tree?: VisualNode;
+    }
   /** Sessions a Mono started, as cards under the reply after the launch. */
   | { type: "sessions"; id: string; sessions: LaunchedSession[] }
   /** A Mono's suggested replies; `chosen` is the reply sent after them. */

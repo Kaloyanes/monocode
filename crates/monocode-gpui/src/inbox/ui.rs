@@ -1,10 +1,12 @@
 use super::*;
+mod ask;
+mod review;
 use crate::popover::{Align, Anchor, popover};
 use crate::tooltip::Tip;
 use gpui::{
     Animation, AnimationExt, AnyElement, ClipboardItem, CursorStyle, Div, FontWeight, Hsla,
-    MouseButton, Pixels, Role, SharedString, Stateful, Window, canvas, div, list, prelude::*, px,
-    rgb,
+    MouseButton, Pixels, Role, SharedString, Stateful, Transformation, Window, canvas, div, list,
+    prelude::*, px, radians, rgb, size,
 };
 
 fn action(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Stateful<Div> {
@@ -37,10 +39,21 @@ const COPIED: Hsla = Hsla {
     l: 0.56,
     a: 1.,
 };
-const COPIED_POP: Duration = Duration::from_millis(260);
+const COPIED_POP: Duration = Duration::from_millis(420);
+
+/// Ease-out with a small overshoot past 1 before settling, so the tick
+/// pops in rather than just growing.
+fn ease_out_back(t: f32) -> f32 {
+    const C1: f32 = 1.9;
+    const C3: f32 = C1 + 1.;
+    1. + C3 * (t - 1.).powi(3) + C1 * (t - 1.).powi(2)
+}
 
 fn icon_action(id: impl Into<SharedString>, label: &str, name: &'static str) -> Stateful<Div> {
     icon_action_ink(id, label, name, content(0.7))
+}
+fn merged(item: &Item) -> bool {
+    item.state.eq_ignore_ascii_case("merged")
 }
 fn icon_action_ink(
     id: impl Into<SharedString>,
@@ -976,24 +989,12 @@ impl Inbox {
                                     )),
                                 )
                             })
-                            .when(is_pr && item.provider == "github", |d| {
+                            .children(self.archive_threads_button(&item, cx))
+                            .when(is_pr && item.provider == "github" && !merged(&item), |d| {
                                 d.child(self.pr_actions(&item, cx))
                             })
+                            .when(is_pr && !self.detail_only, |d| d.child(self.ask_button(cx)))
                             .child(self.copy_link_button(&item, cx))
-                            .child(
-                                icon_action("inbox-copy-link", "Copy link", "response-copy")
-                                    .when(item.url.is_empty(), |d| d.opacity(0.4))
-                                    .on_click({
-                                        let url = item.url.clone();
-                                        move |_, _, cx| {
-                                            if !url.is_empty() {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    url.clone(),
-                                                ));
-                                            }
-                                        }
-                                    }),
-                            )
                             .child(
                                 icon_action(
                                     "inbox-open-external",
@@ -1095,6 +1096,7 @@ impl Inbox {
             .child(title)
             .when_some(self.link_notice_view(cx), |d, notice| d.child(notice))
             .when_some(self.detail_error.clone(), |d, text| d.child(error(text)))
+            .children(self.review_bar(cx))
             .child(body)
             .into_any_element()
     }
@@ -1145,8 +1147,16 @@ impl Inbox {
                 "Copied link",
                 action_icon("check", COPIED).with_animation(
                     ("inbox-copied-tick", press),
-                    Animation::new(COPIED_POP).with_easing(|t| 1. - (1. - t).powi(3)),
-                    |svg, t| svg.size(px(14. * (0.5 + 0.5 * t))).opacity(t),
+                    Animation::new(COPIED_POP).with_easing(ease_out_back),
+                    |svg, t| {
+                        // Scales about its own centre inside a fixed 14px box, so the
+                        // button never reflows. The easing overshoots 1 and settles.
+                        svg.with_transformation(
+                            Transformation::scale(size(t, t))
+                                .with_rotation(radians((1. - t.min(1.)) * -0.6)),
+                        )
+                        .opacity((t * 3.).min(1.))
+                    },
                 ),
                 COPIED,
             )
@@ -1155,6 +1165,40 @@ impl Inbox {
                 .when(item.url.is_empty(), |d| d.opacity(0.4)),
         };
         button.on_click(on_click).into_any_element()
+    }
+    /// The next step once a pull request is merged, so it takes the merge
+    /// button's place and its solid look.
+    fn archive_threads_button(&self, item: &Item, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if item.kind != "pr" || !merged(item) {
+            return None;
+        }
+        let ids: Vec<i64> = self
+            .related_sessions(item)
+            .iter()
+            .filter(|session| !session.archived)
+            .map(|session| session.id)
+            .collect();
+        let label = match ids.len() {
+            0 => return None,
+            1 => "Archive thread".to_owned(),
+            count => format!("Archive {count} threads"),
+        };
+        Some(
+            div()
+                .rounded(px(6.))
+                .bg(content(1.))
+                .child(
+                    icon_action_ink("inbox-archive-threads", &label, "archive", shell_fill())
+                        .debug_selector(|| "inbox-archive-threads".into())
+                        .px(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(shell_fill())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.archive_threads(ids.clone(), cx);
+                        })),
+                )
+                .into_any_element(),
+        )
     }
     fn pr_actions(&self, item: &Item, cx: &mut Context<Self>) -> AnyElement {
         let open = item.state.eq_ignore_ascii_case("open");
@@ -2962,6 +3006,12 @@ impl gpui::Render for Inbox {
             self.focus_comment = false;
             window.focus(&self.comment.focus_handle(cx), cx);
         }
+        if self.focus_ask {
+            self.focus_ask = false;
+            if self.ask_pane().is_none() {
+                window.focus(&self.ask_input.focus_handle(cx), cx);
+            }
+        }
         let list = (!self.detail_only).then(|| self.list_view(cx));
         let detail = match self.link_notice_view(cx) {
             Some(notice) if self.detail_only && self.item().is_none() => div()
@@ -3041,7 +3091,8 @@ impl gpui::Render for Inbox {
                     .min_w_0()
                     .flex()
                     .children(list)
-                    .child(div().flex_1().min_w_0().min_h_0().child(detail)),
+                    .child(div().flex_1().min_w_0().min_h_0().child(detail))
+                    .children(self.ask_pane_view(cx)),
             )
             .when_some(self.error.clone(), |d, text| d.child(error(text)))
             .when(self.filters_open, |d| {
@@ -3069,7 +3120,11 @@ mod tests {
         AssetSource, Bounds, Render, TestAppContext, WindowBounds, WindowHandle, WindowOptions,
         point, size,
     };
-    use std::sync::{Arc, Mutex};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{Arc, Mutex},
+    };
 
     struct Fixture {
         inbox: Entity<Inbox>,
@@ -3082,6 +3137,7 @@ mod tests {
                     .size_full()
                     .flex()
                     .flex_col()
+                    .children(inbox.archive_threads_button(&self.item, cx))
                     .child(inbox.pr_actions(&self.item, cx))
                     .child(inbox.summary_view(&self.item, window, cx))
             })
@@ -3127,8 +3183,11 @@ mod tests {
                     inbox.state.seen.seeded = true;
                     assert!(inbox.phone_view().fetched_at.is_none());
                     assert!(inbox.phone_mark("github:nope", Mark::Done, cx).is_err());
+                    let rev = inbox.phone_rev();
+                    assert_eq!(inbox.phone_rev(), rev, "the same list keeps its rev");
                     inbox.phone_mark(&key, Mark::Done, cx).unwrap();
                     assert!(inbox.phone_view().triage.is_done(&key));
+                    assert_ne!(inbox.phone_rev(), rev, "a phone reads again after a mark");
                     let until = monocode_core::time::now_ms() as i64 + 60_000;
                     inbox.phone_mark(&key, Mark::Snooze(until), cx).unwrap();
                     assert_eq!(
@@ -3148,6 +3207,145 @@ mod tests {
                     // A phone looking at a list that was just fetched starts no refresh.
                     inbox.refresh_for_phone(cx);
                     assert!(!inbox.loading);
+                });
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_phones_action_reaches_both_lists_and_keeps_why_the_item_needs_the_user(
+        cx: &mut TestAppContext,
+    ) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    let key = fixture.item.key();
+                    inbox.state.seen.seeded = true;
+                    inbox.state.filters.assigned_to_me = true;
+                    assert!(inbox.phone_separate());
+                    let listed = Item {
+                        attention_reason: "review_requested".into(),
+                        ..fixture.item.clone()
+                    };
+                    inbox.snapshot.items = vec![listed.clone()];
+                    inbox.phone.snapshot = Some(Snapshot {
+                        items: vec![listed],
+                        ..Default::default()
+                    });
+
+                    // The provider's copy has no attention reason.
+                    let merged = Item {
+                        state: "merged".into(),
+                        updated_at: "2026-11-05T10:00:00Z".into(),
+                        ..fixture.item.clone()
+                    };
+                    let item = inbox.phone_acted(&key, merged, cx);
+
+                    assert_eq!(item.attention_reason, "review_requested");
+                    assert_eq!(inbox.snapshot.items[0].state, "merged");
+                    let phone = inbox.phone.snapshot.as_ref().unwrap();
+                    assert_eq!(phone.items[0].state, "merged");
+                    assert!(!inbox.state.seen.unseen(&item), "the user just acted on it");
+                });
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_phone_and_the_desktop_share_one_pending_review(cx: &mut TestAppContext) {
+        use model::review::Side;
+        use monocode_core::mobile::inbox::ReviewLine;
+        let line = |text: &str| ReviewLine {
+            path: "src/a.rs".into(),
+            line: 7,
+            side: Side::Right,
+            text: text.into(),
+        };
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    let key = fixture.item.key();
+                    inbox.add_review_comment("src/b.rs".into(), 2, Side::Left, "Desk".into(), cx);
+
+                    let both = inbox.phone_review_add(&key, line("Phone"), cx);
+                    assert_eq!(both.len(), 2);
+                    assert_eq!(inbox.review_comments().len(), 2, "the desktop sees it");
+                    assert_eq!(both[1].id, 2);
+
+                    // A later launch reads the saved list.
+                    inbox.review.clear();
+                    assert_eq!(inbox.phone_review(&key), both);
+
+                    let left = inbox.phone_review_remove(&key, 1, cx);
+                    assert_eq!(left.len(), 1);
+                    assert_eq!(inbox.phone_review_remove(&key, 1, cx), left);
+                });
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_review_posts_once_and_keeps_what_it_did_not_send(cx: &mut TestAppContext) {
+        use model::review::Side;
+        use monocode_core::mobile::inbox::ReviewLine;
+        let line = |text: &str| ReviewLine {
+            path: "src/a.rs".into(),
+            line: 7,
+            side: Side::Right,
+            text: text.into(),
+        };
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    let key = fixture.item.key();
+                    assert!(inbox.phone_review_start(&key, cx).is_err(), "nothing to send");
+                    inbox.phone_review_add(&key, line("First"), cx);
+
+                    let sent = inbox.phone_review_start(&key, cx).unwrap();
+                    assert!(inbox.review_posting, "the desktop's button waits");
+                    assert!(inbox.phone_review_start(&key, cx).is_err(), "only one at a time");
+
+                    // A refused review loses nothing.
+                    let kept = inbox.phone_review_finished(&key, &sent, false, cx);
+                    assert_eq!(kept, sent);
+                    assert!(!inbox.review_posting);
+
+                    // A comment written while the review was on its way stays.
+                    let sent = inbox.phone_review_start(&key, cx).unwrap();
+                    inbox.phone_review_add(&key, line("Second"), cx);
+                    let left = inbox.phone_review_finished(&key, &sent, true, cx);
+                    assert_eq!(left.len(), 1);
+                    assert_eq!(left[0].text, "Second");
+                });
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_phone_marks_what_its_list_shows_as_read(cx: &mut TestAppContext) {
+        use monocode_core::mobile::inbox::ListParams;
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    let other = Item {
+                        number: 2,
+                        ..fixture.item.clone()
+                    };
+                    inbox.snapshot.items = vec![fixture.item.clone(), other.clone()];
+                    inbox.state.seen.seeded = true;
+                    inbox
+                        .state
+                        .triage
+                        .mark_done(&other.key(), monocode_core::time::now_ms() as i64);
+                    let all = ListParams::parse(&serde_json::json!({})).unwrap();
+
+                    assert_eq!(inbox.phone_read_all(&all, &[], cx), 1);
+
+                    assert!(!inbox.state.seen.unseen(&fixture.item));
+                    assert!(inbox.state.seen.unseen(&other), "a done item isn't listed");
+                    assert_eq!(inbox.phone_read_all(&all, &[], cx), 0);
+                    let saved = locked(&inbox.store).map(|db| ViewState::load(&db)).unwrap();
+                    assert!(!saved.seen.unseen(&fixture.item));
                 });
             })
             .unwrap();
@@ -3229,6 +3427,98 @@ mod tests {
             })
             .unwrap();
     }
+    fn linked_thread(id: i64, archived: bool) -> Session {
+        Session {
+            id,
+            title: format!("Thread {id}"),
+            provider: "codex".into(),
+            cwd: "/repo".into(),
+            provider_id: None,
+            has_messages: true,
+            updated_at: 0,
+            archived,
+            pinned: false,
+            work_item: Some(monocode_core::session_groups::WorkItem {
+                kind: "pr".into(),
+                repo: "acme/app".into(),
+                number: 7,
+                url: String::new(),
+            }),
+        }
+    }
+
+    #[gpui::test]
+    fn a_merged_pull_request_offers_to_archive_only_its_live_threads(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.item.repo = "acme/app".into();
+                let log = seen.clone();
+                cx.subscribe(&fixture.inbox, move |_, _, event: &Event, _| {
+                    if let Event::ArchiveThreads(ids) = event {
+                        log.borrow_mut().push(ids.clone());
+                    }
+                })
+                .detach();
+                fixture.inbox.update(cx, |inbox, _| {
+                    inbox.sessions = vec![
+                        linked_thread(1, false),
+                        linked_thread(2, true),
+                        linked_thread(3, false),
+                    ];
+                });
+            })
+            .unwrap();
+        draw(window, cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        assert!(
+            visual.debug_bounds("inbox-archive-threads").is_none(),
+            "an open pull request still has work ahead of it"
+        );
+
+        window
+            .update(visual, |fixture, _, cx| {
+                fixture.item.state = "merged".into();
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let button = visual.debug_bounds("inbox-archive-threads").unwrap();
+        visual.simulate_click(button.center(), Default::default());
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+
+        assert_eq!(*seen.borrow(), vec![vec![1, 3]]);
+        assert!(
+            visual.debug_bounds("inbox-archive-threads").is_none(),
+            "nothing is left to archive"
+        );
+    }
+
+    #[gpui::test]
+    fn a_merge_reaches_the_pinned_item_a_detail_view_shows(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, _| {
+                    let item = inbox.snapshot.items.remove(0);
+                    let key = item.key();
+                    inbox.pinned = Some(item.clone());
+                    inbox.replace_item(
+                        &key,
+                        Item {
+                            state: "merged".into(),
+                            ..item
+                        },
+                    );
+                    assert_eq!(inbox.item().unwrap().state, "merged");
+                });
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn the_inbox_opens_scoped_to_its_project_and_labels_projects_by_appearance(
         cx: &mut TestAppContext,

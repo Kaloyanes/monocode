@@ -50,6 +50,12 @@ for (const [name, symbol] of Object.entries(iconNames)) {
     .filter(([key]) => key !== "key").map(([key, v]) => `${attr(key)}="${String(v)}"`).join(" ")}/>`).join("");
   items.push(["icon:" + name, `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">${children}</svg>`]);
 }
+// MonoCode's own mark, for the rows of its chart and draft tools. It is a white
+// glyph on a clear ground, so it tints like the stroke icons above.
+{
+  const mark = readFileSync(resolve(mobile, "assets/images/monocode-mark.png")).toString("base64");
+  items.push(["icon:monocode", `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><image width="24" height="24" href="data:image/png;base64,${mark}"/></svg>`]);
+}
 for (const name of [...files].sort()) if (iconData[name]) items.push(["file:" + name, iconData[name]]);
 const images = {};
 const browser = await chromium.launch({ headless: true });

@@ -667,15 +667,12 @@ impl Protocol {
                         }
                         if self.request.settings.plan {
                             params["sandboxPolicy"] = json!({"type":"readOnly"});
-                            if self.request.settings.operator
-                                || self.request.settings.operator_enabled
-                                || self.request.settings.orchestrator
-                                || self
-                                    .request
-                                    .settings
-                                    .environment
-                                    .get("MONOCODE_THREADS")
-                                    .is_some_and(|v| v == "1")
+                            if self
+                                .request
+                                .settings
+                                .environment
+                                .get("MONOCODE_THREADS")
+                                .is_some_and(|v| v == "1")
                             {
                                 params["sandboxPolicy"]["networkAccess"] = true.into();
                             }
@@ -1539,6 +1536,11 @@ fn run_operation(
             {
                 command.args(["-c", "features.multi_agent=false"]);
             }
+            crate::mono::bridge::configure_codex(
+                &mut command,
+                request.settings.mono.as_ref(),
+                &request.settings.environment,
+            );
             if let Some(mono) = &request.settings.mono {
                 if let Some(home) =
                     crate::mono::codex_home(&mono.root, &request.settings.account.id)?
@@ -1606,22 +1608,33 @@ fn run_operation(
             if let Some(mono) = settings.mono.as_ref().filter(|_| !settings.text_only) {
                 system.push(crate::mono::instructions(&mono.mono, &mono.executable));
             }
+            let mut disallowed = Vec::new();
             if let Some(server) = visual_server {
-                command.args([
-                    "--mcp-config",
-                    &json!({"mcpServers":{(crate::visual_bridge::SERVER_NAME):server}}).to_string(),
-                ]);
-                allowed.push(crate::visual_bridge::CLAUDE_ALLOWED_TOOLS);
-                if let Some(instructions) =
-                    crate::visual_bridge::instructions(&settings.environment, true)
-                {
-                    system.push(instructions);
+                if crate::visual_bridge::executable_missing(&server) {
+                    // The app moved or was rebuilt under a running session. Say
+                    // so, rather than leave the agent to reach for an artifact.
+                    system.push(crate::visual_bridge::UNAVAILABLE.to_owned());
+                } else {
+                    servers.insert(crate::visual_bridge::SERVER_NAME.into(), server);
+                    command.env(crate::visual_bridge::ENV_PROMPTED, "1");
+                    allowed.push(crate::visual_bridge::CLAUDE_ALLOWED_TOOLS);
+                    if let Some(instructions) =
+                        crate::visual_bridge::instructions(&settings.environment, true)
+                    {
+                        system.push(instructions);
+                    }
                 }
                 if settings.monocode_subagents_only
                     && crate::visual_bridge::lead_chat(&settings.environment)
                 {
-                    command.args(["--disallowedTools", "Agent"]);
+                    disallowed.push("Agent");
                 }
+                if crate::visual_bridge::blocks_artifacts(&request.prompt) {
+                    disallowed.push(crate::visual_bridge::ARTIFACTS_SERVER);
+                }
+            }
+            if !disallowed.is_empty() {
+                command.args(["--disallowedTools", &disallowed.join(",")]);
             }
             if !system.is_empty() {
                 command.args(["--append-system-prompt", &system.join("\n\n")]);
@@ -2196,12 +2209,14 @@ mod tests {
         assert!(instructions.contains("- /repo"));
     }
     #[test]
-    fn operator_thread_access_keeps_the_codex_app_bridge_reachable_on_later_turns() {
+    fn thread_access_keeps_the_codex_app_bridge_reachable_on_later_turns() {
         for plan in [false, true] {
             let mut p = protocol(Kind::Codex);
-            p.request.settings.operator_enabled = true;
+            p.request
+                .settings
+                .environment
+                .insert("MONOCODE_THREADS".into(), "1".into());
             p.request.settings.plan = plan;
-            assert!(!p.request.settings.operator);
             assert_eq!(p.codex_access().2["networkAccess"], true);
             let mut out = Vec::new();
             p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();

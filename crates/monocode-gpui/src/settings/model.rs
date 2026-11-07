@@ -11,7 +11,6 @@ pub(crate) enum Section {
     Appearance,
     Keybindings,
     Chat,
-    Visualizations,
     Devices,
     Providers,
     Mcp,
@@ -36,7 +35,6 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
         "Agents",
         &[
             Section::Chat,
-            Section::Visualizations,
             Section::Devices,
             Section::Providers,
             Section::Mcp,
@@ -51,13 +49,12 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
-    pub(crate) const ALL: [Section; 14] = [
+    pub(crate) const ALL: [Section; 13] = [
         Section::General,
         Section::Connections,
         Section::Appearance,
         Section::Keybindings,
         Section::Chat,
-        Section::Visualizations,
         Section::Devices,
         Section::Providers,
         Section::Mcp,
@@ -74,7 +71,6 @@ impl Section {
             Section::Appearance => "appearance",
             Section::Keybindings => "keybindings",
             Section::Chat => "chat",
-            Section::Visualizations => "visualizations",
             Section::Devices => "devices",
             Section::Providers => "providers",
             Section::Mcp => "mcp",
@@ -92,7 +88,6 @@ impl Section {
             Section::Appearance => "Appearance",
             Section::Keybindings => "Keybindings",
             Section::Chat => "Chat",
-            Section::Visualizations => "Visualizations",
             Section::Devices => "Devices",
             Section::Providers => "Providers",
             Section::Mcp => "MCP",
@@ -117,9 +112,6 @@ impl Section {
             }
             Section::Chat => {
                 "How transcripts read, what the composer does with a follow-up, how files save, and how diffs open."
-            }
-            Section::Visualizations => {
-                "How drafts and the pages agents build in the thread are drawn."
             }
             Section::Devices => {
                 "iOS Simulators and Android Emulators in the right panel, and what agents may do with them."
@@ -150,9 +142,6 @@ impl Section {
             Section::Chat => {
                 "transcript composer prompt message diff review layout format save editor"
             }
-            Section::Visualizations => {
-                "draft preview page engine browser webkit safari chromium chrome headless render"
-            }
             Section::Devices => {
                 "simulator emulator ios android iphone pixel device hub stream agent-device node xcode adb"
             }
@@ -179,7 +168,6 @@ impl Section {
             Section::Appearance => "palette",
             Section::Keybindings => "keyboard",
             Section::Chat => "message-square",
-            Section::Visualizations => "chart-square",
             Section::Devices => "smart-phone",
             Section::Providers => "bot",
             Section::Mcp => "globe",
@@ -478,6 +466,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "usage limit meter bar footer bottom shortest window weekly 5-hour most used tightest",
     ),
     (
+        "sidebar-sections",
+        Section::Appearance,
+        "Working and Archived",
+        "sidebar sections docked bottom list top running agents archive placement",
+    ),
+    (
         "show-excluded-files",
         Section::Appearance,
         "Show excluded files",
@@ -500,12 +494,6 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::Devices,
         "Agent access",
         "agent-device automation tap screenshot drive tools",
-    ),
-    (
-        "page-engine",
-        Section::Visualizations,
-        "Page engine",
-        "draft preview browser webkit safari chromium chrome headless download",
     ),
     (
         "transcript-layout",
@@ -704,12 +692,6 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::Archive,
         "Auto-archive inactive conversations",
         "old stale expire idle days weeks month clean up automatically",
-    ),
-    (
-        "show-archived",
-        Section::Archive,
-        "Show archived in the sidebar",
-        "hidden conversations list",
     ),
 ];
 

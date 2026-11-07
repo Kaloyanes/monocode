@@ -1,5 +1,11 @@
 # Drafts on the phone: feature and plan
 
+> Replaced 2026-11-05. The phone's separate draft sheet described here was
+> removed on 2026-11-04, and drafts now run inside the thread; see
+> [drafts.md](drafts.md#on-the-phone) for how it works today. The sync rules
+> below still hold. The card, the `/draft` sheet and the transcript sections
+> are history.
+
 A draft is a live page the agent builds in a thread. The thread is the same on
 the desktop and on a paired phone, so the draft is too: the person can open it
 on either screen, move its controls, pin notes and hand it back, and both

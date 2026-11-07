@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from "react";
 import { Pressable, Text, TextInput, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { useSheetColor } from "@/ui/sheetColor";
+import { SHEET_INSET, SHEET_TOP, SheetTitle, useSheetStyles } from "@/ui/SheetParts";
 import { themedStyles, useColors, useScheme } from "@/ui/theme";
 
 /** Takes a pairing link copied from the desktop, the keyboard up as it opens. */
@@ -16,6 +18,8 @@ export function PairingLinkSheet({
   onConnect: (link: string) => void;
 }) {
   const colors = useColors();
+  const sheetColor = useSheetColor();
+  const parts = useSheetStyles();
   const scheme = useScheme();
   const styles = useStyles();
   const { width } = useWindowDimensions();
@@ -43,17 +47,14 @@ export function PairingLinkSheet({
       isPresented={isPresented}
       onDismiss={dismiss}
       contentPadding={0}
-      containerColor={colors.sheet}
+      containerColor={sheetColor}
     >
       <RNHostView matchContents={{ vertical: true }}>
         <View style={[styles.sheet, { width, paddingBottom: Math.max(bottom, 16) + 8 }]}>
-          <Text accessibilityRole="header" style={styles.title}>
-            Paste a pairing link
-          </Text>
-          <Text style={styles.hint}>
-            On your desktop, open Settings → Connections, choose Pair phone, and
-            copy the link.
-          </Text>
+          <SheetTitle
+            title="Paste a pairing link"
+            detail="On your desktop, open Settings → Connections, choose Pair phone, and copy the link."
+          />
           <TextInput
             ref={input}
             accessibilityLabel="Pairing link"
@@ -70,19 +71,19 @@ export function PairingLinkSheet({
             keyboardAppearance={scheme}
             cursorColor={colors.accent}
             selectionColor={colors.accent}
-            style={styles.input}
+            style={parts.field}
           />
           <Pressable
             accessibilityRole="button"
             disabled={!link.trim()}
             onPress={connect}
             style={({ pressed }) => [
-              styles.button,
-              !link.trim() && styles.dimmed,
-              pressed && styles.pressed,
+              parts.primary,
+              !link.trim() && parts.dimmed,
+              pressed && parts.pressed,
             ]}
           >
-            <Text style={styles.buttonLabel}>Connect</Text>
+            <Text style={parts.primaryLabel}>Connect</Text>
           </Pressable>
         </View>
       </RNHostView>
@@ -90,40 +91,10 @@ export function PairingLinkSheet({
   );
 }
 
-const useStyles = themedStyles((colors) => ({
+const useStyles = themedStyles(() => ({
   sheet: {
-    paddingTop: 28,
-    paddingHorizontal: 24,
+    paddingTop: SHEET_TOP,
+    paddingHorizontal: SHEET_INSET,
     gap: 16,
   },
-  title: {
-    color: colors.content,
-    fontSize: 20,
-    fontWeight: "600",
-    textAlign: "center",
-  },
-  hint: {
-    color: colors.muted,
-    fontSize: 15,
-    lineHeight: 21,
-    textAlign: "center",
-    marginTop: -6,
-  },
-  input: {
-    color: colors.content,
-    fontSize: 16,
-    backgroundColor: colors.background,
-    borderRadius: 16,
-    paddingHorizontal: 16,
-    paddingVertical: 15,
-  },
-  button: {
-    backgroundColor: colors.inverseSurface,
-    borderRadius: 32,
-    padding: 17,
-    alignItems: "center",
-  },
-  buttonLabel: { color: colors.inverse, fontSize: 16, fontWeight: "600" },
-  dimmed: { opacity: 0.4 },
-  pressed: { opacity: 0.8 },
 }));

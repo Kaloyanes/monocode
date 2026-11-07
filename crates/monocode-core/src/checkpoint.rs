@@ -885,12 +885,7 @@ fn resolve_edit_path(workspace: &Path, root: &Path, path: &str) -> Result<String
 }
 
 fn git_command(root: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
+    let mut command = crate::process::git_without_fork();
     command
         .args(["--no-pager", "-C"])
         .arg(root)

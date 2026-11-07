@@ -486,7 +486,10 @@ pub fn copy_identity(root: &Path, source: &Mono, copy: &Mono, now: u64) -> Resul
     Ok(())
 }
 
-pub fn context(mono: &Mono, files: &files::AgentFiles, executable: &Path) -> String {
+/// A Mono's standing rules: who it is, how it talks, and how it reaches the
+/// app. They change only with its projects or the app's location, so
+/// providers that take system instructions get them there, once per process.
+pub fn instructions(mono: &Mono, executable: &Path) -> String {
     let cli = format!(
         "{} app",
         shlex::try_quote(&executable.to_string_lossy()).unwrap_or_default()

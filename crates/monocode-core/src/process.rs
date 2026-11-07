@@ -45,6 +45,67 @@ unsafe extern "C" {
     fn setiopolicy_np(kind: i32, scope: i32, policy: i32) -> i32;
 }
 
+/// Git subcommands that start no hooks. `configure_child` clears the blocked
+/// signals a GCD worker passes on, which a Node hook needs to see its own
+/// children exit; these have nothing that depends on it.
+const GIT_WITHOUT_HOOKS: &[&str] = &[
+    "cat-file",
+    "check-ignore",
+    "check-ref-format",
+    "config",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "for-each-ref",
+    "hash-object",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "merge-base",
+    "rev-list",
+    "rev-parse",
+    "show",
+    "status",
+    "symbolic-ref",
+];
+
+/// Git for the app's own frequent reads, started without `fork`.
+///
+/// `fork` holds every malloc lock until the process is copied, and whatever
+/// the main thread is waiting on stalls with it. The standard library uses
+/// `posix_spawn` instead only for a command with no `pre_exec` and, when PATH
+/// is set, an absolute program. `taskpolicy` is both: it applies
+/// `configure_child`'s scheduling hints, finds `git` on the child's PATH and
+/// becomes it, so the pid stays Git's.
+pub fn git_without_fork() -> Command {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("/usr/sbin/taskpolicy");
+        command.args(["-c", "utility", "-d", "throttle", "git"]);
+        command
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut command = Command::new("git");
+        configure_child(&mut command);
+        command
+    }
+}
+
+/// Git to run `args`: without `fork` when no hook can run.
+pub fn git_for(args: &[&str]) -> Command {
+    if args
+        .first()
+        .is_some_and(|name| GIT_WITHOUT_HOOKS.contains(name))
+    {
+        return git_without_fork();
+    }
+    let mut command = Command::new("git");
+    configure_child(&mut command);
+    command
+}
+
 /// New native provider processes use a separate group for cancellation.
 pub fn isolate(command: &mut Command) {
     configure_child(command);
@@ -248,6 +309,88 @@ fn kill_children() {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[cfg(target_os = "macos")]
+    mod spawning {
+        use crate::process::{configure_child, git_for, git_without_fork};
+        use std::cell::Cell;
+        use std::process::Command;
+
+        thread_local! {
+            static FORKS: Cell<u32> = const { Cell::new(0) };
+        }
+        extern "C" fn count_fork() {
+            FORKS.set(FORKS.get() + 1);
+        }
+
+        /// Forks this thread made during `run`, which other tests cannot touch.
+        fn forks(run: impl FnOnce()) -> u32 {
+            static COUNTING: std::sync::Once = std::sync::Once::new();
+            COUNTING.call_once(|| unsafe {
+                libc::pthread_atfork(Some(count_fork), None, None);
+            });
+            let before = FORKS.get();
+            run();
+            FORKS.get() - before
+        }
+
+        fn git_ok(mut command: Command) {
+            let out = command.arg("--version").output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert!(String::from_utf8_lossy(&out.stdout).starts_with("git version"));
+        }
+
+        #[test]
+        fn the_counter_sees_a_child_that_forks() {
+            let mut child = Command::new("/usr/bin/true");
+            configure_child(&mut child);
+            assert_eq!(
+                forks(|| {
+                    child.status().unwrap();
+                }),
+                1
+            );
+        }
+
+        #[test]
+        fn reads_start_git_without_fork_even_with_their_own_path() {
+            let path = std::env::var("PATH").unwrap();
+            assert_eq!(forks(|| git_ok(git_without_fork())), 0);
+            assert_eq!(
+                forks(|| {
+                    let mut command = git_for(&["status"]);
+                    command.env("PATH", &path);
+                    git_ok(command);
+                }),
+                0
+            );
+        }
+
+        #[test]
+        fn commands_that_can_run_hooks_keep_the_clean_signal_mask() {
+            for args in [&["commit"][..], &["switch"], &["push"], &["worktree"], &[]] {
+                assert_eq!(forks(|| git_ok(git_for(args))), 1, "{args:?}");
+            }
+        }
+
+        #[test]
+        fn killing_the_child_kills_git_itself() {
+            let mut child = git_without_fork()
+                .args(["cat-file", "--batch"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let out = Command::new("/bin/ps")
+                .args(["-o", "command=", "-p", &child.id().to_string()])
+                .output()
+                .unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let running = String::from_utf8_lossy(&out.stdout);
+            assert!(running.starts_with("git cat-file"), "{running}");
+        }
+    }
+
     use super::*;
     #[test]
     fn provider_child_does_not_inherit_executor_signal_mask() {

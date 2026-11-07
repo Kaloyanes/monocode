@@ -1,6 +1,7 @@
 import { View } from "react-native";
 
 import { usePairing } from "@/features/connection/ConnectionProvider";
+import { useFinishedCount } from "@/features/sessions/activityStore";
 import { themedStyles } from "@/ui/theme";
 
 import { useUnreadMonos } from "./monoSeen";
@@ -17,7 +18,14 @@ export function unreadTotal(unreadMonos: number, finishedSessions: number) {
 export function useAnyUnread() {
   const { monos } = useWorkspace();
   const desktop = usePairing()?.desktop.fingerprint;
-  return useUnreadMonos(desktop, monos).size > 0;
+  const unreadMonos = useUnreadMonos(desktop, monos).size;
+  return unreadTotal(unreadMonos, useFinishedCount()) > 0;
+}
+
+/** What the drawer's menu button says it is holding. */
+export function menuLabel(replies: boolean, inbox: boolean) {
+  if (replies) return "Projects, new replies";
+  return inbox ? "Projects, new in Inbox" : "Projects";
 }
 
 /** The unread dot on the drawer's menu button, at its top right. */

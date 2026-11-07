@@ -3973,7 +3973,6 @@ dependencies = [
  "gpui-pre-platform",
  "image",
  "libc",
- "mach2",
  "mermaid-rs-renderer",
  "mimalloc",
  "monocode-core",
@@ -3982,6 +3981,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-av-foundation",
  "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
@@ -3997,7 +3997,6 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "similar",
  "streaming-iterator",
  "syntect",
@@ -4021,7 +4020,6 @@ dependencies = [
  "tree-sitter-zig",
  "tungstenite",
  "unicode-segmentation",
- "ureq",
  "uuid",
 ]
 
@@ -4681,6 +4679,7 @@ dependencies = [
  "bitflags 2.13.1",
  "objc2 0.6.4",
  "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
 ]

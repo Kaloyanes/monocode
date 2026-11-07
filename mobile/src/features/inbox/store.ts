@@ -1,12 +1,19 @@
+import { deepEqual } from "@/features/connection/deepEqual";
+
 import {
   applyMark,
+  facetParams,
   feedKey,
+  hasFacets,
   marksToRestore,
   parseCachedPage,
+  type InboxFacets,
   type Mark,
 } from "./model";
 import {
   PAGE_SIZE,
+  type InboxAction,
+  type InboxActionResult,
   type InboxClient,
   type InboxItem,
   type InboxList,
@@ -22,7 +29,13 @@ export type FeedQuery = {
   projectId?: string;
   source?: InboxSource;
   q?: string;
+  facets?: InboxFacets;
 };
+
+/** A filtered or searched list is passing, not worth one of the cached places. */
+function kept(query: FeedQuery) {
+  return !query.q && !hasFacets(query.facets);
+}
 
 /** One list as the screens see it: items with pending marks laid over them. */
 export type Feed = {
@@ -30,8 +43,6 @@ export type Feed = {
   items: InboxItem[];
   /** Something has been read, from the desktop or the phone's cache. */
   loaded: boolean;
-  /** A read is in flight. */
-  loading: boolean;
   loadingMore: boolean;
   /** What shows came from the phone's cache and the desktop hasn't answered yet. */
   fromCache: boolean;
@@ -44,6 +55,7 @@ export type Feed = {
   fetchedAt: number | null;
   providers: InboxProviderState[];
   counts: InboxList["counts"];
+  options?: InboxList["options"];
 };
 
 type Raw = Omit<Feed, "items" | "key"> & { items: InboxItem[] };
@@ -66,6 +78,11 @@ export type InboxStoreOptions = {
 };
 
 export const POLL_MS = 5000;
+/**
+ * How often with a desktop that says when to read. Only for what its rev can't
+ * see, as a snooze running out.
+ */
+export const FOLLOWED_POLL_MS = 5 * 60_000;
 /** The lists kept on the phone per desktop; the least recently read go. */
 const CACHE_LIMIT = 8;
 /** Pages re-read in one refresh to cover what was scrolled in; the rest is dropped. */
@@ -105,6 +122,8 @@ export function createInboxStore(options: InboxStoreOptions) {
   const generations = new Map<string, number>();
   let linked = true;
   let disposed = false;
+  /** The desktop's Inbox rev, once it publishes one. */
+  let followed: string | null = null;
 
   const cacheKey = (key: string) => `monocode.inbox.${namespace}.${key}`;
   const indexKey = `monocode.inbox.${namespace}.index`;
@@ -118,11 +137,10 @@ export function createInboxStore(options: InboxStoreOptions) {
     queries.set(key, query);
     let value = raws.get(key);
     if (!value) {
-      const cached = query.q ? null : parseCachedPage(storage.get(cacheKey(key)));
+      const cached = kept(query) ? parseCachedPage(storage.get(cacheKey(key))) : null;
       value = {
         items: cached?.items ?? [],
         loaded: !!cached,
-        loading: false,
         loadingMore: false,
         fromCache: !!cached,
         offline: false,
@@ -132,6 +150,7 @@ export function createInboxStore(options: InboxStoreOptions) {
         fetchedAt: cached?.fetchedAt ?? null,
         providers: cached?.providers ?? [],
         counts: cached?.counts ?? EMPTY_COUNTS,
+        options: cached?.options,
       };
       raws.set(key, value);
     }
@@ -173,6 +192,7 @@ export function createInboxStore(options: InboxStoreOptions) {
         fetchedAt: page.fetchedAt,
         providers: page.providers,
         counts: page.counts,
+        options: page.options,
       }),
     );
     let index: string[] = [];
@@ -193,6 +213,7 @@ export function createInboxStore(options: InboxStoreOptions) {
       ...(query.projectId ? { projectId: query.projectId } : {}),
       ...(query.source ? { source: query.source } : {}),
       ...(query.q ? { q: query.q } : {}),
+      ...facetParams(query.facets, Date.now()),
       ...(cursor ? { cursor } : {}),
       limit: PAGE_SIZE,
     };
@@ -205,7 +226,6 @@ export function createInboxStore(options: InboxStoreOptions) {
       update(key, { offline: true });
       return;
     }
-    update(key, { loading: true });
     try {
       const page = await client.list(params(query, undefined, force));
       if (disposed) return;
@@ -220,30 +240,32 @@ export function createInboxStore(options: InboxStoreOptions) {
         items = [...items, ...more.items.filter((item) => !have.has(item.key))];
         cursor = more.nextCursor;
       }
+      const previous = raws.get(key)!;
       const next: Raw = {
-        ...raws.get(key)!,
-        items,
+        ...previous,
+        items: sameItems(previous.items, items),
         loaded: true,
-        loading: false,
         fromCache: false,
         offline: false,
         error: null,
         nextCursor: cursor,
         stale: page.stale,
         fetchedAt: page.fetchedAt,
-        providers: page.providers,
-        counts: page.counts,
+        providers: same(previous.providers, page.providers),
+        counts: same(previous.counts, page.counts),
+        options: same(previous.options, page.options),
       };
+      const shown = views.get(key);
       raws.set(key, next);
       generations.set(key, (generations.get(key) ?? 0) + 1);
-      if (!query.q) remember(key, { ...next, items: page.items, nextCursor: page.nextCursor });
-      for (const item of items) known.set(item.key, item);
-      view(key);
+      for (const item of next.items) known.set(item.key, item);
+      // Most reads find what was there: the screens and the disk hear of none of those.
+      if (view(key) === shown) return;
+      if (kept(query)) remember(key, { ...next, items: page.items, nextCursor: page.nextCursor });
       emit();
     } catch (reason) {
       if (disposed) return;
       update(key, {
-        loading: false,
         offline: true,
         error: reason instanceof Error ? reason.message : String(reason),
       });
@@ -299,7 +321,22 @@ export function createInboxStore(options: InboxStoreOptions) {
       const query = queries.get(key);
       if (query && isActive()) await refresh(query);
       schedule(key);
-    }, pollMs);
+    }, followed ? FOLLOWED_POLL_MS : pollMs);
+  }
+
+  /**
+   * The rev the desktop publishes with its catalog: lists in view are read
+   * when it moves, in place of polling. A desktop without one is polled.
+   */
+  function follow(rev: string | null | undefined) {
+    const next = rev ?? null;
+    if (next === followed) return;
+    followed = next;
+    for (const key of watching.keys()) {
+      schedule(key);
+      const query = queries.get(key);
+      if (next && query && isActive()) void refresh(query);
+    }
   }
 
   /** Reads a list now and keeps it fresh until the returned function is called. */
@@ -400,7 +437,29 @@ export function createInboxStore(options: InboxStoreOptions) {
     };
   }
 
+  /** Runs at the provider, so nothing shows until the desktop says it happened. */
+  async function act(key: string, action: InboxAction): Promise<InboxActionResult> {
+    const result = await client.act(key, action);
+    settle(result.item, key);
+    return result;
+  }
+
+  /** Marks read what the list holds; a refused request changes nothing here. */
+  async function readAll(query: FeedQuery): Promise<void> {
+    await client.readAll(params(query));
+    const key = feedKey(query);
+    const value = raws.get(key);
+    if (value) {
+      update(key, {
+        items: value.items.map((item) => ({ ...item, unread: false })),
+        counts: { ...value.counts, unread: 0 },
+      });
+    }
+    await refresh(query);
+  }
+
   return {
+    follow,
     getFeed(query: FeedQuery): Feed {
       raw(query);
       return view(feedKey(query));
@@ -415,6 +474,8 @@ export function createInboxStore(options: InboxStoreOptions) {
     refresh,
     loadMore,
     mark,
+    act,
+    readAll,
     find,
     /** Whether the desktop is linked; polls stop reading while it isn't. */
     setLinked(next: boolean) {
@@ -443,10 +504,27 @@ export function createInboxStore(options: InboxStoreOptions) {
 
 export type InboxStore = ReturnType<typeof createInboxStore>;
 
+/** `next`, or `previous` when they say the same, so nothing downstream sees a change. */
+function same<T>(previous: T, next: T): T {
+  return deepEqual(previous, next) ? previous : next;
+}
+
+/**
+ * The items of a read, each still the object it was unless it changed. Every
+ * reply arrives as new objects, and a row is only spared a redraw by being
+ * handed the same one.
+ */
+function sameItems(previous: InboxItem[], next: InboxItem[]) {
+  const known = new Map(previous.map((item) => [item.key, item]));
+  return next.map((item) => {
+    const before = known.get(item.key);
+    return before && deepEqual(before, item) ? before : item;
+  });
+}
+
 function sameMeta(feed: Feed, value: Raw) {
   return (
     feed.loaded === value.loaded &&
-    feed.loading === value.loading &&
     feed.loadingMore === value.loadingMore &&
     feed.fromCache === value.fromCache &&
     feed.offline === value.offline &&
@@ -455,6 +533,7 @@ function sameMeta(feed: Feed, value: Raw) {
     feed.stale === value.stale &&
     feed.fetchedAt === value.fetchedAt &&
     feed.providers === value.providers &&
-    feed.counts === value.counts
+    feed.counts === value.counts &&
+    feed.options === value.options
   );
 }

@@ -585,11 +585,12 @@ fn rich_inline(
                     .when(file, |d| {
                         let path = style.link.clone().unwrap_or_else(|| text.clone());
                         let menu_path = path.clone();
+                        let intercept = link_intercept();
                         d.cursor(gpui::CursorStyle::PointingHand)
                             .hover(|s| s.bg(content(0.13)))
                             .on_click(move |event, window, cx| {
                                 if activate_link(event, clicked_selection.as_ref()) {
-                                    open_link(&path, false, None, window, cx)
+                                    open_link(&path, true, intercept.as_ref(), window, cx)
                                 }
                             })
                             .on_mouse_down(MouseButton::Right, move |event, window, cx| {

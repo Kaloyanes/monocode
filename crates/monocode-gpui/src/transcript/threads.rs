@@ -367,6 +367,9 @@ pub(super) fn render(
     let hover_group = SharedString::from(format!("thread-row-{start}"));
     let state = view.thread_states.get(&id);
     let open = view.thread_expanded.contains(&id);
+    let exchange_label = format!("{} {title}'s exchange", if open { "Hide" } else { "Show" });
+    // A start that failed has no conversation to open, only its error.
+    let started = run.id;
     let mut exchange = Vec::new();
     if open {
         let mut last_reply = String::new();
@@ -389,9 +392,15 @@ pub(super) fn render(
                 }
                 Some("wait") => {
                     let result = tool.thread_result();
-                    if result["threadId"].as_i64() == run.id
-                        && result["status"] == "idle"
-                        && let Some(reply) = result["reply"]
+                    // One thread's status, or several under `threads`.
+                    let found = result["threads"]
+                        .as_array()
+                        .map_or(std::slice::from_ref(&result), Vec::as_slice)
+                        .iter()
+                        .find(|thread| thread["threadId"].as_i64() == run.id);
+                    if let Some(thread) = found
+                        && thread["status"] == "idle"
+                        && let Some(reply) = thread["reply"]
                             .as_str()
                             .filter(|s| !s.is_empty() && *s != last_reply)
                     {
@@ -457,13 +466,14 @@ pub(super) fn render(
                         .py_1()
                         .child(
                             div()
-                                .id(("thread-toggle", start))
+                                .id(("thread-row", start))
+                                .debug_selector(move || format!("thread-row-{start}"))
                                 .role(gpui::Role::Button)
-                                .aria_label(format!(
-                                    "{} {title}'s exchange",
-                                    if open { "Hide" } else { "Show" }
-                                ))
-                                .aria_expanded(open)
+                                .aria_label(if started.is_some() {
+                                    format!("Open {title}")
+                                } else {
+                                    exchange_label.clone()
+                                })
                                 .flex_1()
                                 .min_w_0()
                                 .flex()
@@ -501,19 +511,9 @@ pub(super) fn render(
                                         .text_color(tone.color())
                                         .child(label),
                                 )
-                                .child(
-                                    icon(
-                                        if open {
-                                            "chevron-down"
-                                        } else {
-                                            "chevron-right"
-                                        },
-                                        12.,
-                                    )
-                                    .text_color(content(0.4)),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_thread(id, start, cx);
+                                .on_click(cx.listener(move |this, _, _, cx| match started {
+                                    Some(id) => cx.emit(crate::conversation::OpenThread(id)),
+                                    None => this.toggle_thread(id, start, cx),
                                 })),
                         )
                         .when(tone.finished() && run.id.is_some(), |d| {
@@ -534,22 +534,32 @@ pub(super) fn render(
                                     })),
                             )
                         })
-                        .when(run.id.is_some(), |d| {
-                            d.child(
-                                div()
-                                    .id(("thread-open", start))
-                                    .role(gpui::Role::Button)
-                                    .aria_label("Open child thread")
-                                    .p_1()
-                                    .rounded(px(4.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(content(0.08)))
-                                    .child(icon("arrow-up-right", 14.).text_color(content(0.5)))
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        cx.emit(crate::conversation::OpenThread(id))
-                                    })),
-                            )
-                        }),
+                        .child(
+                            div()
+                                .id(("thread-toggle", start))
+                                .debug_selector(move || format!("thread-toggle-{start}"))
+                                .role(gpui::Role::Button)
+                                .aria_label(exchange_label)
+                                .aria_expanded(open)
+                                .p_1()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(content(0.08)))
+                                .child(
+                                    icon(
+                                        if open {
+                                            "chevron-down"
+                                        } else {
+                                            "chevron-right"
+                                        },
+                                        12.,
+                                    )
+                                    .text_color(content(0.4)),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_thread(id, start, cx);
+                                })),
+                        ),
                 )
                 .when(open, |d| {
                     d.child(

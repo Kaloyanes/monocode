@@ -36,17 +36,10 @@ const PICKER_RESIZE: f32 = 0.24;
 const PICKER_FADE_DELAY: f32 = 0.04;
 const PICKER_FADE: f32 = 0.18;
 /// Commands the floating composer offers after a leading `/`.
-const COMMANDS: [(Command, &str); 3] = [
-    (
-        Command::Plan,
-        "Create a reviewable implementation plan before changing files.",
-    ),
-    (
-        Command::Operator,
-        "Give this thread access to MonoCode sessions, folders, and notes.",
-    ),
-    (Command::Orchestrator, "Plan and coordinate agent work."),
-];
+const COMMANDS: [(Command, &str); 1] = [(
+    Command::Plan,
+    "Create a reviewable implementation plan before changing files.",
+)];
 /// RUNTIME_MODES, with their icons and hints.
 const PERMISSIONS: [(AccessMode, &str, &str); 4] = [
     (
@@ -319,9 +312,9 @@ impl QuickComposer {
     fn apply_choice(&mut self, choice: Launch, cx: &mut Context<Self>) {
         self.kind = choice.kind;
         self.model = choice.model;
-        self.effort = choice
-            .effort
-            .or_else(|| crate::conversation::preferred_effort(self.kind.id(), cx));
+        self.effort = choice.effort.or_else(|| {
+            crate::conversation::preferred_effort(self.kind.id(), self.model.as_deref(), cx)
+        });
         self.fast = choice.fast;
         if self.cwd != choice.cwd {
             self.cwd = choice.cwd;
@@ -362,8 +355,8 @@ impl QuickComposer {
         self.update_placeholder(cx);
     }
     fn set_model(&mut self, kind: Kind, model: Option<String>, cx: &mut Context<Self>) {
-        if kind != self.kind {
-            self.effort = crate::conversation::preferred_effort(kind.id(), cx);
+        if kind != self.kind || model != self.model {
+            self.effort = crate::conversation::preferred_effort(kind.id(), model.as_deref(), cx);
             self.fast = false;
         }
         self.kind = kind;
@@ -412,11 +405,11 @@ impl QuickComposer {
     fn leading(&self, cx: &App) -> Option<Command> {
         Command::leading(&self.input.read(cx).content)
     }
-    /// The prompt without a leading mode command; Operator is part of it.
+    /// The prompt without a leading mode command.
     fn message(&self, cx: &App) -> String {
         let prompt = self.prompt(cx);
         match self.leading(cx) {
-            Some(Command::Operator) | None => prompt,
+            None => prompt,
             Some(command) => prompt[command.name().len() + 1..].trim().to_owned(),
         }
     }
@@ -598,8 +591,8 @@ impl QuickComposer {
         }
         cx.notify();
     }
-    /// A leading `/word` opens the command list; Operator only activates at
-    /// the start of a prompt, so every mode does.
+    /// A leading `/word` opens the command list; modes only activate at the
+    /// start of a prompt.
     fn sync_commands(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).content.clone();
         let token = text
@@ -1677,8 +1670,16 @@ impl QuickComposer {
             let width = (bounds.size.width - inset * 2.).max(px(1.));
             let ratio = ((x - bounds.origin.x - inset) / width).clamp(0., 1.);
             let ix = (ratio * (efforts.len() - 1) as f32).round() as usize;
-            if let Some(effort) = efforts.get(ix) {
+            if let Some(effort) = efforts.get(ix)
+                && this.effort.as_ref() != Some(effort)
+            {
                 this.effort = Some(effort.clone());
+                crate::conversation::remember_effort(
+                    this.kind.id(),
+                    this.model.as_deref(),
+                    effort,
+                    cx,
+                );
                 cx.notify();
             }
         };
@@ -1762,8 +1763,11 @@ impl QuickComposer {
                                         }),
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.effort =
-                                        crate::conversation::preferred_effort(this.kind.id(), cx);
+                                    this.effort = crate::conversation::preferred_effort(
+                                        this.kind.id(),
+                                        this.model.as_deref(),
+                                        cx,
+                                    );
                                     this.fast = false;
                                     cx.notify();
                                 })),

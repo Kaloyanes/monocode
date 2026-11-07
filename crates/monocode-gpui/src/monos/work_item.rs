@@ -43,7 +43,14 @@ impl Monos {
                                 shell.mono_start_work_item_session(item, prompt, cx)
                             });
                         }
-                        inbox::Event::ItemsChanged(_) => return,
+                        inbox::Event::ArchiveThreads(ids) => {
+                            let _ = this
+                                .owner
+                                .update(cx, |shell, cx| shell.archive_linked_threads(ids, cx));
+                        }
+                        inbox::Event::ItemsChanged(_)
+                        | inbox::Event::FindAsk(_)
+                        | inbox::Event::AskPr { .. } => return,
                     }
                     cx.notify();
                 });

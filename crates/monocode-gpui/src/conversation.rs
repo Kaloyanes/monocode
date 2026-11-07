@@ -15,15 +15,17 @@ pub(crate) use follow_up::BUILD_PROPOSED_PLAN;
 pub(crate) mod git_actions;
 mod history;
 pub(crate) mod mobile;
+mod model_switcher;
 mod mono;
 mod network_drop;
 mod notifications;
 mod open_pr;
+mod pr_ask;
 mod remote;
 pub(crate) mod remote_plans;
+mod response_menu;
 mod restart;
 mod shell;
-mod response_menu;
 pub(crate) mod subagents;
 #[cfg(test)]
 mod submission_tests;
@@ -48,6 +50,11 @@ use crate::{
     transcript::TranscriptView,
 };
 pub(crate) use accounts::UsageResumed;
+/// How long the ring takes to grow into the full capsule.
+const METER_MORPH: std::time::Duration = std::time::Duration::from_millis(320);
+/// The widest the cost and cache values get; the unroll opens up to it.
+const METER_VALUES_MAX: f32 = 140.;
+
 use gpui::{
     AnyElement, Context, CursorStyle, Entity, EventEmitter, Focusable, MouseButton, Role,
     SharedString, StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
@@ -105,8 +112,6 @@ const ACCESS_MODES: &[(&str, &str, &str, &str)] = &[
 ];
 // Tailwind v4 accents the composer menus tint their icons with.
 const YELLOW_300: u32 = 0xffdf20;
-const SKY_300: u32 = 0x74d4ff;
-const FUCHSIA_300: u32 = 0xf4a8ff;
 const AMBER_400: u32 = 0xffb900;
 fn tint(color: u32, alpha: f32) -> gpui::Hsla {
     let mut c: gpui::Hsla = gpui::rgb(color).into();
@@ -183,16 +188,6 @@ pub(crate) struct Conversation {
     pub(crate) app_read_only: bool,
     /// The newest turn ran in Plan mode, so its answer is a plan to review.
     pub(crate) plan_turn: bool,
-    /// The running turn prepares an orchestration plan.
-    planning_orchestration: bool,
-    /// The plan under review, with the tool call that submitted it (none for
-    /// the tagged fallback).
-    pub(crate) orchestration_plan: Option<(Option<String>, monocode_core::orchestration::Plan)>,
-    orchestration_error: Option<String>,
-    /// The shell's cards for this lead's plans and runs.
-    orchestration_views: Vec<(Option<String>, crate::transcript::orchestration::RunView)>,
-    /// One of this lead's runs is not finished.
-    pub(crate) orchestration_active: bool,
     status: String,
     /// `/pr` is checking the branch or opening the pull request.
     pr_busy: bool,
@@ -207,7 +202,7 @@ pub(crate) struct Conversation {
     notification_cancelled: bool,
     /// The store's saved-draft flag, until the conversation loads its own.
     pub(crate) draft_hint: bool,
-    /// Automation runs, Orchestrator workers and subagents: they are run by
+    /// Automation runs and subagents: they are run by
     /// something else, so they cannot start threads of their own.
     pub(crate) managed: bool,
     /// The lead that drives this subagent. The user can watch it, answer
@@ -250,8 +245,10 @@ pub(crate) struct Conversation {
     preparing_worktree: bool,
     context: Option<monocode_core::context::Usage>,
     context_hovered: bool,
-    context_hover_generation: u64,
-    stats_hovered: bool,
+    meter_open: bool,
+    /// Whether the last paint showed only the ring, and how many times the
+    /// capsule has grown out of that: each growth is one morph animation.
+    meter_morph: std::cell::Cell<(Option<bool>, u32)>,
     stats_anchor: AnchorSlot,
     /// A one-second repaint loop runs while the cache countdown is on screen.
     stats_ticker: std::cell::Cell<bool>,
@@ -259,9 +256,16 @@ pub(crate) struct Conversation {
     /// The auto-compact button was switched off: messages keep the full
     /// history even after the cache lapses.
     keep_full_history: bool,
+    /// The submit button's morph between square and labelled pill.
+    send_morph: std::cell::RefCell<crate::send_morph::Morph>,
+    /// ⌘ (Ctrl elsewhere) as last seen, which flips Queue and Steer.
+    send_alternate: bool,
     menu: Option<OpenMenu>,
     add_anchor: AnchorSlot,
     model_anchor: AnchorSlot,
+    /// The model switcher's search field and its row in the open menu.
+    switcher_input: Option<Entity<input::Input>>,
+    switcher_search_item: Option<MenuItem>,
     access_anchor: AnchorSlot,
     account_anchor: AnchorSlot,
     workspace_anchor: AnchorSlot,
@@ -395,6 +399,15 @@ impl Conversation {
     pub(crate) fn responding(&self) -> bool {
         self.busy && !self.stopping
     }
+    /// What the thread's status shows: an agent turn or a `!` command. Turn
+    /// bookkeeping such as notices and follow-ups reads `responding`.
+    pub(crate) fn working(&self) -> bool {
+        self.responding() || self.shell_running()
+    }
+    /// Work is still going, including a turn that is stopping.
+    pub(crate) fn running(&self) -> bool {
+        self.busy || self.shell_running()
+    }
     pub(crate) fn sidebar_details(&self) -> Option<(SharedString, Option<String>)> {
         self.loaded
             .then(|| (self.model_label(), self.branch.clone()))
@@ -473,7 +486,7 @@ impl Conversation {
                             .text_size(px(11.))
                             .text_color(if self.needs_approval() {
                                 gpui::rgb(0xfbbf24).into()
-                            } else if self.responding() {
+                            } else if self.working() {
                                 accent_color()
                             } else if done {
                                 gpui::rgb(0x34d399).into()
@@ -482,7 +495,7 @@ impl Conversation {
                             })
                             .child(if self.needs_approval() {
                                 "Needs approval".to_owned()
-                            } else if self.busy {
+                            } else if self.running() {
                                 "Working…".to_owned()
                             } else if done {
                                 "Done".to_owned()
@@ -621,7 +634,6 @@ impl Conversation {
             view.identity(&summary.provider, Kind::from_id(&summary.provider).label());
             view.file_link_base = Some(summary.cwd.clone());
             view.draft_session = Some(summary.id);
-            view.set_review(review.clone().into());
             view
         });
         let account = crate::accounts::get(cx)
@@ -682,11 +694,6 @@ impl Conversation {
             app_environment: Default::default(),
             app_read_only: false,
             plan_turn: false,
-            planning_orchestration: false,
-            orchestration_plan: None,
-            orchestration_error: None,
-            orchestration_views: Vec::new(),
-            orchestration_active: false,
             status: "Loading conversation…".into(),
             pr_busy: false,
             loaded: false,
@@ -712,7 +719,7 @@ impl Conversation {
             settings: Settings {
                 account,
                 access: default_access(cx),
-                effort: preferred_effort(&summary.provider, cx),
+                effort: preferred_effort(&summary.provider, None, cx),
                 ..Default::default()
             },
             project_appearance: Default::default(),
@@ -736,15 +743,19 @@ impl Conversation {
             preparing_worktree: false,
             context: None,
             context_hovered: false,
-            context_hover_generation: 0,
-            stats_hovered: false,
+            meter_open: false,
             stats_anchor: AnchorSlot::default(),
             stats_ticker: Default::default(),
             stats_wanted: Default::default(),
+            meter_morph: Default::default(),
             keep_full_history: false,
+            send_morph: Default::default(),
+            send_alternate: false,
             menu: None,
             add_anchor: AnchorSlot::default(),
             model_anchor: AnchorSlot::default(),
+            switcher_input: None,
+            switcher_search_item: None,
             access_anchor: AnchorSlot::default(),
             account_anchor: AnchorSlot::default(),
             workspace_anchor: AnchorSlot::default(),
@@ -1042,15 +1053,7 @@ impl Conversation {
         }
         self.completion
             .update(cx, |completion, cx| completion.dismiss(cx));
-        let mode = if self.settings.orchestrator {
-            Some("orchestrator")
-        } else if self.settings.plan {
-            Some("plan")
-        } else if self.settings.operator {
-            Some("operator")
-        } else {
-            None
-        };
+        let mode = self.settings.plan.then_some("plan");
         if self.settings.pending_provider_switch.is_some() && self.busy {
             // Picking a provider only arms the change. Sending is what stops
             // the outgoing provider and commits the handoff.
@@ -1107,55 +1110,20 @@ impl Conversation {
         {
             return None;
         }
-        let mode = self.settings.orchestrator || self.settings.plan || self.settings.operator;
         Some(
-            if self.busy && !mode && self.steers_follow_up(alternate, cx) {
+            if self.busy && !self.settings.plan && self.steers_follow_up(alternate, cx) {
                 ("Steer", "queue-steer")
             } else {
                 ("Queue", "queue-list")
             },
         )
     }
-    /// The tooltip holds a button, so closing waits briefly for the pointer to
-    /// cross from the ring to the tooltip.
-    fn set_context_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
-        self.context_hover_generation = self.context_hover_generation.wrapping_add(1);
-        if hovered {
-            if !self.context_hovered {
-                self.context_hovered = true;
-                cx.notify();
-            }
-            return;
-        }
-        let generation = self.context_hover_generation;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(160))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.context_hover_generation == generation && this.context_hovered {
-                    this.context_hovered = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
     fn start_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
         if monocode_core::process::shutting_down() {
             return;
         }
         if self.stopping {
-            let mode = if self.settings.orchestrator {
-                Some("orchestrator")
-            } else if self.settings.plan {
-                Some("plan")
-            } else if self.settings.operator {
-                Some("operator")
-            } else {
-                None
-            };
+            let mode = self.settings.plan.then_some("plan");
             self.enqueue_follow_up(prompt, mode.map(str::to_owned), cx);
             if let Some(id) = self
                 .follow_ups
@@ -1207,13 +1175,6 @@ impl Conversation {
         self.sync_tool_paths(cx);
         self.transcript
             .update(cx, |v, _| v.identity(&self.summary.provider, &model_label));
-        // Set here, where the turn really starts, so a deferred or failed
-        // launch cannot leave a later turn parsed as a plan.
-        self.planning_orchestration = self.settings.orchestrator;
-        if self.planning_orchestration {
-            self.orchestration_plan = None;
-            self.orchestration_error = None;
-        }
         self.begin_turn(cx);
         let generation = self.submission_generation;
         let source_provider = self.summary.provider.clone();
@@ -1228,13 +1189,10 @@ impl Conversation {
         let summary = self.summary.clone();
         let store = self.store.clone();
         let cancel = self.cancel.clone();
-        // Composer modes reset after Send; the thread grant and running turn's
-        // access policy must outlive that reset and edits to the next draft.
-        self.settings.operator_enabled |= self.settings.operator;
-        self.app_read_only = self.settings.plan
-            || self.settings.orchestrator
-            || self.settings.access == AccessMode::ReadOnly;
-        self.plan_turn = self.settings.plan && !self.settings.orchestrator;
+        // Composer modes reset after Send; the running turn's access policy
+        // must outlive that reset and edits to the next draft.
+        self.app_read_only = self.settings.plan || self.settings.access == AccessMode::ReadOnly;
+        self.plan_turn = self.settings.plan;
         let mut settings = self.settings.clone();
         settings.resume_after_restart = !self.managed;
         // One-shot: only the launch that continues an interrupted turn.
@@ -1305,11 +1263,6 @@ impl Conversation {
         {
             self.transcript
                 .update(cx, |view, cx| view.submit_prompt(&prompt, &settings, cx));
-        }
-        if settings.orchestrator {
-            settings.plan = true;
-            settings.operator = false;
-            self.settings.orchestrator = false;
         }
         if self.settings.handoff.take().is_some() {
             self.save_settings(cx);
@@ -1689,11 +1642,6 @@ impl Conversation {
                                         info.model_id = model_id;
                                     }
                                 });
-                                if stopping {
-                                    this.planning_orchestration = false;
-                                } else {
-                                    this.finish_orchestration_plan(cx);
-                                }
                                 this.settings.turns = this.transcript.read(cx).window_turns();
                                 this.save_settings(cx);
                                 this.refresh_git(cx);
@@ -1750,7 +1698,6 @@ impl EventEmitter<ChooseFolder> for Conversation {}
 impl EventEmitter<OpenSessionChanges> for Conversation {}
 impl EventEmitter<OpenThread> for Conversation {}
 impl EventEmitter<Transfer> for Conversation {}
-impl EventEmitter<crate::transcript::orchestration::OrchestrationAction> for Conversation {}
 
 impl Conversation {
     pub(crate) fn install_transfer(
@@ -1764,8 +1711,8 @@ impl Conversation {
         }
         self.install_lead_transfer(settings, prompt, cx);
     }
-    /// install_transfer for a lead or the Orchestrator starting work on its
-    /// own subagent, which the user can't send messages to.
+    /// install_transfer for a lead starting work on its own subagent, which
+    /// the user can't send messages to.
     pub(crate) fn install_lead_transfer(
         &mut self,
         settings: Settings,
@@ -2144,6 +2091,7 @@ impl Conversation {
                     if Kind::from_id(&this.summary.provider) == kind && this.catalog_epoch == epoch
                     {
                         this.catalog = models;
+                        this.drop_unsupported_effort(cx);
                         if this.is_remote() && this.model.is_none() {
                             this.model = this
                                 .catalog
@@ -2161,6 +2109,23 @@ impl Conversation {
             }
         })
         .detach();
+    }
+    /// An effort carried over from another model that this one doesn't offer
+    /// would show a level the model can't run at; fall back to its default.
+    fn drop_unsupported_effort(&mut self, cx: &mut Context<Self>) {
+        if !self.loaded || self.busy {
+            return;
+        }
+        let unsupported = match (self.settings.effort.as_deref(), self.model_info()) {
+            (Some(effort), Some(model)) => {
+                !model.efforts.is_empty() && !model.efforts.iter().any(|e| e == effort)
+            }
+            _ => false,
+        };
+        if unsupported {
+            self.settings.effort = None;
+            self.save_settings(cx);
+        }
     }
     fn model_info(&self) -> Option<&Model> {
         match self.model.as_deref().or(self.resolved_model.as_deref()) {
@@ -2300,7 +2265,7 @@ impl Conversation {
                 "thinking" => {
                     self.settings.thinking = Some(!self.settings.thinking.unwrap_or(false))
                 }
-                "plan" | "operator" | "orchestrator" => {
+                "plan" => {
                     self.toggle_mode(id, cx);
                     return;
                 }
@@ -2310,21 +2275,15 @@ impl Conversation {
         self.save_settings(cx);
         cx.notify();
     }
-    fn set_effort_choice(&mut self, effort: &str, cx: &mut Context<Self>) {
+    fn apply_effort(&mut self, effort: &str) {
         self.settings
             .model_settings
             .retain(|key, _| !is_effort_key(key));
         self.settings.effort = (!effort.is_empty()).then(|| effort.to_owned());
-        let provider = self.summary.provider.clone();
-        if cx.has_global::<crate::settings::Preferences>() {
-            cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
-                if effort.is_empty() {
-                    prefs.provider_efforts.remove(&provider);
-                } else {
-                    prefs.provider_efforts.insert(provider, effort.to_owned());
-                }
-            });
-        }
+    }
+    fn set_effort_choice(&mut self, effort: &str, cx: &mut Context<Self>) {
+        self.apply_effort(effort);
+        remember_effort(&self.summary.provider, self.model.as_deref(), effort, cx);
     }
     fn selected_effort(&self) -> Option<&str> {
         self.settings
@@ -2555,7 +2514,7 @@ impl Conversation {
             })
             .detach();
         self.resolved_model = None;
-        self.settings.effort = preferred_effort(&self.summary.provider, cx);
+        self.settings.effort = preferred_effort(&self.summary.provider, self.model.as_deref(), cx);
         self.settings.fast = false;
         self.settings.thinking = None;
         self.settings.service_tier = None;
@@ -2613,6 +2572,9 @@ impl Conversation {
         self.git_picker = None;
         self.git_events = None;
         let mut events = Vec::new();
+        if kind == ComposerMenu::Recent {
+            self.switcher_search(&mut events, window, cx);
+        }
         let (label, items, width, style) = self.menu_items(kind, &mut events, window, cx);
         // The recent models open on the current one.
         let current = (kind == ComposerMenu::Recent)
@@ -2627,6 +2589,11 @@ impl Conversation {
             let menu = Menu::new(label, items, window, cx)
                 .width(width)
                 .style(style);
+            let menu = if kind == ComposerMenu::Recent {
+                menu.search_navigation().keep_search_focus()
+            } else {
+                menu
+            };
             match current {
                 Some(id) => menu.select_value(&id),
                 None => menu,
@@ -2756,24 +2723,11 @@ impl Conversation {
                             .icon("ai-idea")
                             .icon_color(tint(YELLOW_300, 0.8))
                             .description("Review a plan before building"),
-                        MenuAction::new("operator", "Operator")
-                            .disabled(self.is_remote())
-                            .icon("cursor-magic")
-                            .icon_color(tint(SKY_300, 0.8))
-                            .description("Give this thread access to MonoCode"),
-                        MenuAction::new("orchestrator", "Orchestrator")
-                            .disabled(self.is_remote())
-                            .icon("share")
-                            .icon_color(tint(FUCHSIA_300, 0.65))
-                            .badge("v1")
-                            .description("Plan and coordinate agent work"),
                     ]
                     .into_iter()
                     .map(|action| {
                         let checked = match action.id.as_ref() {
                             "plan" => self.settings.plan,
-                            "operator" => self.settings.operator,
-                            "orchestrator" => self.settings.orchestrator,
                             _ => false,
                         };
                         action.checked(checked).into()
@@ -2843,7 +2797,7 @@ impl Conversation {
                 ("Model and settings", items, 250., MenuStyle::Settings)
             }
             ComposerMenu::Recent => (
-                "Recently used models",
+                "Switch model",
                 self.recent_model_items(cx),
                 250.,
                 MenuStyle::Recent,
@@ -2903,53 +2857,6 @@ impl Conversation {
             self.toggle_recent_models(window, cx);
         }
     }
-    /// recentMenuModels: up to six remembered choices, with the current model
-    /// added when it is not among them.
-    fn recent_model_items(&self, cx: &gpui::App) -> Vec<MenuItem> {
-        let provider = Kind::from_id(&self.summary.provider);
-        let current = (provider, self.model.clone());
-        let hidden = cx
-            .try_global::<crate::settings::Preferences>()
-            .map(|p| p.hidden_for(&self.summary.cwd))
-            .unwrap_or_default();
-        let mut choices: Vec<(Kind, Option<String>)> = cx
-            .try_global::<crate::settings::Preferences>()
-            .into_iter()
-            .flat_map(|p| &p.recent_models)
-            .filter_map(|choice| {
-                let kind = Kind::parse(&choice.provider)?;
-                choice.model.as_ref()?;
-                (kind == provider || !hidden.iter().any(|id| id == kind.id()))
-                    .then(|| (kind, choice.model.clone()))
-            })
-            .collect();
-        choices.dedup();
-        if !choices.contains(&current) {
-            choices.push(current.clone());
-        }
-        choices.truncate(6);
-        choices
-            .into_iter()
-            .map(|(kind, model)| {
-                let selected = (kind, model.clone()) == current;
-                let name = if selected {
-                    self.model_label()
-                } else {
-                    let name = cached_model_name(kind, model.as_deref());
-                    match name.strip_prefix("Claude ") {
-                        Some(short) if kind == Kind::Claude => short.to_owned().into(),
-                        _ => name,
-                    }
-                };
-                let id = serde_json::to_string(&(kind.id(), &model)).unwrap_or_default();
-                MenuAction::new(format!("recent-model:{id}"), name)
-                    .image(kind.id())
-                    .description(kind.label())
-                    .checked(selected)
-                    .into()
-            })
-            .collect()
-    }
     /// `Session: Stop` on Escape: cancels a running turn.
     pub(crate) fn stop_if_busy(&mut self, cx: &mut Context<Self>) {
         if self.cancel_edit_last_turn(cx) {
@@ -2957,6 +2864,8 @@ impl Conversation {
         }
         if self.busy {
             self.stop(cx);
+        } else if self.shell_running() {
+            self.cancel_shell();
         } else if self.driven_by.is_none() || self.thread_pending() {
             self.notification_cancelled = true;
             cx.emit(SessionChanged);
@@ -3022,15 +2931,7 @@ impl Conversation {
             return self.thread_composer(cx);
         }
         let radius = COMPOSER_RADIUS;
-        let command = if self.settings.orchestrator {
-            Some(input::Command::Orchestrator)
-        } else if self.settings.plan {
-            Some(input::Command::Plan)
-        } else if self.settings.operator {
-            Some(input::Command::Operator)
-        } else {
-            None
-        };
+        let command = self.settings.plan.then_some(input::Command::Plan);
         let shell_available = self.shell_available();
         self.input.update(cx, |input, cx| {
             input.selected_command(command, cx);
@@ -3092,10 +2993,10 @@ impl Conversation {
             .child(self.composer_anchor.probe())
             .children(menu)
             .children(self.model_list_popover(cx))
-            .children(self.orchestration_card(cx))
             .children(if self.is_remote() { None } else { self.usage_notice(false, cx) })
             .children(self.goal_shelf(cx))
             .children(self.subagent_strip(cx))
+            .child(self.changes_shelf(window, cx))
             .child(self.background_shelf(window, cx))
             .children(self.shell_queue(cx))
             .child(self.message_queue(window, cx))
@@ -3327,35 +3228,57 @@ impl Conversation {
             .child(self.workspace_bar(cx))
             .into_any_element()
     }
-    /// `$0.84 · cache 4:12`: session spend and time left on the prompt
-    /// cache, each hidden when the provider cannot tell.
-    fn session_stats_chip(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// The footer's session meter: context ring, spend and prompt-cache state
+    /// in one capsule, with the details and the auto-compact switch in a
+    /// popover. Each part is hidden when the provider cannot tell.
+    fn session_meter(
+        &self,
+        show_context: bool,
+        can_compact: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         use monocode_core::context::{self as stats_mod, CacheState};
         let stats = stats_mod::SessionStats::from_turns(self.settings.turns.values());
-        stats.started_at?;
+        let has_stats = stats.started_at.is_some();
         let now = monocode_core::time::now_ms();
         let ttl = self.context.and_then(|usage| usage.cache_ttl_ms);
-        let cache = stats_mod::cache_state(&stats, ttl, now, self.busy);
+        let cache = has_stats
+            .then(|| stats_mod::cache_state(&stats, ttl, now, self.busy))
+            .flatten();
         let amber: gpui::Hsla = gpui::rgb(0xfbbf24).into();
+        let green: gpui::Hsla = gpui::rgb(0x34d399).into();
         let approx = if stats.cost_partial { "≥" } else { "" };
-        let cost = stats
-            .cost_usd
-            .map(|usd| format!("{approx}{}", stats_mod::format_cost(usd)));
-        let (cache_label, cache_color) = match cache {
-            Some(CacheState::Live) => (Some("cache live".to_string()), content(0.45)),
-            Some(CacheState::Cold) => (Some("cache cold".to_string()), content(0.3)),
-            Some(CacheState::Warm {
-                remaining_ms,
-                warning,
-            }) => (
-                Some(format!(
-                    "cache {}",
-                    stats_mod::format_countdown(remaining_ms)
-                )),
-                if warning { amber } else { content(0.45) },
-            ),
-            None => (None, content(0.45)),
-        };
+        let cost = has_stats
+            .then(|| {
+                stats
+                    .cost_usd
+                    .map(|usd| format!("{approx}{}", stats_mod::format_cost(usd)))
+            })
+            .flatten();
+        // The capsule shows the state as a dot and a short value; the words
+        // live in the popover and the accessible label.
+        let (cache_label, cache_dot): (Option<String>, Option<(String, gpui::Hsla, bool)>) =
+            match cache {
+                Some(CacheState::Live) => (
+                    Some("cache live".into()),
+                    Some(("live".into(), green, false)),
+                ),
+                Some(CacheState::Cold) => (
+                    Some("cache cold".into()),
+                    Some(("cold".into(), content(0.35), true)),
+                ),
+                Some(CacheState::Warm {
+                    remaining_ms,
+                    warning,
+                }) => {
+                    let short = stats_mod::format_countdown(remaining_ms);
+                    (
+                        Some(format!("cache {short}")),
+                        Some((short, if warning { amber } else { content(0.35) }, false)),
+                    )
+                }
+                None => (None, None),
+            };
         if matches!(cache, Some(CacheState::Warm { .. })) {
             self.stats_wanted.set(true);
             if !self.stats_ticker.replace(true) {
@@ -3383,148 +3306,433 @@ impl Conversation {
                 .detach();
             }
         }
-        let mut parts: Vec<(String, gpui::Hsla)> = Vec::new();
-        parts.extend(cost.clone().map(|c| (c, content(0.45))));
-        parts.extend(cache_label.clone().map(|c| (c, cache_color)));
-        let percent = |hit: Option<f64>| hit.map_or("n/a".to_string(), |h| format!("{h:.0}%"));
-        let mut rows: Vec<(&str, String)> = Vec::new();
-        if let Some(cost) = &cost {
-            rows.push(("Cost (API list price)", cost.clone()));
+        let auto_available = self.cache_compaction_available();
+        let auto_on = auto_available && !self.keep_full_history;
+        let pending = auto_on && self.cache_compaction_pending();
+        let ratio = self.context.and_then(|usage| usage.ratio());
+        if !show_context && cost.is_none() && cache_dot.is_none() && !auto_available {
+            return None;
         }
-        if let Some(label) = &cache_label {
-            rows.push(("Cache", label.clone()));
-        }
-        rows.push((
-            "Cache hit",
+        let open = self.meter_open;
+        let headline = ratio
+            .map(|r| format!("{:.0}% context used", r * 100.))
+            .unwrap_or_else(|| "No context used yet".into());
+        let detail = self.context.map(|usage| {
             format!(
-                "{} session · {} last turn",
-                percent(stats.session_hit_percent),
-                percent(stats.last_hit_percent)
-            ),
-        ));
-        rows.push((
-            "Cache tokens",
-            format!(
-                "{} read · {} written",
-                stats_mod::format_tokens(stats.cache_read_tokens),
-                stats_mod::format_tokens(stats.cache_write_tokens)
-            ),
-        ));
-        rows.push(("Agent worked", stats_mod::format_span(stats.working_ms)));
-        let rewrite = (cache == Some(CacheState::Cold))
-            .then(|| self.context.map(|usage| usage.used))
-            .flatten()
-            .filter(|used| *used > 0)
-            .map(|used| {
-                format!(
-                    "Next message re-writes ~{} tokens to cache",
-                    stats_mod::format_tokens(used)
-                )
-            });
-        let label = parts
+                "{} / {} tokens",
+                stats_mod::format_tokens(usage.used),
+                stats_mod::format_tokens(usage.window.unwrap_or(0))
+            )
+        });
+        let summary = cost
             .iter()
-            .map(|(text, _)| text.as_str())
+            .chain(cache_label.iter())
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join(", ");
-        let compact_button = self.cache_compaction_available().then(|| {
-            let off = self.keep_full_history;
-            let pending = self.cache_compaction_pending();
-            div()
-                .id("compact-next")
-                .role(Role::Button)
-                .aria_label(if off {
-                    "Auto-compact is off. Click to compact a large thread when the prompt cache expires."
-                } else if pending {
-                    "The next message compacts the thread first because the prompt cache expired. Click to turn auto-compact off."
+        let aria = [
+            show_context.then(|| headline.clone()),
+            (!summary.is_empty()).then_some(summary),
+            auto_available.then(|| {
+                if auto_on {
+                    "auto-compact on".to_string()
                 } else {
-                    "Auto-compact is on. A large thread is compacted when the prompt cache expires. Click to turn it off."
-                })
-                .h(px(18.))
-                .px(px(6.))
-                .ml(px(4.))
-                .rounded_full()
+                    "auto-compact off".to_string()
+                }
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+        let separator = || {
+            div()
+                .w(px(1.))
+                .h(px(10.))
+                .flex_shrink_0()
+                .bg(content(0.12))
+                .into_any_element()
+        };
+        let mut extras: Vec<gpui::AnyElement> = Vec::new();
+        if let Some(cost) = cost.clone() {
+            extras.push(
+                div()
+                    .text_color(content(1.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(cost)
+                    .into_any_element(),
+            );
+        }
+        if let Some((short, color, hollow)) = cache_dot.clone() {
+            extras.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .size(px(6.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .when(hollow, |d| d.border(px(1.25)).border_color(color))
+                            .when(!hollow, |d| d.bg(color)),
+                    )
+                    .child(div().when(color == amber, |d| d.text_color(amber)).child(short))
+                    .into_any_element(),
+            );
+        }
+        // With only the ring (and maybe the bolt) there is nothing to frame:
+        // the outline and the lopsided padding made it a pill around one dot.
+        let bare = extras.is_empty();
+        // The first paint, and a paint that shrinks back to the ring, take no
+        // animation. Growing into the pill morphs: the outline fades in and the
+        // values unroll beside the ring.
+        let (was_bare, morphs) = self.meter_morph.get();
+        let morphs = if was_bare.is_some_and(|was| was != bare) {
+            morphs + 1
+        } else {
+            morphs
+        };
+        self.meter_morph.set((Some(bare), morphs));
+        let animate = morphs > 0 && !bare && !cx.reduce_motion();
+        let lead = show_context;
+        let mut capsule_children: Vec<gpui::AnyElement> = Vec::new();
+        if show_context {
+            capsule_children
+                .push(crate::context_meter::labeled_ring(ratio.unwrap_or(0.)).into_any_element());
+        }
+        if !extras.is_empty() {
+            let mut row = div()
                 .flex()
                 .items_center()
-                .cursor_pointer()
-                .text_color(content(if off {
-                    0.4
-                } else if pending {
-                    0.9
-                } else {
-                    0.55
-                }))
-                .bg(content(if pending && !off { 0.12 } else { 0.05 }))
-                .hover(|s| s.bg(content(0.16)).text_color(content(1.)))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(if off {
-                    "Auto-compact off"
-                } else if pending {
-                    "Compacts next"
-                } else {
-                    "Auto-compact"
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.keep_full_history = !this.keep_full_history;
-                    cx.notify();
-                }))
+                .flex_shrink_0()
+                .gap(px(7.))
+                .overflow_hidden()
+                .when(lead, |d| d.pl(px(7.)));
+            for (ix, part) in extras.into_iter().enumerate() {
+                if lead || ix > 0 {
+                    row = row.child(separator());
+                }
+                row = row.child(part);
+            }
+            // The values clip to a width that opens up to their own.
+            capsule_children.push(if animate {
+                gpui::AnimationExt::with_animation(
+                    row,
+                    ("session-meter-values", morphs),
+                    gpui::Animation::new(METER_MORPH).with_easing(gpui::ease_out_quint()),
+                    |el, t| {
+                        if t >= 1. {
+                            el
+                        } else {
+                            el.max_w(px(METER_VALUES_MAX * t)).opacity(t)
+                        }
+                    },
+                )
+                .into_any_element()
+            } else {
+                row.into_any_element()
+            });
+        }
+        // The bolt marks auto-compact as on, beside the last value.
+        if auto_on {
+            capsule_children.push(
+                div()
+                    .when(!bare || lead, |d| d.ml(px(7.)))
+                    .child(icon("zap", 12.).text_color(content(0.7)))
+                    .into_any_element(),
+            );
+        }
+        let capsule = div()
+            .id("session-meter")
+            .role(Role::Button)
+            .aria_label(format!("Session meter: {aria}"))
+            .aria_expanded(open)
+            .child(self.stats_anchor.probe())
+            .flex_shrink_0()
+            .h(px(26.))
+            .rounded_full()
+            .border_1()
+            .border_color(if bare {
+                gpui::transparent_black()
+            } else {
+                content(0.12)
+            })
+            .when(bare, |d| d.px(px(5.)))
+            .when(!bare, |d| d.pl(px(6.)).pr(px(10.)))
+            .flex()
+            .items_center()
+            .text_size(px(11.))
+            .text_color(content(0.7))
+            .font_features(crate::right_panel::tabular())
+            .cursor_pointer()
+            .when(open, |d| d.bg(content(0.08)).text_color(content(1.)))
+            .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(capsule_children)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.meter_open = !this.meter_open;
+                cx.notify();
+            }));
+        let capsule = if animate {
+            gpui::AnimationExt::with_animation(
+                capsule,
+                ("session-meter-shell", morphs),
+                gpui::Animation::new(METER_MORPH).with_easing(gpui::ease_out_quint()),
+                |el, t| {
+                    el.border_color(content(0.12 * t))
+                        .pl(px(5. + t))
+                        .pr(px(5. + 5. * t))
+                },
+            )
+            .into_any_element()
+        } else {
+            capsule.into_any_element()
+        };
+
+        let popover_body = open.then(|| {
+            let percent = |hit: Option<f64>| hit.map_or("n/a".to_string(), |h| format!("{h:.0}%"));
+            let rewrite = (cache == Some(CacheState::Cold))
+                .then(|| self.context.map(|usage| usage.used))
+                .flatten()
+                .filter(|used| *used > 0)
+                .map(|used| {
+                    format!(
+                        "Next message re-writes ~{} tokens to cache",
+                        stats_mod::format_tokens(used)
+                    )
+                });
+            let ring_color = match ratio {
+                Some(r) if r >= 0.9 => gpui::rgb(0xf87171).into(),
+                Some(r) if r >= 0.75 => amber,
+                _ => content(0.6),
+            };
+            let mut sections: Vec<gpui::AnyElement> = Vec::new();
+            if show_context {
+                sections.push(
+                    meter_section("Context")
+                        .child(meter_row(
+                            headline.clone(),
+                            detail.clone().unwrap_or_default(),
+                            true,
+                        ))
+                        .child(
+                            div()
+                                .h(px(4.))
+                                .my(px(6.))
+                                .rounded(px(2.))
+                                .bg(content(0.1))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui::relative(ratio.unwrap_or(0.)))
+                                        .rounded(px(2.))
+                                        .bg(ring_color),
+                                ),
+                        )
+                        .when(can_compact, |d| {
+                            d.child(
+                                div()
+                                    .id("compact-context")
+                                    .role(Role::Button)
+                                    .aria_label("Compact context")
+                                    .mt(px(8.))
+                                    .h(px(24.))
+                                    .px(px(8.))
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .text_color(content(0.8))
+                                    .bg(content(0.08))
+                                    .hover(|s| s.bg(content(0.14)).text_color(content(1.)))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child("Compact context")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.meter_open = false;
+                                        this.compact_context(cx);
+                                    })),
+                            )
+                        })
+                        .into_any_element(),
+                );
+            }
+            if has_stats {
+                sections.push(
+                    meter_section("Prompt cache")
+                        .when_some(cache_label.clone(), |d, label| {
+                            d.child(meter_row(
+                                "Status".into(),
+                                label.trim_start_matches("cache ").to_string(),
+                                false,
+                            ))
+                        })
+                        .child(meter_row(
+                            "Hit rate".into(),
+                            format!(
+                                "{} session · {} last turn",
+                                percent(stats.session_hit_percent),
+                                percent(stats.last_hit_percent)
+                            ),
+                            false,
+                        ))
+                        .child(meter_row(
+                            "Tokens".into(),
+                            format!(
+                                "{} read · {} written",
+                                stats_mod::format_tokens(stats.cache_read_tokens),
+                                stats_mod::format_tokens(stats.cache_write_tokens)
+                            ),
+                            false,
+                        ))
+                        .children(rewrite.map(|text| {
+                            div()
+                                .mt(px(4.))
+                                .text_size(px(11.))
+                                .line_height(px(16.))
+                                .text_color(amber)
+                                .child(text)
+                        }))
+                        .into_any_element(),
+                );
+                sections.push(
+                    meter_section("Session")
+                        .when_some(cost.clone(), |d, cost| {
+                            d.child(meter_row("Cost (API list price)".into(), cost, false))
+                        })
+                        .child(meter_row(
+                            "Agent worked".into(),
+                            stats_mod::format_span(stats.working_ms),
+                            false,
+                        ))
+                        .into_any_element(),
+                );
+            }
+            if auto_available {
+                let accent = accent_color();
+                sections.push(
+                    meter_section_bare()
+                        .child(
+                            div()
+                                .id("auto-compact")
+                                .role(Role::Switch)
+                                .aria_label("Auto-compact")
+                                .aria_description(
+                                    "Compact a large thread when the prompt cache expires.",
+                                )
+                                .flex()
+                                .items_start()
+                                .gap(px(10.))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .mt(px(1.))
+                                        .relative()
+                                        .w(px(28.))
+                                        .h(px(16.))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .bg(if auto_on { accent } else { content(0.18) })
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(px(2.))
+                                                .left(px(if auto_on { 14. } else { 2. }))
+                                                .size(px(12.))
+                                                .rounded_full()
+                                                .bg(gpui::white()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .line_height(px(18.))
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(content(1.))
+                                                .child("Auto-compact"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .line_height(px(15.))
+                                                .text_color(content(0.5))
+                                                .child(
+                                                    "Compact a large thread when the prompt cache expires.",
+                                                ),
+                                        ),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.keep_full_history = !this.keep_full_history;
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+            let mut body = div().flex().flex_col();
+            for (ix, section) in sections.into_iter().enumerate() {
+                body = body.child(
+                    div()
+                        .when(ix > 0, |d| {
+                            d.mt(px(11.))
+                                .pt(px(11.))
+                                .border_t_1()
+                                .border_color(content(0.1))
+                        })
+                        .child(section),
+                );
+            }
+            body
         });
         Some(
             div()
-                .id("session-stats")
-                .role(Role::Group)
-                .aria_label(format!("Session {label}"))
-                .child(self.stats_anchor.probe())
                 .flex()
+                .flex_shrink_0()
                 .items_center()
-                .gap(px(4.))
-                .text_size(px(11.))
-                .font_features(crate::right_panel::tabular())
-                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                    this.stats_hovered = *hovered;
-                    cx.notify();
-                }))
-                .children(
-                    parts
-                        .into_iter()
-                        .enumerate()
-                        .flat_map(|(i, (text, color))| {
-                            let dot = (i > 0).then(|| div().text_color(content(0.45)).child("·"));
-                            dot.into_iter()
-                                .map(IntoElement::into_any_element)
-                                .chain([div().text_color(color).child(text).into_any_element()])
-                        }),
-                )
-                .children(compact_button)
-                .when(self.stats_hovered, |d| {
+                .gap(px(8.))
+                .when(pending, |d| {
+                    d.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(content(0.45))
+                            .child("Compacts next"),
+                    )
+                })
+                .child(capsule)
+                .when_some(popover_body, |d, body| {
                     d.child(
                         popover(
-                            "session-stats-tooltip",
+                            "session-meter-popover",
                             Anchor::Slot(self.stats_anchor.clone()),
                         )
                         .side(Side::Top)
                         .align(Align::End)
-                        .max_width(300.)
-                        .padding(10.)
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.))
-                                .text_size(px(11.))
-                                .line_height(px(16.))
-                                .children(rows.into_iter().map(|(name, value)| {
-                                    div()
-                                        .flex()
-                                        .justify_between()
-                                        .gap(px(16.))
-                                        .child(div().text_color(content(0.5)).child(name))
-                                        .child(div().text_color(content(1.)).child(value))
-                                }))
-                                .children(
-                                    rewrite
-                                        .map(|text| div().mt(px(4.)).text_color(amber).child(text)),
-                                ),
-                        ),
+                        .gap(7.)
+                        .width(290.)
+                        .padding(12.)
+                        .ignore(self.stats_anchor.clone())
+                        .on_dismiss({
+                            let this = cx.entity().downgrade();
+                            move |_, cx| {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.meter_open = false;
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .child(body),
                     )
                 })
                 .into_any_element(),
@@ -3595,21 +3803,11 @@ impl Conversation {
             self.branch.clone()
         };
         let ratio = self.context.and_then(|usage| usage.ratio());
-        let show_context = ratio.is_some() || draft;
+        let show_context = ratio.is_some_and(|ratio| ratio > 0.);
         let can_compact = !new
             && !self.busy
             && self.summary.provider_id.is_some()
             && monocode_core::provider::supports_compact(Kind::from_id(&self.summary.provider));
-        let headline = ratio
-            .map(|r| format!("{:.0}% context used", r * 100.))
-            .unwrap_or_else(|| "No context used yet".into());
-        let detail = self.context.map(|usage| {
-            format!(
-                "{} / {} tokens",
-                monocode_core::context::format_tokens(usage.used),
-                monocode_core::context::format_tokens(usage.window.unwrap_or(0))
-            )
-        });
         div()
             .min_w_0()
             .flex()
@@ -3650,6 +3848,8 @@ impl Conversation {
                 div()
                     .ml_auto()
                     .flex_shrink_0()
+                    // The session meter's height, so the bar holds still when it appears.
+                    .min_h(px(26.))
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -3688,101 +3888,13 @@ impl Conversation {
                             )
                         },
                     )
-                    .children(self.session_stats_chip(cx))
-                    .when(show_context, |d| {
-                        d.child(
-                            div()
-                                .id("context-meter")
-                                .role(Role::Image)
-                                .aria_label(format!(
-                                    "{headline}{}",
-                                    detail
-                                        .as_ref()
-                                        .map(|s| format!(", {s}"))
-                                        .unwrap_or_default()
-                                ))
-                                .child(self.context_anchor.probe())
-                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                    this.set_context_hover(*hovered, cx);
-                                }))
-                                .child(crate::context_meter::ring(ratio.unwrap_or(0.)))
-                                .when(self.context_hovered, |d| {
-                                    d.child(
-                                        popover(
-                                            "context-tooltip",
-                                            Anchor::Slot(self.context_anchor.clone()),
-                                        )
-                                        .side(Side::Top)
-                                        .align(Align::End)
-                                        .max_width(240.)
-                                        .padding(10.)
-                                        .child(
-                                            div()
-                                                .id("context-tooltip-body")
-                                                .on_hover(cx.listener(
-                                                    |this, hovered: &bool, _, cx| {
-                                                        this.set_context_hover(*hovered, cx);
-                                                    },
-                                                ))
-                                                .flex()
-                                                .flex_col()
-                                                .text_size(px(12.))
-                                                .line_height(px(16.))
-                                                .text_color(content(1.))
-                                                .child(headline)
-                                                .when_some(detail, |d, detail| {
-                                                    d.child(
-                                                        div()
-                                                            .text_size(px(11.))
-                                                            .text_color(content(0.5))
-                                                            .child(detail),
-                                                    )
-                                                })
-                                                .when(can_compact, |d| {
-                                                    d.child(
-                                                        div()
-                                                            .id("compact-context")
-                                                            .role(Role::Button)
-                                                            .aria_label("Compact context")
-                                                            .mt(px(8.))
-                                                            .h(px(24.))
-                                                            .px(px(8.))
-                                                            .rounded_md()
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .cursor_pointer()
-                                                            .text_size(px(11.))
-                                                            .text_color(content(0.8))
-                                                            .bg(content(0.08))
-                                                            .hover(|s| {
-                                                                s.bg(content(0.14))
-                                                                    .text_color(content(1.))
-                                                            })
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                |_, _, cx| cx.stop_propagation(),
-                                                            )
-                                                            .child("Compact context")
-                                                            .on_click(cx.listener(
-                                                                |this, _, _, cx| {
-                                                                    this.context_hovered = false;
-                                                                    this.compact_context(cx);
-                                                                },
-                                                            )),
-                                                    )
-                                                }),
-                                        ),
-                                    )
-                                }),
-                        )
-                    }),
+                    .children(self.session_meter(show_context, can_compact, cx)),
             )
     }
 
     // ComposerAction: a solid submit, dimmed while empty; Stop while busy.
     fn action(&self, has_value: bool, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = (self.responding() || self.shell_running()) && !has_value;
+        let busy = self.working() && !has_value;
         let modifiers = window.modifiers();
         let alternate = if cfg!(target_os = "macos") {
             modifiers.platform
@@ -3796,37 +3908,60 @@ impl Conversation {
             && (!self.preparing_worktree || self.busy || self.stopping)
             && (busy || (has_value && self.loaded));
         let shell = !busy && self.input.read(cx).shell_mode();
-        send_button(
-            "send-or-stop",
-            if busy {
+        // Something to send grows the button into a pill naming the action;
+        // empty or stopping, it rests as a square.
+        let face = crate::send_morph::Face {
+            label: if busy {
                 "Stop"
             } else if shell {
                 "Run command"
             } else {
                 follow_up.map_or("Send", |(label, _)| label)
             },
-            busy,
-            if shell {
+            glyph: if shell {
                 "terminal"
             } else {
                 follow_up.map_or("send", |(_, glyph)| glyph)
             },
-            enabled,
-        )
-        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-            if !enabled {
-                return;
-            }
-            if busy && this.shell_running() && !this.busy {
-                this.cancel_shell();
-            } else if busy {
-                this.stop(cx);
-            } else if this.input.read(cx).shell_mode() {
-                this.submit_shell(cx);
-            } else {
-                let modifiers = event.modifiers();
-                let alternate = if cfg!(target_os = "macos") {
-                    modifiers.platform
+            stop: busy,
+            expanded: !busy && has_value,
+        };
+        let frame = self.send_morph.borrow_mut().frame(
+            face,
+            crate::send_morph::expanded_width(face.label, window),
+            !cx.reduce_motion(),
+        );
+        if frame.moving {
+            window.request_animation_frame();
+        }
+        crate::send_morph::button("send-or-stop", face, &frame, enabled)
+            // Holding ⌘ (Ctrl elsewhere) flips Queue and Steer; redraw so the
+            // label rolls to it while the key is down.
+            // Only ⌘'s own changes matter, and only while it changes the action.
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                    let alternate = if cfg!(target_os = "macos") {
+                        event.modifiers.platform
+                    } else {
+                        event.modifiers.control
+                    };
+                    if std::mem::replace(&mut this.send_alternate, alternate) != alternate
+                        && this.follow_up_action(alternate, cx).is_some()
+                    {
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                if !enabled {
+                    return;
+                }
+                if busy && this.shell_running() && !this.busy {
+                    this.cancel_shell();
+                } else if busy {
+                    this.stop(cx);
+                } else if this.input.read(cx).shell_mode() {
+                    this.submit_shell(cx);
                 } else {
                     let modifiers = event.modifiers();
                     let alternate = if cfg!(target_os = "macos") {
@@ -3951,9 +4086,27 @@ fn is_effort_key(key: &str) -> bool {
         "effort" | "reasoning" | "reasoningEffort" | "reasoning_effort"
     )
 }
-pub(crate) fn preferred_effort(provider: &str, cx: &gpui::App) -> Option<String> {
+/// The effort a chat on `model` starts with: the one last chosen for that
+/// model, else for its provider.
+pub(crate) fn preferred_effort(
+    provider: &str,
+    model: Option<&str>,
+    cx: &gpui::App,
+) -> Option<String> {
     cx.try_global::<crate::settings::Preferences>()
-        .and_then(|prefs| prefs.provider_efforts.get(provider).cloned())
+        .and_then(|prefs| prefs.effort_for(provider, model))
+}
+pub(crate) fn remember_effort(
+    provider: &str,
+    model: Option<&str>,
+    effort: &str,
+    cx: &mut gpui::App,
+) {
+    if cx.has_global::<crate::settings::Preferences>() {
+        cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
+            prefs.remember_effort(provider, model, effort)
+        });
+    }
 }
 pub(crate) fn effort_name(value: &str) -> String {
     match value {
@@ -4237,7 +4390,7 @@ mod composer_motion_tests {
 
 /// The thread as the conversation draws it: replayed from cache when nothing
 /// in it changed. A live draft's card keeps its page right through a replay;
-/// see `draft::engine::Presence`.
+/// see `draft::presence::Presence`.
 pub(crate) fn transcript_element(transcript: &Entity<TranscriptView>) -> AnyElement {
     transcript
         .clone()
@@ -4467,6 +4620,41 @@ fn send_button(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 // GitPickerTrigger: the quiet `h-6` controls in the bar under the box.
+/// A titled block inside the session meter's popover.
+fn meter_section(title: &'static str) -> gpui::Div {
+    div().flex().flex_col().child(
+        div()
+            .mb(px(6.))
+            .text_size(px(11.))
+            .line_height(px(14.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(content(0.5))
+            .child(title),
+    )
+}
+fn meter_section_bare() -> gpui::Div {
+    div().flex().flex_col()
+}
+/// A label and value, `strong` for the block's headline figure.
+fn meter_row(name: String, value: String, strong: bool) -> gpui::Div {
+    div()
+        .flex()
+        .justify_between()
+        .gap(px(12.))
+        .text_size(px(12.))
+        .line_height(px(18.))
+        .child(
+            div()
+                .text_color(if strong { content(1.) } else { content(0.5) })
+                .child(name),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(if strong { content(0.5) } else { content(1.) })
+                .child(value),
+        )
+}
 fn bar_trigger(
     id: &'static str,
     path: &'static str,
@@ -4553,6 +4741,32 @@ mod menu_tests {
     use gpui::{TestAppContext, WindowHandle, point};
     use monocode_core::store::Store;
     use std::sync::Mutex;
+    #[gpui::test]
+    fn an_agent_can_set_the_full_id_behind_a_model_alias(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.catalog = vec![Model {
+                    alias_target: Some("claude-sonnet-5-5".into()),
+                    id: "sonnet".into(),
+                    name: "Sonnet 5.5".into(),
+                    efforts: Vec::new(),
+                    default_effort: None,
+                    fast: false,
+                    thinking: false,
+                    default: true,
+                    tiers: Vec::new(),
+                    controls: Vec::new(),
+                }];
+                view.check_agent_change(Some("claude-sonnet-5-5"), None)
+                    .unwrap();
+                assert!(view.check_agent_change(Some("nope"), None).is_err());
+                view.apply_agent_change(Some("claude-sonnet-5-5"), None, None, cx)
+                    .unwrap();
+                assert_eq!(view.model.as_deref(), Some("sonnet"));
+            })
+            .unwrap();
+    }
     #[gpui::test]
     fn combined_picker_paints_effort_and_beside_mode_moves_it_to_its_own_control(
         cx: &mut TestAppContext,
@@ -4854,6 +5068,64 @@ mod menu_tests {
     }
 
     #[gpui::test]
+    fn each_model_remembers_its_own_effort(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let window = conversation(cx);
+        window
+            .update(cx, |c, _, cx| {
+                let opus = ModelPicked(Kind::Claude, Some("opus".into()));
+                let sonnet = ModelPicked(Kind::Claude, Some("sonnet".into()));
+                c.apply_model_pick(&opus, cx);
+                c.menu_choice("effort:max", cx);
+                c.apply_model_pick(&sonnet, cx);
+                // Sonnet has no choice yet, so it starts from the provider's.
+                assert_eq!(c.settings.effort.as_deref(), Some("max"));
+                c.menu_choice("effort:low", cx);
+                c.apply_model_pick(&opus, cx);
+                assert_eq!(c.settings.effort.as_deref(), Some("max"));
+                c.apply_model_pick(&sonnet, cx);
+                assert_eq!(c.settings.effort.as_deref(), Some("low"));
+                assert_eq!(
+                    preferred_effort("claude", Some("opus"), cx).as_deref(),
+                    Some("max")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn an_effort_the_model_does_not_offer_is_dropped(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let window = conversation(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.loaded = true;
+                view.summary.provider = "codex".into();
+                view.model = Some("gpt-6.1-sol".into());
+                view.settings.effort = Some("max".into());
+                view.catalog.push(Model {
+                    alias_target: None,
+                    id: "gpt-6.1-sol".into(),
+                    name: "GPT-6.1 Sol".into(),
+                    efforts: vec!["high".into(), "xhigh".into()],
+                    default_effort: Some("high".into()),
+                    fast: false,
+                    thinking: false,
+                    default: true,
+                    tiers: Vec::new(),
+                    controls: Vec::new(),
+                });
+                view.drop_unsupported_effort(cx);
+                assert_eq!(view.settings.effort, None);
+                assert_eq!(view.selected_effort(), Some("high"));
+                view.settings.effort = Some("xhigh".into());
+                view.drop_unsupported_effort(cx);
+                assert_eq!(view.settings.effort.as_deref(), Some("xhigh"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn effort_choices_survive_provider_switches_and_new_projects(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
         let window = conversation(cx);
@@ -5099,13 +5371,8 @@ mod menu_tests {
                     .update(cx, |i, cx| i.set_text("Review this".into(), cx));
                 c.toggle_mode("plan", cx);
                 assert_eq!(c.input.read(cx).content, "/plan Review this");
-                c.toggle_mode("operator", cx);
-                assert_eq!(c.input.read(cx).content, "/operator Review this");
-                c.toggle_mode("orchestrator", cx);
-                assert_eq!(c.input.read(cx).content, "/orchestrator Review this");
-                c.toggle_mode("orchestrator", cx);
-                assert_eq!(c.input.read(cx).content, "Review this");
                 c.toggle_mode("plan", cx);
+                assert_eq!(c.input.read(cx).content, "Review this");
             })
             .unwrap();
         cx.run_until_parked();
@@ -5113,7 +5380,7 @@ mod menu_tests {
             .update(cx, |c, w, cx| {
                 c.input.update(cx, |i, cx| {
                     i.select_range(0..i.content.len(), cx);
-                    i.replace_text_in_range(None, "/operator New draft", w, cx);
+                    i.replace_text_in_range(None, "/plan New draft", w, cx);
                 });
             })
             .unwrap();
@@ -5121,8 +5388,8 @@ mod menu_tests {
         window
             .update(cx, |c, _, cx| {
                 assert!(!c.settings.plan);
-                assert_eq!(c.input.read(cx).content, "/operator New draft");
-                c.enable_mode("operator", cx);
+                assert_eq!(c.input.read(cx).content, "/plan New draft");
+                c.enable_mode("plan", cx);
                 c.input.update(cx, |i, cx| i.select_range(1..1, cx));
             })
             .unwrap();
@@ -5130,8 +5397,8 @@ mod menu_tests {
         cx.run_until_parked();
         window
             .update(cx, |c, _, cx| {
-                assert!(!c.settings.operator);
-                assert_eq!(c.input.read(cx).content, "operator New draft");
+                assert!(!c.settings.plan);
+                assert_eq!(c.input.read(cx).content, "plan New draft");
             })
             .unwrap();
     }
@@ -5140,39 +5407,34 @@ mod menu_tests {
     fn submitted_modes_clear_for_a_started_turn_and_stay_cleared_after_completion(
         cx: &mut TestAppContext,
     ) {
-        for mode in ["operator", "orchestrator", "plan"] {
-            let window = conversation(cx);
-            window
-                .update(cx, |view, _, cx| {
-                    // An unsupported synthetic provider stops before any CLI I/O.
-                    view.summary.provider = "fixture".into();
-                    view.loaded = true;
-                    view.input
-                        .update(cx, |i, cx| i.set_text("check the composer".into(), cx));
-                    view.toggle_mode(mode, cx);
-                    view.send(cx);
-                    assert!(view.busy);
-                    assert!(view.input.read(cx).content.is_empty());
-                    assert!(
-                        !view.settings.plan
-                            && !view.settings.operator
-                            && !view.settings.orchestrator
-                    );
-                })
-                .unwrap();
-            cx.run_until_parked();
-            window
-                .update(cx, |view, _, cx| {
-                    let saved = locked(&view.store)
-                        .unwrap()
-                        .agent_settings(view.summary.id)
-                        .unwrap()
-                        .unwrap();
-                    assert!(!saved.plan && !saved.operator && !saved.orchestrator);
-                    assert!(view.input.read(cx).content.is_empty());
-                })
-                .unwrap();
-        }
+        let mode = "plan";
+        let window = conversation(cx);
+        window
+            .update(cx, |view, _, cx| {
+                // An unsupported synthetic provider stops before any CLI I/O.
+                view.summary.provider = "fixture".into();
+                view.loaded = true;
+                view.input
+                    .update(cx, |i, cx| i.set_text("check the composer".into(), cx));
+                view.toggle_mode(mode, cx);
+                view.send(cx);
+                assert!(view.busy);
+                assert!(view.input.read(cx).content.is_empty());
+                assert!(!view.settings.plan);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                let saved = locked(&view.store)
+                    .unwrap()
+                    .agent_settings(view.summary.id)
+                    .unwrap()
+                    .unwrap();
+                assert!(!saved.plan);
+                assert!(view.input.read(cx).content.is_empty());
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -5251,21 +5513,27 @@ mod menu_tests {
         window
             .update(visual, |c, _, cx| {
                 assert!(c.menu_is(ComposerMenu::Recent));
-                // Recents with a model, in order; the default is not one.
-                let items = c.recent_model_items(cx);
-                let labels: Vec<_> = items
+                // One header per provider, the session's own first; the
+                // default is not a recent.
+                let rows: Vec<_> = c
+                    .recent_model_items(cx)
                     .iter()
                     .filter_map(|item| match item {
-                        MenuItem::Action(a) => Some((a.label.to_string(), a.checked)),
+                        MenuItem::Header(text) => Some(format!("# {text}")),
+                        MenuItem::Action(a) => {
+                            Some(format!("{}{}", a.label, if a.checked { " *" } else { "" }))
+                        }
                         _ => None,
                     })
                     .collect();
                 assert_eq!(
-                    labels,
+                    rows,
                     [
-                        ("GPT-6.1-Sol".to_string(), false),
-                        ("Opus".to_string(), true),
-                        ("GPT-6-luna".to_string(), false),
+                        "# Claude Code",
+                        "Opus *",
+                        "# Codex",
+                        "GPT-6.1-Sol",
+                        "GPT-6-luna"
                     ]
                 );
             })
@@ -5277,9 +5545,9 @@ mod menu_tests {
             .update(visual, |c, _, cx| {
                 assert!(c.menu.is_none());
                 assert_eq!(c.summary.provider, "codex");
-                assert_eq!(c.model.as_deref(), Some("gpt-6-luna"));
+                assert_eq!(c.model.as_deref(), Some("gpt-6.1-sol"));
                 let recent = &cx.global::<crate::settings::Preferences>().recent_models[0];
-                assert_eq!(recent.model.as_deref(), Some("gpt-6-luna"));
+                assert_eq!(recent.model.as_deref(), Some("gpt-6.1-sol"));
                 // App: Switch Model toggles the same menu.
             })
             .unwrap();
@@ -5294,6 +5562,61 @@ mod menu_tests {
             .unwrap();
         window
             .update(visual, |c, _, _| assert!(c.menu.is_none()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_model_switcher_filters_as_you_type(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        window
+            .update(cx, |c, _, cx| {
+                c.model = Some("opus".into());
+                cx.set_global(crate::settings::Preferences {
+                    recent_models: [
+                        ("codex", Some("gpt-6.1-sol")),
+                        ("claude", Some("opus")),
+                        ("claude", Some("haiku")),
+                        ("codex", Some("gpt-6-luna")),
+                    ]
+                    .into_iter()
+                    .map(|(provider, model)| crate::settings::ModelChoice {
+                        provider: provider.into(),
+                        model: model.map(Into::into),
+                    })
+                    .collect(),
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |c, w, cx| c.toggle_recent_models(w, cx))
+            .unwrap();
+        visual.run_until_parked();
+        visual.simulate_input("luna");
+        visual.run_until_parked();
+        window
+            .update(visual, |c, _, cx| {
+                let rows: Vec<_> = c
+                    .recent_model_items(cx)
+                    .iter()
+                    .filter_map(|item| match item {
+                        MenuItem::Header(text) => Some(format!("# {text}")),
+                        MenuItem::Action(a) => Some(a.label.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(rows, ["# Codex", "GPT-6-luna"]);
+            })
+            .unwrap();
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        window
+            .update(visual, |c, _, _| {
+                assert!(c.menu.is_none());
+                assert_eq!(c.summary.provider, "codex");
+                assert_eq!(c.model.as_deref(), Some("gpt-6-luna"));
+            })
             .unwrap();
     }
 

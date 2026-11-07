@@ -966,6 +966,14 @@ fn project(
                     }
                 }
             }
+            // The desktop sends a draft's card with the notice older phones
+            // show; the page itself is the transcript view's own.
+            "notice" if item["draft"]["draft"].is_string() => {
+                let mut row = Row::text(id, "draft", string(&item["draft"], "title"));
+                row.action = item["draft"].clone();
+                row.action["type"] = json!("draft");
+                rows.push(Arc::new(row));
+            }
             // The desktop sends a visual's program with the notice older
             // phones show; this phone runs it.
             "notice" if crate::visuals::SUPPORTED && item["visual"]["source"].is_string() => {
@@ -983,12 +991,6 @@ fn project(
                     },
                     string(item, "text"),
                 );
-                row.action = item.clone();
-                rows.push(Arc::new(row));
-            }
-            // A card the phone opens the live page from.
-            "draft" => {
-                let mut row = Row::text(id, "draft", string(item, "title"));
                 row.action = item.clone();
                 rows.push(Arc::new(row));
             }
@@ -1321,6 +1323,22 @@ mod tests {
 
     #[cfg(not(target_os = "android"))]
     #[test]
+    fn a_draft_notice_becomes_a_card_and_a_plain_notice_stays_one() {
+        let turn = json!({"id":"t","items":[
+            {"id":"d","type":"notice","text":"Pricing · Open on desktop to view",
+             "draft":{"draft":"draft-1-a","title":"Pricing","kept":"kept:k.html"}},
+            {"id":"n","type":"notice","text":"Screenshot · Open on desktop to view"}
+        ]});
+        let rows = project(&turn, &mut HashMap::new(), &HashMap::new(), false);
+        let card = rows.iter().find(|row| row.id == "t/d").unwrap();
+        assert_eq!(card.kind, "draft");
+        assert_eq!(card.action["type"], "draft");
+        assert_eq!(card.action["draft"], "draft-1-a");
+        assert_eq!(card.action["kept"], "kept:k.html");
+        assert_eq!(rows.iter().filter(|row| row.kind == "draft").count(), 1);
+    }
+
+    #[test]
     fn a_visual_notice_becomes_a_live_row_its_controls_change() {
         let source = "const s = visual.state({ n: 1 });\nreturn () => visual.column([visual.text('n ' + s.n), visual.button('Add', () => { s.n += 1; })]);";
         let turn = json!({"id":"t","items":[
@@ -1395,20 +1413,6 @@ mod tests {
         assert_eq!(reply[0].presentation["top"], 4);
         assert_eq!(reply[1].presentation["gap"], 12);
         assert_eq!(reply[1].presentation["bottom"], 4);
-    }
-
-    #[test]
-    fn a_draft_is_a_card_row_that_carries_what_opens_it() {
-        let turn = json!({"id":"t","items":[
-            {"id":"r3","type":"draft","draft":"draft-1-a","title":"Pricing"},
-            {"id":"r4","type":"draft","draft":"kept:p.html","title":"Kept","kept":true}
-        ]});
-        let rows = project(&turn, &mut HashMap::new(), &HashMap::new(), false);
-        let cards: Vec<_> = rows.iter().filter(|r| r.kind == "draft").collect();
-        assert_eq!(cards.len(), 2);
-        assert_eq!(cards[0].id, "t/r3");
-        assert_eq!(cards[0].action["draft"], "draft-1-a");
-        assert_eq!(cards[1].action["kept"], true);
     }
 
     #[test]

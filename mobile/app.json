@@ -17,6 +17,7 @@
       "infoPlist": {
         "CFBundleDisplayName": "Monocode",
         "NSLocalNetworkUsageDescription": "Connect securely to your paired Monocode desktop.",
+        "ITSAppUsesNonExemptEncryption": false,
         "NSSupportsLiveActivities": true,
         "NSSupportsLiveActivitiesFrequentUpdates": true
       },
@@ -53,6 +54,7 @@
       [
         "expo-notifications",
         {
+          "defaultChannel": "sessions",
           "enableBackgroundRemoteNotifications": true
         }
       ],
@@ -85,7 +87,7 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Choose photos to attach to messages, or as the background of new sessions.",
+          "photosPermission": "Choose photos and videos to attach to messages, or as the background of new sessions.",
           "cameraPermission": "Scan the pairing code from your Monocode desktop."
         }
       ],

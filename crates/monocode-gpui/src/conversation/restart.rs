@@ -25,7 +25,6 @@ impl Conversation {
             || self.account_switching
             || self.managed
             || self.is_remote()
-            || turn.orchestrator
             || self.settings.mono.is_some()
             || self.settings.usage_limit.is_some()
             || self.settings.pending_provider_switch.is_some()
@@ -45,15 +44,8 @@ impl Conversation {
         } else {
             return;
         };
-        let draft = (
-            self.settings.plan,
-            self.settings.operator,
-            self.settings.orchestrator,
-            std::mem::take(&mut self.attachments),
-        );
+        let draft = (self.settings.plan, std::mem::take(&mut self.attachments));
         self.settings.plan = turn.plan;
-        self.settings.operator = turn.operator;
-        self.settings.orchestrator = false;
         self.settings.access = turn.access;
         self.settings.restart_continuation = resumable;
         if !resumable {
@@ -63,10 +55,8 @@ impl Conversation {
         // The continuation owns the interrupted turn's modes; the composer
         // keeps the draft the user had.
         self.settings.plan = draft.0;
-        self.settings.operator = draft.1;
-        self.settings.orchestrator = draft.2;
         self.settings.restart_continuation = false;
-        self.attachments.extend(draft.3);
+        self.attachments.extend(draft.1);
         cx.emit(SessionChanged);
         cx.notify();
     }
@@ -115,7 +105,6 @@ mod tests {
         let window = conversation(&dir, cx);
         window
             .update(cx, |view, _, cx| {
-                view.settings.operator = true;
                 view.resume_after_restart(plan_turn(), Interrupted::default(), cx);
                 assert!(view.busy, "the continuation launched");
                 assert!(
@@ -124,8 +113,7 @@ mod tests {
                 );
                 assert!(view.app_read_only);
                 assert_eq!(view.settings.access, AccessMode::ReadOnly);
-                assert!(view.settings.operator, "the composer keeps its own mode");
-                assert!(!view.settings.plan);
+                assert!(!view.settings.plan, "the composer keeps its own mode");
                 assert!(!view.settings.restart_continuation);
                 let rows = view.transcript.read(cx).source_rows().to_vec();
                 assert!(rows.iter().any(|row| row.text == CONTINUE_PROMPT));
@@ -136,15 +124,14 @@ mod tests {
     #[gpui::test]
     fn chats_with_their_own_recovery_only_keep_the_notice(cx: &mut TestAppContext) {
         let dir = std::env::temp_dir();
-        for case in 0..4 {
+        for case in 0..3 {
             let window = conversation(&dir, cx);
             window
                 .update(cx, |view, _, cx| {
-                    let mut turn = plan_turn();
+                    let turn = plan_turn();
                     match case {
                         0 => view.managed = true,
-                        1 => turn.orchestrator = true,
-                        2 => {
+                        1 => {
                             view.settings.usage_limit = Some(Default::default());
                         }
                         _ => {

@@ -55,6 +55,8 @@ const SWITCH_AT = 8;
 const SWAP_TIMEOUT = 1500;
 /** Frames the next screen is given to draw under the loading cover. */
 const SWITCH_FRAMES = 2;
+/** The longest the drawer waits for a screen pushed behind it to start. */
+const HOLD_TIMEOUT = 1000;
 /** The scene's dimming with the drawer fully open, as that drawer's overlay:
  *  in dark mode only, as a light scene dimmed with black reads as going dark. */
 const OVERLAY_OPACITY = { dark: 0.5, light: 0 } as const;
@@ -134,6 +136,14 @@ type DrawerActions = {
    *  useSceneSwitching), and only then runs `change`, a switch to another
    *  screen, showing it once it is drawn. */
   closeThen: (change: () => void) => void;
+  /** For a screen that slides in over this one and shows its own loading:
+   *  runs `change`, a push, at once, and holds the drawer until the screen
+   *  calls releaseDrawer as its slide starts, so the two move together.
+   *  Mounting a pushed screen stalls the main thread for 80 to 150ms, and
+   *  a drawer already moving would freeze and jump through it. */
+  closeBehind: (change: () => void) => void;
+  /** Shuts a drawer held by closeBehind; does nothing otherwise. */
+  releaseDrawer: () => void;
   /** Lets a swipe right open the drawer while a screen that wants it is in
    *  front; returns the undo. */
   allowSwipe: () => () => void;
@@ -327,7 +337,12 @@ export function ScenePagerHost({
   // screen has drawn.
   const [switching, setSwitching] = useState(false);
   const pendingSwitch = useRef<(() => void) | null>(null);
+  // Whether the cover is up, as a switch without one picked after one with
+  // it still has to bring it down.
+  const coverUp = useRef(false);
   const switchWaiting = useSharedValue(false);
+  // Set while closeBehind holds the drawer for the screen to start.
+  const holdTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // The cover comes down once the next screen has arrived, as the route
   // changing says, and drawn; not a set number of frames after the switch,
   // as a screen can take longer to arrive and the last one shows through.
@@ -342,6 +357,7 @@ export function ScenePagerHost({
       // A newer switch keeps the cover up for its own screen.
       if (pendingSwitch.current || swapFrom.current) return;
       traceSwitch("new screen drawn, cover leaving");
+      coverUp.current = false;
       setSwapping(false);
       setSwitching(false);
     });
@@ -353,7 +369,11 @@ export function ScenePagerHost({
   const runSwitch = useCallback(() => {
     const change = pendingSwitch.current;
     pendingSwitch.current = null;
-    traceSwitch("drawer shut, switching");
+    traceSwitch("switching");
+    if (!coverUp.current) {
+      change?.();
+      return;
+    }
     const from = route.current;
     swapFrom.current = from;
     setSwapping(true);
@@ -373,6 +393,13 @@ export function ScenePagerHost({
     },
   );
 
+  const releaseDrawer = useCallback(() => {
+    if (holdTimer.current === null) return;
+    clearTimeout(holdTimer.current);
+    holdTimer.current = null;
+    translateX.set(withSpring(0, SPRING));
+  }, [translateX]);
+
   const switchState = useMemo(() => ({ switching, swapping }), [switching, swapping]);
 
   const actions = useMemo<DrawerActions>(
@@ -382,12 +409,26 @@ export function ScenePagerHost({
       closeThen: (change) => {
         traceSwitch("tap");
         pendingSwitch.current = change;
+        coverUp.current = true;
         setSwitching(true);
         animateTo(false);
         // Already shut: the cover still draws before the switch.
         if (translateX.get() <= SWITCH_AT) afterFrames(1, runSwitch);
         else switchWaiting.set(true);
       },
+      closeBehind: (change) => {
+        traceSwitch("tap");
+        // Shut as far as the app goes, with only the motion still to come.
+        if (isOpen.get()) onToggled(false);
+        isOpen.set(false);
+        if (holdTimer.current !== null) clearTimeout(holdTimer.current);
+        // The screen never starting mustn't leave the drawer open.
+        holdTimer.current = setTimeout(releaseDrawer, HOLD_TIMEOUT);
+        pendingSwitch.current = change;
+        switchWaiting.set(false);
+        runSwitch();
+      },
+      releaseDrawer,
       allowSwipe: () => {
         swipes.set(swipes.get() + 1);
         setSwipeCount((count) => count + 1);
@@ -397,7 +438,7 @@ export function ScenePagerHost({
         };
       },
     }),
-    [animateTo, swipes, translateX, switchWaiting, runSwitch],
+    [animateTo, onToggled, isOpen, releaseDrawer, swipes, translateX, switchWaiting, runSwitch],
   );
 
   // Android's back shuts the drawer before it leaves the screen.

@@ -1,5 +1,5 @@
 use crate::tooltip::Tip;
-use gpui::{Div, Hsla, Role, Stateful, Svg, div, img, prelude::*, px, rgb, rgba, svg};
+use gpui::{AnyElement, Div, Hsla, Role, Stateful, Svg, div, img, prelude::*, px, rgb, rgba, svg};
 // Shared appearance tokens. Interaction fills use translucent content ink
 // rather than opaque replacement greys.
 pub(crate) const CHAT: u32 = 0x141414;
@@ -390,7 +390,7 @@ pub(crate) fn background_base() -> Hsla {
     base
 }
 /// `--zen-rail`: ink 14% over the opaque base, the tree rails under tool
-/// phases and orchestrator/operator rows. Opaque, so the curve and spine
+/// phases and subagent rows. Opaque, so the curve and spine
 /// overlapping where they meet don't stack into a brighter pixel.
 pub(crate) fn rail_color() -> Hsla {
     let (base, ink) = (background_base().to_rgb(), content(1.).to_rgb());
@@ -476,6 +476,58 @@ impl RenderOnce for Chevron {
             .with_transformation(gpui::Transformation::rotate(gpui::percentage(turn)))
     }
 }
+/// A provider's brand fill for its icon tile, top and bottom of a gentle
+/// gradient. `None` for a multicolour logo that keeps a light tile.
+pub(crate) fn provider_tile(provider: &str) -> Option<(Hsla, Hsla)> {
+    let (top, bottom) = match provider {
+        "claude" => (0xE3876A, 0xD06A49),
+        "antigravity" => return None,
+        // The violet-to-pink of its mark.
+        "omp" => (0xC45BE0, 0x8A5CF2),
+        "cursor" | "grok" | "pi" | "fx" => (0x343434, 0x161616),
+        "opencode" => (0x3B3636, 0x1F1C1C),
+        "hermes" | "devin" => (0x3A3A3E, 0x1E1E22),
+        // Codex: the blue of its mark's gradient.
+        _ => (0x7A8CFF, 0x4048FF),
+    };
+    Some((rgb(top).into(), rgb(bottom).into()))
+}
+
+/// The provider's mark in white, to sit on its [`provider_tile`] colour.
+/// A multicolour logo sits on a neutral tile in that tile's ink.
+pub(crate) fn provider_glyph(provider: &str, side: f32) -> AnyElement {
+    let (path, scale) = match provider {
+        // A multicolour logo on a neutral tile: one colour, like the rest.
+        "antigravity" => {
+            return svg()
+                .path("antigravity.svg")
+                .size(px(side))
+                .text_color(crate::tab_tile::tile_ink())
+                .flex_shrink_0()
+                .into_any_element();
+        }
+        // Codex's mark without the white disc behind it, so the prompt cut
+        // out of it shows the tile's colour.
+        "codex" => ("codex-glyph.svg", 1.),
+        "claude" => ("claude.svg", 1.),
+        "cursor" => ("cursor.svg", 1.),
+        "grok" => ("grok.svg", 1.),
+        "opencode" => ("opencode.svg", 1.),
+        "pi" => ("pi.svg", 1.),
+        "omp" => ("omp.svg", 1.),
+        "fx" => ("fx.svg", 1.),
+        "hermes" => ("hermes.svg", 0.72),
+        "devin" => ("devin.svg", 0.88),
+        _ => ("codex-glyph.svg", 1.),
+    };
+    svg()
+        .path(path)
+        .size(px(side * scale))
+        .text_color(gpui::white())
+        .flex_shrink_0()
+        .into_any_element()
+}
+
 pub(crate) fn provider_icon(provider: &str, side: f32) -> Div {
     let (path, monochrome, scale) = match provider {
         "claude" => ("claude.svg", false, 1.),
@@ -525,7 +577,16 @@ pub(crate) fn icon_button_hover(
     path: &'static str,
     hover_alpha: f32,
 ) -> Stateful<Div> {
-    chrome_button(id, label, path, true, hover_alpha)
+    chrome_button(id, label, path, true, hover_alpha, 0.5)
+}
+/// An icon button drawn over busy content, where the usual half ink fades out.
+pub(crate) fn icon_button_ink(
+    id: &'static str,
+    label: &'static str,
+    path: &'static str,
+    ink: f32,
+) -> Stateful<Div> {
+    chrome_button(id, label, path, true, 0.1, ink)
 }
 pub(crate) fn icon_button_enabled(
     id: &'static str,
@@ -533,7 +594,7 @@ pub(crate) fn icon_button_enabled(
     path: &'static str,
     enabled: bool,
 ) -> Stateful<Div> {
-    chrome_button(id, label, path, enabled, 0.1)
+    chrome_button(id, label, path, enabled, 0.1, 0.5)
 }
 fn chrome_button(
     id: &'static str,
@@ -541,7 +602,9 @@ fn chrome_button(
     path: &'static str,
     enabled: bool,
     hover_alpha: f32,
+    ink: f32,
 ) -> Stateful<Div> {
+    let ink = content(if enabled { ink } else { 0.25 });
     div()
         .id(id)
         .role(Role::Button)
@@ -555,17 +618,13 @@ fn chrome_button(
         .justify_center()
         .size(px(24.))
         .rounded_md()
-        .text_color(content(if enabled { 0.5 } else { 0.25 }))
+        .text_color(ink)
         .when(enabled, |d| {
             d.hover(|s| s.bg(content(hover_alpha)).text_color(content(1.)))
         })
-        .child(
-            icon(path, 14.)
-                .text_color(content(if enabled { 0.5 } else { 0.25 }))
-                .when(enabled, |i| {
-                    i.group_hover("chrome-button", |s| s.text_color(content(1.)))
-                }),
-        )
+        .child(icon(path, 14.).text_color(ink).when(enabled, |i| {
+            i.group_hover("chrome-button", |s| s.text_color(content(1.)))
+        }))
 }
 // `.primary-action` paints with literal white and black, not theme ink.
 pub(crate) fn white(alpha: f32) -> Hsla {

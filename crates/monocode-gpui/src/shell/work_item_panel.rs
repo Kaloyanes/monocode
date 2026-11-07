@@ -60,6 +60,30 @@ impl Shell {
                         inbox::Event::StartSession { item, prompt } => {
                             this.start_inbox_session(item.as_ref().clone(), prompt.clone(), cx)
                         }
+                        inbox::Event::FindAsk(item) => {
+                            this.find_pr_ask_session(item.as_ref().clone(), cx)
+                        }
+                        inbox::Event::AskPr {
+                            item,
+                            question,
+                            prompt,
+                            title,
+                        } => this.start_pr_ask_session(
+                            item.as_ref().clone(),
+                            question.clone(),
+                            prompt.clone(),
+                            title.clone(),
+                            cx,
+                        ),
+                        inbox::Event::ArchiveThreads(ids) => {
+                            // Its thread is leaving, and the panel belongs to it.
+                            let followed =
+                                this.workspace.active.is_some_and(|id| ids.contains(&id));
+                            this.archive_linked_threads(ids, cx);
+                            if followed {
+                                this.close_work_item_panel(window, cx);
+                            }
+                        }
                         inbox::Event::ItemsChanged(_) => {}
                     },
                 ));
@@ -182,6 +206,8 @@ mod tests {
 
     #[gpui::test]
     fn a_link_followed_from_a_thread_opens_beside_it(cx: &mut TestAppContext) {
+        // The bounds below are the panel's at rest, not partway through its slide.
+        cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, _) = window(cx);
         window
             .update(cx, |shell, window, cx| {
@@ -226,6 +252,88 @@ mod tests {
             .update(cx, |shell, window, cx| {
                 shell.close_work_item_panel(window, cx);
                 assert!(!shell.workspace.right_panel_open);
+            })
+            .unwrap();
+    }
+
+    /// Links the active thread to `PULL` and opens that pull request, merged,
+    /// in the panel, as following the thread's badge would.
+    fn open_merged_pull(window: gpui::WindowHandle<Shell>, cx: &mut TestAppContext) -> i64 {
+        let id = window
+            .update(cx, |shell, window, cx| {
+                let id = shell.workspace.active.unwrap();
+                let item = monocode_core::session_groups::parse_github_work_item(PULL).unwrap();
+                locked(&shell.store)
+                    .unwrap()
+                    .set_work_item(id, Some(&item))
+                    .unwrap();
+                shell.open_work_link(PULL, window, cx);
+                let view = shell.work_item_panel.clone().unwrap();
+                view.update(cx, |inbox, _| {
+                    inbox.pin_for_test(monocode_core::inbox::Item {
+                        provider: "github".into(),
+                        kind: "pr".into(),
+                        state: "merged".into(),
+                        repo: "acme/app".into(),
+                        number: 7,
+                        url: PULL.into(),
+                        ..Default::default()
+                    })
+                });
+                id
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, w, cx| {
+            w.simulate_next_frame(cx);
+            w.draw(cx).clear(cx);
+        })
+        .unwrap();
+        id
+    }
+
+    #[gpui::test]
+    fn archiving_a_merged_pull_requests_thread_closes_its_panel(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let id = open_merged_pull(window, cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let button = visual
+            .debug_bounds("inbox-archive-threads")
+            .expect("opening the panel finds the thread with no list refresh");
+        visual.simulate_click(button.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.session_summaries[&id].archived);
+                let saved = locked(&shell.store).unwrap().sessions().unwrap();
+                assert!(saved.iter().any(|s| s.id == id && s.archived));
+                let panel = shell.right_panel.clone().unwrap();
+                assert!(panel.read(cx).issue_tab().is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn archiving_skips_threads_it_would_restore_or_does_not_know(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let id = window
+            .update(cx, |shell, _, cx| {
+                let id = shell.workspace.active.unwrap();
+                shell.archive_linked_threads(&[id, i64::MAX], cx);
+                id
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.session_summaries[&id].archived);
+                shell.archive_linked_threads(&[id], cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.session_summaries[&id].archived, "stays archived");
             })
             .unwrap();
     }

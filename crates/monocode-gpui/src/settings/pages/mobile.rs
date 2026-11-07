@@ -343,6 +343,7 @@ impl SettingsView {
         if !status.devices.is_empty() {
             page.push(self.mobile_access(&status, cx));
             page.push(self.mobile_terminal(&status, cx));
+            page.push(self.mobile_presence(cx));
         }
         page.push(self.mobile_devices(&status, showing, cx));
         if let Some(error) = &status.error {
@@ -744,6 +745,69 @@ impl SettingsView {
                         )
                     })
             }))
+            .into_any_element()
+    }
+
+    /// When paired phones are told: always, or only once this Mac is idle.
+    fn mobile_presence(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (on, minutes) = (
+            self.prefs.phone_alerts_when_away,
+            self.prefs.phone_away_minutes,
+        );
+        let description: SharedString = if on {
+            format!(
+                "Approvals, questions and finished work reach your phones once this Mac has been idle for {minutes} min or its screen is locked. While you use it, they wait here, and drop away if you handle them first."
+            )
+            .into()
+        } else {
+            "Your phones are told right away, even while you use this Mac.".into()
+        };
+        let mut rows = vec![self.row(
+            Some("mobile-away-alerts"),
+            !on,
+            "Only notify phones when I’m away",
+            Some(description),
+            vec![self.toggle(
+                "mobile-away-alerts",
+                "Only notify phones when I’m away",
+                on,
+                false,
+                cx,
+                |this, on, cx| this.update(cx, |p| p.phone_alerts_when_away = on),
+            )],
+        )];
+        if on {
+            rows.push(self.row(
+                Some("mobile-away-minutes"),
+                true,
+                "Count me as away after",
+                None,
+                vec![self.segmented(
+                    "mobile-away-minutes",
+                    "Idle time before phones are notified",
+                    &minutes.to_string(),
+                    &[
+                        ("1", "1 min"),
+                        ("3", "3 min"),
+                        ("5", "5 min"),
+                        ("10", "10 min"),
+                    ],
+                    cx,
+                    |this, value, cx| {
+                        let minutes = value.parse().unwrap_or(3);
+                        this.update(cx, |p| p.phone_away_minutes = minutes)
+                    },
+                )],
+            ));
+        }
+        div()
+            .mt_5()
+            .overflow_hidden()
+            .rounded_xl()
+            .border_1()
+            .border_color(content(0.1))
+            .bg(content(0.03))
+            .children(rows)
             .into_any_element()
     }
 
@@ -1417,8 +1481,8 @@ mod tests {
                             );
                             view.discovery_task = None;
                             view.discovery_loading = false;
-                    view.worktrees_task = None;
-                    view.worktrees_loading = false;
+                            view.worktrees_task = None;
+                            view.worktrees_loading = false;
                             view.mobile.poll = None;
                             view
                         });

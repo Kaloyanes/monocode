@@ -75,6 +75,7 @@ vi.mock("react-native-safe-area-context", () => ({
 }));
 vi.mock("@/ui/CircleButton", () => ({ CircleButton: () => null }));
 vi.mock("@/ui/GradualBlur", () => ({ GradualBlur: () => null }));
+vi.mock("expo-linear-gradient", () => ({ LinearGradient: () => null }));
 // The drawer's pager and its loading cover reach native modules; here the
 // drawer is shut and no screen switch is under way.
 vi.mock("@/ui/ScenePager", () => ({
@@ -89,7 +90,9 @@ vi.mock("@/ui/ScenePager", () => ({
   useSceneSwitching: () => false,
 }));
 vi.mock("@/ui/DitherLoading", () => ({ DitherLoading: () => null }));
+vi.mock("@/features/inbox/InboxProvider", () => ({ useInboxBadge: () => 0 }));
 vi.mock("@/features/workspace/UnreadDot", () => ({
+  menuLabel: () => "Projects",
   UnreadDot: () => null,
   useAnyUnread: () => false,
 }));

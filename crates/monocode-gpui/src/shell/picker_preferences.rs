@@ -13,6 +13,7 @@ impl Shell {
                 && saved.file_view_mode == prefs.file_view_mode
                 && saved.default_access == prefs.default_access
                 && saved.provider_efforts == prefs.provider_efforts
+                && saved.model_efforts == prefs.model_efforts
                 && saved.hidden_models == prefs.hidden_models
                 && saved.project_providers == prefs.project_providers
             {
@@ -25,6 +26,7 @@ impl Shell {
             saved.file_view_mode = prefs.file_view_mode.clone();
             saved.default_access = prefs.default_access.clone();
             saved.provider_efforts = prefs.provider_efforts.clone();
+            saved.model_efforts = prefs.model_efforts.clone();
             saved.hidden_models = prefs.hidden_models.clone();
             saved.project_providers = prefs.project_providers.clone();
             this.sync_settings(cx);

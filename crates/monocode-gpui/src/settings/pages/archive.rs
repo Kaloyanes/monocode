@@ -12,7 +12,7 @@ impl SettingsView {
         let mut rows = vec![
             self.row(
                 Some("auto-archive"),
-                false,
+                true,
                 "Auto-archive inactive conversations",
                 Some(
                     "Archives conversations with no activity for this long. Running, drafted, open and pinned ones are kept."
@@ -42,20 +42,7 @@ impl SettingsView {
                     },
                 )],
             ),
-            self.row(
-            Some("show-archived"),
-            true,
-            "Show archived in the sidebar",
-            Some("Keep archived conversations listed alongside the active ones.".into()),
-            vec![self.toggle(
-                "show-archived",
-                "Show archived in the sidebar",
-                self.prefs.show_archived,
-                false,
-                cx,
-                |this, on, cx| this.update(cx, |p| p.show_archived = on),
-            )],
-        )];
+        ];
         if self.ctx.cwd.is_empty() {
             rows.push(note("Open a project to see its archived conversations."));
         } else if self.ctx.archived.is_empty() {

@@ -14,7 +14,6 @@ mod mobile_push;
 mod monos;
 mod providers;
 mod skills;
-mod visualizations;
 mod worktree_sweep;
 mod worktrees;
 
@@ -43,7 +42,6 @@ impl SettingsView {
             Section::Appearance => self.appearance_page(window, cx),
             Section::Keybindings => self.keybindings_page(cx),
             Section::Chat => self.chat_page(cx),
-            Section::Visualizations => self.visualizations_page(cx),
             Section::Devices => self.devices_page(cx),
             Section::Providers => self.providers_page(cx),
             Section::Mcp => self.mcp_page(cx),

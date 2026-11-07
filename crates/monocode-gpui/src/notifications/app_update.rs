@@ -125,6 +125,9 @@ impl Render for InstalledUpdateNotice {
                     .role(Role::Button)
                     .aria_label("Dismiss update notification")
                     .tip("Dismiss update notification")
+                    .debug_selector(|| "dismiss-installed-update".into())
+                    // The X sits over the clickable card; keep its click from opening What's new.
+                    .block_mouse_except_scroll()
                     .absolute()
                     .right(px(4.))
                     .top(px(4.))

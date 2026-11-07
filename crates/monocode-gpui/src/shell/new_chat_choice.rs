@@ -1,10 +1,11 @@
 //! The provider and model a new conversation starts with. One resolver, so
 //! every way of starting a chat agrees.
 //!
-//! Order: project default, Settings default, last choice (`recent_models[0]`),
-//! then Codex (or the first allowed provider). A step is skipped when its
-//! provider is hidden. Hidden providers are ignored for remote projects, as
-//! the model picker ignores them there.
+//! Order of the provider: project default, Settings default, last choice
+//! (`recent_models[0]`), then Codex (or the first allowed provider). A step is
+//! skipped when its provider is hidden. The model follows the project, then
+//! "New chats start with" (`Preferences::model_for_new_chat`). Hidden providers
+//! are ignored for remote projects, as the model picker ignores them there.
 use super::*;
 use crate::settings::Preferences;
 
@@ -24,14 +25,10 @@ impl NewChatChoice {
     }
 }
 
-/// The project's model for the provider, else the Settings default.
+/// The project's model for the provider, else what "New chats start with"
+/// says: the last one picked, the provider's default or the chosen model.
 fn default_model(prefs: &Preferences, cwd: &str, kind: Kind) -> Option<String> {
-    prefs
-        .project_providers
-        .get(cwd)
-        .and_then(|p| p.models.get(kind.id()))
-        .or(prefs.default_models.get(kind.id()))
-        .cloned()
+    prefs.model_for_new_chat(kind.id(), cwd)
 }
 
 fn allowed(prefs: &Preferences, cwd: &str, kind: Kind) -> bool {
@@ -57,10 +54,7 @@ pub(crate) fn resolve(prefs: &Preferences, cwd: &str) -> NewChatChoice {
     if let Some(recent) = prefs.recent_models.first()
         && let Some(kind) = Kind::parse(&recent.provider).filter(|k| allowed(prefs, cwd, *k))
     {
-        return NewChatChoice::of(
-            kind,
-            default_model(prefs, cwd, kind).or_else(|| recent.model.clone()),
-        );
+        return NewChatChoice::of(kind, default_model(prefs, cwd, kind));
     }
     // 4. Codex, or the first provider left.
     let kind = [Kind::Codex]
@@ -79,6 +73,10 @@ impl Shell {
     /// A new chat in the current project.
     pub(super) fn default_choice(&self) -> NewChatChoice {
         self.new_chat_choice(&self.workspace.project)
+    }
+    /// The provider a new chat in the current project starts with.
+    pub(super) fn default_kind(&self) -> Kind {
+        self.default_choice().kind
     }
     /// A caller-picked provider in the current project.
     pub(super) fn explicit_choice(&self, kind: Kind) -> NewChatChoice {

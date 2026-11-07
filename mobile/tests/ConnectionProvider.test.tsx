@@ -1,6 +1,6 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const world = vi.hoisted(() => ({
   appState: "active",
@@ -11,6 +11,10 @@ const world = vi.hoisted(() => ({
   catalog: undefined as unknown as Record<string, unknown>,
   addresses: [{ host: "10.0.0.2", port: 1 }],
   fail: false,
+  rev: null as string | null,
+  revs: [] as (string | undefined)[],
+  // A desktop without `workspace.watch` unless a test opens one.
+  watch: null as null | { frames: unknown[]; closed: number; opened: number; fail: string | null },
 }));
 vi.mock("react-native", () => ({
   Platform: { OS: "ios" },
@@ -43,10 +47,29 @@ vi.mock("expo-sqlite/kv-store", () => ({
 vi.mock("@/features/connection/nativeLink", () => ({
   nativeCall: async () => ({}),
   parseInvitation: () => ({}),
-  request: async () => {
+  openWatch: async () => {
+    if (!world.watch) throw new Error("Unsupported mobile operation");
+    if (world.watch.fail) throw new Error(world.watch.fail);
+    world.watch.opened++;
+    return world.watch.opened;
+  },
+  nextUpdates: async () => {
+    const watch = world.watch!;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (watch.fail) throw new Error(watch.fail);
+    return watch.frames.splice(0);
+  },
+  closeWatch: async () => void world.watch!.closed++,
+  request: async (_: unknown, __: string, params: { rev?: string } = {}) => {
     world.requests++;
+    world.revs.push(params.rev);
     if (world.fail) throw new Error("offline");
-    return structuredClone({ ...world.catalog, addresses: world.addresses });
+    if (world.rev && params.rev === world.rev) return { unchanged: true, rev: world.rev };
+    return structuredClone({
+      ...world.catalog,
+      addresses: world.addresses,
+      ...(world.rev ? { rev: world.rev } : {}),
+    });
   },
 }));
 
@@ -83,9 +106,14 @@ function Everything() {
 
 const session = (id: string, busy = false) => ({ id, busy, title: id });
 let root: ReturnType<typeof createRoot>;
+let pushing = false;
 const settle = () => act(async () => void (await vi.advanceTimersByTimeAsync(0)));
 const advance = (ms: number) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
 const catalogWrites = () => world.writes.filter((key) => key.endsWith(".catalog")).length;
+const flushedCatalog = () => {
+  world.appListeners.forEach((listener) => listener("inactive"));
+  return world.store.get("monocode.mobile.fp.catalog") ?? "{}";
+};
 const pairingWrites = () => world.writes.filter((key) => key === "monocode.mobile.pairing").length;
 
 beforeEach(async () => {
@@ -96,6 +124,9 @@ beforeEach(async () => {
   world.writes.length = 0;
   world.requests = 0;
   world.fail = false;
+  world.rev = null;
+  world.revs.length = 0;
+  world.watch = pushing ? { frames: [], closed: 0, opened: 0, fail: null } : null;
   world.addresses = [{ host: "10.0.0.2", port: 1 }];
   world.catalog = { projects: [], monos: [], sessions: [session("one")] };
   world.store.set(
@@ -121,15 +152,103 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("ConnectionProvider following the desktop", () => {
+  beforeAll(() => void (pushing = true));
+  afterAll(() => void (pushing = false));
+
+  const push = (frame: unknown) => world.watch!.frames.push(frame);
+
+  it("reads nothing while the desktop has nothing to push", async () => {
+    await advance(60_000);
+    expect(world.requests).toBe(0);
+    expect(world.watch!.opened).toBe(1);
+  });
+
+  it("takes what the desktop pushes", async () => {
+    push({ projects: [], monos: [], sessions: [session("pushed")], rev: "a" });
+    await advance(200);
+    expect(JSON.parse(flushedCatalog()).sessions[0].id).toBe("pushed");
+    expect(world.requests).toBe(0);
+  });
+
+  it("opens again on what it holds after the watch ends", async () => {
+    push({ projects: [], monos: [], sessions: [session("pushed")], rev: "a" });
+    await advance(200);
+    world.watch!.fail = "Desktop stopped answering";
+    await advance(200);
+    expect(world.watch!.closed).toBe(1);
+    world.watch!.fail = null;
+    await advance(2_000);
+    expect(world.watch!.opened).toBe(2);
+  });
+
+  it("closes the watch in the background and opens it again when shown", async () => {
+    world.appState = "background";
+    world.appListeners.forEach((listener) => listener("background"));
+    await advance(200);
+    expect(world.watch!.closed).toBe(1);
+    await advance(60_000);
+    expect(world.watch!.opened).toBe(1);
+    world.appState = "active";
+    world.appListeners.forEach((listener) => listener("active"));
+    await advance(200);
+    expect(world.watch!.opened).toBe(2);
+  });
+});
+
 describe("ConnectionProvider polling", () => {
-  it("reads every five seconds while the app is active, busy or not", async () => {
+  it("reads every five seconds while a session works", async () => {
+    world.catalog = { projects: [], monos: [], sessions: [session("one", true)] };
+    await advance(5000);
     world.requests = 0;
     await advance(5000 * 12 + 100);
     expect(world.requests).toBe(12);
-    world.catalog = { projects: [], monos: [], sessions: [session("one", true)] };
+  });
+
+  it("reads every five seconds while a Mono works", async () => {
+    world.catalog = { projects: [], monos: [{ id: "m", status: "working" }], sessions: [] };
+    await advance(5000);
     world.requests = 0;
-    await advance(5000 * 12);
+    await advance(5000 * 12 + 100);
     expect(world.requests).toBe(12);
+  });
+
+  it("slows down once nothing is moving, and picks up when something does", async () => {
+    await advance(5000 * 4);
+    world.requests = 0;
+    await advance(15000 * 4 + 100);
+    expect(world.requests).toBe(4);
+    world.catalog = { projects: [], monos: [], sessions: [session("one"), session("two")] };
+    await advance(15000);
+    world.requests = 0;
+    await advance(5000 * 2 + 100);
+    expect(world.requests).toBe(2);
+  });
+
+  it("asks with the desktop's rev, and keeps the workspace it holds", async () => {
+    world.rev = "a";
+    await advance(5000);
+    world.revs.length = 0;
+    const seen = world.requests;
+    await advance(5000 + 100);
+    expect(world.requests).toBe(seen + 1);
+    expect(world.revs).toEqual(["a"]);
+    const before = renders.everything;
+    await advance(5000);
+    expect(renders.everything).toBe(before);
+    expect(world.fail).toBe(false);
+    world.rev = "b";
+    world.catalog = { projects: [], monos: [], sessions: [session("one"), session("two")] };
+    await advance(15000);
+    expect(renders.everything).toBeGreaterThan(before);
+    world.revs.length = 0;
+    await advance(5000 + 100);
+    expect(world.revs).toEqual(["b"]);
+  });
+
+  it("reads an older desktop in full, without a rev", async () => {
+    await advance(5000 * 3);
+    expect(world.revs.every((rev) => rev === undefined)).toBe(true);
   });
 
   it("shows a session started on the desktop within one poll", async () => {
@@ -227,9 +346,9 @@ describe("ConnectionProvider writes and renders", () => {
     const quiet = { ...renders };
     commits.mockClear();
     world.requests = 0;
-    await advance(5000 * 12);
-    expect(world.requests).toBe(12);
-    // Twelve reads of the same workspace: no render of any reader, no commit.
+    await advance(15000 * 4);
+    expect(world.requests).toBeGreaterThanOrEqual(4);
+    // Reads of the same workspace: no render of any reader, no commit.
     expect(renders).toEqual(quiet);
     expect(commits).not.toHaveBeenCalled();
     expect(before.everything).toBeGreaterThan(0);

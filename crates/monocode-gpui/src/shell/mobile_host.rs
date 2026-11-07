@@ -9,7 +9,7 @@ use super::*;
 use crate::{
     accounts::Tone,
     mobile::{
-        catalog as mobile_catalog, orchestration as mobile_orchestration, project,
+        catalog as mobile_catalog, project,
         transcript as turns,
     },
     notifications::delivery,
@@ -19,7 +19,8 @@ use gpui::{EntityId, Task};
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
     mobile::{
-        Event, Invite, MobileHost, Push, Request, Status, TerminalStart, WatchStart, notify, watch,
+        Attendance, Event, Invite, MobileHost, Push, Request, Status, TerminalStart, WatchStart,
+        notify, watch,
     },
     transcript::Row,
 };
@@ -33,8 +34,12 @@ use std::{
 
 /// How often the workspace a phone polls is refreshed while access is on.
 const PUBLISH_INTERVAL: Duration = Duration::from_secs(3);
-/// At most this often while a reply streams: about 20 frames a second.
-const PUSH_INTERVAL: Duration = Duration::from_millis(50);
+/// At most this often while a reply streams: about 10 frames a second. Every
+/// frame costs the phone a radio wake and a layout pass.
+const PUSH_INTERVAL: Duration = Duration::from_millis(100);
+/// As much of a Mono's last message as its row shows on the phone. The rest
+/// would ride along on every workspace poll for nothing.
+const LAST_MESSAGE_MAX: usize = 1200;
 /// Turns a conversation opens on when the phone does not say.
 const DEFAULT_TAIL: usize = 3;
 const MAX_PAGE: usize = 100;
@@ -73,6 +78,8 @@ pub(super) struct Mobile {
     mono_previews: HashMap<i64, MonoPreview>,
     /// Avatar addresses handed to phones as opaque keys.
     inbox_avatars: monocode_core::mobile::inbox::AvatarBook,
+    /// What a phone's Inbox holds, as of the last time one followed along.
+    inbox_rev: Option<String>,
 }
 
 #[derive(Clone)]
@@ -81,14 +88,17 @@ struct MonoPreview {
     text: Value,
 }
 
+/// The most archived sessions the phone can page through; the newest are kept.
+const ARCHIVED_MAX: usize = 500;
+
 struct CatalogEntry {
     id: i64,
-    /// The lead of a subagent (a thread it drives, or an Orchestrator
-    /// worker), which the phone lists under it.
+    /// The lead of a subagent, which the phone lists under it.
     lead: Option<i64>,
     project: String,
     summary: Session,
     live: Option<mobile_catalog::LiveSession>,
+    draft: bool,
 }
 
 enum Receipt {
@@ -436,17 +446,11 @@ impl Shell {
 
     /// What a new session in `cwd` starts with, as a new desktop tab would.
     fn mobile_defaults(&self, cwd: &str, cx: &App) -> (Kind, Option<String>, AccessMode) {
-        let prefs = &self.workspace.preferences;
-        let project = prefs.project_providers.get(cwd);
-        let kind = project
-            .and_then(|p| p.provider.as_deref())
-            .or(prefs.default_provider.as_deref())
-            .and_then(Kind::parse)
-            .unwrap_or(Kind::Codex);
-        let model = prefs
-            .model_for_new_chat(kind.id(), cwd)
-            .and_then(|model| monocode_core::store::native_model(&model, kind.id()));
-        (kind, model, crate::conversation::default_access(cx))
+        let choice = self.new_chat_choice(cwd);
+        let model = choice
+            .model
+            .and_then(|model| monocode_core::store::native_model(&model, choice.kind.id()));
+        (choice.kind, model, crate::conversation::default_access(cx))
     }
 
     fn mobile_catalog_sessions(&self, paths: &[String], cx: &App) -> Vec<CatalogEntry> {
@@ -455,9 +459,10 @@ impl Shell {
             .filter(|id| !self.sidebar_hidden_sessions.contains(id))
             .filter_map(|&id| {
                 let metadata = self.session_metadata(id, cx);
+                let draft = metadata.has_any_draft();
                 let summary = metadata.summary;
-                if summary.archived
-                    || !summary.has_messages
+                // Archived ones stay, for the phone's Archived list.
+                if !summary.has_messages
                     || self
                         .monos
                         .as_ref()
@@ -471,6 +476,7 @@ impl Shell {
                     .find(|path| monocode_core::files::path_key(path) == key)?;
                 let live = self.sessions.get(&id).map(|view| {
                     let view = view.read(cx);
+                    let waiting_draft = self.waiting_draft(id, cx);
                     mobile_catalog::LiveSession {
                         loaded: view.history_loaded(),
                         metadata: monocode_core::store::MobileSessionMetadata {
@@ -479,16 +485,15 @@ impl Shell {
                             worktree_cwd: view.settings.worktree_cwd.clone(),
                             worktree_removed: view.settings.worktree_removed,
                             access: view.settings.access,
+                            updated_at: view.summary.updated_at,
                         },
-                        busy: view.busy,
+                        busy: view.running(),
                         waiting: match view.mobile_waiting(cx) {
                             Some(crate::conversation::MobileWaiting::Approval) => Some("approval"),
                             Some(crate::conversation::MobileWaiting::Question) => Some("question"),
-                            None => None,
+                            None => waiting_draft.as_ref().map(|_| "draft"),
                         },
-                        orchestration: mobile_orchestration::current(view.orchestration_views())
-                            .last()
-                            .map(|(_, run)| mobile_orchestration::summary(run)),
+                        waiting_draft,
                     }
                 });
                 Some(CatalogEntry {
@@ -497,6 +502,7 @@ impl Shell {
                     project: project_id(project),
                     summary: summary.clone(),
                     live,
+                    draft,
                 })
             })
             .collect()
@@ -540,6 +546,13 @@ impl Shell {
         if self.mobile.publishing || !host.enabled() {
             return;
         }
+        // A followed phone reads its Inbox only when this rev moves, so its
+        // reading no longer starts the fetches that move it.
+        if let Some(inbox) = self.inbox.clone().filter(|_| host.followed()) {
+            inbox.update(cx, |inbox, cx| inbox.refresh_for_phone(cx));
+            self.mobile.inbox_rev = Some(inbox.read(cx).phone_rev());
+        }
+        let inbox_rev = self.mobile.inbox_rev.clone();
         let paths = self.mobile_projects(cx);
         let projects: Vec<Value> = paths
             .iter()
@@ -559,13 +572,13 @@ impl Shell {
                         let live = manager.open_chat(&mono.id).map(|chat| {
                             let chat = chat.read(cx);
                             let rows = chat.transcript.read(cx).source_rows();
-                            let last = turns::messages(rows).pop();
+                            let status = chat.mono_status();
                             json!({
-                                "status": chat.mono_status(),
+                                "status": status,
                                 "busy": chat.busy,
                                 "harness": chat.summary.provider,
                                 "model": mobile_catalog::model_id(Kind::from_id(&chat.summary.provider), chat.mobile_model()),
-                                "lastMessage": last.map(|m| m["text"].clone()).unwrap_or(json!("")),
+                                "lastMessage": turns::last_message(rows, status == "working"),
                                 "lastActiveAt": chat.summary.updated_at,
                             })
                         });
@@ -576,11 +589,10 @@ impl Shell {
             .unwrap_or_default();
         // A Mono's conversation not open here still shows its last message
         // on the phone, read from its saved history.
-        let saved_monos: Vec<(i64, Option<u64>)> = monos
+        let saved_monos: Vec<i64> = monos
             .iter()
             .filter(|(_, live)| live.is_none())
             .filter_map(|(mono, _)| mono.session_id)
-            .map(|id| (id, self.session_summaries.get(&id).map(|s| s.updated_at)))
             .collect();
         let mut previews = self.mobile.mono_previews.clone();
         let store = self.store.clone();
@@ -596,24 +608,23 @@ impl Shell {
                         entry.insert(value);
                     }
                 }
-                for (id, updated_at) in &saved_monos {
+                let saved = store.mobile_session_metadata()?;
+                for id in &saved_monos {
+                    let updated_at = saved.get(id).map(|session| session.updated_at);
                     let fresh = previews
                         .get(id)
-                        .is_some_and(|p| updated_at.is_some_and(|at| at == p.updated_at));
+                        .is_some_and(|p| updated_at == Some(p.updated_at));
                     if fresh {
                         continue;
                     }
                     let Ok(history) = store.load(*id) else {
                         continue;
                     };
-                    let text = turns::messages(&history.rows)
-                        .pop()
-                        .map(|m| m["text"].clone())
-                        .unwrap_or(json!(""));
+                    let text = json!(turns::last_message(&history.rows, false));
                     previews.insert(*id, MonoPreview { updated_at: updated_at.unwrap_or(0), text });
                 }
-                previews.retain(|id, _| saved_monos.iter().any(|(saved, _)| saved == id));
-                store.mobile_session_metadata()?
+                previews.retain(|id, _| saved_monos.contains(id));
+                saved
             };
             let mut branches = HashMap::new();
             let projects: Vec<_> = projects.into_iter().map(|mut project| {
@@ -625,10 +636,15 @@ impl Shell {
                 monos.iter().map(|(mono, _)| (mono.id.as_str(), mono.launches.iter().map(|l| l.session_id).collect())),
             );
             let mut sessions = Vec::new();
+            let mut archived = Vec::new();
             for entry in entries {
                 let Some(id) = ids.get(&entry.id) else {
                     continue;
                 };
+                // An archived worker goes with its lead; it isn't listed.
+                if entry.summary.archived && entry.lead.is_some() {
+                    continue;
+                }
                 // A worker whose lead the phone can't open is left out, as before.
                 let lead = match entry.lead {
                     Some(lead) => match ids.get(&lead) {
@@ -648,9 +664,18 @@ impl Shell {
                 if let Some(mono) = origins.get(&entry.id) {
                     session["monoId"] = json!(mono);
                 }
-                sessions.push(session);
+                if entry.draft {
+                    session["draft"] = json!(true);
+                }
+                if entry.summary.archived {
+                    archived.push(session);
+                } else {
+                    sessions.push(session);
+                }
             }
             sessions.sort_by_key(|s| std::cmp::Reverse(s["updatedAt"].as_u64()));
+            archived.sort_by_key(|s| std::cmp::Reverse(s["updatedAt"].as_u64()));
+            archived.truncate(ARCHIVED_MAX);
             let monos: Vec<Value> = monos
                 .into_iter()
                 .map(|(mono, live)| {
@@ -684,6 +709,13 @@ impl Shell {
                             }
                         }
                     }
+                    let clipped = value["lastMessage"].as_str().and_then(|text| {
+                        let (end, _) = text.char_indices().nth(LAST_MESSAGE_MAX)?;
+                        Some(text[..end].to_owned())
+                    });
+                    if let Some(text) = clipped {
+                        value["lastMessage"] = json!(text);
+                    }
                     value
                 })
                 .collect();
@@ -694,7 +726,8 @@ impl Shell {
                 // Expo, so they no longer post their own alerts. `monoFiles`:
                 // it reads and saves a Mono's soul and memory for the phone.
                 // `inbox`: it answers the phone's `inbox.*` requests.
-                json!({"projects": projects, "monos": monos, "sessions": sessions, "monoTools": true, "push": true, "monoFiles": true, "inbox": true, "sessionUnarchive": true}),
+                // `inboxRev`: the phone reads its Inbox when this moves.
+                json!({"inboxRev": inbox_rev, "projects": projects, "monos": monos, "sessions": sessions, "monoTools": true, "push": true, "monoFiles": true, "inbox": true, "inboxActions": true, "sessionUnarchive": true, "archived": archived, "archivedList": true}),
                 ids,
                 previews,
             ))
@@ -828,16 +861,19 @@ impl Shell {
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
             "session.commands" => self.mobile_commands(request, cx),
-            "orchestration.read" => {
-                let result = self.mobile_orchestration(&request.params, cx);
-                request.reply(result);
-            }
             "draft.read" => self.mobile_draft_read(request, window, cx),
             "draft.frame" => self.mobile_draft_frame(request, window, cx),
-            "composer.read" => self.mobile_composer_read(request, cx),
-            method if method.starts_with("inbox.") && method != "inbox.start" => {
-                self.mobile_inbox(request, window, cx)
+            "draft.poster" => {
+                let reply = self.mobile_draft_poster(&request.params, cx);
+                request.reply(reply);
             }
+            "composer.read" => self.mobile_composer_read(request, cx),
+            "inbox.start"
+            | "inbox.action"
+            | "inbox.comment"
+            | "inbox.reviewAdd"
+            | "inbox.reviewSubmit" => self.mobile_command(request, window, cx),
+            method if method.starts_with("inbox.") => self.mobile_inbox(request, window, cx),
             method if method.starts_with("terminal.") => self.mobile_terminal_request(request, cx),
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
@@ -1132,7 +1168,12 @@ impl Shell {
         let waiting = match chat.mobile_waiting(cx) {
             Some(crate::conversation::MobileWaiting::Approval) => Some("Waiting for approval"),
             Some(crate::conversation::MobileWaiting::Question) => Some("Waiting for answers"),
-            None => None,
+            None => match target {
+                Target::Session(session) => self
+                    .waiting_draft(*session, cx)
+                    .map(|_| "Waiting for you"),
+                Target::Mono(_) => None,
+            },
         };
         let snapshot = Snapshot {
             usage_limit: chat.mobile_usage_limit(cx),
@@ -1141,7 +1182,7 @@ impl Shell {
             cwd: &chat.summary.cwd,
             harness: &chat.summary.provider,
             model: chat.mobile_model().map(str::to_owned),
-            busy: chat.busy,
+            busy: chat.running(),
             waiting,
             mono,
             pending: chat.mobile_pending(cx),
@@ -1190,6 +1231,7 @@ impl Shell {
             let rows = store.load(id)?.rows;
             let history = store.history_before(id)?;
             let settings = store.agent_settings(id)?.unwrap_or_default();
+            let turns = settings.turns.clone();
             let (harness, cwd) = match summary {
                 Some(summary) => (summary.provider, summary.cwd),
                 None => store
@@ -1203,7 +1245,7 @@ impl Shell {
                 id,
                 settings,
                 rows,
-                turns: settings.turns,
+                turns,
                 senders,
                 harness,
                 cwd,
@@ -1561,6 +1603,23 @@ impl Shell {
             "session.start" => self.mobile_start(request, finish, cx),
             "conversation.send" => self.mobile_send(request, finish, cx),
             "inbox.start" => self.mobile_inbox_start(request, finish, cx),
+            "inbox.action" => {
+                self.ensure_background_inbox(window, cx);
+                self.mobile_inbox_action(request, finish, cx);
+            }
+            "inbox.comment" => {
+                self.ensure_background_inbox(window, cx);
+                self.mobile_inbox_comment(request, finish, cx);
+            }
+            "inbox.reviewAdd" => {
+                self.ensure_background_inbox(window, cx);
+                let result = self.mobile_inbox_review_add(&request.params, cx);
+                finish(self, request, result);
+            }
+            "inbox.reviewSubmit" => {
+                self.ensure_background_inbox(window, cx);
+                self.mobile_inbox_review_submit(request, finish, cx);
+            }
             _ => {
                 let result =
                     self.mobile_session_command(&request.method, &request.params, window, cx);
@@ -1579,7 +1638,7 @@ impl Shell {
         let conversation = string(params, "conversationId").unwrap_or_default();
         let target = self.mobile_target(&conversation, cx)?;
         let reply = json!({"sessionId": conversation});
-        match (request.method.as_str(), &target) {
+        match (method, &target) {
             // An approval answered from the phone's Live Activity.
             ("session.decide", target) => {
                 let request_id = string(params, "requestId").ok_or("Missing approval")?;
@@ -1708,27 +1767,6 @@ impl Shell {
                 self.delete_session(*id, window, cx);
                 Ok(reply)
             }
-            ("orchestration.action", Target::Session(id)) => {
-                let action = mobile_orchestration::action(
-                    params["action"].as_str().unwrap_or_default(),
-                    params["taskId"].as_str(),
-                    params["index"].as_u64().map(|ix| ix as usize),
-                )
-                .ok_or("Unsupported orchestration action")?;
-                let call = string(params, "call").unwrap_or_default();
-                let lead = *id;
-                self.ensure_session(lead, cx)
-                    .ok_or("Session is no longer available")?;
-                self.orchestration_action(
-                    lead,
-                    crate::transcript::orchestration::OrchestrationAction { call, action },
-                    cx,
-                );
-                self.mobile_orchestration(params, cx)
-            }
-            ("orchestration.action", Target::Mono(_)) => {
-                Err("A Mono's conversation has no orchestration".into())
-            }
             ("draft.action", _) => self.mobile_draft_action(params, window, cx),
             ("composer.write", _) => self.mobile_composer_write(params, cx),
             ("session.answerQuestion" | "session.keepQuestionOpen", target) => {
@@ -1758,40 +1796,6 @@ impl Shell {
             }
             _ => Err("Unsupported mobile command".into()),
         }
-    }
-
-    /// A lead's current Orchestrator cards in full, for the phone's Agents
-    /// sheet. Opening the lead brings back a run saved before a restart.
-    fn mobile_orchestration(
-        &mut self,
-        params: &Value,
-        cx: &mut Context<Self>,
-    ) -> Result<Value, String> {
-        let conversation = string(params, "conversationId").unwrap_or_default();
-        let Target::Session(lead) = self.mobile_target(&conversation, cx)? else {
-            return Ok(json!({"runs": []}));
-        };
-        let view = self
-            .ensure_session(lead, cx)
-            .ok_or("Session is no longer available")?;
-        self.push_orchestration_views(lead, cx);
-        let views: Vec<_> = mobile_orchestration::current(view.read(cx).orchestration_views())
-            .into_iter()
-            .cloned()
-            .collect();
-        let workers: HashMap<i64, String> = views
-            .iter()
-            .flat_map(|(_, run)| run.tasks.iter().filter_map(|task| task.session))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .map(|id| (id, self.mobile_session_id(id)))
-            .collect();
-        Ok(json!({
-            "runs": views
-                .iter()
-                .map(|(call, run)| mobile_orchestration::run(call.as_deref(), run, |id| workers.get(&id).cloned()))
-                .collect::<Vec<_>>(),
-        }))
     }
 
     fn mobile_send(
@@ -1873,10 +1877,6 @@ impl Shell {
             let mode = message_mode(&params)?;
             let cwd =
                 self.mobile_project_path(&string(&params, "projectId").unwrap_or_default(), cx)?;
-            // Checked before the session exists, so a refused mode leaves none behind.
-            if cwd.starts_with("remote://") && matches!(mode, Some("operator" | "orchestrator")) {
-                return Err("This mode is not available on remote projects.".into());
-            }
             let (default_kind, default_model, default_access) = self.mobile_defaults(&cwd, cx);
             let chosen = string(&params, "harness").as_deref().and_then(Kind::parse);
             let kind = chosen.unwrap_or(default_kind);
@@ -1900,7 +1900,7 @@ impl Shell {
             Ok(prepared) => prepared,
             Err(error) => return finish(self, request, Err(error)),
         };
-        let effort = crate::conversation::preferred_effort(kind.id(), cx);
+        let effort = crate::conversation::preferred_effort(kind.id(), model.as_deref(), cx);
         let mut chosen_settings = model_settings(&params);
         let stage = self.stage_mobile_attachments(&params, cx);
         let store = self.store.clone();
@@ -2086,25 +2086,41 @@ impl Shell {
         }
     }
 
-    fn send_mobile_notice(&self, category: &str, notice: notify::Notice, cx: &App) {
+    /// Hands a notice to the host, which sends it now or, while the user is
+    /// at this Mac, once they are away.
+    fn send_mobile_notice(&self, category: &str, notice: notify::Notice, _cx: &App) {
+        if let Some(host) = &self.mobile.host {
+            host.notice(category, notice);
+        }
+    }
+
+    /// Tells the host whether the user is at this Mac, so phone alerts wait for
+    /// them to leave: idle for the chosen time, or the screen locked.
+    pub(super) fn poll_presence(&mut self, cx: &App) {
         let Some(host) = self.mobile.host.clone() else {
             return;
         };
-        let tokens = host.push_tokens(category);
-        if tokens.is_empty() {
-            return;
-        }
-        cx.background_executor()
-            .spawn(async move {
-                match notify::send_notice(&tokens, &notice) {
-                    Ok(gone) if !gone.is_empty() => {
-                        let _ = host.forget_push_tokens(&gone);
-                    }
-                    Ok(_) => {}
-                    Err(error) => eprintln!("Mobile notification not sent: {error}"),
+        let prefs = &self.workspace.preferences;
+        let attendance = match crate::notifications::platform::idle_seconds() {
+            Some(idle) if prefs.phone_alerts_when_away => {
+                let limit = f64::from(prefs.phone_away_minutes.max(1)) * 60.;
+                if idle >= limit || crate::notifications::platform::screen_locked() {
+                    Attendance::Away
+                } else {
+                    Attendance::AtDesk
                 }
-            })
-            .detach();
+            }
+            _ => Attendance::Ignore,
+        };
+        host.set_attendance(attendance);
+        // A finish on the screen in front of them needs no phone alert later.
+        if attendance == Attendance::AtDesk
+            && self.window_active
+            && let Some(id) = self.workspace.active
+            && self.notice_session_visible(id, cx)
+        {
+            host.seen(&self.mobile_session_id(id));
+        }
     }
 
     /// The account a new session uses: the phone's pick, checked against the
@@ -2279,7 +2295,9 @@ impl Shell {
                 .map(|cwd| {
                     let (kind, model, access) = self.mobile_defaults(&cwd, cx);
                     let mut settings = HashMap::new();
-                    if let Some(effort) = crate::conversation::preferred_effort(kind.id(), cx) {
+                    if let Some(effort) =
+                        crate::conversation::preferred_effort(kind.id(), model.as_deref(), cx)
+                    {
                         settings.insert("effort".into(), effort);
                     }
                     (cwd, kind, model, settings, access, None)
@@ -2289,7 +2307,7 @@ impl Shell {
             Ok(current) => current,
             Err(error) => return request.reply(Err(error)),
         };
-        let hidden = self.workspace.preferences.hidden_providers.clone();
+        let hidden = hidden_providers(&self.workspace.preferences, &cwd);
         let hidden_models = self.workspace.preferences.hidden_models_for(&cwd);
         let center = crate::accounts::get(cx).map(|c| c.read(cx));
         let account_kinds = [Kind::Claude, Kind::Codex];
@@ -3015,6 +3033,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_phone_sees_a_bash_command_as_work_until_it_stops(cx: &mut gpui::TestAppContext) {
+        let (window, saved, _) = super::super::tests::window(cx);
+        let busy = |shell: &Shell, cx: &App| {
+            let paths = shell.mobile_projects(cx);
+            shell
+                .mobile_catalog_sessions(&paths, cx)
+                .into_iter()
+                .find(|entry| entry.id == saved)
+                .and_then(|entry| entry.live)
+                .is_some_and(|live| live.busy)
+        };
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(!busy(shell, cx));
+                shell.sessions[&saved].update(cx, |s, cx| s.start_shell_for_test("sleep 30", cx));
+                assert!(shell.sessions[&saved].read(cx).shell_running());
+                assert!(busy(shell, cx));
+                shell.sessions[&saved].update(cx, |s, cx| s.stop_if_busy(cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| assert!(!busy(shell, cx)))
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn mobile_catalog_matches_sidebar_visibility_for_saved_and_open_sessions(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -3026,6 +3071,7 @@ mod tests {
                     shell
                         .mobile_catalog_sessions(&paths, cx)
                         .into_iter()
+                        .filter(|entry| !entry.summary.archived)
                         .map(|entry| entry.id)
                         .collect::<Vec<_>>()
                 };
@@ -3042,12 +3088,24 @@ mod tests {
                     entries[0].live.is_none(),
                     "history must not need an open desktop view"
                 );
+                shell.draft_sessions.insert(saved);
+                assert!(shell.mobile_catalog_sessions(&paths, cx)[0].draft);
+                shell.draft_sessions.remove(&saved);
+                shell.composer_draft_sessions.insert(saved);
+                assert!(shell.mobile_catalog_sessions(&paths, cx)[0].draft);
+                shell.composer_draft_sessions.remove(&saved);
+                assert!(!shell.mobile_catalog_sessions(&paths, cx)[0].draft);
                 shell.sessions.insert(saved, view.clone());
                 shell.sidebar_hidden_sessions.insert(saved);
                 assert!(ids(shell, cx).is_empty());
                 shell.sidebar_hidden_sessions.remove(&saved);
                 view.update(cx, |chat, _| chat.summary.archived = true);
-                assert!(ids(shell, cx).is_empty());
+                let entries = shell.mobile_catalog_sessions(&paths, cx);
+                assert_eq!(
+                    entries.iter().map(|e| (e.id, e.summary.archived)).collect::<Vec<_>>(),
+                    vec![(saved, true)],
+                    "an archived session stays in the entries, flagged, for the phone's Archived list"
+                );
                 shell.sessions[&blank].update(cx, |chat, _| chat.summary.has_messages = true);
                 assert_eq!(
                     ids(shell, cx),
@@ -3059,60 +3117,13 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_lead_shows_its_plan_on_the_phone_and_lists_its_workers_under_it(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use monocode_core::orchestration::{Plan, Summary, SummaryTask, Task};
+    fn a_lead_lists_its_subagents_under_it_on_the_phone(cx: &mut gpui::TestAppContext) {
+        use monocode_core::subagents::{Summary, SummaryTask};
         let (window, lead, worker) = super::super::tests::window(cx);
-        let task = |id: &str| Task {
-            id: id.into(),
-            title: format!("Assignment {id}"),
-            prompt: "Do it and report.".into(),
-            files: vec!["src".into()],
-            depends_on: Vec::new(),
-            provider: None,
-            model: None,
-            difficulty: None,
-        };
-        let plan = Plan {
-            title: "Split settings".into(),
-            summary: String::new(),
-            tasks: vec![task("a"), task("b")],
-        };
         window
             .update(cx, |shell, _, cx| {
-                let id = shell.mobile_session_id(lead);
-                let params = json!({"conversationId": id});
-                assert_eq!(
-                    shell.mobile_orchestration(&params, cx).unwrap()["runs"],
-                    json!([])
-                );
-
-                shell.sessions[&lead].update(cx, |v, cx| {
-                    v.orchestration_plan = Some((Some("plan-call".into()), plan.clone()));
-                    cx.notify();
-                });
-                let runs = shell.mobile_orchestration(&params, cx).unwrap()["runs"].clone();
-                assert_eq!(runs[0]["phase"], "review");
-                assert_eq!(runs[0]["call"], "plan-call");
-                assert_eq!(runs[0]["tasks"].as_array().unwrap().len(), 2);
-
-                // The phone's Remove reaches the plan under review.
-                let action = mobile_orchestration::action("remove", Some("b"), None).unwrap();
-                shell.orchestration_action(
-                    lead,
-                    crate::transcript::orchestration::OrchestrationAction {
-                        call: "plan-call".into(),
-                        action,
-                    },
-                    cx,
-                );
-                let runs = shell.mobile_orchestration(&params, cx).unwrap()["runs"].clone();
-                assert_eq!(runs[0]["tasks"].as_array().unwrap().len(), 1);
-
-                // The lead's catalog entry carries the card; its worker names it.
                 shell.sessions[&worker].update(cx, |chat, _| chat.summary.has_messages = true);
-                shell.orchestration_summaries.insert(
+                shell.agent_summaries.insert(
                     lead,
                     Summary {
                         tasks: vec![SummaryTask {
@@ -3126,19 +3137,105 @@ mod tests {
                 let paths = shell.mobile_projects(cx);
                 let entries = shell.mobile_catalog_sessions(&paths, cx);
                 let entry = |id: i64| entries.iter().find(|e| e.id == id).unwrap();
-                let summary = entry(lead)
-                    .live
-                    .as_ref()
-                    .unwrap()
-                    .orchestration
-                    .clone()
-                    .unwrap();
-                assert_eq!(summary["phase"], "review");
-                assert_eq!(summary["tones"], json!(["queued"]));
                 assert_eq!(entry(worker).lead, Some(lead));
                 assert_eq!(entry(lead).lead, None);
             })
             .unwrap();
+    }
+    #[gpui::test]
+    fn saved_and_live_usage_tokens_match_and_shell_routes_continuation_controls(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&id].update(cx, |v, cx| v.load(cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let conversation = window
+            .update(cx, |shell, _, cx| {
+                let conversation = shell.mobile_session_id(id);
+                shell.sessions[&id].update(cx, |v, cx| {
+                    v.mobile_configure(
+                        Some((Kind::Codex, Some("fixture-model".into()))),
+                        &HashMap::new(),
+                        None,
+                        cx,
+                    );
+                    v.settings.usage_limit = Some(monocode_core::usage::Limit {
+                        resets_at: Some(monocode_core::usage::now_ms() + 60_000),
+                        resume_at_reset: false,
+                    });
+                    let token = v.mobile_usage_limit(cx)["token"].clone();
+                    v.mobile_resume_usage(&token, Some(true), cx).unwrap();
+                });
+                conversation
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window.update(cx, |shell, window, cx| {
+            let store = locked(&shell.store).unwrap();
+            let summary = shell.session_summaries[&id].clone();
+            let saved = Saved { turns: Default::default(), senders: Default::default(), id, settings: store.agent_settings(id).unwrap().unwrap(), rows: store.load(id).unwrap().rows, harness: summary.provider, cwd: summary.cwd, history: None, mono: None, launches: HashMap::new() };
+            drop(store);
+            let from_disk = saved_snapshot(&saved).usage_limit;
+            let live = shell.with_live_snapshot(&Target::Session(id), cx, |s| s.usage_limit.clone()).unwrap();
+            assert_eq!(from_disk["token"], live["token"]);
+            let params = json!({"conversationId":conversation, "token":from_disk["token"], "enabled":false});
+            shell.mobile_session_command("session.resumeUsageAtReset", &params, window, cx).unwrap();
+            assert!(!shell.sessions[&id].read(cx).settings.usage_limit.as_ref().unwrap().resume_at_reset);
+            assert!(shell.mobile_session_command("session.resumeUsageAtReset", &params, window, cx).unwrap_err().contains("changed"));
+            shell.sessions[&id].update(cx, |v, _| {
+                v.settings.usage_limit.as_mut().unwrap().resets_at = None;
+                v.settings.mono = Some(monocode_core::agent::MonoContext { mono: Default::default(), root: "/fixture".into(), executable: "/fixture/binary".into() });
+            });
+            let token = shell.sessions[&id].read(cx).mobile_usage_limit(cx)["token"].clone();
+            let params = json!({"conversationId":conversation, "token":token});
+            shell.mobile_session_command("session.resumeUsage", &params, window, cx).unwrap();
+            assert!(shell.sessions[&id].read(cx).settings.usage_limit.is_none());
+            assert!(shell.mobile_session_command("session.resumeUsage", &params, window, cx).unwrap_err().contains("no longer paused"));
+            shell.session_summaries.remove(&id);
+            assert!(shell.mobile_session_command("session.resumeUsage", &params, window, cx).unwrap_err().contains("no longer available"));
+        }).unwrap();
+    }
+
+    #[test]
+    fn saved_usage_state_carries_provider_reset_and_recomputes_eligibility() {
+        let reset = monocode_core::usage::now_ms() + 7 * 24 * 3_600_000;
+        let mut saved = Saved {
+            turns: Default::default(),
+            senders: Default::default(),
+            id: 42,
+            settings: Settings {
+                usage_limit: Some(monocode_core::usage::Limit {
+                    resets_at: Some(reset),
+                    resume_at_reset: true,
+                }),
+                ..Default::default()
+            },
+            rows: Vec::new(),
+            harness: "codex".into(),
+            cwd: "/fixture".into(),
+            history: None,
+            mono: None,
+            launches: HashMap::new(),
+        };
+        let state = saved_snapshot(&saved).usage_limit;
+        assert_eq!(state["resetsAt"], reset);
+        assert_eq!(state["canResume"], false);
+        assert_eq!(state["resumeAtReset"], true);
+        saved.settings.usage_limit.as_mut().unwrap().resets_at =
+            Some(monocode_core::usage::now_ms() - 1);
+        let state = saved_snapshot(&saved).usage_limit;
+        assert_eq!(state["canResume"], true);
+        assert_eq!(state["resetLabel"], "Limit has reset");
+        saved.cwd = "remote://host/fixture".into();
+        let remote = saved_snapshot(&saved).usage_limit;
+        assert_eq!(remote["canResume"], false);
+        assert_eq!(remote["canAutoResume"], false);
+        saved.settings.usage_limit = None;
+        assert!(saved_snapshot(&saved).usage_limit.is_null());
     }
 
     #[test]

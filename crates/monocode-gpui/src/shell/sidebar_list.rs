@@ -9,6 +9,8 @@ use std::cell::{Cell, RefCell};
 enum Row {
     Navigation,
     Monos,
+    /// The Working section; its sessions, so a change in them remeasures it.
+    Working(Vec<i64>),
     Pinned,
     Folders,
     Group(Entry),
@@ -31,7 +33,6 @@ enum Row {
     },
     ClassicFolderNew(String),
     ClassicGap(usize),
-    ClassicHeading(&'static str),
     Empty,
 }
 
@@ -48,6 +49,10 @@ pub(super) struct SidebarList {
     visible_rows: RefCell<Vec<usize>>,
     pub(super) cascade: ListCascade,
     reduce_motion: bool,
+    /// The sessions the Working section holds.
+    pub(super) live: Vec<i64>,
+    /// The project's archived sessions, most recently archived first.
+    pub(super) archived: Vec<i64>,
 }
 
 fn row_session(row: &Row) -> Option<i64> {
@@ -98,6 +103,8 @@ impl SidebarList {
             visible_rows: RefCell::new(Vec::new()),
             cascade: ListCascade::default(),
             reduce_motion: false,
+            live: Vec::new(),
+            archived: Vec::new(),
         }
     }
 
@@ -108,6 +115,17 @@ impl SidebarList {
     pub(super) fn remeasure(&self) {
         self.state.remeasure_items(0..self.rows.len());
         self.clear_bounds();
+    }
+
+    /// The Working section changes height while it folds.
+    pub(super) fn remeasure_working(&self) {
+        if let Some(ix) = self
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Working(_)))
+        {
+            self.state.remeasure_items(ix..ix + 1);
+        }
     }
 
     pub(super) fn track_anchor(&self, anchor: AnchorSlot) {
@@ -357,10 +375,15 @@ impl Shell {
     pub(super) fn refresh_sidebar_structure(&mut self, cx: &mut Context<Self>) {
         let scope = self.sidebar_scope();
         let minute = monocode_core::time::now_ms() / 60_000;
+        let live = self.sync_live_sessions(cx);
+        self.leave_stale_archive_view(cx);
         if self.sidebar_list.structure_dirty.replace(false)
             || self.sidebar_list.scope != scope
             || self.sidebar_list.indexed_minute != minute
+            || self.sidebar_list.live != live
         {
+            self.sidebar_list.live = live;
+            self.refresh_archived_sessions(cx);
             // Date/time expiry refreshes membership without resetting the
             // project scope or scroll anchor.
             self.sidebar_list.indexed_minute = minute;
@@ -405,12 +428,13 @@ impl Shell {
 
     fn sidebar_scope(&self) -> String {
         format!(
-            "{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{}",
             self.workspace.project,
             self.working_copy(),
             self.query,
             self.workspace.session_filters,
-            self.workspace.preferences.show_archived,
+            self.archive_view_open(),
+            self.workspace.preferences.docked_sections,
             self.workspace.boxy_layout(),
             self.workspace.classic_layout,
             self.tab_strip_visible()
@@ -418,13 +442,32 @@ impl Shell {
     }
 
     pub(super) fn prepare_sidebar_list(&mut self, entries: &[Entry], cx: &App) {
+        // Working holds these, so the dated list doesn't repeat them. Pinned
+        // and foldered sessions keep their place in both.
+        let working = self.sessions_in_working();
+        let listed: Vec<Entry> = entries
+            .iter()
+            .filter(|entry| !matches!(entry, Entry::Session(id) if working.contains(id)))
+            .cloned()
+            .collect();
+        let empty = entries.is_empty();
         if self.workspace.classic_layout {
-            self.prepare_classic_sidebar_list(entries, cx);
+            self.prepare_classic_sidebar_list(&listed, empty);
             return;
         }
+        let entries = &listed;
         let groups = self.project_groups();
         let now = monocode_core::time::now_ms();
-        let mut rows = vec![Row::Navigation, Row::Monos];
+        let archive = self.archive_view_open();
+        let mut rows = if archive {
+            Vec::new()
+        } else {
+            vec![Row::Navigation, Row::Monos]
+        };
+        if self.working_in_list() {
+            rows.push(Row::Working(self.sidebar_list.live.clone()));
+            rows.push(Row::Gap);
+        }
         let fresh: Vec<i64> = entries
             .iter()
             .filter_map(|entry| match entry {
@@ -481,9 +524,9 @@ impl Shell {
         if folders {
             rows.push(Row::Gap);
         }
-        let archived_listed = self.workspace.preferences.show_archived;
-        let mut previous = None;
-        let mut first = true;
+        // The archive view's own header names the list.
+        let mut previous = archive.then_some("Archived");
+        let mut first = !archive;
         for entry in entries {
             if let Entry::Folder {
                 id,
@@ -523,7 +566,7 @@ impl Shell {
                 continue;
             }
             let summary = self.session_metadata(*id, cx).summary;
-            let label = if archived_listed && summary.archived {
+            let label = if archive && summary.archived {
                 "Archived"
             } else {
                 age_label(summary.updated_at, now)
@@ -540,38 +583,24 @@ impl Shell {
                 label: "Sessions",
                 first: true,
             });
-            if entries.is_empty() {
+            if empty {
                 rows.push(Row::Empty);
             }
         }
         self.sidebar_list.update(self.sidebar_scope(), rows);
     }
 
-    fn prepare_classic_sidebar_list(&mut self, entries: &[Entry], cx: &App) {
+    fn prepare_classic_sidebar_list(&mut self, entries: &[Entry], empty: bool) {
         let groups = self.project_groups();
-        // With archived threads shown, the flat archive list at the end sits
-        // under its own heading, as in the new layout.
-        let archived_listed = self.workspace.preferences.show_archived;
-        let mut archive_heading = false;
         // Original Sidebar.tsx: the list has p-1.5, gap-0.5 and pb-10.
         // Its project navigation and Mono roster belong to the first rail.
         let mut rows = vec![Row::ClassicGap(6)];
+        if self.working_in_list() {
+            rows.push(Row::Working(self.sidebar_list.live.clone()));
+            rows.push(Row::ClassicGap(6));
+        }
         for (ix, entry) in entries.iter().enumerate() {
-            let archived_entry = match entry {
-                Entry::Session(id) => {
-                    self.session_metadata(*id, cx).summary.archived
-                        && !self.archive_exits.exiting(*id)
-                }
-                Entry::Folder { archived, .. } => *archived,
-                _ => false,
-            };
-            if archived_entry && archived_listed && !archive_heading {
-                archive_heading = true;
-                if ix > 0 {
-                    rows.push(Row::ClassicGap(8));
-                }
-                rows.push(Row::ClassicHeading("Archived"));
-            } else if ix > 0 {
+            if ix > 0 {
                 rows.push(Row::ClassicGap(2));
             }
             let (members, collapsed) = match entry {
@@ -617,7 +646,7 @@ impl Shell {
                 rows.push(Row::ClassicGap(6));
             }
         }
-        if entries.is_empty() {
+        if empty {
             rows.push(Row::Empty);
         }
         rows.push(Row::ClassicGap(40));
@@ -633,7 +662,7 @@ impl Shell {
                 | Row::GroupedSession { id, .. }
                 | Row::ClassicGroupMember { id, .. },
             ) = self.sidebar_list.rows.get(ix)
-                && self.orchestration_summaries.contains_key(id)
+                && self.agent_summaries.contains_key(id)
             {
                 self.sidebar_list.state.remeasure_items(ix..ix + 1);
             }
@@ -682,7 +711,7 @@ impl Shell {
                 !self.workspace.boxy_layout(),
                 false,
             ))
-            .when(live, |d| d.children(self.archive_burst_overlay()))
+            .when(live, |d| d.children(self.archive_dust_overlay()))
             .into_any()
     }
 
@@ -793,9 +822,18 @@ impl Shell {
                     .clone()
                     .map(|monos| {
                         monos.update(cx, |monos, cx| {
-                            monos.rail(Some(self.workspace.project.clone()), cx)
+                            monos.rail(
+                                Some(self.workspace.project.clone()),
+                                self.workspace.sidebar_monos_collapsed,
+                                cx,
+                            )
                         })
                     })
+                    .unwrap_or_else(|| div().into_any());
+            }
+            Row::Working(_) => {
+                return self
+                    .live_agents_preview(cx)
                     .unwrap_or_else(|| div().into_any());
             }
             Row::Pinned => section_label("Pinned").into_any(),
@@ -843,13 +881,6 @@ impl Shell {
                     .into_any();
             }
             Row::ClassicGap(height) => return div().h(px(height as f32)).into_any(),
-            Row::ClassicHeading(label) => {
-                return div()
-                    .debug_selector(move || format!("sidebar-heading-{label}"))
-                    .px(px(6.))
-                    .child(section_label(label))
-                    .into_any();
-            }
             Row::Empty => div()
                 .px_2()
                 .py_2()
@@ -1109,10 +1140,7 @@ impl Shell {
         }
     }
     pub(super) fn sidebar_filter_button(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self
-            .workspace
-            .session_filters
-            .active(self.workspace.preferences.show_archived)
+        let active = self.workspace.session_filters.active(false)
             || self.menu_open(&MenuTarget::SessionFilter);
         let button = if self.workspace.classic_layout {
             div()
@@ -1421,8 +1449,12 @@ mod tests {
         let (window, a, b) = super::super::tests::window(cx);
         window
             .update(cx, |shell, _, cx| {
+                let project = shell.workspace.project.clone();
                 for id in [a, b] {
-                    shell.sessions[&id].update(cx, |session, _| session.busy = true);
+                    shell.sessions[&id].update(cx, |session, _| {
+                        session.summary.cwd = project.clone();
+                        session.busy = true;
+                    });
                 }
                 shell.invalidate_chrome(cx);
             })
@@ -1512,7 +1544,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn classic_lists_archived_threads_under_their_own_heading(cx: &mut TestAppContext) {
+    fn the_archive_view_replaces_the_list_with_archived_threads(cx: &mut TestAppContext) {
         use super::{Entry, Row};
         let (window, a, b) = super::super::tests::window(cx);
         let c = window
@@ -1540,7 +1572,7 @@ mod tests {
                         s.summary.archived = id == a;
                     });
                 }
-                shell.workspace.preferences.show_archived = true;
+                shell.archive_view = Some(project);
                 shell.invalidate_chrome(cx);
                 c
             })
@@ -1551,14 +1583,11 @@ mod tests {
         window
             .update(visual, |shell, _, _| {
                 let rows = &shell.sidebar_list.rows;
-                let heading = rows
-                    .iter()
-                    .position(|row| *row == Row::ClassicHeading("Archived"))
-                    .expect("classic shows an Archived heading");
-                let archived = rows.iter().position(|row| *row == Row::Session(a));
-                let active = rows.iter().position(|row| *row == Row::Session(b));
-                assert!(archived.is_some_and(|ix| ix > heading));
-                assert!(active.is_some_and(|ix| ix < heading));
+                assert!(rows.contains(&Row::Session(a)));
+                assert!(
+                    !rows.contains(&Row::Session(b)),
+                    "live threads leave the list"
+                );
             })
             .unwrap();
         assert!(
@@ -1575,17 +1604,12 @@ mod tests {
                 shell.invalidate_chrome(cx);
                 shell.refresh_sidebar_structure(cx);
                 let rows = &shell.sidebar_list.rows;
-                let heading = rows
-                    .iter()
-                    .position(|row| *row == Row::ClassicHeading("Archived"))
-                    .unwrap();
-                let group = rows
-                    .iter()
-                    .position(|row| {
+                assert!(
+                    rows.iter().any(|row| {
                         matches!(row, Row::Group(Entry::Folder { id, archived: true, .. }) if id == "f")
-                    })
-                    .expect("the archived folder is one group");
-                assert!(group > heading);
+                    }),
+                    "the archived folder is one group"
+                );
                 assert!(!rows.iter().any(|row| matches!(row, Row::ClassicFolderNew(_))));
                 assert!(!rows.contains(&Row::Session(a)), "its threads sit in the group");
                 assert!(
@@ -1596,18 +1620,270 @@ mod tests {
             .unwrap();
         window
             .update(visual, |shell, _, cx| {
-                shell.workspace.preferences.show_archived = false;
+                shell.archive_view = None;
                 shell.invalidate_chrome(cx);
                 shell.refresh_sidebar_structure(cx);
                 let rows = &shell.sidebar_list.rows;
-                assert!(!rows.contains(&Row::ClassicHeading("Archived")));
+                assert!(rows.contains(&Row::Session(b)));
                 assert!(!rows.contains(&Row::Session(a)));
+                assert_eq!(
+                    shell.sidebar_list.archived.len(),
+                    2,
+                    "the dock still counts them"
+                );
                 assert!(
                     !rows
                         .iter()
                         .any(|row| matches!(row, Row::Group(Entry::Folder { archived: true, .. })))
                 );
             })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_bash_command_counts_as_working_until_it_ends(cx: &mut TestAppContext) {
+        let (window, a, b) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.classic_layout = false;
+                let project = shell.workspace.project.clone();
+                for id in [a, b] {
+                    shell.sessions[&id].update(cx, |s, _| {
+                        s.summary.cwd = project.clone();
+                        s.summary.has_messages = true;
+                    });
+                }
+                shell.workspace.active = Some(b);
+                shell.sessions[&a].update(cx, |s, cx| {
+                    s.start_shell_for_test("sleep 30", cx);
+                    assert!(s.shell_running() && !s.busy);
+                });
+                shell.refresh_sidebar_structure(cx);
+                assert_eq!(shell.sidebar_list.live, vec![a]);
+                assert!(shell.session_metadata(a, cx).busy);
+            })
+            .unwrap();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.busy_sessions.contains(&a));
+                shell.sessions[&a].update(cx, |s, _| s.cancel_shell_for_test());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                shell.refresh_sidebar_structure(cx);
+                assert!(shell.sidebar_list.live.is_empty());
+                assert!(!shell.busy_sessions.contains(&a));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn working_sessions_lead_the_list_and_leave_their_dated_row(cx: &mut TestAppContext) {
+        use super::Row;
+        let (window, a, b) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.classic_layout = false;
+                let project = shell.workspace.project.clone();
+                for id in [a, b] {
+                    shell.sessions[&id].update(cx, |s, _| {
+                        s.summary.cwd = project.clone();
+                        s.summary.has_messages = true;
+                    });
+                }
+                shell.workspace.active = Some(b);
+                shell.sessions[&a].update(cx, |s, _| s.busy = true);
+                shell.invalidate_chrome(cx);
+                shell.refresh_sidebar_structure(cx);
+                assert_eq!(shell.sidebar_list.live, vec![a]);
+                let rows = &shell.sidebar_list.rows;
+                let working = rows.iter().position(|row| *row == Row::Working(vec![a]));
+                let dated = rows.iter().position(|row| *row == Row::Session(b));
+                assert!(working.is_some() && working < dated);
+                assert!(!rows.contains(&Row::Session(a)));
+
+                // Docked, the section leaves the list but keeps the session.
+                shell.workspace.preferences.docked_sections = true;
+                shell.refresh_sidebar_structure(cx);
+                let rows = &shell.sidebar_list.rows;
+                assert!(!rows.iter().any(|row| matches!(row, Row::Working(_))));
+                assert!(!rows.contains(&Row::Session(a)));
+                shell.workspace.preferences.docked_sections = false;
+
+                // One finishing while it's open leaves at once, too.
+                shell.workspace.active = Some(a);
+                shell.refresh_sidebar_structure(cx);
+                assert_eq!(shell.sidebar_list.live, vec![a]);
+                shell.sessions[&a].update(cx, |s, _| s.busy = false);
+                shell.refresh_sidebar_structure(cx);
+                assert!(shell.sidebar_list.live.is_empty());
+                assert!(shell.sidebar_list.rows.contains(&Row::Session(a)));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_session_finishing_in_the_background_goes_back_to_its_dated_row(cx: &mut TestAppContext) {
+        use super::Row;
+        let (window, a, b) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.classic_layout = false;
+                let project = shell.workspace.project.clone();
+                for id in [a, b] {
+                    shell.sessions[&id].update(cx, |s, _| {
+                        s.summary.cwd = project.clone();
+                        s.summary.has_messages = true;
+                    });
+                }
+                shell.workspace.active = Some(b);
+                shell.sessions[&a].update(cx, |s, cx| {
+                    s.busy = true;
+                    cx.emit(SessionChanged);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                shell.refresh_sidebar_structure(cx);
+                assert_eq!(shell.sidebar_list.live, vec![a]);
+                shell.sessions[&a].update(cx, |s, cx| {
+                    s.busy = false;
+                    cx.emit(SessionChanged);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                shell.refresh_sidebar_structure(cx);
+                assert!(
+                    shell.unseen_finished.contains(&a),
+                    "the row still says Done"
+                );
+                assert!(shell.sidebar_list.live.is_empty());
+                assert!(shell.sidebar_list.rows.contains(&Row::Session(a)));
+                assert!(
+                    !shell
+                        .sidebar_list
+                        .rows
+                        .iter()
+                        .any(|row| matches!(row, Row::Working(_)))
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn working_lists_only_the_current_project(cx: &mut TestAppContext) {
+        let (window, a, b) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                assert_ne!(
+                    shell.sessions[&a].read(cx).summary.cwd,
+                    shell.workspace.project
+                );
+                for id in [a, b] {
+                    shell.ensure_session(id, cx);
+                    shell.sessions[&id].update(cx, |s, _| s.busy = true);
+                }
+                shell.invalidate_chrome(cx);
+                shell.refresh_sidebar_structure(cx);
+                assert_eq!(shell.sidebar_list.live, vec![b]);
+                shell.workspace.project = "/work/another-project".into();
+                shell.refresh_sidebar_structure(cx);
+                assert_eq!(shell.sidebar_list.live, vec![a]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn working_lists_every_session_without_a_cap(cx: &mut TestAppContext) {
+        let (window, a, b) = super::super::tests::window(cx);
+        let mut ids = vec![a, b];
+        window
+            .update(cx, |shell, _, cx| {
+                let project = shell.workspace.project.clone();
+                for _ in 0..4 {
+                    let session = locked(&shell.store)
+                        .unwrap()
+                        .create("claude", &project)
+                        .unwrap();
+                    ids.push(session.id);
+                    shell.order.push(session.id);
+                    shell.session_summaries.insert(session.id, session);
+                    shell.ensure_session(*ids.last().unwrap(), cx);
+                }
+                for id in &ids {
+                    shell.sessions[id].update(cx, |s, _| {
+                        s.summary.cwd = project.clone();
+                        s.summary.has_messages = true;
+                        s.busy = true;
+                    });
+                }
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        for id in &ids {
+            let row: &'static str = format!("live-agent-{id}").leak();
+            assert!(visual.debug_bounds(row).is_some(), "{row}");
+        }
+    }
+
+    #[gpui::test]
+    fn clicking_archived_opens_its_view_and_back_returns(cx: &mut TestAppContext) {
+        let (window, a, b) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.classic_layout = false;
+                let project = shell.workspace.project.clone();
+                for id in [a, b] {
+                    shell.sessions[&id].update(cx, |s, _| {
+                        s.summary.cwd = project.clone();
+                        s.summary.has_messages = true;
+                        s.summary.archived = id == a;
+                    });
+                }
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let row = visual.debug_bounds("sidebar-archived").unwrap();
+        visual.simulate_click(row.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.archive_view_open());
+                assert_eq!(shell.sidebar_session_ids(cx), vec![a]);
+            })
+            .unwrap();
+        assert!(visual.debug_bounds("sidebar-archived").is_none());
+        let back = visual.debug_bounds("archive-view-back").unwrap();
+        visual.simulate_click(back.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(!shell.archive_view_open());
+                assert_eq!(shell.sidebar_session_ids(cx), vec![b]);
+                shell.workspace.preferences.docked_sections = true;
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        // Docked, the same row opens in place.
+        let row = visual.debug_bounds("sidebar-archived").unwrap();
+        visual.simulate_click(row.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("sidebar-archived-list").is_some());
+        window
+            .update(visual, |shell, _, _| assert!(!shell.archive_view_open()))
             .unwrap();
     }
 

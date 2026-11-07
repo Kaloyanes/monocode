@@ -27,18 +27,18 @@ import { selectedWorkspace } from "@/features/connection/selection";
 import type { ModelCatalog, ModelChoice } from "@/features/models/types";
 import { toWire, type Attachment } from "@/features/sessions/attachments";
 import type {
+  ComposerMode,
   DisplayedQuestionPrompt,
   Message,
   Mono,
-  OrchestrationActionName,
-  OrchestrationRun,
-  OrchestrationTask,
+  MonoSubsessions,
   Project,
   QuestionPrompt,
   QuestionReply,
   SessionSummary,
   Turn,
   TurnItem,
+  UsageLimitState,
 } from "./types";
 import { applyFrames, type WatchFrame } from "./watchUpdates";
 /**
@@ -73,17 +73,8 @@ type Workspace = {
   projects: Project[];
   monos: Mono[];
   sessions: SessionSummary[];
-  /** Orchestrator workers, apart from `sessions` so no list shows them. */
+  /** Subagents, apart from `sessions` so no list shows them. */
   agents: SessionSummary[];
-  /** A lead's plan under review and latest run, in full. */
-  readOrchestration: (conversationId: string) => Promise<OrchestrationRun[]>;
-  /** Presses one of a card's buttons; resolves to the cards as they are after it. */
-  orchestrationAction: (
-    conversationId: string,
-    run: OrchestrationRun,
-    action: OrchestrationActionName,
-    task?: OrchestrationTask,
-  ) => Promise<OrchestrationRun[]>;
   watch: (id: string | null) => void;
   startSession: (
     projectId: string,
@@ -116,6 +107,13 @@ type Workspace = {
     offset: number,
     filters?: SessionListFilters,
   ) => Promise<SessionPage>;
+  /** A page of a project's archived sessions, newest first. Only where `canListArchived`. */
+  listArchived: (projectId: string, query: string, offset: number) => Promise<SessionPage>;
+  /** Whether the desktop serves its archived sessions; an older one doesn't. */
+  canListArchived: boolean;
+  /** An archived session as the phone last changed it, or null once deleted or
+   *  taken out of the archive here. */
+  editedArchived: (session: SessionSummary) => SessionSummary | null;
   /** Keeps a paged-in session known, so its screen has its title and model. */
   rememberSession: (session: SessionSummary) => void;
   loadOlder: (conversationId: string) => Promise<void>;
@@ -146,6 +144,8 @@ type Workspace = {
   unarchiveSession: (conversationId: string) => Promise<void>;
   /** Whether the desktop can unarchive; without it an archive can't be undone. */
   canUnarchive: boolean;
+  /** The sessions the desktop's poll carries now, not ones only remembered here. */
+  polled: ReadonlySet<string>;
   /** A session as the phone last changed it, or null once deleted here. */
   edited: (session: SessionSummary) => SessionSummary | null;
   nativeTranscriptStatus: (id: string, status: NativeTranscriptStatus) => void;
@@ -170,7 +170,7 @@ type Status = {
   questions: Record<string, DisplayedQuestionPrompt>;
   usageLimits: Record<string, UsageLimitState>;
 };
-export type SessionPage = { sessions: SessionSummary[]; hasMore: boolean };
+export type SessionPage = { sessions: SessionSummary[]; hasMore: boolean; total?: number };
 /** Narrows a page to sessions active since a time, and without some providers.
  *  An older desktop ignores them. */
 export type SessionListFilters = { since: number; hiddenHarnesses: string[] };
@@ -309,6 +309,15 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const [renamed, setRenamed] = useState<Record<string, { title: string; from: string }>>({});
   const [monoEdits, setMonoEdits] = useState<MonoEdits>({});
   const [deleted, setDeleted] = useState<ReadonlySet<string>>(new Set());
+  // Where a session was last put here: true in the archive, false out of it
+  // (restored or deleted), until the desktop's archived list catches up.
+  const [archiveMarks, setArchiveMarks] = useState<Readonly<Record<string, boolean>>>({});
+  const markArchived = useCallback((id: string, archived: boolean | undefined) => {
+    setArchiveMarks((previous) => {
+      const { [id]: _, ...rest } = previous;
+      return archived === undefined ? rest : { ...rest, [id]: archived };
+    });
+  }, []);
   const [watching, watch] = useState<string | null>(null);
   // Conversations showing turns from the disk cache, until the desktop's arrive.
   // They may be long out of date, so a watch opens on the latest turns rather
@@ -706,6 +715,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const removeSession = useCallback(
     async (method: "session.delete" | "session.archive", conversationId: string) => {
       setDeleted((previous) => new Set(previous).add(conversationId));
+      markArchived(conversationId, method === "session.archive");
       try {
         await mutate(method, { conversationId });
       } catch (reason) {
@@ -714,11 +724,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           next.delete(conversationId);
           return next;
         });
+        markArchived(conversationId, undefined);
         throw reason;
       }
       void refresh();
     },
-    [mutate, refresh],
+    [mutate, refresh, markArchived],
   );
   const deleteSession = useCallback(
     (conversationId: string) => removeSession("session.delete", conversationId),
@@ -728,29 +739,25 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     (conversationId: string) => removeSession("session.archive", conversationId),
     [removeSession],
   );
-  const readOrchestration = useCallback(
-    async (conversationId: string) =>
-      (await command<{ runs: OrchestrationRun[] }>("orchestration.read", { conversationId })).runs,
-    [command],
-  );
-  const orchestrationAction = useCallback(
-    async (
-      conversationId: string,
-      run: OrchestrationRun,
-      action: OrchestrationActionName,
-      task?: OrchestrationTask,
-    ) => {
-      const result = await mutate<{ runs: OrchestrationRun[] }>("orchestration.action", {
-        conversationId,
-        call: run.call,
-        action,
-        ...(task ? { taskId: task.id, index: task.index } : {}),
+  const unarchiveSession = useCallback(
+    async (conversationId: string) => {
+      setDeleted((previous) => {
+        const next = new Set(previous);
+        next.delete(conversationId);
+        return next;
       });
-      // The lead's row and strip follow on the next catalog.
+      markArchived(conversationId, false);
+      try {
+        await mutate("session.unarchive", { conversationId });
+      } catch (reason) {
+        // Still archived there, so still off the lists.
+        setDeleted((previous) => new Set(previous).add(conversationId));
+        markArchived(conversationId, true);
+        throw reason;
+      }
       void refresh();
-      return result.runs;
     },
-    [mutate, refresh],
+    [mutate, refresh, markArchived],
   );
   const listSessions = useCallback(
     (projectId: string, query: string, offset: number, filters?: SessionListFilters) =>
@@ -760,6 +767,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         offset,
         limit: SESSION_PAGE,
         ...filters,
+      }),
+    [command],
+  );
+  const listArchived = useCallback(
+    (projectId: string, query: string, offset: number) =>
+      command<SessionPage>("sessions.list", {
+        projectId,
+        query,
+        offset,
+        limit: SESSION_PAGE,
+        archived: true,
       }),
     [command],
   );
@@ -809,6 +827,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         : renamed[session.id]?.from === session.title
           ? { ...session, title: renamed[session.id].title }
           : session;
+    const editedArchived = (session: SessionSummary) =>
+      archiveMarks[session.id] === false
+        ? null
+        : renamed[session.id]?.from === session.title
+          ? { ...session, title: renamed[session.id].title }
+          : session;
     const all = [
       ...selected.sessions,
       ...Object.values(remembered).filter((session) => !known.has(session.id)),
@@ -826,9 +850,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         return shown;
       }),
       sessions: all.filter((session) => !session.leadId),
+      polled: known,
       agents: all.filter((session) => !!session.leadId),
-      readOrchestration,
-      orchestrationAction,
       watch,
       startSession,
       sendMessage,
@@ -837,6 +860,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       keepQuestionOpen,
       recoverUsage,
       listSessions,
+      listArchived,
+      canListArchived: catalog.archivedList === true,
+      editedArchived,
       rememberSession,
       loadOlder,
       listModels,
@@ -855,18 +881,18 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     monoEdits,
     editMono,
     deleted,
+    archiveMarks,
     catalog,
     selection,
     remembered,
     startSession,
     sendMessage,
     stop,
-    readOrchestration,
-    orchestrationAction,
     answerQuestion,
     keepQuestionOpen,
     recoverUsage,
     listSessions,
+    listArchived,
     rememberSession,
     loadOlder,
     listModels,

@@ -1,4 +1,5 @@
 //! React Settings forms and their asynchronous actions.
+use super::mcp_form;
 use super::widgets::{note, secondary_button};
 use super::*;
 use monocode_core::provider::Kind;
@@ -20,8 +21,8 @@ pub(super) struct Editor {
     pub target: Target,
     pub name: Entity<Input>,
     pub body: Entity<Input>,
-    pub provider: String,
     pub scope: String,
+    pub mcp: mcp_form::Choice,
     pub base: String,
     pub existing: bool,
     pub delete_sessions: bool,
@@ -45,7 +46,7 @@ impl SettingsView {
         self.management_generation += 1;
         let (label, placeholder) = match target {
             Target::Cli(_) => ("CLI path", "Auto-detected path"),
-            Target::Mcp => ("Name (optional with mcpServers)", "my-server"),
+            Target::Mcp => ("Server name", "my-server"),
             Target::Skill => ("Skill name", "skill-name"),
             _ => ("New branch name", "feature/my-task"),
         };
@@ -72,10 +73,23 @@ impl SettingsView {
                 input.set_text(monocode_core::skills::slug_name(&self.skill_query), cx);
             });
         }
-        let body=cx.new(|cx|Input::multiline_field("JSON configuration", "{\"mcpServers\":{\"my-server\":{\"command\":\"npx\",\"args\":[\"-y\",\"example-mcp\"]}}}",cx));
+        let body = cx.new(|cx| {
+            Input::multiline_field_sized(
+                "Server config",
+                "Paste JSON, a \u{201c}claude mcp add\u{201d} command, an npx or uvx command, or a URL",
+                88.,
+                cx,
+            )
+        });
         let subscriptions = vec![
             cx.subscribe(&name, |_, _, _: &input::Changed, cx| cx.notify()),
-            cx.subscribe(&body, |_, _, _: &input::Changed, cx| cx.notify()),
+            cx.subscribe(&body, |this, _, _: &input::Changed, cx| {
+                this.mcp_text_changed(cx);
+                cx.notify()
+            }),
+            cx.subscribe(&body, |this, _, _: &input::Submitted, cx| {
+                this.submit_management(cx)
+            }),
             cx.subscribe(&name, |this, _, _: &input::Submitted, cx| {
                 this.submit_management(cx)
             }),
@@ -90,6 +104,8 @@ impl SettingsView {
                 | Target::ResetMono(_)
         ) {
             window.focus(&self.focus, cx);
+        } else if matches!(target, Target::Mcp) {
+            window.focus(&body.read(cx).focus_handle(cx), cx);
         } else {
             window.focus(&name.read(cx).focus_handle(cx), cx);
         }
@@ -116,7 +132,7 @@ impl SettingsView {
             target: target.clone(),
             name,
             body,
-            provider,
+            mcp: mcp_form::Choice::new(&provider),
             scope,
             base: "HEAD".into(),
             existing: false,
@@ -236,6 +252,13 @@ impl SettingsView {
         cx.notify();
     }
     pub(super) fn submit_management(&mut self, cx: &mut Context<Self>) {
+        if self
+            .management
+            .as_ref()
+            .is_some_and(|e| matches!(e.target, Target::Mcp))
+        {
+            return self.submit_mcp(cx);
+        }
         let Some(editor) = &mut self.management else {
             return;
         };
@@ -247,10 +270,8 @@ impl SettingsView {
             return;
         }
         let name = editor.name.read(cx).content.trim().to_owned();
-        let body = editor.body.read(cx).content.to_string();
         let cwd = self.selected_project.clone();
         let target = editor.target.clone();
-        let provider = editor.provider.clone();
         let scope = editor.scope.clone();
         let base = editor.base.clone();
         let existing = editor.existing;
@@ -294,7 +315,7 @@ impl SettingsView {
         let generation = self.management_generation;
         let work = cx.background_executor().spawn(async move {
             match target {
-                Target::Mcp => monocode_core::mcp::mcp_add(cwd, provider, scope, name, body),
+                Target::Mcp => unreachable!("Add MCP server submits through submit_mcp"),
                 Target::Skill => {
                     monocode_core::skills::create_blank(&cwd, &name, scope == "user").map(|_| ())
                 }
@@ -330,7 +351,6 @@ impl SettingsView {
         name.update(cx, |input, _| input.set_read_only(busy));
         body.update(cx, |input, _| input.set_read_only(busy));
         let error = e.error.clone();
-        let provider = e.provider.clone();
         let scope = e.scope.clone();
         let existing = e.existing;
         let base = e.base.clone();
@@ -427,89 +447,7 @@ impl SettingsView {
                     );
                 }
             }
-            Target::Mcp => {
-                let available = self.scroll.bounds().size.width.as_f32();
-                let column = ((if available > 0. {
-                    available.min(560.)
-                } else {
-                    560.
-                }) - 46.)
-                    / 2.;
-                rows.push(note(
-                    "Paste a server configuration and choose where to add it.",
-                ));
-                rows.push(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(labeled_control(
-                            "Provider",
-                            self.select(
-                                "mcp-provider",
-                                "Provider",
-                                &provider,
-                                [
-                                    ("claude", "Claude Code"),
-                                    ("claude_desktop", "Claude Desktop"),
-                                    ("codex", "Codex"),
-                                    ("cursor", "Cursor"),
-                                    ("opencode", "OpenCode"),
-                                ]
-                                .into_iter()
-                                .map(|(id, label)| (id.into(), label.into(), None))
-                                .collect(),
-                                Some(column),
-                                cx,
-                                |this, v, cx| {
-                                    if let Some(e) = &mut this.management {
-                                        e.provider = v;
-                                        e.scope = match e.provider.as_str() {
-                                            "claude" => "local",
-                                            "codex" | "claude_desktop" => "user",
-                                            _ => "project",
-                                        }
-                                        .into();
-                                    }
-                                    cx.notify();
-                                },
-                            ),
-                        ))
-                        .child(labeled_control(
-                            "Scope",
-                            self.select(
-                                "mcp-scope",
-                                "Scope",
-                                &scope,
-                                scopes(&provider)
-                                    .iter()
-                                    .map(|s| {
-                                        (
-                                            s.to_string(),
-                                            SharedString::from(match *s {
-                                                "local" => "Local",
-                                                "project" => "Project",
-                                                _ => "User",
-                                            }),
-                                            None,
-                                        )
-                                    })
-                                    .collect(),
-                                Some(column),
-                                cx,
-                                |this, v, cx| {
-                                    if let Some(e) = &mut this.management {
-                                        e.scope = v;
-                                    }
-                                    cx.notify();
-                                },
-                            ),
-                        ))
-                        .into_any_element(),
-                );
-                rows.push(form_field("Name (optional with mcpServers)", name, 32.));
-                rows.push(form_field("JSON configuration", body, 140.));
-                rows.push(note("Paste one entry from an mcpServers block, or a single server object with a name above."));
-            }
+            Target::Mcp => rows.extend(self.mcp_rows(name, body, cx)),
             Target::Skill => {
                 rows.push(form_field("Skill name", name, 32.));
                 rows.push(self.segmented(
@@ -769,16 +707,31 @@ impl SettingsView {
             Target::DeleteTrees(list) => Some(format!("Delete {} worktrees", list.len())),
             _ => None,
         };
+        let (mcp_label, mcp_ready, mcp_skipped) = match &self.management {
+            Some(e) if matches!(target, Target::Mcp) => (
+                mcp_form::submit_label(e, cx),
+                !mcp_form::targets(e, cx).is_empty(),
+                mcp_form::skipped(e, cx),
+            ),
+            _ => (String::new(), true, 0),
+        };
+        if matches!(target, Target::Mcp) {
+            actions = actions.child(
+                div()
+                    .flex_1()
+                    .text_size(px(11.))
+                    .text_color(content(0.45))
+                    .child(if mcp_skipped > 0 && mcp_ready {
+                        format!("{mcp_skipped} skipped \u{b7} \u{2318}\u{21b5} to add")
+                    } else {
+                        "\u{2318}\u{21b5} to add".to_owned()
+                    }),
+            );
+        }
         let label = match target {
             Target::Sweep(_) | Target::DeleteTrees(_) => sweep_label.as_deref().unwrap_or_default(),
             Target::Cli(_) => "Save path",
-            Target::Mcp => {
-                if busy {
-                    "Adding…"
-                } else {
-                    "Add server"
-                }
-            }
+            Target::Mcp => mcp_label.as_str(),
             Target::Skill => {
                 if busy {
                     "Creating…"
@@ -823,7 +776,7 @@ impl SettingsView {
                     } else {
                         crate::modal::primary_button("submit-management", label)
                     },
-                    busy,
+                    busy || !mcp_ready,
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.submit_management(cx))),
             );
@@ -852,12 +805,20 @@ impl SettingsView {
             Target::DeleteTrees(ref list) => format!(
                 "Delete {} {}?",
                 list.len(),
-                if list.len() == 1 { "worktree" } else { "worktrees" }
+                if list.len() == 1 {
+                    "worktree"
+                } else {
+                    "worktrees"
+                }
             ),
             Target::Sweep(ref list) => format!(
                 "Remove {} {}?",
                 list.len(),
-                if list.len() == 1 { "worktree" } else { "worktrees" }
+                if list.len() == 1 {
+                    "worktree"
+                } else {
+                    "worktrees"
+                }
             ),
             Target::ResetMono(ref mono) => format!("Reset {} to its defaults?", mono.name),
             _ => String::new(),
@@ -901,7 +862,7 @@ impl SettingsView {
                     .role(Role::Dialog)
                     .aria_label(title.clone())
                     .w(px(if matches!(target, Target::Mcp) {
-                        560.
+                        600.
                     } else {
                         448.
                     }))
@@ -945,21 +906,14 @@ impl SettingsView {
         Some(crate::modal::window_overlay(window, overlay).into_any_element())
     }
 }
-fn scopes(provider: &str) -> &'static [&'static str] {
-    match provider {
-        "claude" => &["local", "project", "user"],
-        "codex" | "claude_desktop" => &["user"],
-        _ => &["project", "user"],
-    }
-}
-fn form_field(label: &str, input: Entity<Input>, height: f32) -> AnyElement {
+pub(super) fn form_field(label: &str, input: Entity<Input>, height: f32) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(6.))
         .text_size(px(12.))
         .text_color(content(0.65))
-        .child(label.to_owned())
+        .when(!label.is_empty(), |d| d.child(label.to_owned()))
         .child(
             div()
                 .h(px(height))
@@ -969,22 +923,10 @@ fn form_field(label: &str, input: Entity<Input>, height: f32) -> AnyElement {
                 .border_1()
                 .border_color(content(0.1))
                 .bg(content(0.04))
-                .when(label == "JSON configuration", |d| {
+                .when(label == "Server config", |d| {
                     d.font_family(crate::fonts::mono())
                 })
                 .child(input),
         )
-        .into_any_element()
-}
-
-fn labeled_control(label: &str, control: AnyElement) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .text_size(px(12.))
-        .text_color(content(0.65))
-        .child(label.to_owned())
-        .child(control)
         .into_any_element()
 }

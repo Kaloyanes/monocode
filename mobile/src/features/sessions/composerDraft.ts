@@ -6,6 +6,8 @@
  * and the mode chip stay on each screen. See docs/native/composer-drafts-sync.md.
  */
 
+import { useSyncExternalStore } from "react";
+
 /** The desktop's copy, as `composer.read` answers. A cleared draft is revision 0. */
 export type DesktopText = { text: string; rev: number };
 /** What `composer.write` answers: whether it was kept, and the desktop's copy after. */
@@ -17,6 +19,9 @@ export const WRITE_DELAY_MS = 700;
 /** For this long after a keystroke the person is typing here, and the
  *  desktop's text waits rather than replacing theirs. */
 export const HOLD_MS = 3000;
+/** How long a list row trusts the text here over the desktop's word, which
+ *  trails a write by up to a poll and a publish. */
+export const MARK_HOLD_MS = 10_000;
 
 export type ComposerSync = {
   /** What the field shows. */
@@ -31,6 +36,8 @@ export type ComposerSync = {
   incoming: DesktopText | null;
   /** When the person last changed the text here; 0 if they haven't. */
   typedAt: number;
+  /** When a change here last happened or reached the desktop. */
+  markedAt: number;
   /** Writes sent and not answered yet. */
   writing: number;
   /** Moves on with each send, so answers to writes from before it are ignored. */
@@ -44,6 +51,7 @@ export const freshSync = (): ComposerSync => ({
   seen: null,
   incoming: null,
   typedAt: 0,
+  markedAt: 0,
   writing: 0,
   epoch: 0,
 });
@@ -69,6 +77,7 @@ function adopt(sync: ComposerSync, desktop: DesktopText): string | null {
 export function typed(sync: ComposerSync, text: string, now: number) {
   sync.text = text;
   sync.typedAt = now;
+  sync.markedAt = now;
 }
 
 /**
@@ -131,6 +140,7 @@ export function written(
 ): string | null {
   sync.writing = Math.max(0, sync.writing - 1);
   sync.seen = reply.rev;
+  sync.markedAt = now;
   // A send cleared the field since; its own answer says what's left.
   if (write.epoch !== sync.epoch) return null;
   if (reply.accepted) {
@@ -155,12 +165,13 @@ export function written(
  * its copy if it is still the one the message came from. Returns that
  * revision for the send to carry.
  */
-export function sent(sync: ComposerSync): number | undefined {
+export function sent(sync: ComposerSync, now = Date.now()): number | undefined {
   const base = sync.base ?? undefined;
   sync.text = "";
   sync.remote = "";
   sync.incoming = null;
   sync.typedAt = 0;
+  sync.markedAt = now;
   sync.epoch += 1;
   return base;
 }
@@ -187,3 +198,40 @@ export function syncFor(conversationId: string): ComposerSync {
 /** What a thread's composer opens with. */
 export const cachedText = (conversationId?: string) =>
   (conversationId && threads.get(conversationId)?.text) || "";
+
+/**
+ * Whether the text here earns the thread a Draft mark. Null leaves it to the
+ * desktop: once the text has settled there, the desktop also knows what
+ * changed while this thread wasn't followed.
+ */
+export function localMark(sync: ComposerSync, now: number): boolean | null {
+  const settled = sync.text === sync.remote && sync.writing === 0;
+  return settled && now - sync.markedAt >= MARK_HOLD_MS ? null : sync.text.trim().length > 0;
+}
+
+const watchers = new Set<() => void>();
+let settledTimer: ReturnType<typeof setTimeout> | undefined;
+const tellWatchers = () => watchers.forEach((watcher) => watcher());
+
+/** The text behind a Draft mark changed; rows look again now and once the hold ends. */
+export function marksChanged() {
+  tellWatchers();
+  clearTimeout(settledTimer);
+  settledTimer = setTimeout(tellWatchers, MARK_HOLD_MS);
+}
+
+function watchMarks(watcher: () => void) {
+  watchers.add(watcher);
+  return () => {
+    watchers.delete(watcher);
+  };
+}
+
+/** A row's Draft mark: the text here while it's newer, otherwise the desktop's word. */
+export function useDraftMark(session: { id: string; draft?: boolean }) {
+  const local = useSyncExternalStore(watchMarks, () => {
+    const sync = threads.get(session.id);
+    return sync ? localMark(sync, Date.now()) : null;
+  });
+  return local ?? !!session.draft;
+}

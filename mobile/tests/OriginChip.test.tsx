@@ -42,7 +42,6 @@ vi.mock("react-native", () => ({
 }));
 vi.mock("react-native-gesture-handler/ReanimatedSwipeable", () => ({ default: () => null }));
 vi.mock("react-native-reanimated", () => ({ default: { View: () => null } }));
-vi.mock("@/features/orchestration/AgentDots", () => ({ AgentDots: () => null }));
 vi.mock("@/features/mascots/PixelMascot", () => ({
   PixelMascot: ({ name, color }: { name: string; color: string }) => (
     <i data-mascot={name} data-color={color} />

@@ -6,17 +6,21 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Linking, Platform, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 import { FileTypeIcon } from "@/features/files/FileTypeIcon";
+import { Icon } from "@/ui/Icon";
 import { withAlpha, themedStyles, useColors } from "@/ui/theme";
 
 import {
+  holdsImage,
   numberWords,
   parseMarkdown,
+  splitImages,
   splitWords,
   type Inline,
   type MarkdownBlock,
+  type MarkdownImage,
 } from "./markdownParser";
 import { closeOpenMarkers, useStreamedText, useWordFade, type WordClock } from "./wordReveal";
 
@@ -30,6 +34,11 @@ const Muted = createContext(false);
  * Unset where there is no project to read it from, and files show unlinked.
  */
 export const FileOpener = createContext<((path: string) => void) | undefined>(undefined);
+
+/** Draws an image; `href` is the link around it, if any. */
+export type RenderImage = (image: MarkdownImage, href?: string) => ReactNode;
+
+const ImageRenderer = createContext<RenderImage | undefined>(undefined);
 
 /** Words still fading in, and the clock they fade by. */
 type Fade = { clock: WordClock; now: number; ms: number; from: number };
@@ -45,6 +54,7 @@ export const Markdown = memo(function Markdown({
   muted = false,
   streaming = false,
   animate = false,
+  renderImage,
 }: {
   text: string;
   /** As the desktop's `zen-fold-prose`: muted ink, headings as bold lines. */
@@ -52,24 +62,29 @@ export const Markdown = memo(function Markdown({
   streaming?: boolean;
   /** Fade in the words there on mount too: a reply that arrives whole. */
   animate?: boolean;
+  /** A provider's text, which mixes HTML in, read with its images drawn by this. */
+  renderImage?: RenderImage;
 }) {
   const styles = useStyles();
   const shown = useStreamedText(text, streaming);
+  const html = renderImage !== undefined;
   const { blocks, count, ranges } = useMemo(() => {
-    const blocks = parseMarkdown(streaming ? closeOpenMarkers(shown) : shown);
+    const blocks = parseMarkdown(streaming ? closeOpenMarkers(shown) : shown, { html });
     return { blocks, ...numberWords(blocks) };
-  }, [shown, streaming]);
+  }, [shown, streaming, html]);
   const { clock, now, fadeMs } = useWordFade(count, animate || streaming);
   const from = clock.firstFading(now, fadeMs);
   const fade: Fade = { clock, now, ms: fadeMs, from };
   return (
     <Muted value={muted}>
-      <View style={styles.blocks}>
-        {blocks.map((block, index) => (
-          // Blocks with nothing fading keep their props, so they skip the frame.
-          <BlockView key={index} block={block} fade={ranges[index][1] > from ? fade : undefined} />
-        ))}
-      </View>
+      <ImageRenderer value={renderImage}>
+        <View style={styles.blocks}>
+          {blocks.map((block, index) => (
+            // Blocks with nothing fading keep their props, so they skip the frame.
+            <BlockView key={index} block={block} fade={ranges[index][1] > from ? fade : undefined} />
+          ))}
+        </View>
+      </ImageRenderer>
     </Muted>
   );
 });
@@ -149,9 +164,13 @@ const BlockView = memo(function BlockView({ block, fade }: { block: MarkdownBloc
         <View style={styles.list}>
           {block.items.map((item, index) => (
             <View key={index} style={styles.item}>
-              <Text style={[styles.text, styles.marker]}>
-                {block.ordered ? `${block.start + index}.` : "•"}
-              </Text>
+              {block.tasks?.[index] !== undefined ? (
+                <TaskBox done={block.tasks[index]} />
+              ) : (
+                <Text style={[styles.text, styles.marker]}>
+                  {block.ordered ? `${block.start + index}.` : "•"}
+                </Text>
+              )}
               <View style={styles.itemBody}>
                 <Blocks blocks={item} fade={fade} />
               </View>
@@ -169,8 +188,63 @@ const BlockView = memo(function BlockView({ block, fade }: { block: MarkdownBloc
       return <Table rows={block.rows} fade={fade} />;
     case "rule":
       return <View style={styles.rule} />;
+    case "image":
+      return <ImageBlock image={block.image} href={block.href} />;
+    case "details":
+      return <Details block={block} fade={fade} />;
   }
 }, sameBlock);
+
+function ImageBlock({ image, href }: { image: MarkdownImage; href?: string }) {
+  const renderImage = use(ImageRenderer);
+  return <>{renderImage?.(image, href)}</>;
+}
+
+function TaskBox({ done }: { done: boolean }) {
+  const colors = useColors();
+  const styles = useStyles();
+  return (
+    <View
+      accessible
+      accessibilityRole="checkbox"
+      accessibilityState={{ checked: done }}
+      style={[styles.task, done && { backgroundColor: colors.accent, borderColor: colors.accent }]}
+    >
+      {done ? <Icon name="check" size={12} color={colors.inverse} /> : null}
+    </View>
+  );
+}
+
+/** A `<details>` fold, shut until pressed unless the text says `open`. */
+function Details({
+  block,
+  fade,
+}: {
+  block: Extract<MarkdownBlock, { type: "details" }>;
+  fade?: Fade;
+}) {
+  const colors = useColors();
+  const styles = useStyles();
+  const [open, setOpen] = useState(block.open);
+  return (
+    <View style={styles.details}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityState={{ expanded: open }}
+        onPress={() => setOpen((value) => !value)}
+        style={styles.summary}
+      >
+        <View style={open && styles.chevronOpen}>
+          <Icon name="chevronRight" size={14} color={colors.muted} />
+        </View>
+        <Text style={[styles.text, styles.summaryText]}>
+          <Inlines nodes={block.summary} fade={fade} />
+        </Text>
+      </Pressable>
+      {open ? <Blocks blocks={block.children} fade={fade} /> : null}
+    </View>
+  );
+}
 
 /** Columns share the screen's width, down to a floor; past it, the table scrolls. */
 const MIN_COLUMN_WIDTH = 140;
@@ -191,18 +265,54 @@ function Table({ rows, fade }: { rows: Inline[][][]; fade?: Fade }) {
         {rows.map((row, rowIndex) => (
           <View key={rowIndex} style={[styles.row, rowIndex > 0 && styles.rowDivider]}>
             {row.map((cell, cellIndex) => (
-              <Text
+              <Cell
                 key={cellIndex}
-                style={[styles.cell, { width: cellWidth }, rowIndex === 0 && styles.headerCell]}
-                selectable
-              >
-                <Inlines nodes={cell} fade={fade} />
-              </Text>
+                nodes={cell}
+                width={cellWidth}
+                header={rowIndex === 0}
+                fade={fade}
+              />
             ))}
           </View>
         ))}
       </View>
     </ScrollView>
+  );
+}
+
+function Cell({
+  nodes,
+  width,
+  header,
+  fade,
+}: {
+  nodes: Inline[];
+  width: number;
+  header: boolean;
+  fade?: Fade;
+}) {
+  const styles = useStyles();
+  const text = [styles.cell, header && styles.headerCell];
+  if (!nodes.some(holdsImage)) {
+    return (
+      <Text style={[text, { width }]} selectable>
+        <Inlines nodes={nodes} fade={fade} />
+      </Text>
+    );
+  }
+  // Before and after, side by side: the table many pull requests are written as.
+  return (
+    <View style={[styles.imageCell, { width }]}>
+      {splitImages(nodes).map((piece, index) =>
+        piece.kind === "image" ? (
+          <ImageBlock key={index} image={piece.image} href={piece.href} />
+        ) : (
+          <Text key={index} style={[text, styles.imageCellText]} selectable>
+            <Inlines nodes={piece.inline} fade={fade} />
+          </Text>
+        ),
+      )}
+    </View>
   );
 }
 
@@ -359,6 +469,9 @@ function inline(
           <Inlines nodes={node.children} fade={fade} />
         </Text>
       );
+    // Images stand apart from text; one left in a heading shows what it is of.
+    case "image":
+      return node.alt;
   }
 }
 
@@ -462,6 +575,33 @@ const useStyles = themedStyles((colors) => ({
     flex: 1,
     minWidth: 0,
   },
+  task: {
+    width: 18,
+    height: 18,
+    marginTop: 3,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 5,
+    borderCurve: "continuous",
+    borderWidth: 1.5,
+    borderColor: colors.muted,
+  },
+  details: {
+    gap: 10,
+  },
+  summary: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    minHeight: 32,
+  },
+  summaryText: {
+    flex: 1,
+    fontWeight: "600",
+  },
+  chevronOpen: {
+    transform: [{ rotate: "90deg" }],
+  },
   quote: {
     borderLeftWidth: 2,
     borderLeftColor: withAlpha(colors.content, 0.2),
@@ -488,6 +628,14 @@ const useStyles = themedStyles((colors) => ({
   },
   headerCell: {
     fontWeight: "600",
+  },
+  imageCell: {
+    gap: 6,
+    padding: 6,
+  },
+  imageCellText: {
+    paddingHorizontal: 4,
+    paddingVertical: 0,
   },
   rule: {
     height: StyleSheet.hairlineWidth,

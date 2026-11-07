@@ -1,9 +1,10 @@
 import { BottomSheet, RNHostView } from "@expo/ui";
-import { ScrollView, StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import { Pressable, ScrollView, Text, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Icon } from "@/ui/Icon";
-import { LiquidView } from "@/ui/LiquidView";
+import { useSheetColor } from "@/ui/sheetColor";
+import { SHEET_INSET, SHEET_TOP, SheetCard, SheetTitle, useSheetStyles } from "@/ui/SheetParts";
 import { themedStyles, useColors, withAlpha } from "@/ui/theme";
 
 import { sessionErrorContent } from "./sessionError";
@@ -19,6 +20,8 @@ export function SessionErrorSheet({
   onDismiss: () => void;
 }) {
   const colors = useColors();
+  const sheetColor = useSheetColor();
+  const parts = useSheetStyles();
   const styles = useStyles();
   const { width, height } = useWindowDimensions();
   const { bottom } = useSafeAreaInsets();
@@ -28,14 +31,14 @@ export function SessionErrorSheet({
       isPresented={isPresented}
       onDismiss={onDismiss}
       contentPadding={0}
-      containerColor={colors.sheet}
+      containerColor={sheetColor}
     >
       <RNHostView matchContents={{ vertical: true }}>
         <View style={[styles.sheet, { width, paddingBottom: Math.max(bottom, 16) + 8 }]}>
           <View style={styles.badge}>
-            <Icon name={content.recovery ? "lock" : "chat"} size={30} color={colors.accent} />
+            <Icon name={content.recovery ? "lock" : "chat"} size={24} color={colors.accent} />
           </View>
-          <Text accessibilityRole="header" style={styles.title}>{content.title}</Text>
+          <SheetTitle title={content.title} />
           <ScrollView
             style={[styles.details, { maxHeight: height * 0.35 }]}
             contentContainerStyle={styles.detailsContent}
@@ -43,24 +46,23 @@ export function SessionErrorSheet({
           >
             <Text style={styles.message} selectable>{content.message}</Text>
             {content.recovery ? (
-              <View style={styles.recovery}>
+              <SheetCard style={styles.recovery}>
                 <Icon name="computer" size={22} color={colors.muted} />
                 <View style={styles.recoveryText}>
                   <Text style={styles.recoveryTitle}>Switch accounts</Text>
                   <Text style={styles.recoveryMessage}>{content.recovery}</Text>
                 </View>
-              </View>
+              </SheetCard>
             ) : null}
           </ScrollView>
-          <LiquidView
-            onPress={onDismiss}
+          <Pressable
+            accessibilityRole="button"
             accessibilityLabel="Got it"
-            pressedScale={1.03}
-            style={styles.button}
-            innerStyle={styles.buttonSurface}
+            onPress={onDismiss}
+            style={({ pressed }) => [parts.primary, styles.button, pressed && parts.pressed]}
           >
-            <Text style={styles.buttonLabel}>Got it</Text>
-          </LiquidView>
+            <Text style={parts.primaryLabel}>Got it</Text>
+          </Pressable>
         </View>
       </RNHostView>
     </BottomSheet>
@@ -70,58 +72,45 @@ export function SessionErrorSheet({
 const useStyles = themedStyles((colors) => ({
   sheet: {
     alignItems: "center",
-    paddingTop: 32,
-    paddingHorizontal: 24,
+    paddingTop: SHEET_TOP + 8,
+    paddingHorizontal: SHEET_INSET,
   },
   badge: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: withAlpha(colors.accent, 0.09),
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: withAlpha(colors.accent, 0.16),
-    marginBottom: 20,
-  },
-  title: {
-    color: colors.content,
-    fontSize: 24,
-    fontWeight: "600",
-    textAlign: "center",
+    backgroundColor: withAlpha(colors.accent, 0.12),
+    marginBottom: 14,
   },
   details: {
     alignSelf: "stretch",
-    marginTop: 10,
-    marginBottom: 24,
+    marginTop: 8,
+    marginBottom: 20,
   },
   detailsContent: {
-    gap: 24,
+    gap: 16,
   },
   message: {
     color: colors.muted,
-    fontSize: 16,
-    lineHeight: 23,
+    fontSize: 15,
+    lineHeight: 21,
     textAlign: "center",
   },
   recovery: {
     flexDirection: "row",
     alignItems: "flex-start",
     gap: 12,
-    padding: 16,
-    borderRadius: 18,
-    borderCurve: "continuous",
-    backgroundColor: withAlpha(colors.content, 0.04),
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.stroke,
+    padding: SHEET_INSET,
   },
   recoveryText: {
     flex: 1,
-    gap: 5,
+    gap: 4,
   },
   recoveryTitle: {
     color: colors.content,
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: "600",
     lineHeight: 20,
   },
@@ -132,15 +121,5 @@ const useStyles = themedStyles((colors) => ({
   },
   button: {
     alignSelf: "stretch",
-  },
-  buttonSurface: {
-    minHeight: 52,
-    paddingVertical: 14,
-    paddingHorizontal: 24,
-  },
-  buttonLabel: {
-    color: colors.content,
-    fontSize: 16,
-    fontWeight: "600",
   },
 }));

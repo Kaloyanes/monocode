@@ -369,13 +369,22 @@ impl Input {
         input
     }
     pub(crate) fn multiline_field(label: &str, placeholder: &str, cx: &mut Context<Self>) -> Self {
+        Self::multiline_field_sized(label, placeholder, 124., cx)
+    }
+    /// A textarea that keeps one height and scrolls past it.
+    pub(crate) fn multiline_field_sized(
+        label: &str,
+        placeholder: &str,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut input = Self::commit_message(cx);
         input.label = label.to_owned().into();
         input.font_size = 12.;
         input.placeholder = placeholder.to_owned().into();
-        input.height = 124.;
-        input.min_height = 124.;
-        input.max_height = 124.;
+        input.height = height;
+        input.min_height = height;
+        input.max_height = height;
         input
     }
     /// An action's shell command: three rows growing to six.
@@ -2444,11 +2453,7 @@ mod native_input_tests {
         window
             .update(cx, |i, _, cx| i.enable_inline_commands(cx))
             .unwrap();
-        for (name, icon) in [
-            ("plan", "ai-idea"),
-            ("operator", "cursor-magic"),
-            ("orchestrator", "share"),
-        ] {
+        for (name, icon) in [("plan", "ai-idea")] {
             let text = format!(
                 "/{name} café 🙂\nA long prompt that wraps across several visual lines and keeps the full input width."
             );

@@ -330,6 +330,27 @@ fn summaries(items: &[(String, u64)]) -> Option<HashMap<(String, u64), Value>> {
     }
     Some(out)
 }
+#[derive(Debug, PartialEq)]
+enum Report {
+    Nothing,
+    /// A card to archive the thread by. Its feeds are skipped, because every
+    /// entry in them would be older than `since`.
+    MergeOnly,
+    Activity,
+}
+/// A turn's own pushes are not news, so activity counts only after `since`,
+/// the later of that turn and the last acknowledgment. A merge counts until
+/// acknowledged: a thread that merged its own pull request ends after the
+/// merge, and would otherwise never offer to archive itself.
+fn report(updated_at: i64, since: i64, seen_at: i64, merged: bool) -> Report {
+    if updated_at > since {
+        Report::Activity
+    } else if merged && updated_at > seen_at {
+        Report::MergeOnly
+    } else {
+        Report::Nothing
+    }
+}
 fn fetch(
     sessions: Vec<Session>,
     seen: &HashMap<i64, i64>,
@@ -369,9 +390,11 @@ fn fetch(
             continue;
         };
         let updated_at = timestamp(body["updated_at"].as_str().unwrap_or(""));
-        let since = (session.updated_at.min(i64::MAX as u64) as i64)
-            .max(*seen.get(&session.id).unwrap_or(&0));
-        if updated_at <= since {
+        let seen_at = *seen.get(&session.id).unwrap_or(&0);
+        let since = (session.updated_at.min(i64::MAX as u64) as i64).max(seen_at);
+        let merged = item.kind == "pr" && body["merged"].as_bool() == Some(true);
+        let report = report(updated_at, since, seen_at, merged);
+        if report == Report::Nothing {
             continue;
         }
         let mut card = Card {
@@ -388,6 +411,10 @@ fn fetch(
             details_error: false,
             truncated: false,
         };
+        if report == Report::MergeOnly {
+            cards.insert(card.session, card);
+            continue;
+        }
         let issue_base = format!("repos/{}/issues/{}", card.item.repo, card.item.number);
         let mut feeds = vec![(format!("{issue_base}/comments?per_page=100"), "comment")];
         if card.item.kind == "pr" {
@@ -475,4 +502,23 @@ fn fetch(
         cards.insert(card.session, card);
     }
     (cards, details)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_merge_outlives_the_turn_that_made_it_until_it_is_acknowledged() {
+        let (merge, turn_end) = (100, 200);
+        assert_eq!(report(merge, turn_end, 0, true), Report::MergeOnly);
+        assert_eq!(report(merge, turn_end, merge, true), Report::Nothing);
+        assert_eq!(report(merge, turn_end, 0, false), Report::Nothing);
+    }
+
+    #[test]
+    fn activity_after_the_cutoff_reads_its_feeds_whether_merged_or_not() {
+        assert_eq!(report(300, 200, 0, true), Report::Activity);
+        assert_eq!(report(300, 200, 0, false), Report::Activity);
+    }
 }

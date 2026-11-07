@@ -23,7 +23,10 @@ import type {
   Turn,
 } from "@/features/workspace/types";
 import {
+  closeWatch,
   nativeCall,
+  nextUpdates,
+  openWatch,
   parseInvitation,
   request,
   type Pairing,
@@ -40,6 +43,33 @@ export type Catalog = {
   monos: Mono[];
   sessions: SessionSummary[];
   addresses?: Desktop["addresses"];
+  /** Names this workspace, so the next poll can ask whether it moved on;
+   *  the older desktop app sends none. */
+  rev?: string;
+  /** The poll's `rev` is still current: nothing else came with it. */
+  unchanged?: boolean;
+  /** Moves when the Inbox has something new to read; absent or null, the
+   *  phone polls it instead. */
+  inboxRev?: string | null;
+  /** The desktop answers Mono profiles, editing, reset, delete and create;
+   *  the older desktop app sends no such flag. */
+  monoTools?: boolean;
+  /** The desktop sends this phone push notifications once it registers;
+   *  the older desktop app doesn't, and the phone posts its own. */
+  push?: boolean;
+  /** The desktop reads and saves a Mono's soul and memory for the phone. */
+  monoFiles?: boolean;
+  /** The desktop serves the Inbox (`inbox.*`); the older desktop app doesn't,
+   *  and the phone leaves the Inbox out. */
+  inbox?: boolean;
+  /** The desktop answers `inbox.readAll`, `inbox.action` and `inbox.comment`. */
+  inboxActions?: boolean;
+  /** The desktop answers `session.unarchive`, so an archive can be undone;
+   *  the desktop app today only archives, and the phone then offers no Undo. */
+  sessionUnarchive?: boolean;
+  /** The desktop pages its archived sessions (`sessions.list` with `archived`);
+   *  an older one doesn't, and the phone then has no Archived list. */
+  archivedList?: boolean;
   /** Whether the desktop lets this phone open a terminal; missing on older desktops. */
   terminal?: boolean;
 };
@@ -48,10 +78,19 @@ const PAIRING = "monocode.mobile.pairing";
 const IDENTITY = "monocode.mobile.identity";
 const key = (fingerprint: string, kind: string) =>
   `monocode.mobile.${fingerprint}.${kind}`;
-/** How often the workspace is read while the app is in the foreground. */
+/** How often an older desktop, with no `workspace.watch`, is read in the foreground. */
 export const POLL_MS = 5000;
+/**
+ * How often with nothing working and nothing moving. Every read keeps a
+ * cellular radio powered for seconds after it, which is what warms the phone.
+ */
+export const QUIET_POLL_MS = 15000;
+/** Reads in a row that find nothing new before they slow down. */
+const QUIET_READS = 3;
 /** After failed reads the wait doubles, up to this. */
 const MAX_POLL_MS = 30000;
+/** A desktop too old to push its workspace answers a watch with this. */
+const NO_WATCH = "Unsupported mobile operation";
 /** The catalog is saved for the next launch at most this often, and when the app leaves the foreground. */
 export const CATALOG_SAVE_MS = 30000;
 
@@ -104,6 +143,9 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
   const active = useRef<Pairing | null>(null);
   const refreshing = useRef(false);
   const failures = useRef(0);
+  const unchanged = useRef(0);
+  // The workspace the desktop last named, and what the phone made of it.
+  const held = useRef<{ catalog: Catalog; rev: string } | null>(null);
   // The catalog saved for the next launch is written lazily, not on every change.
   const unsaved = useRef<{ fingerprint: string; catalog: Catalog } | null>(null);
   const savedAt = useRef(0);
@@ -161,14 +203,21 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
       disposed = true;
     };
   }, [store]);
-  const refresh = useCallback(async () => {
-    const value = active.current;
-    if (!value || refreshing.current) return;
-    const version = generation.current;
-    refreshing.current = true;
-    try {
-      const next = await request<Catalog>(value, "workspace.list");
-      if (active.current !== value || version !== generation.current) return;
+  // Only a rev for what is still shown: anything else needs the whole of it.
+  const knownRev = useCallback(() => {
+    const known = held.current?.catalog === store.get() ? held.current : null;
+    return known ? { rev: known.rev } : {};
+  }, [store]);
+  /** What the desktop said the workspace is, read or pushed. */
+  const take = useCallback(
+    async (value: Pairing, next: Catalog) => {
+      if (next.unchanged) {
+        unchanged.current++;
+        failures.current = 0;
+        setConnected(true);
+        setError(null);
+        return;
+      }
       if (
         !Array.isArray(next.projects) ||
         !Array.isArray(next.monos) ||
@@ -181,40 +230,106 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
         await Storage.setItem(PAIRING, JSON.stringify(value.desktop));
         if (active.current !== value) return;
       }
-      // The poll repeats every few seconds; only a changed workspace is
-      // re-rendered, and it is saved a little later.
-      const { addresses: _, ...workspace } = next;
+      // Only a changed workspace is re-rendered, and it is saved a little later.
+      const { addresses: _, rev, ...workspace } = next;
       const merged = mergeCatalog(store.get(), workspace);
       if (merged !== store.get()) {
         store.set(merged);
         saveCatalog(value.desktop.fingerprint, merged);
+        unchanged.current = 0;
+      } else {
+        unchanged.current++;
       }
+      held.current = rev ? { catalog: merged, rev } : null;
       failures.current = 0;
       setConnected(true);
       setError(null);
+    },
+    [store, saveCatalog],
+  );
+  const failed = useCallback((value: Pairing, reason: unknown) => {
+    if (active.current !== value) return;
+    failures.current++;
+    setConnected(false);
+    setError(reason instanceof Error ? reason.message : String(reason));
+  }, []);
+  const refresh = useCallback(async () => {
+    const value = active.current;
+    if (!value || refreshing.current) return;
+    const version = generation.current;
+    refreshing.current = true;
+    try {
+      const next = await request<Catalog>(value, "workspace.list", knownRev());
+      if (active.current !== value || version !== generation.current) return;
+      await take(value, next);
     } catch (reason) {
-      if (active.current === value) {
-        failures.current++;
-        setConnected(false);
-        setError(reason instanceof Error ? reason.message : String(reason));
-      }
+      failed(value, reason);
     } finally {
       refreshing.current = false;
     }
-  }, [store, saveCatalog]);
+  }, [knownRev, take, failed]);
+  /**
+   * Holds the workspace watch open, as a thread's is, so the radio only wakes
+   * for what changed. Returns once the app leaves the foreground; throws when
+   * the watch can't open or ends.
+   */
+  const follow = useCallback(
+    async (value: Pairing, stop: AbortSignal) => {
+      const version = generation.current;
+      const watchId = await openWatch(value, "workspace.watch", knownRev());
+      const close = () => void closeWatch(watchId);
+      stop.addEventListener("abort", close, { once: true });
+      try {
+        while (!stop.aborted && AppState.currentState === "active") {
+          const frames = await nextUpdates<Catalog>(watchId, 10_000);
+          if (active.current !== value || version !== generation.current) return;
+          // Each frame is the whole workspace, so the last says it all.
+          const last = frames.at(-1);
+          if (last) await take(value, last);
+        }
+      } finally {
+        stop.removeEventListener("abort", close);
+        close();
+      }
+    },
+    [knownRev, take],
+  );
   useEffect(() => {
     if (!pairing) return;
     const stop = new AbortController();
     void (async () => {
+      let polling = false;
       while (!stop.signal.aborted) {
         // In the background there is nothing to read for; wait to be shown again.
         await waitForActive(stop.signal);
         if (stop.signal.aborted) break;
+        const value = active.current;
+        if (!polling && value) {
+          try {
+            await follow(value, stop.signal);
+            continue;
+          } catch (reason) {
+            if (stop.signal.aborted) break;
+            polling = reason instanceof Error && reason.message === NO_WATCH;
+            if (!polling) {
+              failed(value, reason);
+              await pause(backoff(1000, failures.current - 1, MAX_POLL_MS), stop.signal);
+              continue;
+            }
+          }
+        }
         await refresh();
+        const catalog = store.get();
+        const quiet =
+          unchanged.current >= QUIET_READS &&
+          !catalog.sessions.some((session) => session.busy) &&
+          !catalog.monos.some((mono) => mono.status === "working");
         await pause(
           failures.current > 0
             ? backoff(POLL_MS, failures.current - 1, MAX_POLL_MS)
-            : POLL_MS,
+            : quiet
+              ? QUIET_POLL_MS
+              : POLL_MS,
           stop.signal,
         );
       }
@@ -229,7 +344,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
       stopActive();
       subscription.remove();
     };
-  }, [pairing, refresh, flushCatalog]);
+  }, [pairing, refresh, follow, failed, flushCatalog]);
   const pair = useCallback(async (text: string) => {
     if (pairingNow.current) return;
     pairingNow.current = true;

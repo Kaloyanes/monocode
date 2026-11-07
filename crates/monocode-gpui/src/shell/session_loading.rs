@@ -23,8 +23,8 @@ impl Metadata<'_> {
     pub(super) fn needs_approval(&self) -> bool {
         self.live.is_some_and(Conversation::needs_approval) || self.remote_waiting
     }
-    pub(super) fn responding(&self) -> bool {
-        self.live.is_some_and(Conversation::responding)
+    pub(super) fn working(&self) -> bool {
+        self.live.is_some_and(Conversation::working)
     }
     pub(super) fn has_saved_draft(&self) -> bool {
         self.live.map_or(self.draft, Conversation::has_saved_draft)
@@ -37,6 +37,11 @@ impl Metadata<'_> {
     pub(super) fn shows_draft(&self) -> bool {
         self.has_saved_draft() || (self.composer_draft && !self.open)
     }
+    /// The phone's Draft mark. The thread open here isn't open there, so its
+    /// composer text counts.
+    pub(super) fn has_any_draft(&self) -> bool {
+        self.has_saved_draft() || self.composer_draft
+    }
 }
 
 impl Shell {
@@ -44,7 +49,7 @@ impl Shell {
         let live = self.sessions.get(&id).map(|view| view.read(cx));
         Metadata {
             summary: live.map_or_else(|| &self.session_summaries[&id], |v| &v.summary),
-            busy: live.is_some_and(|v| v.busy)
+            busy: live.is_some_and(Conversation::running)
                 || self.remote_marks.get(&id).is_some_and(|state| state.0),
             usage_limit: live.map_or_else(
                 || self.usage_limits.get(&id),

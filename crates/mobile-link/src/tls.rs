@@ -148,12 +148,14 @@ pub fn client(identity: &Identity, pin: &str) -> LinkResult<quinn::ClientConfig>
     let crypto =
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(|e| e.to_string())?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    // Connections stay open between requests: pings keep an idle one alive,
-    // and one the desktop no longer answers fails within seconds rather than
-    // holding up the next request.
+    // Connections stay open between requests, so pings keep an idle one alive.
+    // A cellular radio stays powered for seconds after each packet: pings any
+    // closer would keep it awake, and the phone warm, for as long as the app
+    // is open. The cost is that a desktop gone silent takes up to the idle
+    // timeout to notice.
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(4)));
-    transport.max_idle_timeout(Some(std::time::Duration::from_secs(12).try_into().unwrap()));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
     config.transport_config(Arc::new(transport));
     Ok(config)
 }

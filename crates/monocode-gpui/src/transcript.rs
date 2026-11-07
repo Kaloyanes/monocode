@@ -14,7 +14,6 @@ mod live_phase;
 mod mascot;
 mod measurements;
 mod mono_divider;
-pub(crate) mod orchestration;
 mod outline;
 pub(crate) mod phases;
 mod provider_switch;
@@ -23,6 +22,8 @@ pub(crate) mod selection;
 mod shell;
 pub(crate) mod tasks;
 pub(crate) mod threads;
+#[cfg(test)]
+mod tool_shots;
 mod tools;
 mod user_links;
 mod visuals;
@@ -780,16 +781,15 @@ pub(crate) struct TranscriptView {
     document: bool,
     side_question: bool,
     pub(crate) file_link_base: Option<String>,
+    /// Claims file links and chips before they open the editor: the Inbox's
+    /// "Ask about this PR" chat uses it to jump to a cited line in the diff.
+    pub(crate) link_intercept: Option<markdown::LinkIntercept>,
     /// The conversation shown, so a draft card can open its saved page.
     pub(crate) draft_session: Option<i64>,
     expanded: HashSet<usize>,
     agent_panels: tasks::AgentPanels,
     thread_states: HashMap<i64, serde_json::Value>,
-    thread_expanded: HashSet<i64>,
-    /// Orchestration cards, by the tool call that submitted their plan.
-    orchestration: HashMap<String, orchestration::RunView>,
-    /// Assignments whose details are open, by plan call and index.
-    orchestration_open: HashSet<(String, usize)>,
+    pub(crate) thread_expanded: HashSet<i64>,
     /// Finished child threads the user removed from the spawn tree.
     thread_dismissed: HashSet<i64>,
     /// Threads that sent messages into this one, by session.
@@ -972,10 +972,10 @@ impl TranscriptView {
         view
     }
     /// liveAgents.ts's toLiveAgent: the last turn's latest tool, as "Read
-    /// src/app.rs", when that turn was sent, and how long it ran once done.
-    pub(crate) fn live_turn(&self, cwd: &str) -> (Option<String>, Option<u64>, Option<u64>) {
+    /// src/app.rs", and when that turn was sent.
+    pub(crate) fn live_turn(&self, cwd: &str) -> (Option<String>, Option<u64>) {
         let Some(prompt) = self.source.iter().rposition(|r| r.first && r.is_prompt()) else {
-            return (None, None, None);
+            return (None, None);
         };
         let turn = (prompt + 1..self.source.len())
             .find(|&at| self.source[at].first)
@@ -1002,12 +1002,7 @@ impl TranscriptView {
                     .join(" ")
             })
             .filter(|label| !label.is_empty());
-        let duration = self
-            .turns
-            .get(&turn)
-            .filter(|info| info.has_duration())
-            .map(|info| info.duration_ms);
-        (tool, self.source[prompt].sent_at, duration)
+        (tool, self.source[prompt].sent_at)
     }
     /// Follow-ups delivered during a provider run share its original receipt.
     pub(crate) fn active_turn(&self) -> Option<usize> {
@@ -2608,13 +2603,12 @@ impl TranscriptView {
             document: false,
             side_question: false,
             file_link_base: None,
+            link_intercept: None,
             draft_session: None,
             expanded: HashSet::new(),
             agent_panels: Default::default(),
             thread_states: HashMap::new(),
             thread_expanded: HashSet::new(),
-            orchestration: HashMap::new(),
-            orchestration_open: HashSet::new(),
             thread_dismissed: HashSet::new(),
             senders: HashMap::new(),
             subagent: false,
@@ -3662,17 +3656,16 @@ impl TranscriptView {
                     });
                 }
             } else if role == monocode_core::visual_bridge::DRAFT_ROLE {
-                let body = match serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(
-                    &text,
-                ) {
-                    // One card per draft: the page is a single native view.
-                    Ok(card) if self.shows_draft(&card.draft) => None,
-                    Ok(card) => {
-                        let kept = self.kept_picture(at, turn, turn_end);
-                        Some(Body::Draft(Arc::new(card), kept))
-                    }
-                    Err(_) => Some(Body::Plain("This draft could not be loaded.".into())),
-                };
+                let body =
+                    match serde_json::from_str::<monocode_core::visual_bridge::DraftCard>(&text) {
+                        // One card per draft: the page is a single native view.
+                        Ok(card) if self.shows_draft(&card.draft) => None,
+                        Ok(card) => {
+                            let kept = self.kept_picture(at, turn, turn_end);
+                            Some(Body::Draft(Arc::new(card), kept))
+                        }
+                        Err(_) => Some(Body::Plain("This draft could not be loaded.".into())),
+                    };
                 if let Some(body) = body {
                     self.rows.push(UiRow {
                         key: (0, 0),
@@ -4771,6 +4764,41 @@ impl TranscriptView {
             let (line, column) = location.unwrap_or((fence.start_line, 1));
             format!("{path}:{line}:{column}")
         });
+        let copy = icon_button_ink(
+            "copy-code",
+            if copied { "Copied" } else { "Copy code" },
+            if copied { "check" } else { "copy" },
+            0.8,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                code.strip_suffix("\r\n")
+                    .or_else(|| code.strip_suffix('\n'))
+                    .unwrap_or(&code)
+                    .to_owned(),
+            ));
+            this.copied = Some(key);
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.copied == Some(key) {
+                        this.copied = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }));
+        // Without a header the button sits on the code itself, so it needs its
+        // own solid backing, painted after the code, to stay readable.
+        let (header_copy, floating_copy) = if fence.label.is_empty() {
+            (None, first.then_some(copy))
+        } else {
+            (Some(copy), None)
+        };
         div()
             .relative()
             .w_full()
@@ -4783,20 +4811,17 @@ impl TranscriptView {
             .when(last, |d| d.border_b_1())
             .border_color(content(0.1))
             .bg(content(0.06))
-            .when(first, |d| {
+            .when(first && !fence.label.is_empty(), |d| {
                 d.child(
                     div()
-                        .when(!fence.label.is_empty(), |d| d.min_h(px(36.)))
-                        .when(fence.label.is_empty(), |d| {
-                            d.absolute().top(px(6.)).right(px(6.))
-                        })
+                        .min_h(px(36.))
                         .px(px(10.))
                         .flex()
                         .items_center()
                         .gap_2()
                         .text_size(px(12.))
                         .text_color(content(0.65))
-                        .when(!fence.label.is_empty(), |d| {
+                        .child({
                             let extension = match fence.language.as_str() {
                                 "rust" => "rs",
                                 "javascript" => "js",
@@ -4811,7 +4836,7 @@ impl TranscriptView {
                             } else {
                                 format!("code.{extension}")
                             };
-                            d.child(crate::activity::file_icon(&file, 16.))
+                            crate::activity::file_icon(&file, 16.)
                         })
                         .child(
                             div()
@@ -4849,37 +4874,7 @@ impl TranscriptView {
                                 })
                                 .child(fence.label.clone()),
                         )
-                        .child(
-                            icon_button(
-                                "copy-code",
-                                if copied { "Copied" } else { "Copy code" },
-                                if copied { "check" } else { "copy" },
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        code.strip_suffix("\r\n")
-                                            .or_else(|| code.strip_suffix('\n'))
-                                            .unwrap_or(&code)
-                                            .to_owned(),
-                                    ));
-                                    this.copied = Some(key);
-                                    cx.notify();
-                                    cx.spawn(async move |this, cx| {
-                                        cx.background_executor()
-                                            .timer(std::time::Duration::from_millis(1500))
-                                            .await;
-                                        let _ = this.update(cx, |this, cx| {
-                                            if this.copied == Some(key) {
-                                                this.copied = None;
-                                                cx.notify();
-                                            }
-                                        });
-                                    })
-                                    .detach();
-                                },
-                            )),
-                        ),
+                        .when_some(header_copy, |d, copy| d.child(copy)),
                 )
             })
             .child(
@@ -4909,6 +4904,19 @@ impl TranscriptView {
                         ),
                     )),
             )
+            .when_some(floating_copy, |d, copy| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(6.))
+                        .right(px(6.))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(content(0.14))
+                        .bg(floating_fill())
+                        .child(copy),
+                )
+            })
             .into_any_element()
     }
     fn row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -5502,25 +5510,28 @@ impl TranscriptView {
                 } else if let Part::Visual { id, caption } = &md.part {
                     self.placed_visual(id, caption, cx)
                 } else {
-                    markdown::body_selected(
-                        md,
-                        format!("md-{ix}").into(),
-                        if reasoning {
-                            markdown::Tone::Reasoning
-                        } else if row.work {
-                            markdown::Tone::Work
-                        } else {
-                            markdown::Tone::Normal
-                        },
-                        self.reveals.get(&message_start).map(|r| &r.fades),
-                        self.frame_now,
-                        if reasoning {
-                            None
-                        } else {
-                            self.text_selection(row.key, message_start, !user && !error, cx)
-                        },
-                        Some(&prepared),
-                    )
+                    let intercept = self.link_intercept.clone();
+                    markdown::with_link_intercept(intercept, || {
+                        markdown::body_selected(
+                            md,
+                            format!("md-{ix}").into(),
+                            if reasoning {
+                                markdown::Tone::Reasoning
+                            } else if row.work {
+                                markdown::Tone::Work
+                            } else {
+                                markdown::Tone::Normal
+                            },
+                            self.reveals.get(&message_start).map(|r| &r.fades),
+                            self.frame_now,
+                            if reasoning {
+                                None
+                            } else {
+                                self.text_selection(row.key, message_start, !user && !error, cx)
+                            },
+                            Some(&prepared),
+                        )
+                    })
                     .into_any_element()
                 };
                 div()
@@ -6396,7 +6407,9 @@ impl Render for TranscriptView {
 /// The frosted fill behind the round controls floating over the transcript.
 pub(crate) fn floating_surface() -> impl IntoElement {
     canvas(
-        |_, _, _| {},
+        |bounds, window, _| {
+            window.insert_hitbox(bounds, gpui::HitboxBehavior::Float(bounds.size.height / 2.));
+        },
         |bounds, _, window, _| {
             let radius = bounds.size.height / 2.;
             #[cfg(any(target_os = "macos", target_os = "windows"))]

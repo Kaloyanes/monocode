@@ -394,10 +394,10 @@ mod model_label_tests {
         let (window, picks, _events) =
             rendered_picker(cx, Kind::Codex, "/work", &["example-model"]);
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        // Default (0) and the catalog's model (1) both get a star.
+        // The catalog's model gets a star; this picker has no separate Default row.
         visual.refresh().unwrap();
         assert!(visual.debug_bounds("model-star-0").is_some());
-        click_star(visual, 1);
+        click_star(visual, 0);
         visual.update(|_, cx| {
             assert_eq!(
                 favorites(cx),
@@ -441,7 +441,7 @@ mod model_label_tests {
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.refresh().unwrap();
         // The option sits left of its star, so aim at the row's left edge.
-        let star = visual.debug_bounds("model-star-1").unwrap();
+        let star = visual.debug_bounds("model-star-0").unwrap();
         visual.simulate_click(
             gpui::point(star.left() - gpui::px(80.), star.center().y),
             Default::default(),
@@ -492,7 +492,7 @@ mod model_label_tests {
             rendered_picker(cx, Kind::Hermes, "remote://env/home/code", &[REMOTE]);
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         // Default (0), then the host's model (1).
-        click_star(visual, 1);
+        click_star(visual, 0);
         visual.update(|_, cx| {
             assert_eq!(favorites(cx), vec![("hermes".into(), Some(REMOTE.into()))])
         });
@@ -1118,18 +1118,7 @@ impl Render for ModelList {
                     .map(|rest| rest.to_owned().into())
                     .unwrap_or_else(|| entry.name.clone());
                 div()
-                    .id(("model-option", ix))
-                            .role(Role::ListBoxOption)
-                    .aria_label(entry.name.clone())
-                    .aria_selected(current)
-                    .when(!entry.enabled, |d| {
-                        d.aria_description(if self.missing.contains(&entry.kind) {
-                            if self.remote_project.is_some() { "This provider is not installed on the connected machine. Install it there, then retry model discovery" } else { "This provider is not installed. Install it, then retry model discovery" }
-                        } else {
-                            "Wait for the current turn to finish before switching providers"
-                        })
-                    })
-                    .cursor_pointer()
+                    .id(("model-row", ix))
                     .flex_shrink_0()
                     .h(px(ROW))
                     .px_1()
@@ -1168,9 +1157,11 @@ impl Render for ModelList {
                             .cursor_pointer()
                             .flex_1()
                             .min_w_0()
+                            .h_full()
                             .px(px(6.))
                             .flex()
                             .flex_col()
+                            .justify_center()
                             .gap(px(3.))
                             .child(div().truncate().child(name))
                             .child(
@@ -1182,7 +1173,8 @@ impl Render for ModelList {
                                     .text_color(content(0.45))
                                     .child(provider_icon(entry.kind.id(), 12.))
                                     .child(entry.kind.label()),
-                            ),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, cx))),
                     )
                     .when(entry.hidden, |d| {
                         d.child(
@@ -1208,19 +1200,10 @@ impl Render for ModelList {
                     .child(
                         div()
                             .id(("model-star", ix))
+                            .debug_selector(move || format!("model-star-{ix}"))
                             .role(Role::Button)
-                            .aria_label(format!(
-                                "{} {} {} favorites",
-                                if starred { "Remove" } else { "Add" },
-                                star_name,
-                                if starred { "from" } else { "to" }
-                            ))
-                            .tip(format!(
-                                "{} {} {} favorites",
-                                if starred { "Remove" } else { "Add" },
-                                star_name,
-                                if starred { "from" } else { "to" }
-                            ))
+                            .aria_label(favorite_label(starred, &star_name))
+                            .tip(favorite_label(starred, &star_name))
                             .cursor_pointer()
                             .size(px(24.))
                             .flex_shrink_0()
@@ -1236,13 +1219,6 @@ impl Render for ModelList {
                                 this.toggle_favorite(star_kind, star_id.clone(), cx)
                             })),
                     )
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        if *hovered {
-                            this.highlighted = ix;
-                            cx.notify();
-                        }
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, cx)))
                     .into_any()
             })
             .collect();

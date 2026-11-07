@@ -138,6 +138,7 @@ pub(crate) fn summary(tools: &[ToolCall], live: bool) -> (String, &'static str) 
     let mut failed_agents = 0;
     let mut others = 0;
     let mut charts = 0;
+    let mut pages = 0;
     let mut chart_steps = 0;
     let mut current = "think";
     for tool in tools {
@@ -159,8 +160,10 @@ pub(crate) fn summary(tools: &[ToolCall], live: bool) -> (String, &'static str) 
         }
         if let Some(step) = visual {
             chart_steps += 1;
-            if step == monocode_core::tool::VisualStep::Show {
-                charts += 1;
+            match step {
+                monocode_core::tool::VisualStep::Show => charts += 1,
+                monocode_core::tool::VisualStep::Draft => pages += 1,
+                _ => {}
             }
             continue;
         }
@@ -244,6 +247,12 @@ pub(crate) fn summary(tools: &[ToolCall], live: bool) -> (String, &'static str) 
                         format!("{commands} commands")
                     }
                 ),
+                "visual" if pages > 0 && charts == 0 => if live {
+                    "Drafting a page"
+                } else {
+                    "Drafted a page"
+                }
+                .into(),
                 "visual" if charts == 0 => if live {
                     "Planning a chart"
                 } else {
@@ -447,5 +456,46 @@ mod shimmer_tests {
                 first = Some(current);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use monocode_core::tool::ToolCall;
+
+    fn call(name: &str, input: serde_json::Value, state: ToolState) -> ToolCall {
+        let mut call = ToolCall::new("1", name);
+        call.input = input.to_string();
+        call.state = state;
+        call
+    }
+
+    #[test]
+    fn a_draft_turn_reads_as_a_page_not_a_tool() {
+        let draft = |input, state| call("mcp__monocode__draft_preview", input, state);
+        let done = [
+            draft(
+                serde_json::json!({"html": "<p>x</p>"}),
+                ToolState::Completed,
+            ),
+            draft(serde_json::json!({"draft": "d"}), ToolState::Completed),
+        ];
+        assert_eq!(summary(&done, false), ("Drafted a page".into(), "monocode"));
+        let live = [draft(
+            serde_json::json!({"html": "<p>x</p>"}),
+            ToolState::Running,
+        )];
+        assert_eq!(summary(&live, true), ("Drafting a page".into(), "monocode"));
+    }
+
+    #[test]
+    fn a_chart_turn_keeps_its_wording() {
+        let show = call(
+            "mcp__monocode__visual_show",
+            serde_json::json!({"title": "Stars"}),
+            ToolState::Completed,
+        );
+        assert_eq!(summary(&[show], false).0, "Drew a chart");
     }
 }

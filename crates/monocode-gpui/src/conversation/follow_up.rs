@@ -216,7 +216,7 @@ impl Conversation {
     pub(crate) fn composer_has_draft(&self) -> bool {
         self.draft_has_value || !self.attachments.is_empty()
     }
-    /// Saved drafts, from an Operator draft launch, a remote host or from
+    /// Saved drafts, from a draft launch, a remote host or from
     /// before drafts lived in the composer, open in the composer so a thread
     /// has one kind of draft. A launch waiting to send its draft keeps it, and
     /// a child thread keeps its lead's: it has no composer.
@@ -238,8 +238,12 @@ impl Conversation {
             return;
         };
         self.attachments = draft.attachments;
-        self.input
-            .update(cx, |input, cx| input.set_text(draft.text, cx));
+        // The composer holds a pending mode as its slash command.
+        let text = match draft.mode {
+            Some(mode) => format!("/{mode} {}", draft.text),
+            None => draft.text,
+        };
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
         // The composer's copy is written first, so a crash between the two
         // writes cannot lose the draft.
         self.save_composer_draft(cx);
@@ -364,7 +368,7 @@ impl Conversation {
         self.save_composer_draft(cx);
         self.composer_draft.typed = typed;
     }
-    /// A saved draft or unsent composer text that an Operator must not overwrite.
+    #[cfg(test)]
     pub(crate) fn has_unsent_draft(&self) -> bool {
         self.has_saved_draft() || self.composer_has_draft()
     }
@@ -422,8 +426,6 @@ impl Conversation {
         }
         self.summary.has_messages = true;
         self.settings.plan = false;
-        self.settings.operator = false;
-        self.settings.orchestrator = false;
         self.save_settings(cx);
         self.follow_ups.state.draft = Some(message.clone());
         self.transcript
@@ -745,14 +747,8 @@ impl Conversation {
     /// The user's next composer selection must not change a message already
     /// queued, and the message must not take the composer's.
     pub(super) fn launch_message(&mut self, message: Message, cx: &mut Context<Self>) {
-        let previous = (
-            self.settings.plan,
-            self.settings.operator,
-            self.settings.orchestrator,
-        );
+        let previous = self.settings.plan;
         self.settings.plan = message.mode.as_deref() == Some("plan");
-        self.settings.operator = message.mode.as_deref() == Some("operator");
-        self.settings.orchestrator = message.mode.as_deref() == Some("orchestrator");
         let composer_attachments = std::mem::take(&mut self.attachments);
         self.settings.attachments = message.attachments;
         let previous_prepared = self.settings.prepared_prompt.take();
@@ -761,11 +757,7 @@ impl Conversation {
         self.settings.prepared_prompt = previous_prepared;
         self.attachments = composer_attachments;
         self.settings.attachments.clear();
-        (
-            self.settings.plan,
-            self.settings.operator,
-            self.settings.orchestrator,
-        ) = previous;
+        self.settings.plan = previous;
     }
     /// What queued messages are waiting for while background work is still out.
     pub(super) fn queue_waits_on(&self) -> Option<String> {
@@ -1430,52 +1422,47 @@ mod tests {
     fn submitted_modes_clear_after_queueing_and_do_not_leak_into_the_next_message(
         cx: &mut TestAppContext,
     ) {
-        for mode in ["operator", "orchestrator", "plan"] {
-            let window = conversation(cx);
-            cx.run_until_parked();
-            window
-                .update(cx, |view, _, cx| {
-                    view.busy = true;
-                    view.follow_ups.state.paused = true;
-                    view.toggle_mode(mode, cx);
-                    let selected = view.input.read(cx).content.clone();
-                    view.send(cx);
-                    assert_eq!(
-                        view.input.read(cx).content,
-                        selected,
-                        "an empty submission keeps its mode"
-                    );
-                    view.input
-                        .update(cx, |i, cx| i.set_text(format!("/{mode} first message"), cx));
-                    view.send(cx);
-                    assert!(view.input.read(cx).content.is_empty());
-                    assert!(
-                        !view.settings.plan
-                            && !view.settings.operator
-                            && !view.settings.orchestrator
-                    );
-                    view.input
-                        .update(cx, |i, cx| i.set_text("ordinary follow-up".into(), cx));
-                    view.send(cx);
-                    let messages = &view.follow_ups.state.messages;
-                    assert_eq!(messages[0].mode.as_deref(), Some(mode));
-                    assert_eq!(messages[0].text, "first message");
-                    assert_eq!(messages[1].mode, None);
-                    assert_eq!(messages[1].text, "ordinary follow-up");
-                })
-                .unwrap();
-            cx.run_until_parked();
-            window
-                .update(cx, |view, _, _| {
-                    let store = locked(&view.store).unwrap();
-                    let saved = store.agent_settings(view.summary.id).unwrap().unwrap();
-                    assert!(!saved.plan && !saved.operator && !saved.orchestrator);
-                    let queue = store.follow_ups(view.summary.id).unwrap();
-                    assert_eq!(queue.messages[0].mode.as_deref(), Some(mode));
-                    assert_eq!(queue.messages[1].mode, None);
-                })
-                .unwrap();
-        }
+        let mode = "plan";
+        let window = conversation(cx);
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                view.busy = true;
+                view.follow_ups.state.paused = true;
+                view.toggle_mode(mode, cx);
+                let selected = view.input.read(cx).content.clone();
+                view.send(cx);
+                assert_eq!(
+                    view.input.read(cx).content,
+                    selected,
+                    "an empty submission keeps its mode"
+                );
+                view.input
+                    .update(cx, |i, cx| i.set_text(format!("/{mode} first message"), cx));
+                view.send(cx);
+                assert!(view.input.read(cx).content.is_empty());
+                assert!(!view.settings.plan);
+                view.input
+                    .update(cx, |i, cx| i.set_text("ordinary follow-up".into(), cx));
+                view.send(cx);
+                let messages = &view.follow_ups.state.messages;
+                assert_eq!(messages[0].mode.as_deref(), Some(mode));
+                assert_eq!(messages[0].text, "first message");
+                assert_eq!(messages[1].mode, None);
+                assert_eq!(messages[1].text, "ordinary follow-up");
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| {
+                let store = locked(&view.store).unwrap();
+                let saved = store.agent_settings(view.summary.id).unwrap().unwrap();
+                assert!(!saved.plan);
+                let queue = store.follow_ups(view.summary.id).unwrap();
+                assert_eq!(queue.messages[0].mode.as_deref(), Some(mode));
+                assert_eq!(queue.messages[1].mode, None);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

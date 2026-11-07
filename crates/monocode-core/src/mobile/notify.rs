@@ -96,10 +96,10 @@ pub(super) fn alerts(before: &Value, after: &Value) -> Vec<Alert> {
         let busy = session["busy"] == true;
         let (category, body, urgent) = match waiting {
             Some(kind) if last["waiting"].as_str() != Some(kind) => {
-                let lead = if kind == "approval" {
-                    "Needs your approval"
-                } else {
-                    "Has a question for you"
+                let lead = match kind {
+                    "approval" => "Needs your approval",
+                    "draft" => "Waiting for you on a draft",
+                    _ => "Has a question for you",
                 };
                 // Say what it asks, when the desktop knows.
                 let body = match session["request"]["label"].as_str().map(str::trim) {
@@ -340,6 +340,20 @@ pub(super) fn message(token: &str, alert: &Alert) -> Value {
     message
 }
 
+/// One push for many alerts. It names no session, so a tap opens the app.
+pub(super) fn digest(token: &str, title: &str, body: &str, urgent: bool) -> Value {
+    json!({
+        "to": token,
+        "title": title,
+        "body": body,
+        "sound": "default",
+        "priority": "high",
+        "collapseId": "digest",
+        "threadId": "digest",
+        "interruptionLevel": if urgent { "time-sensitive" } else { "active" },
+    })
+}
+
 pub(super) enum SendError {
     /// The phone uninstalled the app or turned its token over; forget it.
     Unregistered,
@@ -391,6 +405,7 @@ const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 /// The phone's Android channel for session alerts.
 const CHANNEL: &str = "sessions";
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Notice {
     pub title: String,
     /// Under the title on iOS, as the project a session is in.
@@ -464,7 +479,6 @@ fn unregistered(tokens: &[String], response: &Value) -> Vec<String> {
         .map(|(token, _)| token.clone())
         .collect()
 }
-
 
 #[cfg(test)]
 mod expo_tests {

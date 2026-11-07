@@ -40,7 +40,7 @@ soul.read {}; soul.update {text,expectedHash}
 memory.read {topic?}; memory.search {query,since?}; memory.add {fact,topic?,until?}; memory.replace {find,fact,topic?,until?}; memory.remove {find,topic?}
 habits.list {}; habits.add {name,instructions,schedule:{kind,time?,minute?,dayOfWeek?}}; habits.update {id,name?,instructions?,schedule?,enabled?}; habits.run {id}; habits.remove {id}
 chat.card {type:"pr",repo?,number,note?} / {type:"session",sessionId,note?} / {type:"choices",options:[text]} / {type:"habit",name,instructions,schedule}
-Ordinary Operator sessions are visible in project history. Mono launches follow its Show started sessions preference. reveal defaults to false and controls navigation, not history visibility. placement right/down explicitly opens a split beside besideSessionId (or the caller).
+Mono launches follow its Show started sessions preference. reveal defaults to false and controls navigation, not history visibility. placement right/down explicitly opens a split beside besideSessionId (or the caller).
 sessions.read returns up to three prose exchanges and nextBefore for older turns; pass that turn ID as before.
 notes.write requires body for a new note; existing notes accept title, body or tags independently.
 Artifacts, memory, soul, habits, cards and notifyOnComplete:true require a Mono.
@@ -233,6 +233,9 @@ pub fn client(args: &[String]) -> Result<Value, String> {
 fn response_timeout(action: &str, input: &Value) -> Duration {
     Duration::from_secs(if action == "threads.wait" {
         input["timeoutSeconds"].as_u64().unwrap_or(50).min(50) + 10
+    } else if action == "control.set" {
+        // Raising access waits on the person.
+        300
     } else {
         60
     })
@@ -395,7 +398,7 @@ fn mcp_response(request: Value) -> Option<Value> {
                     .as_str()
                     .filter(|id| !id.is_empty())
                     .map_or_else(super::new_id, str::to_owned);
-                call(action.to_owned(), input, request_id)
+                call(action, input, &request_id, &std::env::vars().collect())
             } else {
                 Err("action is required".to_string())
             };
@@ -490,6 +493,44 @@ mod capability_tests {
         assert_eq!(
             response_timeout("threads.list", &json!({})),
             Duration::from_secs(60)
+        );
+    }
+    #[test]
+    fn mcp_server_offers_one_app_tool_only_to_a_mono_with_app_access() {
+        let mono = crate::agent::MonoContext {
+            mono: Default::default(),
+            root: "/monos".into(),
+            executable: "/bin/monocode-gpui".into(),
+        };
+        let (server, _rx) = Server::start().unwrap();
+        let environment = server.environment(7);
+        assert!(mcp_server(None, &environment).is_none());
+        assert!(mcp_server(Some(&mono), &HashMap::new()).is_none());
+        let entry = mcp_server(Some(&mono), &environment).unwrap();
+        assert_eq!(entry["args"], json!(["app-mcp"]));
+        let mut codex = std::process::Command::new("codex");
+        configure_codex(&mut codex, Some(&mono), &environment);
+        let args: Vec<_> = codex
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(
+            &r#"mcp_servers.monocode_app.default_tools_approval_mode="approve""#.to_string()
+        ));
+        let acp = acp_server(Some(&mono), &environment).unwrap();
+        assert_eq!(acp["name"], MCP_SERVER);
+        assert_eq!(acp["env"].as_array().unwrap().len(), 3);
+
+        let list = mcp_response(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap();
+        let tools = list["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "app");
+        let unknown = mcp_response(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"other","arguments":{}}})).unwrap();
+        assert_eq!(unknown["result"]["isError"], true);
+        let missing = mcp_response(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"app","arguments":{}}})).unwrap();
+        assert_eq!(missing["result"]["isError"], true);
+        assert!(
+            mcp_response(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none()
         );
     }
     #[test]

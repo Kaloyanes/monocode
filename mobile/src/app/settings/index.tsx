@@ -22,6 +22,7 @@ import {
 } from "@/features/settings/notifications";
 import { useOpenSessionAfterStarting } from "@/features/settings/newSessions";
 import { useChangeLayout, useMonoOnlyLayout } from "@/features/settings/monoOnly";
+import { useMonosInDrawer } from "@/features/settings/monosInDrawer";
 import { SettingsPage, SettingsRow } from "@/features/settings/SettingsUI";
 import { projectForRoute } from "@/features/workspace/routing";
 import { useWorkspace } from "@/features/workspace/WorkspaceProvider";
@@ -49,6 +50,22 @@ export default function SettingsScreen() {
   const [openAfterStarting, setOpenAfterStarting] = useOpenSessionAfterStarting();
   const blocked = useNotificationsBlocked();
   const [liveActivity, setLiveActivity] = useLiveActivityPreference();
+  const [monoOnly] = useMonoOnlyLayout();
+  const [monosInDrawer, setMonosInDrawer] = useMonosInDrawer();
+  const navigation = useNavigationContainerRef();
+  const switchLayout = useChangeLayout();
+  // The layouts go about the app differently, so settings closes, and the
+  // app starts again from the top in the new one under the loading cover:
+  // the list of Monos, or back where the user last was.
+  // The switch shows the pick at once, as the sheet slides away with it.
+  const [picked, setPicked] = useState<boolean | null>(null);
+  const changeLayout = (next: boolean) => {
+    setPicked(next);
+    switchLayout(next, {
+      close: () => router.back(),
+      reset: () => navigation.reset({ index: 0, routes: [{ name: "index" }] }),
+    });
+  };
   // Both pages act on the project open under settings.
   const params = project ? { projectId: project.id } : {};
   const connection = useConnection();
@@ -225,9 +242,29 @@ export default function SettingsScreen() {
                 />
               }
             />
+            {picked ?? monoOnly ? null : (
+              <>
+                <View style={styles.divider} />
+                <SettingsRow
+                  icon="people"
+                  label="Monos in the drawer"
+                  onPress={() => setMonosInDrawer(!monosInDrawer)}
+                  accessory={
+                    <Switch
+                      accessibilityLabel="Monos in the drawer"
+                      value={monosInDrawer}
+                      onValueChange={setMonosInDrawer}
+                      trackColor={{ true: colors.accent }}
+                    />
+                  }
+                />
+              </>
+            )}
           </View>
           <Text style={styles.note}>
-            A list of your Monos and their chats, with no sidebar or projects.
+            Monos only shows a list of your Monos and their chats, with no sidebar or projects.
+            Monos in the drawer lists them above your projects there, instead of above each
+            project’s sessions.
           </Text>
         </>
       ) : null}

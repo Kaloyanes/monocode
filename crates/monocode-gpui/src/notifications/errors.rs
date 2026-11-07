@@ -1,6 +1,8 @@
 //! Dismissible app errors use the same glass card as pending approvals.
 use crate::theme::*;
-use gpui::{Div, FontWeight, Hsla, Role, Stateful, div, prelude::*, px, rgb};
+use gpui::{
+    Context, Div, FontWeight, Hsla, Render, Role, Stateful, Window, div, prelude::*, px, rgb,
+};
 
 pub(crate) fn card(id: &'static str, message: String, dismiss: impl IntoElement) -> Stateful<Div> {
     let rose: Hsla = rgb(0xf43f5e).into();
@@ -49,4 +51,19 @@ pub(crate) fn card(id: &'static str, message: String, dismiss: impl IntoElement)
                         .child(message),
                 ),
         )
+}
+
+/// A still copy of a card, for its exit.
+pub(crate) struct Frozen {
+    pub id: &'static str,
+    pub message: String,
+}
+impl Render for Frozen {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        card(
+            self.id,
+            self.message.clone(),
+            icon_button("dismiss-leaving-error", "Dismiss", "close"),
+        )
+    }
 }

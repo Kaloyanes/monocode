@@ -10,11 +10,14 @@ export function SlashRow({
   entry,
   onPress,
   lines = 1,
+  grouped = false,
 }: {
   entry: SlashEntry;
   onPress?: () => void;
   /** How many lines its description may take. */
   lines?: number;
+  /** In a sheet's card, which supplies the rounding and takes its inset. */
+  grouped?: boolean;
 }) {
   const styles = useStyles();
   const colors = useColors();
@@ -52,7 +55,7 @@ export function SlashRow({
       accessibilityLabel={`${entry.kind === "skill" ? "Skill" : "Command"} ${entry.name}`}
       accessibilityHint={entry.detail || undefined}
       onPress={onPress}
-      style={({ pressed }) => [styles.row, pressed && styles.pressed]}
+      style={({ pressed }) => [styles.row, grouped && styles.grouped, pressed && styles.pressed]}
     >
       {body}
     </Pressable>
@@ -68,6 +71,12 @@ const useStyles = themedStyles((colors) => ({
     paddingVertical: 7,
     paddingHorizontal: 6,
     borderRadius: 12,
+  },
+  grouped: {
+    minHeight: 56,
+    paddingVertical: 9,
+    paddingHorizontal: 16,
+    borderRadius: 0,
   },
   pressed: {
     backgroundColor: colors.fill,

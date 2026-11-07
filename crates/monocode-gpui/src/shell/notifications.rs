@@ -11,13 +11,35 @@ use crate::notifications::{
     layout_notice::{LayoutNotice, LayoutNoticeEvent},
     linked_activity::{Cleanup, LinkedActivity, LinkedActivityEvent},
     platform, reminders,
+    surface::{self, ToastSlot},
     undo_notice::{UndoNotice, UndoNoticeEvent},
     updater::{self, Event as UpdaterEvent, Updater},
 };
-use std::{sync::mpsc::Receiver, time::Duration};
+use std::{
+    sync::mpsc::Receiver,
+    time::{Duration, Instant},
+};
+
+const APP_ERROR: &str = "app-error";
+const MONO_ERROR: &str = "mono-error";
+
+/// Approval cards come and go in numbers, so they keep their own exits.
+#[derive(Default)]
+struct ToastSlots {
+    app_error: ToastSlot<errors::Frozen>,
+    mono_error: ToastSlot<errors::Frozen>,
+    file_error: ToastSlot<FileActionError>,
+    undo: ToastSlot<UndoNotice>,
+    reminders: ToastSlot<reminders::View>,
+    harness: ToastSlot<HarnessUpdates>,
+    layout: ToastSlot<LayoutNotice>,
+    /// Only one session's GitHub card shows at a time, so they share a slot.
+    linked: ToastSlot<LinkedActivity>,
+}
 
 pub(super) struct State {
     pub region: AnchorSlot,
+    toasts: ToastSlots,
     pub harness: Entity<HarnessUpdates>,
     pub approvals: Entity<ApprovalNotices>,
     pub reminders: Entity<reminders::View>,
@@ -33,6 +55,11 @@ pub(super) struct State {
     pub github: Entity<GithubActivity>,
     linked: HashMap<i64, Entity<LinkedActivity>>,
     linked_cleanup: HashMap<i64, Cleanup>,
+    /// When each card first showed. It slides in once, not on every return
+    /// to its tab.
+    linked_arrived: HashMap<i64, Instant>,
+    /// The session whose card showed last.
+    linked_shown: Option<i64>,
     linked_seen_ready: bool,
     linked_last_poll: Option<std::time::Instant>,
     linked_revisions: HashMap<String, i64>,
@@ -57,6 +84,7 @@ impl State {
     pub(super) fn new(workspace: &Workspace, store: Database, cx: &mut Context<Shell>) -> Self {
         Self {
             region: AnchorSlot::default(),
+            toasts: ToastSlots::default(),
             harness: cx
                 .new(|cx| HarnessUpdates::new(workspace.preferences.hidden_providers.clone(), cx)),
             approvals: cx.new(|_| ApprovalNotices::default()),
@@ -80,6 +108,8 @@ impl State {
             linked_seen_ready: false,
             linked_last_poll: None,
             linked_revisions: HashMap::new(),
+            linked_arrived: HashMap::new(),
+            linked_shown: None,
             linked_primed: false,
             linked_started_at: monocode_core::time::now_ms(),
             linked_seen_writes: None,
@@ -363,6 +393,7 @@ impl Shell {
                         }
                         this.poll_reminders(cx);
                         this.poll_linked_activity(cx);
+                        this.poll_presence(cx);
                         // Scheduled mutes expire without a preference change;
                         // redraw when one does, not on every tick.
                         let passed = this
@@ -421,7 +452,7 @@ impl Shell {
                     harness: Kind::from_id(&chat.summary.provider).label().to_owned(),
                     pending: chat.pending_notification_inputs(cx),
                     inbox_ask: false,
-                    orchestration_worker: self.orchestration_worker(chat.summary.id),
+                    former_worker: self.former_worker(chat.summary.id),
                     conversation_focused: false,
                 }
             })
@@ -527,7 +558,7 @@ impl Shell {
                 harness: Kind::from_id(&chat.summary.provider).label().to_owned(),
                 pending: chat.pending_notification_inputs(cx),
                 inbox_ask: false,
-                orchestration_worker: self.orchestration_worker(id),
+                former_worker: self.former_worker(id),
                 conversation_focused: self.window_active
                     && (self.workspace.active == Some(id) || mono_visible)
                     && self.notice_session_visible(id, cx)
@@ -980,8 +1011,64 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn notices_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// Copies are taken every render because these toasts can clear from
+    /// anywhere, and by the next render their content is already gone.
+    fn sync_toasts(&mut self, cx: &mut Context<Self>) {
+        let frozen = |id, message| errors::Frozen { id, message };
+        let app_error = self.error.clone().map(|message| frozen(APP_ERROR, message));
+        let mono_error = self
+            .monos
+            .as_ref()
+            .and_then(|monos| monos.read(cx).error.clone())
+            .map(|message| frozen(MONO_ERROR, message));
         let state = &self.notification_state;
+        let file_error = state.file_error.read(cx);
+        let file_error = file_error.is_visible().then(|| file_error.clone());
+        let undo = state.undo.read(cx);
+        let undo = undo.is_visible().then(|| undo.clone());
+        let reminders = state.reminders.read(cx);
+        let reminders = (!reminders.is_empty()).then(|| reminders.frozen());
+        let harness = state.harness.read(cx);
+        let harness = harness.is_visible().then(|| harness.clone());
+        let layout = state.layout.read(cx);
+        let layout = layout.is_visible().then(|| layout.clone());
+
+        let toasts = &mut self.notification_state.toasts;
+        toasts.app_error.sync(
+            app_error,
+            |s| &mut s.notification_state.toasts.app_error,
+            cx,
+        );
+        toasts.mono_error.sync(
+            mono_error,
+            |s| &mut s.notification_state.toasts.mono_error,
+            cx,
+        );
+        toasts.file_error.sync(
+            file_error,
+            |s| &mut s.notification_state.toasts.file_error,
+            cx,
+        );
+        toasts
+            .undo
+            .sync(undo, |s| &mut s.notification_state.toasts.undo, cx);
+        toasts.reminders.sync(
+            reminders,
+            |s| &mut s.notification_state.toasts.reminders,
+            cx,
+        );
+        toasts
+            .harness
+            .sync(harness, |s| &mut s.notification_state.toasts.harness, cx);
+        toasts
+            .layout
+            .sync(layout, |s| &mut s.notification_state.toasts.layout, cx);
+    }
+
+    pub(super) fn notices_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.sync_toasts(cx);
+        let state = &self.notification_state;
+        let toasts = &state.toasts;
         let mono_error = self.monos.as_ref().and_then(|monos| {
             monos
                 .read(cx)
@@ -999,51 +1086,83 @@ impl Shell {
             .flex()
             .flex_col()
             .items_end()
-            .gap(px(8.))
+            .gap(px(surface::TOAST_GAP))
             .child(state.region.probe())
             .when_some(self.error.clone(), |stack, message| {
-                stack.child(errors::card(
-                    "app-error",
-                    message,
-                    icon_button("dismiss-error", "Dismiss error", "close")
-                        .debug_selector(|| "dismiss-error".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.error = None;
-                            cx.notify();
-                        })),
-                ))
-            })
-            .when_some(mono_error, |stack, (monos, message)| {
-                stack.child(errors::card(
-                    "mono-error",
-                    message,
-                    icon_button("mono-error-close", "Dismiss Mono error", "close")
-                        .debug_selector(|| "mono-error-close".into())
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            monos.update(cx, |monos, cx| monos.dismiss_error(cx));
-                        })),
-                ))
-            })
-            .when(state.file_error.read(cx).is_visible(), |stack| {
-                stack.child(state.file_error.clone())
-            })
-            .when(state.undo.read(cx).is_visible(), |stack| {
-                stack.child(state.undo.clone())
-            })
-            .when(!state.reminders.read(cx).is_empty(), |d| {
-                d.child(
-                    div()
-                        .w(px(320.))
-                        .max_w_full()
-                        .child(state.reminders.clone()),
+                stack.child(
+                    toasts.app_error.enter(
+                        "app-error-enter",
+                        div().w_full().child(errors::card(
+                            APP_ERROR,
+                            message,
+                            icon_button("dismiss-error", "Dismiss error", "close")
+                                .debug_selector(|| "dismiss-error".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.error = None;
+                                    cx.notify();
+                                })),
+                        )),
+                    ),
                 )
             })
+            .children(toasts.app_error.exit("app-error-exit"))
+            .when_some(mono_error, |stack, (monos, message)| {
+                stack.child(
+                    toasts.mono_error.enter(
+                        "mono-error-enter",
+                        div().w_full().child(errors::card(
+                            MONO_ERROR,
+                            message,
+                            icon_button("mono-error-close", "Dismiss Mono error", "close")
+                                .debug_selector(|| "mono-error-close".into())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    monos.update(cx, |monos, cx| monos.dismiss_error(cx));
+                                })),
+                        )),
+                    ),
+                )
+            })
+            .children(toasts.mono_error.exit("mono-error-exit"))
+            .when(state.file_error.read(cx).is_visible(), |stack| {
+                stack.child(toasts.file_error.enter(
+                    "file-error-enter",
+                    div().w_full().child(state.file_error.clone()),
+                ))
+            })
+            .children(toasts.file_error.exit("file-error-exit"))
+            .when(state.undo.read(cx).is_visible(), |stack| {
+                stack.child(toasts.undo.enter(
+                    "undo-notice-enter",
+                    div().w_full().child(state.undo.clone()),
+                ))
+            })
+            .children(toasts.undo.exit("undo-notice-exit"))
+            .when(!state.reminders.read(cx).is_empty(), |d| {
+                d.child(
+                    toasts.reminders.enter(
+                        "reminders-enter",
+                        div()
+                            .w(px(320.))
+                            .max_w_full()
+                            .child(state.reminders.clone()),
+                    ),
+                )
+            })
+            .children(toasts.reminders.exit("reminders-exit"))
             .when(state.harness.read(cx).is_visible(), |d| {
-                d.child(div().w(px(340.)).max_w_full().child(state.harness.clone()))
+                d.child(toasts.harness.enter(
+                    "harness-updates-enter",
+                    div().w(px(340.)).max_w_full().child(state.harness.clone()),
+                ))
             })
+            .children(toasts.harness.exit("harness-updates-exit"))
             .when(state.layout.read(cx).is_visible(), |d| {
-                d.child(div().w(px(340.)).max_w_full().child(state.layout.clone()))
+                d.child(toasts.layout.enter(
+                    "layout-notice-enter",
+                    div().w(px(340.)).max_w_full().child(state.layout.clone()),
+                ))
             })
+            .children(toasts.layout.exit("layout-notice-exit"))
             .when(!state.approvals.read(cx).is_empty(), |d| {
                 d.child(
                     div()
@@ -1224,6 +1343,9 @@ impl Shell {
             .values()
             .cloned()
             .collect();
+        self.notification_state
+            .linked_arrived
+            .retain(|id, _| cards.iter().any(|card| card.session == *id));
         for card in cards {
             let key = format!(
                 "{}:{}:{}:{}",
@@ -1278,11 +1400,47 @@ impl Shell {
 
     /// The pane host positions the returned card at top/right 12px, clipped to
     /// the exact session surface, so split chats and Mono sessions stay scoped.
-    pub(super) fn linked_notice(
-        &mut self,
-        id: i64,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<LinkedActivity>> {
+    pub(super) fn linked_notice(&mut self, id: i64, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(notice) = self.linked_view(id, cx) else {
+            let state = &self.notification_state;
+            return (state.linked_shown == Some(id))
+                .then(|| state.toasts.linked.exit("linked-activity-exit"))
+                .flatten()
+                .map(IntoElement::into_any_element);
+        };
+        let state = &mut self.notification_state;
+        state.toasts.linked.stay();
+        state.linked_shown = Some(id);
+        let arrived = *state.linked_arrived.entry(id).or_insert_with(Instant::now);
+        let toast = div().w_full().child(notice);
+        let slot = &state.toasts.linked;
+        Some(if arrived.elapsed() < surface::TOAST_ENTER {
+            slot.enter(("linked-activity-enter", id as u64), toast)
+                .into_any_element()
+        } else {
+            slot.settled(toast).into_any_element()
+        })
+    }
+
+    /// Runs from the card's own events, because a card also disappears when
+    /// its tab closes or changes, and that must not look like a dismissal.
+    fn linked_leave(&mut self, id: i64, cx: &mut Context<Self>) {
+        let state = &self.notification_state;
+        // The close button acknowledges and dismisses, so this runs twice.
+        if state.linked_shown != Some(id) || !state.github.read(cx).cards.contains_key(&id) {
+            return;
+        }
+        let Some(copy) = state.linked.get(&id).map(|notice| notice.read(cx).clone()) else {
+            return;
+        };
+        self.notification_state.toasts.linked.leave(
+            copy,
+            |shell| &mut shell.notification_state.toasts.linked,
+            cx,
+        );
+    }
+
+    fn linked_view(&mut self, id: i64, cx: &mut Context<Self>) -> Option<Entity<LinkedActivity>> {
         let card = self
             .notification_state
             .github
@@ -1311,6 +1469,17 @@ impl Shell {
         Some(notice)
     }
 
+    /// Archives threads the Inbox offered, as the card's button would. An id
+    /// the shell does not list is skipped, and so is one already archived,
+    /// because the archive toggle would restore it.
+    pub(crate) fn archive_linked_threads(&mut self, ids: &[i64], cx: &mut Context<Self>) {
+        for &id in ids {
+            if self.session_summaries.get(&id).is_some_and(|s| !s.archived) {
+                self.handle_linked_activity(LinkedActivityEvent::Archive(id), cx);
+            }
+        }
+    }
+
     fn open_work_link_later(&mut self, url: String, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let _ = this.update_in(cx, |this, window, cx| this.open_work_link(&url, window, cx));
@@ -1321,6 +1490,7 @@ impl Shell {
     fn handle_linked_activity(&mut self, event: LinkedActivityEvent, cx: &mut Context<Self>) {
         match event {
             LinkedActivityEvent::Acknowledge(id) | LinkedActivityEvent::Dismiss(id) => {
+                self.linked_leave(id, cx);
                 self.notification_state
                     .github
                     .update(cx, |feed, cx| feed.acknowledge(id, cx));
@@ -1418,6 +1588,7 @@ mod tests {
 
     #[gpui::test]
     fn error_cards_share_top_right_stack_and_dismiss_independently(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, _) = crate::shell::tests::window(cx);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         let body = visual.debug_bounds("main-pane-frame").unwrap();
@@ -1473,6 +1644,239 @@ mod tests {
                 assert!(!shell.notification_state.file_error.read(cx).is_visible());
             })
             .unwrap();
+    }
+
+    fn settle(visual: &mut VisualTestContext) {
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+    }
+
+    #[gpui::test]
+    fn closed_toast_stays_until_its_exit_ends(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let set_error = |visual: &mut VisualTestContext, error: Option<&str>| {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.error = error.map(Into::into);
+                    cx.notify();
+                })
+                .unwrap();
+            settle(visual);
+        };
+        set_error(visual, Some("Could not save workspace"));
+        set_error(visual, None);
+        assert!(visual.debug_bounds("app-error").is_some());
+
+        visual.executor().advance_clock(surface::TOAST_EXIT);
+        settle(visual);
+        assert!(visual.debug_bounds("app-error").is_none());
+    }
+
+    #[gpui::test]
+    fn toast_view_stays_until_its_exit_ends(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, _, cx| {
+                shell.notification_state.undo.update(cx, |notice, cx| {
+                    notice.set_message(Some("Archived 2 threads".into()), cx)
+                });
+            })
+            .unwrap();
+        settle(visual);
+        window
+            .update(visual, |shell, _, cx| shell.dismiss_undo_notice(cx))
+            .unwrap();
+        settle(visual);
+        assert!(visual.debug_bounds("undo-notice").is_some());
+
+        visual.executor().advance_clock(surface::TOAST_EXIT);
+        settle(visual);
+        assert!(visual.debug_bounds("undo-notice").is_none());
+    }
+
+    #[gpui::test]
+    fn toast_returning_during_its_exit_stays(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let set_error = |visual: &mut VisualTestContext, error: Option<&str>| {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.error = error.map(Into::into);
+                    cx.notify();
+                })
+                .unwrap();
+            settle(visual);
+        };
+        set_error(visual, Some("First"));
+        set_error(visual, None);
+        set_error(visual, Some("Second"));
+
+        visual.executor().advance_clock(surface::TOAST_EXIT);
+        settle(visual);
+        assert!(visual.debug_bounds("app-error").is_some());
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(
+                    shell
+                        .notification_state
+                        .toasts
+                        .app_error
+                        .exit("exit")
+                        .is_none()
+                );
+                cx.notify();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn narrow_toast_keeps_its_right_edge_as_it_leaves(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let set_layout = |visual: &mut VisualTestContext, dismissed| {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.workspace.classic_layout = true;
+                    shell.workspace.new_layout_prompt_dismissed = dismissed;
+                    cx.notify();
+                })
+                .unwrap();
+            settle(visual);
+            settle(visual);
+        };
+        set_layout(visual, false);
+        let shown = visual.debug_bounds("new-layout-notice").unwrap();
+        assert_eq!(shown.size.width, px(340.));
+        set_layout(visual, true);
+        let leaving = visual.debug_bounds("new-layout-notice").unwrap();
+        assert_eq!(leaving.size.width, px(340.));
+        // It only ever moves right of its resting place while leaving.
+        let viewport = window.update(visual, |_, w, _| w.viewport_size()).unwrap();
+        let rest = viewport.width - px(12. + 340.);
+        assert!(leaving.left() >= rest);
+    }
+
+    #[gpui::test]
+    fn reduced_motion_closes_toasts_at_once(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, _, cx| {
+                shell.error = Some("Could not save workspace".into());
+                cx.notify();
+            })
+            .unwrap();
+        settle(visual);
+        window
+            .update(visual, |shell, _, cx| {
+                shell.error = None;
+                cx.notify();
+            })
+            .unwrap();
+        settle(visual);
+        assert!(visual.debug_bounds("app-error").is_none());
+    }
+
+    fn linked_card(session: i64) -> github_activity::Card {
+        github_activity::Card {
+            session,
+            item: monocode_core::session_groups::WorkItem {
+                kind: "pr".into(),
+                repo: "acme/app".into(),
+                number: 7,
+                url: "https://github.com/acme/app/pull/7".into(),
+            },
+            title: "Fix the thing".into(),
+            state: "open".into(),
+            updated_at: monocode_core::time::now_ms() as i64,
+            entries: Vec::new(),
+            details_error: false,
+            truncated: false,
+        }
+    }
+
+    /// Shows a GitHub card on the active session and returns that session.
+    fn with_linked_card(window: gpui::WindowHandle<Shell>, visual: &mut VisualTestContext) -> i64 {
+        let id = window
+            .update(visual, |shell, _, cx| {
+                let id = shell.workspace.active.unwrap();
+                shell.notification_state.github.update(cx, |feed, cx| {
+                    feed.cards.insert(id, linked_card(id));
+                    cx.notify();
+                });
+                id
+            })
+            .unwrap();
+        settle(visual);
+        settle(visual);
+        assert!(visual.debug_bounds("linked-activity").is_some());
+        id
+    }
+
+    #[gpui::test]
+    fn closing_a_github_card_plays_its_exit(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let id = with_linked_card(window, visual);
+        window
+            .update(visual, |shell, _, cx| {
+                // What the close button sends.
+                shell.handle_linked_activity(LinkedActivityEvent::Acknowledge(id), cx);
+                shell.handle_linked_activity(LinkedActivityEvent::Dismiss(id), cx);
+                assert!(shell.notification_state.github.read(cx).cards.is_empty());
+            })
+            .unwrap();
+        settle(visual);
+        assert!(visual.debug_bounds("linked-activity").is_some());
+
+        visual.executor().advance_clock(surface::TOAST_EXIT);
+        settle(visual);
+        assert!(visual.debug_bounds("linked-activity").is_none());
+    }
+
+    #[gpui::test]
+    fn leaving_a_github_card_for_another_tab_plays_no_exit(cx: &mut TestAppContext) {
+        let (window, a, b) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let id = with_linked_card(window, visual);
+        let other = if id == a { b } else { a };
+        window
+            .update(visual, |shell, window, cx| shell.open(other, window, cx))
+            .unwrap();
+        settle(visual);
+        settle(visual);
+        assert!(visual.debug_bounds("linked-activity").is_none());
+    }
+
+    #[gpui::test]
+    fn returning_to_a_tab_does_not_replay_a_github_cards_entry(cx: &mut TestAppContext) {
+        let (window, a, b) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let id = with_linked_card(window, visual);
+        let other = if id == a { b } else { a };
+        window
+            .update(visual, |shell, _, cx| {
+                let long_ago = Instant::now() - Duration::from_secs(60);
+                let arrived = &mut shell.notification_state.linked_arrived;
+                arrived.insert(id, long_ago);
+                cx.notify();
+            })
+            .unwrap();
+        settle(visual);
+        settle(visual);
+        let rest = visual.debug_bounds("linked-activity").unwrap();
+
+        for session in [other, id] {
+            window
+                .update(visual, |shell, window, cx| shell.open(session, window, cx))
+                .unwrap();
+            settle(visual);
+            settle(visual);
+        }
+        assert_eq!(visual.debug_bounds("linked-activity").unwrap(), rest);
     }
 
     #[gpui::test]

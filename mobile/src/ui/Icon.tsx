@@ -2,9 +2,14 @@ import Alert01Icon from "@hugeicons/core-free-icons/Alert01Icon";
 import ArrowUpRight01Icon from "@hugeicons/core-free-icons/ArrowUpRight01Icon";
 import CancelCircleIcon from "@hugeicons/core-free-icons/CancelCircleIcon";
 import CheckmarkCircle01Icon from "@hugeicons/core-free-icons/CheckmarkCircle01Icon";
+import CircleDashedIcon from "@hugeicons/core-free-icons/CircleDashedIcon";
+import CircleDotIcon from "@hugeicons/core-free-icons/CircleDotIcon";
 import CircleIcon from "@hugeicons/core-free-icons/CircleIcon";
 import Clock01Icon from "@hugeicons/core-free-icons/Clock01Icon";
 import Comment01Icon from "@hugeicons/core-free-icons/Comment01Icon";
+import GitMergeIcon from "@hugeicons/core-free-icons/GitMergeIcon";
+import GitPullRequestClosedIcon from "@hugeicons/core-free-icons/GitPullRequestClosedIcon";
+import GitPullRequestDraftIcon from "@hugeicons/core-free-icons/GitPullRequestDraftIcon";
 import GitPullRequestIcon from "@hugeicons/core-free-icons/GitPullRequestIcon";
 import Link01Icon from "@hugeicons/core-free-icons/Link01Icon";
 import Undo02Icon from "@hugeicons/core-free-icons/Undo02Icon";
@@ -18,7 +23,6 @@ import ArrowUp02Icon from "@hugeicons/core-free-icons/ArrowUp02Icon";
 import BotIcon from "@hugeicons/core-free-icons/BotIcon";
 import BubbleChatIcon from "@hugeicons/core-free-icons/BubbleChatIcon";
 import Cancel01Icon from "@hugeicons/core-free-icons/Cancel01Icon";
-import CircleIcon from "@hugeicons/core-free-icons/CircleIcon";
 import ChartBreakoutSquareIcon from "@hugeicons/core-free-icons/ChartBreakoutSquareIcon";
 import ClipboardPasteIcon from "@hugeicons/core-free-icons/ClipboardPasteIcon";
 import ComputerIcon from "@hugeicons/core-free-icons/ComputerIcon";
@@ -37,6 +41,9 @@ import GitBranchIcon from "@hugeicons/core-free-icons/GitBranchIcon";
 import Image01Icon from "@hugeicons/core-free-icons/Image01Icon";
 import InboxIcon from "@hugeicons/core-free-icons/InboxIcon";
 import KeyboardOffIcon from "@hugeicons/core-free-icons/KeyboardOffIcon";
+import InformationCircleIcon from "@hugeicons/core-free-icons/InformationCircleIcon";
+import Layers01Icon from "@hugeicons/core-free-icons/Layers01Icon";
+import LayoutAlignRightIcon from "@hugeicons/core-free-icons/LayoutAlignRightIcon";
 import LockIcon from "@hugeicons/core-free-icons/LockIcon";
 import ArrowLeft01Icon from "@hugeicons/core-free-icons/ArrowLeft01Icon";
 import LeftToRightListBulletIcon from "@hugeicons/core-free-icons/LeftToRightListBulletIcon";
@@ -77,8 +84,7 @@ const icons = {
   more: MoreHorizontalIcon,
   search: Search01Icon,
   close: Cancel01Icon,
-  // The Orchestrator, as the desktop's + menu draws it.
-  orchestrator: Share02Icon,
+  subagent: Share02Icon,
   add: Add01Icon,
   compose: PencilEdit02Icon,
   chat: BubbleChatIcon,
@@ -125,10 +131,16 @@ const icons = {
   appearance: DarkModeIcon,
   sun: Sun03Icon,
   moon: Moon02Icon,
+  // The composer modes, as the desktop's + menu draws them.
+  plan: AiIdeaIcon,
+  operator: CursorMagicSelection04Icon,
   // The Inbox: snooze, items, checks, and the offline note.
   clock: Clock01Icon,
   pullRequest: GitPullRequestIcon,
-  issue: CircleIcon,
+  pullRequestDraft: GitPullRequestDraftIcon,
+  pullRequestClosed: GitPullRequestClosedIcon,
+  merge: GitMergeIcon,
+  issue: CircleDotIcon,
   comment: Comment01Icon,
   link: Link01Icon,
   external: ArrowUpRight01Icon,
@@ -138,6 +150,11 @@ const icons = {
   alert: Alert01Icon,
   passing: CheckmarkCircle01Icon,
   failing: CancelCircleIcon,
+  info: InformationCircleIcon,
+  people: UserGroupIcon,
+  layers: Layers01Icon,
+  circle: CircleIcon,
+  draft: CircleDashedIcon,
 };
 
 export type IconName = keyof typeof icons;

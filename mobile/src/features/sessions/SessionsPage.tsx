@@ -7,7 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
 import Animated, { FadeIn, FadeOut, LinearTransition } from "react-native-reanimated";
 
@@ -21,10 +21,15 @@ import { useCreateMono } from "@/features/workspace/useCreateMono";
 import { useWorkspace } from "@/features/workspace/WorkspaceProvider";
 import { AnimationsPaused } from "@/ui/AnimationsPaused";
 import { GradualBlur } from "@/ui/GradualBlur";
+import { Icon } from "@/ui/Icon";
 import { themedStyles, useColors } from "@/ui/theme";
 import { UndoToast } from "@/ui/UndoToast";
 import { useToast } from "@/ui/useToast";
 
+import { ArchivedSessions } from "./ArchivedSessions";
+import { dayHeadings } from "./dayHeadings";
+import { inWorktree } from "./inWorktree";
+import { useMonosInDrawer } from "@/features/settings/monosInDrawer";
 import { MonoGroup } from "./MonoGroup";
 import {
   finishedFromMono,
@@ -49,8 +54,12 @@ import { REMOVE_MS, useSessionActions } from "./useSessionActions";
 import { useSessionPages, visibleSessions } from "./useSessionPages";
 
 /**
- * A project's sessions, newest first and paged in as the list scrolls, under
- * the Monos pinned above them. Each swipes left to archive, rename or delete,
+ * A project's sessions, newest first under the desktop sidebar's day headings
+ * and paged in as the list scrolls, below the Monos pinned above them and the
+ * ones working now, which leave their
+ * place in the list while they run, as on the desktop sidebar. An Archived row
+ * ends the list, and the filter menu has the same, opening the archive in
+ * place of the list. Each session swipes left to archive, rename or delete,
  * as on the desktop sidebar; one a Mono started says so in a chip. Searched and
  * filtered from the bar where the composer rests on the chat page, and
  * narrowed to `worktree` when the header's menu picks one, as the desktop's
@@ -70,7 +79,8 @@ export function SessionsPage({
 }) {
   const colors = useColors();
   const styles = useStyles();
-  const { sessions, edited, rememberSession, monos, allMonos, projects } = useWorkspace();
+  const { sessions, polled, edited, rememberSession, monos, allMonos, projects, canListArchived } =
+    useWorkspace();
   const desktop = useConnection().pairing?.desktop.fingerprint;
   const { pageTop, dockBottom } = useSessionLayout();
   // Room for the search bar where the composer rests, and the blur under it.
@@ -79,13 +89,45 @@ export function SessionsPage({
   const [filter, setFilter] = useState<SessionFilter>(NO_FILTER);
   const needle = query.trim().toLowerCase();
   const recent = sessions.filter((session) => session.projectId === projectId);
-  const pages = useSessionPages(projectId, needle, active);
-  const listed = visibleSessions(pages, recent, needle, edited).filter((session) =>
+  // Which sessions the poll carries, not their order: visibleSessions keeps the
+  // order, so an agent finishing a turn costs no read.
+  const roster = recent
+    .flatMap((session) => (polled.has(session.id) ? [session.id] : []))
+    .sort()
+    .join(",");
+  const pages = useSessionPages(projectId, needle, active, false, roster);
+  const listed = visibleSessions(pages, recent, needle, edited, polled).filter((session) =>
     inWorktree(session, worktree),
   );
-  const visible = filterSessions(listed, filter);
+  // The sessions working now come from the poll, which carries every one, and
+  // leave the paged list below while they do.
+  const working = useMemo(
+    () =>
+      filterSessions(
+        recent.filter(
+          (session) => session.busy && inWorktree(session, worktree) && matches(session, needle),
+        ),
+        filter,
+      ),
+    [recent, worktree, needle, filter],
+  );
+  const rest = useMemo(
+    () =>
+      filterSessions(
+        listed.filter((session) => !session.busy),
+        filter,
+      ),
+    [listed, filter],
+  );
+  const visible = useMemo(() => [...working, ...rest], [working, rest]);
   const scope = JSON.stringify([projectId, needle, filter, worktree?.path, !!pages]);
-  const arrivals = useArrivals(visible, scope, active);
+  const arrivals = useArrivals(rest, scope, active);
+  const dayStarts = dayHeadings(arrivals.sessions);
+  const headingsKey = [...dayStarts].join();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const headings = useMemo(() => dayStarts, [headingsKey]);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const archive = useSessionPages(projectId, "", active && canListArchived, true, roster);
   // The agents to filter by: those in the list, in the order first seen.
   const harnesses = [...new Set<Harness>(listed.map((session) => session.harness))];
   if (filter.harness && !harnesses.includes(filter.harness)) harnesses.push(filter.harness);
@@ -98,6 +140,8 @@ export function SessionsPage({
 
   // The Monos pinned above the rows, unless the filter menu hides them.
   const prefs = useMonoGroupPrefs(desktop);
+  // With "Monos in the drawer" on, they are listed there and not here.
+  const [monosInDrawer] = useMonosInDrawer();
   const unread = useUnreadMonos(desktop, monos);
   const createMono = useCreateMono(projectId);
   const group = useMemo(
@@ -105,7 +149,7 @@ export function SessionsPage({
     [monos, projects, projectId, needle],
   );
   // The filter offers "Monos" wherever the project has some, so it can come back.
-  const hasMonos = groupSize(monosForProject(monos, projects, projectId)) > 0;
+  const hasMonos = !monosInDrawer && groupSize(monosForProject(monos, projects, projectId)) > 0;
   // Who started each session, from every Mono on the desktop.
   const everyMono = useMemo(() => new Map(allMonos.map((mono) => [mono.id, mono])), [allMonos]);
   const shownMonos = useMemo(() => new Set(monos.map((mono) => mono.id)), [monos]);
@@ -114,9 +158,8 @@ export function SessionsPage({
     [visible, everyMono, shownMonos],
   );
   const openMono = useCallback((mono: Pick<Mono, "id">) => {
-    // As the drawer opens one: in place of this screen, so the drawer still
-    // switches projects from it.
-    router.replace({ pathname: "/mono/[monoId]", params: { monoId: mono.id } });
+    // Pushed, as a session is, so it swipes back here and not to the drawer.
+    router.push({ pathname: "/mono/[monoId]", params: { monoId: mono.id } });
   }, []);
   useEffect(() => {
     if (!active) closeOpenRow();
@@ -150,17 +193,35 @@ export function SessionsPage({
   const removingId = actions.removing?.id;
   const { arriving, moving } = arrivals;
   const renderItem = useCallback(
-    ({ item }: { item: SessionSummary }) => (
-      <SessionRow
-        session={item}
-        removing={removingId === item.id}
-        arriving={arriving.has(item.id)}
-        origin={origins.get(item.id) ?? null}
-        handlers={handlers}
-      />
-    ),
-    [removingId, arriving, handlers, origins],
+    ({ item, index }: { item: SessionSummary; index: number }) => {
+      const heading = headings.get(item.id);
+      return (
+        <>
+          {heading ? <SectionLabel title={heading} /> : index > 0 ? <Divider /> : null}
+          <SessionRow
+            session={item}
+            removing={removingId === item.id}
+            arriving={arriving.has(item.id)}
+            origin={origins.get(item.id) ?? null}
+            handlers={handlers}
+          />
+        </>
+      );
+    },
+    [removingId, arriving, handlers, origins, headings],
   );
+
+  if (archiveOpen)
+    return (
+      <ArchivedSessions
+        projectId={projectId}
+        active={active}
+        worktree={worktree}
+        roster={roster}
+        onOpen={onOpen}
+        onBack={() => setArchiveOpen(false)}
+      />
+    );
 
   return (
     <AnimationsPaused value={!active}>
@@ -178,28 +239,66 @@ export function SessionsPage({
           extraData={[moving, origins]}
           keyExtractor={(session) => session.id}
           renderItem={renderItem}
-          ItemSeparatorComponent={Divider}
           ListHeaderComponent={
-            prefs.shown && groupSize(group) > 0 ? (
-              <MonoGroup
-                group={group}
-                unread={unread}
-                collapsed={prefs.collapsed}
-                onToggle={() => setMonoGroupPrefs(desktop, { collapsed: !prefs.collapsed })}
-                onOpen={openMono}
-                onNew={createMono}
-              />
-            ) : null
+            <>
+              {!monosInDrawer && prefs.shown && groupSize(group) > 0 ? (
+                <MonoGroup
+                  group={group}
+                  unread={unread}
+                  collapsed={prefs.collapsed}
+                  onToggle={() => setMonoGroupPrefs(desktop, { collapsed: !prefs.collapsed })}
+                  onOpen={openMono}
+                  onNew={createMono}
+                />
+              ) : null}
+              {working.length ? (
+                <>
+                  <SectionLabel title="Working" count={working.length} />
+                  {working.map((session, index) => (
+                    <View key={session.id}>
+                      {index > 0 ? <Divider /> : null}
+                      <SessionRow
+                        session={session}
+                        removing={removingId === session.id}
+                        arriving={false}
+                        origin={origins.get(session.id) ?? null}
+                        handlers={handlers}
+                      />
+                    </View>
+                  ))}
+                </>
+              ) : null}
+            </>
           }
           ListEmptyComponent={
-            pages ? (
+            pages && !working.length ? (
               <Text style={styles.empty}>
                 {narrowed ? "No matching sessions." : "No sessions yet."}
               </Text>
             ) : null
           }
           ListFooterComponent={
-            pages?.loadingMore ? <ActivityIndicator style={styles.more} color={colors.muted} /> : null
+            <>
+              {pages?.loadingMore ? (
+                <ActivityIndicator style={styles.more} color={colors.muted} />
+              ) : null}
+              {canListArchived && archive?.total ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Archived, ${archive.total} sessions`}
+                  onPress={() => {
+                    closeOpenRow();
+                    setArchiveOpen(true);
+                  }}
+                  style={({ pressed }) => [styles.archived, pressed && styles.pressed]}
+                >
+                  <Icon name="archive" size={18} color={colors.muted} />
+                  <Text style={styles.archivedLabel}>Archived</Text>
+                  <Text style={styles.archivedCount}>{archive.total}</Text>
+                  <Icon name="chevronRight" size={14} color={colors.faint} />
+                </Pressable>
+              ) : null}
+            </>
           }
           onScrollBeginDrag={closeOpenRow}
           onEndReached={pages?.loadMore}
@@ -222,6 +321,14 @@ export function SessionsPage({
               value={filter}
               onChange={setFilter}
               harnesses={harnesses}
+              onOpenArchived={
+                canListArchived
+                  ? () => {
+                      closeOpenRow();
+                      setArchiveOpen(true);
+                    }
+                  : undefined
+              }
               monos={
                 hasMonos
                   ? { shown: prefs.shown, onChange: (shown) => setMonoGroupPrefs(desktop, { shown }) }
@@ -236,19 +343,25 @@ export function SessionsPage({
   );
 }
 
-/**
- * Whether a session works in `worktree`; any does without one. An older
- * desktop doesn't say where a session works, so it goes by the branch, which
- * only one working copy can have checked out.
- */
-function inWorktree(session: SessionSummary, worktree: Worktree | undefined) {
-  if (!worktree) return true;
-  if (session.worktreePath) return samePath(session.worktreePath, worktree.path);
-  return session.branch === worktree.name;
+/** Whether a session's title, model or branch has `needle` (lowercase) in it. */
+function matches(session: SessionSummary, needle: string) {
+  return (
+    !needle ||
+    [session.title, session.model, session.branch].some((field) =>
+      field.toLowerCase().includes(needle),
+    )
+  );
 }
 
-function samePath(a: string, b: string) {
-  return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+/** A small title over a run of rows, such as the sessions working now. */
+function SectionLabel({ title, count }: { title: string; count?: number }) {
+  const styles = useStyles();
+  return (
+    <View style={styles.section} accessibilityRole="header">
+      <Text style={styles.sectionTitle}>{title}</Text>
+      {count ? <Text style={styles.sectionCount}>{count}</Text> : null}
+    </View>
+  );
 }
 
 /** A hairline between cards, inset to their text. */
@@ -278,7 +391,10 @@ function sameRow(a: SessionSummary, b: SessionSummary) {
     (a.id === b.id &&
       a.title === b.title &&
       a.busy === b.busy &&
+      a.draft === b.draft &&
       a.updatedAt === b.updatedAt &&
+      a.workItem?.kind === b.workItem?.kind &&
+      a.workItem?.number === b.workItem?.number &&
       a.branch === b.branch &&
       a.monoId === b.monoId &&
       a.model === b.model &&
@@ -342,6 +458,46 @@ const useStyles = themedStyles((colors) => ({
   },
   more: {
     paddingVertical: 16,
+  },
+  section: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 4,
+  },
+  sectionTitle: {
+    color: colors.muted,
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  sectionCount: {
+    color: colors.faint,
+    fontSize: 13,
+    fontVariant: ["tabular-nums"],
+  },
+  archived: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    minHeight: 44,
+    marginTop: 8,
+    paddingHorizontal: 14,
+  },
+  archivedLabel: {
+    flex: 1,
+    color: colors.muted,
+    fontSize: 15,
+    fontWeight: "500",
+  },
+  archivedCount: {
+    color: colors.faint,
+    fontSize: 14,
+    fontVariant: ["tabular-nums"],
+  },
+  pressed: {
+    opacity: 0.6,
   },
   divider: {
     height: StyleSheet.hairlineWidth,

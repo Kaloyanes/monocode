@@ -338,7 +338,7 @@ pub(crate) fn sandbox(body: &str, palette: Palette) -> String {
     let source = format!(
         "<!doctype html>{csp}<style id=mc-theme>{theme}</style><style>*{{box-sizing:border-box}}html{{background:transparent!important;scrollbar-width:none}}html::-webkit-scrollbar{{display:none}}:where(:focus-visible){{outline:2px solid var(--ring);outline-offset:-2px}}body{{margin:0;font:var(--font-size)/1.5 var(--font-sans);color:var(--foreground);background:transparent!important;-webkit-font-smoothing:antialiased}}a{{color:var(--link)}}::selection{{background:var(--selection)}}{KIT_STYLE}</style>{PAGE_PROBE}<script>{KIT_SCRIPT}</script><body>{body}"
     );
-    // The frame and its page share one color scheme: Chromium paints an
+    // The frame and its page share one color scheme: a browser paints an
     // opaque backdrop behind a frame whose scheme differs from its parent's.
     let scheme = if palette.light() { "light" } else { "dark" };
     format!(
@@ -451,7 +451,7 @@ mod tests {
         assert!(PAGE_PROBE.contains("pin({px:d.__mcPin.x,py:d.__mcPin.y,at:d.__mcPin.at},pins)"));
         // Pins follow their element when the page lays out again.
         assert!(PAGE_PROBE.contains("new ResizeObserver(replace)"));
-        // Chromium runs the probe before a dev server's page has a root.
+        // The probe can run before a dev server's page has a root.
         assert!(!PAGE_PROBE.contains("new ResizeObserver(replace).observe"));
         assert!(PAGE_PROBE.contains("realNow()-touched>2000"));
     }

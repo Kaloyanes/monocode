@@ -4,6 +4,8 @@ import {
   cachedText,
   freshSync,
   HOLD_MS,
+  localMark,
+  MARK_HOLD_MS,
   received,
   sent,
   settle,
@@ -115,4 +117,46 @@ it("remembers each thread's text while the app runs", () => {
   expect(syncFor("thread-1")).toBe(sync);
   expect(cachedText("thread-2")).toBe("");
   expect(cachedText()).toBe("");
+});
+
+const NOW = 1_000_000;
+
+it("leaves a thread's mark to the desktop until something changes here", () => {
+  expect(localMark(freshSync(), NOW)).toBeNull();
+});
+
+it("marks text typed here at once, however long it waits for the desktop", () => {
+  const sync = freshSync();
+  typed(sync, "offline thought", NOW);
+  expect(localMark(sync, NOW)).toBe(true);
+  expect(localMark(sync, NOW + MARK_HOLD_MS * 100)).toBe(true);
+});
+
+it("doesn't mark blank text", () => {
+  const sync = freshSync();
+  typed(sync, "   ", NOW);
+  expect(localMark(sync, NOW)).toBe(false);
+});
+
+it("keeps the mark while the desktop's word catches up with a write, then lets go", () => {
+  const sync = freshSync();
+  received(sync, { text: "", rev: 1 }, NOW);
+  typed(sync, "saved soon", NOW);
+  const write = startWrite(sync)!;
+  written(sync, write, { text: "saved soon", rev: 2, accepted: true }, NOW + 100);
+  expect(localMark(sync, NOW + 100 + MARK_HOLD_MS - 1)).toBe(true);
+  expect(localMark(sync, NOW + 100 + MARK_HOLD_MS)).toBeNull();
+});
+
+it("drops the mark as soon as the text is cleared or sent", () => {
+  const cleared = freshSync();
+  received(cleared, { text: "old", rev: 1 }, NOW);
+  typed(cleared, "", NOW);
+  expect(localMark(cleared, NOW)).toBe(false);
+
+  const sending = freshSync();
+  received(sending, { text: "", rev: 1 }, NOW);
+  typed(sending, "go", NOW);
+  sent(sending, NOW + 1);
+  expect(localMark(sending, NOW + 1)).toBe(false);
 });

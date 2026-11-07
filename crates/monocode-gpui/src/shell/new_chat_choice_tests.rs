@@ -91,6 +91,41 @@ fn last_choice_is_used_and_defaults_win_over_its_model() {
 }
 
 #[test]
+fn last_used_mode_beats_the_settings_model() {
+    // The saved state that showed Opus after the last pick was Sonnet:
+    // "Last used" is chosen, and Settings still names a model for Claude.
+    let mut prefs = Preferences {
+        new_chat_model: Some("last".into()),
+        default_provider: Some("claude".into()),
+        default_models: [("claude".into(), "opus".into())].into(),
+        last_models: [("claude".into(), Some("sonnet".into()))].into(),
+        recent_models: vec![recent("claude", Some("sonnet"))],
+        ..Default::default()
+    };
+    assert_eq!(pick(&prefs, LOCAL), (Kind::Claude, Some("sonnet".into())));
+    assert_eq!(
+        NewChatChoice::explicit(&prefs, LOCAL, Kind::Claude).model,
+        Some("sonnet".into())
+    );
+    // Each provider remembers its own last model.
+    prefs
+        .last_models
+        .insert("codex".into(), Some("gpt-mini".into()));
+    assert_eq!(
+        NewChatChoice::explicit(&prefs, LOCAL, Kind::Codex).model,
+        Some("gpt-mini".into())
+    );
+    // The other modes still read Settings.
+    prefs.new_chat_model = Some("pinned".into());
+    assert_eq!(pick(&prefs, LOCAL), (Kind::Claude, Some("opus".into())));
+    prefs.new_chat_model = Some("default".into());
+    assert_eq!(pick(&prefs, LOCAL), (Kind::Claude, None));
+    // A project's model still wins.
+    project(&mut prefs, LOCAL, None, &[("claude", "haiku")], &[]);
+    assert_eq!(pick(&prefs, LOCAL), (Kind::Claude, Some("haiku".into())));
+}
+
+#[test]
 fn hidden_providers_are_skipped_step_by_step() {
     let mut prefs = Preferences {
         default_provider: Some("claude".into()),

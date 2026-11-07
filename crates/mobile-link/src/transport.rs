@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, Notify, Semaphore},
+    sync::{mpsc, watch as signal, Notify, Semaphore},
     task::JoinSet,
     time::timeout,
 };
@@ -82,8 +82,10 @@ async fn write_message(
 
 /// Where a watch handler sends its updates. The stream ends when it is dropped.
 pub type WatchSink = mpsc::Sender<Value>;
-/// How often an idle watch proves the desktop is still there.
-pub const WATCH_HEARTBEAT: Duration = Duration::from_secs(10);
+/// How often an idle watch proves the desktop is still there. Each one wakes a
+/// phone's cellular radio, and a dead link is found sooner by QUIC's idle
+/// timeout anyway. Under 30 s, where a phone on an older build gives up.
+pub const WATCH_HEARTBEAT: Duration = Duration::from_secs(25);
 /// Answers each request on its own stream. A request marked `"watch": true`
 /// goes to `watcher` instead, and its stream stays open: every value the
 /// watcher sends becomes a frame, with heartbeats between, until the watcher
@@ -353,7 +355,61 @@ fn give(key: &str, endpoint: quinn::Endpoint, connection: quinn::Connection) {
     if idle.len() > POOL_SIZE {
         idle.remove(0).connection.close(0_u32.into(), b"Idle");
     }
+    drop(pool);
+    let key = key.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(POOL_IDLE).await;
+        sweep(&key, POOL_IDLE);
+    });
 }
+/// Lets go of the connections idle at least `after`. Each one left open pings
+/// the desktop for as long as it lasts, which keeps the phone's radio awake.
+fn sweep(key: &str, after: Duration) {
+    let mut pool = pool().lock().unwrap();
+    let Some(idle) = pool.get_mut(key) else {
+        return;
+    };
+    idle.retain(|pooled| {
+        let keep = pooled.since.elapsed() < after;
+        if !keep {
+            pooled.connection.close(0_u32.into(), b"Idle");
+        }
+        keep
+    });
+    if idle.is_empty() {
+        pool.remove(key);
+    }
+}
+
+/// How long a reused connection gets to show it still reaches the desktop.
+/// Pings are too far apart to notice a dead one quickly, so a request finds
+/// out for itself and moves to a new connection.
+const DELIVERY: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(5)
+};
+
+/// Counts network changes; whatever is waiting on the old network watches it.
+fn network() -> &'static signal::Sender<u64> {
+    static NETWORK: OnceLock<signal::Sender<u64>> = OnceLock::new();
+    NETWORK.get_or_init(|| signal::channel(0).0)
+}
+/// The phone moved to another network: what it had open may never answer
+/// again, so nothing waits out the idle timeout to find that out.
+pub fn network_changed() {
+    let idle: Vec<Pooled> = pool()
+        .lock()
+        .unwrap()
+        .drain()
+        .flat_map(|(_, v)| v)
+        .collect();
+    for pooled in idle {
+        pooled.connection.close(0_u32.into(), b"Network changed");
+    }
+    network().send_modify(|changes| *changes += 1);
+}
+const NETWORK_CHANGED: &str = "The network changed";
 
 /// Why a request on a connection failed: the link itself, which a fresh
 /// connection may not hit, or the desktop taking too long, which it would.
@@ -373,7 +429,8 @@ impl From<Failure> for String {
 /// Runs `run` on a pooled connection, or on a new one when none is idle or
 /// the pooled one turns out to be gone; its request is sent again under the
 /// same ID, which the desktop deduplicates. A connection that served its
-/// request goes back to the pool.
+/// request goes back to the pool. `run` is told whether it was reused, and so
+/// may be dead.
 async fn on_connection<T, F, Fut>(
     identity: &Identity,
     pin: &str,
@@ -381,12 +438,12 @@ async fn on_connection<T, F, Fut>(
     run: F,
 ) -> LinkResult<T>
 where
-    F: Fn(quinn::Endpoint, quinn::Connection) -> Fut,
+    F: Fn(quinn::Endpoint, quinn::Connection, bool) -> Fut,
     Fut: Future<Output = Result<(T, bool), Failure>>,
 {
     let key = pool_key(identity, pin, addresses);
     if let Some((endpoint, connection)) = take(&key) {
-        match run(endpoint.clone(), connection.clone()).await {
+        match run(endpoint.clone(), connection.clone(), true).await {
             Ok((value, reusable)) => {
                 if reusable {
                     give(&key, endpoint, connection);
@@ -401,7 +458,7 @@ where
         }
     }
     let (endpoint, connection) = connect(identity, pin, addresses).await?;
-    match run(endpoint.clone(), connection.clone()).await {
+    match run(endpoint.clone(), connection.clone(), false).await {
         Ok((value, reusable)) => {
             if reusable {
                 give(&key, endpoint, connection);
@@ -429,11 +486,33 @@ fn answer(response: Value) -> LinkResult<Value> {
 /// The server's wait for a request to arrive in full.
 const REQUEST_UPLOAD: Duration = Duration::from_secs(120);
 
-/// The desktop's 30 seconds to answer, and the time to upload the request:
-/// most are tiny, but one carrying attachments can be megabytes.
-fn exchange_timeout(request: &Value) -> Duration {
+/// The time to upload a request: most are tiny, but one carrying attachments
+/// can be megabytes.
+fn upload_time(request: &Value) -> Duration {
     let size = serde_json::to_vec(request).map_or(0, |bytes| bytes.len()) as u64;
-    Duration::from_secs(35) + Duration::from_secs(size / (256 * 1024)).min(REQUEST_UPLOAD)
+    Duration::from_secs(size / (256 * 1024)).min(REQUEST_UPLOAD)
+}
+
+/// The desktop's 30 seconds to answer, and the upload.
+fn exchange_timeout(request: &Value) -> Duration {
+    Duration::from_secs(35) + upload_time(request)
+}
+
+/// Sends a request and, on a reused connection, waits for the desktop to
+/// acknowledge it. That says the link works however long the answer takes, so
+/// a long read or a slow command is never mistaken for a dead connection and
+/// sent twice.
+async fn deliver(send: &mut quinn::SendStream, request: &Value, reused: bool) -> LinkResult<()> {
+    if !reused {
+        return write_frame(send, request, REQUEST_LIMIT).await;
+    }
+    timeout(DELIVERY + upload_time(request), async {
+        write_frame(send, request, REQUEST_LIMIT).await?;
+        send.stopped().await.map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|_| Err("Desktop did not receive the request".into()))
 }
 
 pub async fn exchange(
@@ -442,13 +521,21 @@ pub async fn exchange(
     addresses: &[Address],
     request: Value,
 ) -> LinkResult<Value> {
-    let response = on_connection(identity, pin, addresses, |_, connection| {
+    let response = on_connection(identity, pin, addresses, |_, connection, reused| {
         let request = &request;
+        let mut changes = network().subscribe();
         async move {
             let response = timeout(exchange_timeout(request), async {
-                let (mut send, mut recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
-                write_frame(&mut send, request, REQUEST_LIMIT).await?;
-                read_frame(&mut recv, RESPONSE_LIMIT).await
+                let answer = async {
+                    let (mut send, mut recv) =
+                        connection.open_bi().await.map_err(|e| e.to_string())?;
+                    deliver(&mut send, request, reused).await?;
+                    read_frame(&mut recv, RESPONSE_LIMIT).await
+                };
+                tokio::select! {
+                    answer = answer => answer,
+                    _ = changes.changed() => Err(NETWORK_CHANGED.to_string()),
+                }
             })
             .await
             .map_err(|_| Failure::Timeout)?
@@ -531,17 +618,29 @@ pub async fn watch(
     request["watch"] = Value::Bool(true);
     let key = pool_key(identity, pin, addresses);
     // A refused watch leaves its connection as good as it was.
-    let opened = on_connection(identity, pin, addresses, |endpoint, connection| {
+    let opened = on_connection(identity, pin, addresses, |endpoint, connection, reused| {
         let request = &request;
         async move {
-            let opened = timeout(Duration::from_secs(35), async {
+            // A watch's stream stays open, so its answer shows the link works.
+            let limit = if reused {
+                DELIVERY
+            } else {
+                Duration::from_secs(35)
+            };
+            let opened = timeout(limit, async {
                 let (mut send, mut recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
                 write_message(&mut send, request, REQUEST_LIMIT).await?;
                 let answer = read_frame(&mut recv, RESPONSE_LIMIT).await?;
                 Ok::<_, String>((send, recv, answer))
             })
             .await
-            .map_err(|_| Failure::Timeout)?
+            .map_err(|_| {
+                if reused {
+                    Failure::Link("Desktop did not answer".into())
+                } else {
+                    Failure::Timeout
+                }
+            })?
             .map_err(Failure::Link)?;
             let (send, recv, answer) = opened;
             if answer["ok"] != true {
@@ -562,13 +661,17 @@ pub async fn watch(
     let incoming = ready.clone();
     let ended = Arc::new(AtomicBool::new(false));
     let ending = ended.clone();
+    let mut changes = network().subscribe();
     let task = tokio::spawn(async move {
         // Finishing our side tells the desktop to stop, so hold it open.
         let _send = send;
         loop {
-            let frame = timeout(WATCH_HEARTBEAT * 3, read_frame(&mut recv, RESPONSE_LIMIT))
-                .await
-                .unwrap_or_else(|_| Err("Desktop stopped answering".into()));
+            let frame = tokio::select! {
+                frame = timeout(WATCH_HEARTBEAT * 3, read_frame(&mut recv, RESPONSE_LIMIT)) => {
+                    frame.unwrap_or_else(|_| Err("Desktop stopped answering".into()))
+                }
+                _ = changes.changed() => Err(NETWORK_CHANGED.to_string()),
+            };
             let update = match frame {
                 Ok(frame) if frame["heartbeat"] == true => continue,
                 Ok(frame) if frame["ok"] == true => Ok(frame["result"].clone()),
@@ -836,6 +939,176 @@ mod tests {
             json!("after")
         );
         assert_eq!(endpoint.open_connections(), 1);
+        endpoint.close(0_u32.into(), b"Test complete");
+        task.await.unwrap();
+    }
+
+    /// Passes datagrams to a desktop until `cut` silences the clients it has
+    /// seen, as when a phone leaves their network. New clients still get through.
+    struct Relay {
+        port: u16,
+        seen: Arc<Mutex<HashMap<SocketAddr, Arc<tokio::net::UdpSocket>>>>,
+        cut: Arc<Mutex<Vec<SocketAddr>>>,
+    }
+    impl Relay {
+        async fn start(desktop: SocketAddr) -> Self {
+            let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let port = front.local_addr().unwrap().port();
+            let seen: Arc<Mutex<HashMap<SocketAddr, Arc<tokio::net::UdpSocket>>>> =
+                Default::default();
+            let cut: Arc<Mutex<Vec<SocketAddr>>> = Default::default();
+            let (flows, silenced) = (seen.clone(), cut.clone());
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 65536];
+                while let Ok((length, from)) = front.recv_from(&mut buffer).await {
+                    if silenced.lock().unwrap().contains(&from) {
+                        continue;
+                    }
+                    let known = flows.lock().unwrap().get(&from).cloned();
+                    let back = match known {
+                        Some(back) => back,
+                        None => {
+                            let back =
+                                Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                            back.connect(desktop).await.unwrap();
+                            flows.lock().unwrap().insert(from, back.clone());
+                            let (reply, front, silenced) =
+                                (back.clone(), front.clone(), silenced.clone());
+                            tokio::spawn(async move {
+                                let mut buffer = vec![0; 65536];
+                                while let Ok(length) = reply.recv(&mut buffer).await {
+                                    if !silenced.lock().unwrap().contains(&from) {
+                                        let _ = front.send_to(&buffer[..length], from).await;
+                                    }
+                                }
+                            });
+                            back
+                        }
+                    };
+                    let _ = back.send(&buffer[..length]).await;
+                }
+            });
+            Self { port, seen, cut }
+        }
+        fn cut(&self) {
+            let seen = self.seen.lock().unwrap();
+            self.cut.lock().unwrap().extend(seen.keys().copied());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reused_connection_gone_silent_gives_way_within_seconds() {
+        let desktop = Identity::generate().unwrap();
+        let phone = Identity::generate().unwrap();
+        let gate = Gate::default();
+        gate.allow(phone.fingerprint().unwrap(), None);
+        let endpoint =
+            server_endpoint(&desktop, gate.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let relay = Relay::start(endpoint.local_addr().unwrap()).await;
+        let task = tokio::spawn(serve(
+            endpoint.clone(),
+            gate,
+            |_, request| async move { Ok(request) },
+            |_, _, sink: WatchSink| async move {
+                tokio::spawn(async move { sink.closed().await });
+                Ok(())
+            },
+        ));
+        let address = [Address {
+            host: "127.0.0.1".into(),
+            port: relay.port,
+        }];
+        let pin = desktop.fingerprint().unwrap();
+        exchange(&phone, &pin, &address, json!(1)).await.unwrap();
+        relay.cut();
+        let started = Instant::now();
+        assert_eq!(
+            exchange(&phone, &pin, &address, json!(2)).await.unwrap(),
+            json!(2)
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+
+        relay.cut();
+        let started = Instant::now();
+        let watching = watch(&phone, &pin, &address, json!({})).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(4));
+        watching.close().await;
+        endpoint.close(0_u32.into(), b"Test complete");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_slow_answer_on_a_reused_connection_is_not_sent_twice() {
+        let desktop = Identity::generate().unwrap();
+        let phone = Identity::generate().unwrap();
+        let gate = Gate::default();
+        gate.allow(phone.fingerprint().unwrap(), None);
+        let endpoint =
+            server_endpoint(&desktop, gate.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let task = tokio::spawn(serve(
+            endpoint.clone(),
+            gate,
+            move |_, request: Value| {
+                count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if request["slow"] == true {
+                        tokio::time::sleep(DELIVERY * 2 + Duration::from_millis(500)).await;
+                    }
+                    Ok(request)
+                }
+            },
+            no_watch,
+        ));
+        let address = [Address {
+            host: "127.0.0.1".into(),
+            port: endpoint.local_addr().unwrap().port(),
+        }];
+        let pin = desktop.fingerprint().unwrap();
+        exchange(&phone, &pin, &address, json!({})).await.unwrap();
+        exchange(&phone, &pin, &address, json!({"slow": true}))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        endpoint.close(0_u32.into(), b"Test complete");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_connections_are_let_go_without_another_request() {
+        let desktop = Identity::generate().unwrap();
+        let phone = Identity::generate().unwrap();
+        let gate = Gate::default();
+        gate.allow(phone.fingerprint().unwrap(), None);
+        let endpoint =
+            server_endpoint(&desktop, gate.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let task = tokio::spawn(serve(
+            endpoint.clone(),
+            gate,
+            |_, request| async move { Ok(request) },
+            no_watch,
+        ));
+        let address = [Address {
+            host: "127.0.0.1".into(),
+            port: endpoint.local_addr().unwrap().port(),
+        }];
+        let pin = desktop.fingerprint().unwrap();
+        exchange(&phone, &pin, &address, json!({})).await.unwrap();
+        assert_eq!(endpoint.open_connections(), 1);
+        let key = pool_key(&phone, &pin, &address);
+        // Younger than the limit, it stays for the next request.
+        sweep(&key, Duration::from_secs(60));
+        assert!(pool().lock().unwrap().contains_key(&key));
+        sweep(&key, Duration::ZERO);
+        assert!(!pool().lock().unwrap().contains_key(&key));
+        timeout(Duration::from_secs(5), async {
+            while endpoint.open_connections() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the desktop sees the connection close");
         endpoint.close(0_u32.into(), b"Test complete");
         task.await.unwrap();
     }

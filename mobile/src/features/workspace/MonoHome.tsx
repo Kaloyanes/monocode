@@ -21,7 +21,7 @@ import { CircleButton } from "@/ui/CircleButton";
 import { GradualBlur } from "@/ui/GradualBlur";
 import { Icon } from "@/ui/Icon";
 import { LiquidView } from "@/ui/LiquidView";
-import { Shimmer } from "@/ui/Shimmer";
+import { AnimationsPaused } from "@/ui/AnimationsPaused";
 import { themedStyles, useColors, useScheme } from "@/ui/theme";
 
 import { markMonoSeen, markMonoUnread, useUnreadMonos } from "./monoSeen";
@@ -54,6 +54,17 @@ const PREVIEW_HEIGHT = 260;
  * composer. A Mono's chat pushes over it.
  */
 export function MonoHome() {
+  // A chat pushes over this screen and leaves it mounted, so its mascots would
+  // go on running out of sight.
+  const focused = useIsFocused();
+  return (
+    <AnimationsPaused value={!focused}>
+      <MonoList />
+    </AnimationsPaused>
+  );
+}
+
+function MonoList() {
   const insets = useSafeAreaInsets();
   const colors = useColors();
   const styles = useStyles();
@@ -248,7 +259,6 @@ export function MonoHome() {
               <MonoRow
                 mono={mono}
                 unread={unread.has(mono.id)}
-                shown={focused}
                 tools={tools}
                 actions={actions}
               />
@@ -361,15 +371,12 @@ type RowActions = {
 const MonoRow = memo(function MonoRow({
   mono,
   unread,
-  shown,
   tools,
   actions,
 }: {
   mono: Mono;
   /** A reply it sent that the user hasn't seen. */
   unread: boolean;
-  /** Whether the list is in front, for the working shimmer. */
-  shown: boolean;
   /** Whether the desktop can show its details, reset or delete it. */
   tools: boolean;
   actions: RowActions;
@@ -408,20 +415,16 @@ const MonoRow = memo(function MonoRow({
               ) : null}
             </View>
             <View style={styles.rowLine}>
-              {mono.status === "working" && shown ? (
-                <Shimmer style={[styles.rowDetail, styles.rowFill]}>{detail}</Shimmer>
-              ) : (
-                <Text
-                  style={[
-                    styles.rowDetail,
-                    styles.rowFill,
-                    mono.status === "needs-you" && styles.rowNeedsYou,
-                  ]}
-                  numberOfLines={1}
-                >
-                  {detail}
-                </Text>
-              )}
+              <Text
+                style={[
+                  styles.rowDetail,
+                  styles.rowFill,
+                  mono.status === "needs-you" && styles.rowNeedsYou,
+                ]}
+                numberOfLines={1}
+              >
+                {detail}
+              </Text>
               {unread ? <View style={styles.unread} /> : null}
             </View>
           </View>

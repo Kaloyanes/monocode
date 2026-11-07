@@ -50,7 +50,7 @@ impl Shell {
                     .any(|t| is_equal_or_inside(&t.read(cx).cwd, path))
                     || self.session_summaries.keys().any(|id| {
                         is_equal_or_inside(self.session_working_copy(*id, cx), path)
-                            && self.sessions.get(id).is_some_and(|v| v.read(cx).busy)
+                            && self.sessions.get(id).is_some_and(|v| v.read(cx).running())
                     });
                 if in_use {
                     skipped.push(format!(

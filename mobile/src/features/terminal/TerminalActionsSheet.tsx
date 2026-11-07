@@ -10,6 +10,15 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Icon } from "@/ui/Icon";
+import { useSheetColor } from "@/ui/sheetColor";
+import {
+  SHEET_INSET,
+  SHEET_TOP,
+  SheetCard,
+  SheetDivider,
+  SheetTitle,
+  useSheetStyles,
+} from "@/ui/SheetParts";
 import { themedStyles, useColors } from "@/ui/theme";
 
 import { type NewAction, useTerminalActions } from "./terminalActions";
@@ -31,7 +40,7 @@ export function TerminalActionsSheet({
   isPresented: boolean;
   onDismiss: () => void;
 }) {
-  const colors = useColors();
+  const sheetColor = useSheetColor();
   const { width } = useWindowDimensions();
   const { bottom } = useSafeAreaInsets();
   return (
@@ -39,7 +48,7 @@ export function TerminalActionsSheet({
       isPresented={isPresented}
       onDismiss={onDismiss}
       contentPadding={0}
-      containerColor={colors.sheet}
+      containerColor={sheetColor}
     >
       <RNHostView matchContents={{ vertical: true }}>
         <View style={{ width, paddingBottom: Math.max(bottom, 16) + 8 }}>
@@ -67,6 +76,7 @@ function ActionsEditor({
   const [command, setCommand] = useState("");
   const [error, setError] = useState<string | null>(null);
   const styles = useStyles();
+  const parts = useSheetStyles();
   const colors = useColors();
   const commandInput = useRef<TextInput>(null);
   const ready = name.trim() !== "" && command.trim() !== "";
@@ -87,36 +97,32 @@ function ActionsEditor({
   };
   return (
     <View style={styles.content}>
-      <View>
-        <Text accessibilityRole="header" style={styles.title}>
-          Actions
-        </Text>
-        <Text style={styles.project} numberOfLines={1}>
-          {projectName} · the same as the desktop’s footer
-        </Text>
-      </View>
-      <View style={styles.list}>
+      <SheetTitle
+        title="Actions"
+        detail={`${projectName} · the same as the desktop’s footer`}
+      />
+      <SheetCard>
         {actions.map((action, index) => (
-          <View
-            key={action.id ?? `new-${index}`}
-            style={[styles.row, index > 0 && styles.divider]}
-          >
-            <View style={styles.rowText}>
-              <Text style={styles.name} numberOfLines={1}>
-                {action.name}
-              </Text>
-              <Text style={styles.command} numberOfLines={1}>
-                {action.command}
-              </Text>
+          <View key={action.id ?? `new-${index}`}>
+            {index > 0 ? <SheetDivider /> : null}
+            <View style={styles.row}>
+              <View style={styles.rowText}>
+                <Text style={styles.name} numberOfLines={1}>
+                  {action.name}
+                </Text>
+                <Text style={styles.command} numberOfLines={1}>
+                  {action.command}
+                </Text>
+              </View>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`Remove ${action.name}`}
+                hitSlop={10}
+                onPress={() => change(actions.filter((_, at) => at !== index))}
+              >
+                <Icon name="trash" size={18} color={colors.muted} />
+              </Pressable>
             </View>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={`Remove ${action.name}`}
-              hitSlop={10}
-              onPress={() => change(actions.filter((_, at) => at !== index))}
-            >
-              <Icon name="trash" size={18} color={colors.muted} />
-            </Pressable>
           </View>
         ))}
         {actions.length === 0 ? (
@@ -124,10 +130,10 @@ function ActionsEditor({
             No actions yet. Add one here or from the desktop.
           </Text>
         ) : null}
-      </View>
+      </SheetCard>
       <View style={styles.form}>
         <TextInput
-          style={styles.input}
+          style={parts.field}
           value={name}
           onChangeText={setName}
           onSubmitEditing={() => commandInput.current?.focus()}
@@ -140,7 +146,7 @@ function ActionsEditor({
         <View style={styles.add}>
           <TextInput
             ref={commandInput}
-            style={[styles.input, styles.mono, styles.grow]}
+            style={[parts.field, styles.mono, styles.grow]}
             value={command}
             onChangeText={setCommand}
             onSubmitEditing={add}
@@ -156,9 +162,9 @@ function ActionsEditor({
             accessibilityLabel="Add action"
             disabled={!ready}
             onPress={add}
-            style={[styles.addButton, !ready && styles.disabled]}
+            style={[parts.primary, styles.addButton, !ready && parts.dimmed]}
           >
-            <Text style={styles.addLabel}>Add</Text>
+            <Text style={parts.primaryLabel}>Add</Text>
           </Pressable>
         </View>
       </View>
@@ -168,43 +174,23 @@ function ActionsEditor({
 }
 
 const useStyles = themedStyles((colors) => ({
-  content: { paddingHorizontal: 20, paddingTop: 28, gap: 16 },
-  title: { color: colors.content, fontSize: 20, fontWeight: "600" },
-  project: { color: colors.muted, fontSize: 13, marginTop: 2 },
-  list: { borderRadius: 14, backgroundColor: colors.fill, overflow: "hidden" },
+  content: { paddingHorizontal: SHEET_INSET, paddingTop: SHEET_TOP, gap: 16 },
   row: {
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 11,
+    minHeight: 56,
+    paddingHorizontal: SHEET_INSET,
+    paddingVertical: 9,
   },
   rowText: { flex: 1, gap: 2 },
-  divider: { borderTopWidth: 1, borderTopColor: colors.background },
-  name: { color: colors.content, fontSize: 15, fontWeight: "500" },
+  name: { color: colors.content, fontSize: 16, fontWeight: "500" },
   command: { color: colors.muted, fontSize: 13, fontFamily: "Menlo" },
-  empty: { color: colors.muted, padding: 14, fontSize: 14 },
+  empty: { color: colors.muted, padding: SHEET_INSET, fontSize: 15 },
   form: { gap: 8 },
   add: { flexDirection: "row", gap: 8 },
-  input: {
-    height: 44,
-    paddingHorizontal: 14,
-    borderRadius: 12,
-    backgroundColor: colors.fill,
-    color: colors.content,
-    fontSize: 15,
-  },
-  mono: { fontFamily: "Menlo" },
+  mono: { fontFamily: "Menlo", fontSize: 15 },
   grow: { flex: 1 },
-  addButton: {
-    height: 44,
-    paddingHorizontal: 18,
-    borderRadius: 12,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: colors.content,
-  },
-  addLabel: { color: colors.background, fontSize: 15, fontWeight: "600" },
-  disabled: { opacity: 0.4 },
+  addButton: { height: 48, paddingHorizontal: 22, borderRadius: 24 },
   error: { color: colors.deletions, fontSize: 13 },
 }));

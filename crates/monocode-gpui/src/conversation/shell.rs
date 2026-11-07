@@ -140,13 +140,26 @@ impl Conversation {
                     .child(format!("Runs in {folder} \u{b7} Enter to run")),
             )
     }
-    pub(super) fn shell_running(&self) -> bool {
+    pub(crate) fn shell_running(&self) -> bool {
         self.shell.running.is_some()
     }
     pub(super) fn cancel_shell(&mut self) {
         if let Some(id) = &self.shell.running {
             shell_run::cancel(id);
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn start_shell_for_test(&mut self, command: &str, cx: &mut Context<Self>) {
+        self.loaded = true;
+        self.input.update(cx, |input, cx| {
+            input.set_shell_commands(true, cx);
+            input.set_text(format!("!{command}"), cx);
+        });
+        self.submit_shell(cx);
+    }
+    #[cfg(test)]
+    pub(crate) fn cancel_shell_for_test(&mut self) {
+        self.cancel_shell();
     }
     /// Only local, non-Mono threads run commands; elsewhere `!` is plain text.
     pub(super) fn shell_available(&self) -> bool {
@@ -516,6 +529,29 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn the_phone_queues_behind_a_command_and_can_stop_it(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.start_shell_for_test("sleep 30", cx);
+                view.mobile_submit("After it".into(), None, Vec::new(), cx)
+                    .unwrap();
+                assert!(!view.busy, "the message waits for the command");
+                assert_eq!(view.follow_ups.state.messages[0].text, "After it");
+                view.stop_if_busy(cx);
+                assert!(!view.notification_cancelled);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert!(!view.shell_running());
+                assert_eq!(runs(view, cx)[0].state, shell_run::State::Cancelled);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

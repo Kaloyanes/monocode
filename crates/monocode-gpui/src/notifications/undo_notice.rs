@@ -6,7 +6,7 @@ pub(crate) enum UndoNoticeEvent {
     Undo,
     Dismiss,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct UndoNotice {
     message: Option<String>,
 }

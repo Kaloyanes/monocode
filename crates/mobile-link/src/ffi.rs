@@ -49,6 +49,8 @@ enum Call {
     Unwatch {
         watch_id: u64,
     },
+    /// The phone moved to another network: stop waiting on the old one.
+    NetworkChanged,
     #[serde(rename_all = "camelCase")]
     TranscriptCreate {
         #[serde(default)]
@@ -162,6 +164,10 @@ fn execute(input: &str) -> LinkResult<Value> {
             let watch = watching(watch_id)?;
             runtime().block_on(watch.ready());
             Ok(json!({"ready":true}))
+        }
+        Call::NetworkChanged => {
+            runtime().block_on(async { crate::network_changed() });
+            Ok(Value::Null)
         }
         Call::Unwatch { watch_id } => {
             if let Some(watch) = watches().lock().unwrap().remove(&watch_id) {

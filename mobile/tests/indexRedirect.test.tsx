@@ -22,7 +22,7 @@ vi.mock("react-native", () => ({
   Pressable: ({ children }: { children?: ReactNode }) => <button>{children}</button>,
 }));
 vi.mock("@/features/connection/ConnectionProvider", () => ({
-  useConnection: () => ({ pairing: { desktop: { fingerprint: "desk" } } }),
+  usePairing: () => ({ desktop: { fingerprint: "desk" } }),
 }));
 vi.mock("@/features/connection/ConnectScreen", () => ({
   useConnectionStyles: () => ({ screen: {}, title: {}, subtitle: {}, primary: {}, primaryLabel: {} }),
@@ -33,6 +33,8 @@ vi.mock("@/features/sessions/SessionScreen", () => ({
 vi.mock("@/features/workspace/WorkspaceProvider", () => ({
   useWorkspace: () => ({ projects: app.projects, monos: app.monos }),
 }));
+vi.mock("@/features/settings/monoOnly", () => ({ useMonoOnlyLayout: () => [false] }));
+vi.mock("@/features/workspace/MonoHome", () => ({ MonoHome: () => null }));
 
 import Index from "@/app/index";
 

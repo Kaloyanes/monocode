@@ -1,26 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { AppState } from "react-native";
-import type { ChangedFile, ChangeSummary } from "@/features/workspace/types";
-import { useConnection } from "./ConnectionProvider";
-type Changes = {
-  branch: string;
-  /** Staged first, then the rest; with a limit, only the first so many. */
-  files: ChangedFile[];
-  worktreePath?: string;
-  hash?: string;
-  /** Every change counted; absent from an older desktop, which sends them all. */
-  total?: number;
-  stagedTotal?: number;
-  additions?: number;
-  deletions?: number;
-};
+import { useCallback, useMemo } from "react";
+import type { ChangeSummary } from "@/features/workspace/types";
+import { useCommand } from "./ConnectionProvider";
+import { mergeChanges, type Changes } from "./changed";
+import { polledResource } from "./polledResource";
+import { usePolled } from "./usePolled";
+
 /** A desktop that hashes its replies says only this when the phone has the latest. */
 type Reply = Changes | { unchanged: true; hash: string; worktreePath?: string };
-/** The last changes read for each working copy, so a screen moved to shows
- *  them at once while it reads them again. */
-const lastRead = new Map<string, Changes>();
-const keyFor = (projectId: string, worktreePath: string | undefined, limit?: number) =>
-  `${projectId}\n${worktreePath ?? ""}\n${limit === 0 ? "summary" : "list"}`;
+
+const resourceFor = (projectId: string, worktreePath: string | undefined, limit?: number) =>
+  polledResource<Changes>(
+    `changes\n${projectId}\n${worktreePath ?? ""}\n${limit === 0 ? "summary" : "list"}`,
+    { merge: mergeChanges },
+  );
 
 /** What a reply counts, or what its files add up to from an older desktop. */
 export function summarize(changes: Changes | null): ChangeSummary {
@@ -45,6 +37,8 @@ export function summarize(changes: Changes | null): ChangeSummary {
  * The project checkout's changes, or a worktree's when given its path. With
  * `limit`, only that many files are read, staged first, though the summary
  * counts them all; at 0, only the summary, for screens that just count them.
+ * Every screen reading the same working copy shares one poller, which runs
+ * only while one is up and focused and the app is in the foreground.
  */
 export function useProjectChanges(
   projectId: string,
@@ -52,69 +46,29 @@ export function useProjectChanges(
   worktreePath?: string,
   limit?: number,
 ) {
-  const { command } = useConnection();
-  const [result, setResult] = useState<Changes | null>(
-    () => lastRead.get(keyFor(projectId, worktreePath, limit)) ?? null,
+  const command = useCommand();
+  const resource = useMemo(
+    () => resourceFor(projectId, worktreePath, limit),
+    [projectId, worktreePath, limit],
   );
-  const [error, setError] = useState<string | null>(null);
-  // Bumped to read again at once, say after a commit.
-  const [nonce, setNonce] = useState(0);
-  // Another working copy's changes aren't these; clear them rather than show them meanwhile.
-  const [shown, setShown] = useState(worktreePath);
-  if (shown !== worktreePath) {
-    setShown(worktreePath);
-    setResult(lastRead.get(keyFor(projectId, worktreePath, limit)) ?? null);
-    setError(null);
-  }
-  useEffect(() => {
-    if (!enabled) return;
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      if (AppState.currentState === "active") {
-        try {
-          const key = keyFor(projectId, worktreePath, limit);
-          const before = lastRead.get(key);
-          // With the hash of what is held, the desktop answers in a few bytes
-          // when nothing changed, rather than resending every file.
-          const reply = await command<Reply>("project.changes", {
-            projectId,
-            ...(worktreePath ? { worktreePath } : {}),
-            ...(before?.hash ? { since: before.hash } : {}),
-            ...(limit !== undefined ? { limit } : {}),
-          });
-          // A desktop that predates worktrees answers with the checkout's
-          // changes; say so rather than show them as the worktree's.
-          if (reply.worktreePath !== worktreePath)
-            throw new Error("Update or reload Monocode on your desktop to see this worktree's changes.");
-          // Unchanged, the screen showing them needn't render again. Without a
-          // hash, an older desktop's reply is compared whole.
-          const value = "unchanged" in reply ? before : reply;
-          const same =
-            !!before &&
-            (value === before ||
-              (value?.hash
-                ? value.hash === before.hash
-                : JSON.stringify(before) === JSON.stringify(value)));
-          if (!same && value) lastRead.set(key, value);
-          if (!disposed) {
-            setResult((same ? before : value) ?? null);
-            setError(null);
-          }
-        } catch (reason) {
-          if (!disposed)
-            setError(reason instanceof Error ? reason.message : String(reason));
-        }
-      }
-      if (!disposed) timer = setTimeout(() => void poll(), 10000);
-    };
-    void poll();
-    return () => {
-      disposed = true;
-      clearTimeout(timer);
-    };
-  }, [projectId, enabled, worktreePath, command, nonce, limit]);
-  const reload = useCallback(() => setNonce((n) => n + 1), []);
-  const summary = useMemo(() => summarize(result), [result]);
-  return { result, error, reload, summary };
+  const fetch = useCallback(async () => {
+    const before = resource.getSnapshot().value;
+    // With the hash of what is held, the desktop answers in a few bytes when
+    // nothing changed, rather than resending every file.
+    const reply = await command<Reply>("project.changes", {
+      projectId,
+      ...(worktreePath ? { worktreePath } : {}),
+      ...(before?.hash ? { since: before.hash } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    });
+    // A desktop that predates worktrees answers with the checkout's
+    // changes; say so rather than show them as the worktree's.
+    if (reply.worktreePath !== worktreePath)
+      throw new Error("Update or reload Monocode on your desktop to see this worktree's changes.");
+    if ("unchanged" in reply && before) return before;
+    return reply as Changes;
+  }, [command, projectId, worktreePath, limit, resource]);
+  const { value, error } = usePolled(resource, fetch, enabled);
+  const summary = useMemo(() => summarize(value), [value]);
+  return { result: value, error, reload: resource.reload, summary };
 }

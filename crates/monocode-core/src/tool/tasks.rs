@@ -9,8 +9,6 @@ pub enum Panel {
     Tasks(TaskList),
     Agent(AgentRun),
     Thread(super::threads::ThreadRun),
-    /// A plan an Orchestrator turn submitted; its run shows in the same card.
-    Orchestration(crate::orchestration::Plan),
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskList {
@@ -557,9 +555,6 @@ impl ToolCall {
         if let Some(panel) = self.thread_panel() {
             return Some(panel);
         }
-        if let Some(plan) = self.orchestration_plan() {
-            return Some(Panel::Orchestration(plan));
-        }
         let input: Value = serde_json::from_str(&self.input).unwrap_or_default();
         if is_todo_tool(&self.name) {
             return TaskList::from_value(&input).map(Panel::Tasks);
@@ -603,7 +598,7 @@ impl ToolCall {
         }
     }
     pub fn agent_mut(&mut self) -> Option<&mut AgentRun> {
-        // Cache only agent panels: thread and orchestration panels are derived
+        // Cache only agent panels: thread panels are derived
         // from the output, which a snapshot taken at tool_use would freeze.
         if self.panel.is_none() {
             self.panel = self

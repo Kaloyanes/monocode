@@ -10,7 +10,6 @@ mod arcade;
 mod assets;
 mod automations;
 mod changes;
-mod chromium;
 mod composer_completion;
 mod composer_motion;
 mod composer_runner;
@@ -57,9 +56,11 @@ mod notes;
 mod notifications;
 mod pane_layout;
 mod pane_motion;
+mod panic_report;
 mod particle_text;
 #[cfg(feature = "perf-trace")]
 mod performance_probe;
+mod phase_tile;
 mod pickers;
 mod plan_rail;
 mod popover;
@@ -343,6 +344,7 @@ fn main() {
         );
         std::process::exit(2);
     }
+    panic_report::install(database.with_file_name("gpui-panics"));
     let mut db = if check_data {
         Store::read_monocode(&database)
     } else {
@@ -464,6 +466,7 @@ fn main() {
     let db = Arc::new(Mutex::new(db));
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
+    std::thread::spawn(draft::remove_old_chromium);
     gpui::Application::with_platform(platform)
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {

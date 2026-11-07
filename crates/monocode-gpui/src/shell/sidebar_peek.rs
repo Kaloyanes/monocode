@@ -2,7 +2,7 @@
 // the workspace while the pointer rests on the window's left edge or on the
 // sidebar toggle, and puts itself away once the pointer leaves it.
 use super::Shell;
-use crate::{reveal::bezier, theme::*};
+use crate::{popover::POPOVER_LAYER, reveal::bezier, theme::*};
 use gpui::{
     AnyElement, BoxShadow, Context, DispatchPhase, MouseDownEvent, MouseMoveEvent, Pixels, Point,
     StyleRefinement, Window, canvas, div, prelude::*, px, rgba,
@@ -125,7 +125,7 @@ impl Shell {
         }));
     }
 
-    fn peek_contains(&self, position: Point<Pixels>) -> bool {
+    pub(super) fn peek_contains(&self, position: Point<Pixels>) -> bool {
         let (x, y) = (position.x.as_f32(), position.y.as_f32());
         x >= PEEK_INSET
             && x <= PEEK_INSET + self.workspace.sidebar_width
@@ -174,9 +174,13 @@ impl Shell {
     }
 
     /// Watches the pointer across the whole window, ahead of any view that
-    /// would stop its events, while the sidebar can peek.
+    /// would stop its events, while the sidebar can peek. The peek draws in
+    /// the popover layer: over the workspace's popovers, which come earlier in
+    /// the tree, and under its own menus. A modal's scrim isn't in that layer,
+    /// so under a modal the peek stays in the tree to be dimmed with the rest.
     pub(super) fn peek_watch(
         &mut self,
+        modal_open: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -225,6 +229,13 @@ impl Shell {
         if self.sidebar_peek.is_none() {
             return Some(watch);
         }
+        let peek = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(self.peek_backdrop(progress, cx))
+            .child(self.peek_panel(progress, window));
         Some(
             div()
                 .absolute()
@@ -232,8 +243,13 @@ impl Shell {
                 .left_0()
                 .size_full()
                 .child(watch)
-                .child(self.peek_backdrop(progress, cx))
-                .child(self.peek_panel(progress, window))
+                .child(if modal_open {
+                    peek.into_any_element()
+                } else {
+                    gpui::deferred(peek)
+                        .with_priority(POPOVER_LAYER)
+                        .into_any_element()
+                })
                 .into_any_element(),
         )
     }

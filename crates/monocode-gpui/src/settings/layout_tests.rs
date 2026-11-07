@@ -271,3 +271,71 @@ fn cleanup_offers_removal_only_for_clean_merged_or_pushed_worktrees(cx: &mut Tes
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn add_mcp_server_reads_pasted_text_and_skips_providers_that_cannot_take_it(
+    cx: &mut TestAppContext,
+) {
+    let window = window(Section::Mcp, cx);
+    window
+        .update(cx, |view, window, cx| {
+            view.open_management(management::Target::Mcp, window, cx)
+        })
+        .unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("settings-management-dialog").is_some());
+    assert!(
+        visual.debug_bounds("mcp-target-claude").is_none(),
+        "nothing to place until something is pasted"
+    );
+    let paste = |visual: &mut VisualTestContext, text: &str| {
+        window
+            .update(visual, |view, _, cx| {
+                let body = view.management.as_ref().unwrap().body.clone();
+                body.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
+            })
+            .unwrap();
+        visual.run_until_parked();
+    };
+    paste(
+        visual,
+        r#"{"mcpServers":{"context7":{"command":"npx","args":["-y","@upstash/context7-mcp"],"env":{"API_KEY":"sk-live-3f9a"}}}}"#,
+    );
+    for row in [
+        "mcp-target-claude",
+        "mcp-target-claude_desktop",
+        "mcp-target-codex",
+        "mcp-target-cursor",
+        "mcp-target-opencode",
+    ] {
+        assert!(visual.debug_bounds(row).is_some(), "{row}");
+    }
+    let state = |visual: &mut VisualTestContext| {
+        window
+            .update(visual, |view, _, cx| {
+                let editor = view.management.as_ref().unwrap();
+                (
+                    editor.name.read(cx).content.to_string(),
+                    mcp_form::targets(editor, cx),
+                    mcp_form::skipped(editor, cx),
+                )
+            })
+            .unwrap()
+    };
+    assert_eq!(state(visual), ("context7".into(), vec!["claude"], 0));
+    let codex = visual.debug_bounds("mcp-target-codex").unwrap();
+    visual.simulate_click(codex.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(state(visual).1, vec!["claude", "codex"]);
+    paste(
+        visual,
+        r#"{"mcpServers":{"remote":{"url":"https://example.com/mcp","headers":{"A":"b"}}}}"#,
+    );
+    let (name, targets, skipped) = state(visual);
+    assert_eq!(name, "remote");
+    assert_eq!(targets, vec!["claude"], "Codex cannot keep headers");
+    assert_eq!(skipped, 1);
+    paste(visual, "claude mcp add oops");
+    assert_eq!(state(visual).1, Vec::<&str>::new());
+}

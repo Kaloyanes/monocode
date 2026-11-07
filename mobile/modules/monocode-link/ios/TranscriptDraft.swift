@@ -51,11 +51,10 @@ private final class DraftTouchWatcher: UIGestureRecognizer, UIGestureRecognizerD
     shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
   ) -> Bool { true }
 
-  /// Since iOS 26 a screen swipes back from anywhere on it, and a Mono's chat
-  /// swipes right to the drawer: both pans sit above the transcript and neither
-  /// knows a slider from the thread, so dragging one left the thread. They sit
-  /// out this touch; the scroller's own pans keep it, so the thread still
-  /// scrolls under the finger.
+  /// Since iOS 26 a screen swipes back from anywhere on it: that pan sits above
+  /// the transcript and doesn't know a slider from the thread, so dragging one
+  /// left the thread. It sits out this touch; the scroller's own pans keep it,
+  /// so the thread still scrolls under the finger.
   private func holdPans(over touch: UITouch) {
     guard heldPans.isEmpty else { return }
     var ancestor = view?.superview

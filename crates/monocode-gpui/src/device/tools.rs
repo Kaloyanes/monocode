@@ -35,11 +35,10 @@ pub(super) enum Tool {
     Logs,
     Presets,
     Shots,
-    Record,
 }
 
 /// The rail top to bottom; `None` is a divider between groups.
-const RAIL: [Option<Tool>; 12] = [
+const RAIL: [Option<Tool>; 11] = [
     Some(Tool::Display),
     Some(Tool::Accessibility),
     None,
@@ -51,7 +50,6 @@ const RAIL: [Option<Tool>; 12] = [
     None,
     Some(Tool::Presets),
     Some(Tool::Shots),
-    Some(Tool::Record),
 ];
 
 impl Tool {
@@ -66,7 +64,6 @@ impl Tool {
             Self::Logs => "Logs",
             Self::Presets => "Presets",
             Self::Shots => "Screenshot matrix",
-            Self::Record => "Record the screen",
         }
     }
     fn icon(self) -> &'static str {
@@ -80,7 +77,6 @@ impl Tool {
             Self::Logs => "terminal",
             Self::Presets => "star",
             Self::Shots => "screenshots",
-            Self::Record => "record",
         }
     }
     /// ⌥ and this digit opens the tool while the panel has focus.
@@ -104,7 +100,7 @@ impl Tool {
     }
     /// Tools worth keeping open while you use the phone.
     fn pinnable(self) -> bool {
-        !matches!(self, Self::Presets | Self::Shots | Self::Record)
+        !matches!(self, Self::Presets | Self::Shots)
     }
     fn index(self) -> usize {
         self as usize
@@ -841,7 +837,7 @@ impl DevicePanel {
         .detach();
     }
 
-    fn toggle_recording(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_recording(&mut self, cx: &mut Context<Self>) {
         if let Some(recording) = self.tools.recording.take() {
             self.tools.busy.insert("record");
             let task = cx
@@ -925,10 +921,6 @@ impl DevicePanel {
     /// Opens a tool's flyout, or closes it if it is open.
     pub(super) fn toggle_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
-        if tool == Tool::Record {
-            self.toggle_recording(cx);
-            return;
-        }
         if self.tools.open == Some(tool) {
             self.tools.open = None;
         } else {
@@ -1046,15 +1038,13 @@ impl DevicePanel {
     }
 
     fn rail_button(&mut self, tool: Tool, cx: &mut Context<Self>) -> AnyElement {
-        let recording = tool == Tool::Record && self.tools.recording.is_some();
-        let active = self.tools.visible(tool) || recording;
+        let active = self.tools.visible(tool);
         let slot = self.tools.anchors.entry(tool).or_default().clone();
         let badge = (tool == Tool::Logs && self.tools.unseen_errors > 0)
             .then(|| self.tools.unseen_errors.min(99));
         let modified = self.tools.modified(tool);
         let tip = match tool.key() {
             Some(key) => format!("{}  ⌥{key}", tool.label()),
-            None if recording => "Stop recording".into(),
             None => tool.label().into(),
         };
         let red: gpui::Hsla = rgb(0xf87171).into();
@@ -1075,9 +1065,7 @@ impl DevicePanel {
             .when(active, |d| d.bg(content(0.1)))
             .when(!active, |d| d.hover(|s| s.bg(content(0.06))))
             .child(slot.probe())
-            .child(icon(tool.icon(), 16.).text_color(if recording {
-                red
-            } else if active {
+            .child(icon(tool.icon(), 16.).text_color(if active {
                 content(0.95)
             } else {
                 content(0.55)
@@ -1361,7 +1349,6 @@ impl DevicePanel {
             Tool::Logs => self.logs_body(cx),
             Tool::Presets => self.presets_body(cx),
             Tool::Shots => self.shots_body(cx),
-            Tool::Record => div().into_any_element(),
         };
         let _ = window;
         div()
@@ -1442,7 +1429,7 @@ impl DevicePanel {
                     "Liquid Glass",
                     segmented(
                         "device-glass",
-                        &[("clear", "Clear"), ("tinted", "Tinted")],
+                        &[("clear", "Clear"), ("default", "Default"), ("tinted", "Tinted")],
                         &glass,
                         cx,
                         |this, value, cx| this.set_setting(Setting::LiquidGlass, value, false, cx),

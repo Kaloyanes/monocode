@@ -416,7 +416,7 @@ fn index_mode(root: &Path, relative: &str) -> Option<String> {
     (mode.len() == 6 && mode.bytes().all(|b| b.is_ascii_digit())).then(|| mode.to_string())
 }
 fn hash_object(root: &Path, relative: &str, contents: &[u8]) -> Result<String, String> {
-    let mut command = git_cmd();
+    let mut command = git_cmd_for_args(&["hash-object"]);
     command
         .arg("--no-pager")
         .arg("-C")
@@ -427,7 +427,6 @@ fn hash_object(root: &Path, relative: &str, contents: &[u8]) -> Result<String, S
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::process::configure_child(&mut command);
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let mut stdin = child
         .stdin

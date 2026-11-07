@@ -29,7 +29,18 @@ export function sameFile(a: ChangedFile, b: ChangedFile): boolean {
   return true;
 }
 
-export type Changes = { branch: string; files: ChangedFile[]; worktreePath?: string };
+export type Changes = {
+  branch: string;
+  /** Staged first, then the rest; with a limit, only the first so many. */
+  files: ChangedFile[];
+  worktreePath?: string;
+  hash?: string;
+  /** Every change counted; absent from an older desktop, which sends them all. */
+  total?: number;
+  stagedTotal?: number;
+  additions?: number;
+  deletions?: number;
+};
 
 /**
  * The new read, keeping each file that did not change as it was and the whole
@@ -45,6 +56,11 @@ export function mergeChanges(held: Changes | null, next: Changes): Changes {
   const same =
     held.branch === next.branch &&
     held.worktreePath === next.worktreePath &&
+    held.hash === next.hash &&
+    held.total === next.total &&
+    held.stagedTotal === next.stagedTotal &&
+    held.additions === next.additions &&
+    held.deletions === next.deletions &&
     files.length === held.files.length &&
     files.every((file, i) => file === held.files[i]);
   return same ? held : { ...next, files };

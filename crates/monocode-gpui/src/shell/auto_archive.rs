@@ -34,7 +34,6 @@ impl Shell {
         let meta = self.session_metadata(id, cx);
         meta.summary.pinned
             || meta.busy
-            || meta.responding()
             || meta.needs_approval()
             || meta.has_saved_draft()
             || meta.has_composer_draft()
@@ -43,7 +42,6 @@ impl Shell {
             || self.workspace.active == Some(id)
             || self.workspace.tab_of(id).is_some()
             || self.session_preview.as_ref().is_some_and(|p| p.id == id)
-            || self.orchestrations.active(id)
             || self.thread_status(id, cx)["status"] != "idle"
     }
 

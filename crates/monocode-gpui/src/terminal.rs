@@ -1,7 +1,7 @@
 //! Port of TerminalView.tsx: a login shell on a PTY, emulated by
 //! alacritty_terminal and painted as a grid of cell-snapped text runs.
 mod shell;
-use shell::default_shell;
+pub(crate) use shell::default_shell;
 
 use crate::theme::*;
 use alacritty_terminal::{
@@ -1489,29 +1489,6 @@ pub(crate) fn working_dir(cwd: &str) -> std::path::PathBuf {
         home().unwrap_or(path)
     }
 }
-pub(crate) fn default_shell() -> (String, Vec<String>) {
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "macos") {
-                "/bin/zsh".into()
-            } else {
-                "/bin/bash".into()
-            }
-        });
-    let stem = std::path::Path::new(&shell)
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_owned();
-    let args = match stem.as_str() {
-        "zsh" | "bash" | "sh" | "fish" => vec!["-l".to_owned()],
-        _ => Vec::new(),
-    };
-    (shell, args)
-}
-
 /// pty.rs's foreground_label: the command holding the terminal, unless it
 /// is the shell itself.
 #[cfg(unix)]

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The phone's Photo Library picker offers videos as well as photos. iOS compresses them to 540p as they're attached, and a video can be up to 18 MB.
+- The phone's Inbox has the desktop's filters: project, author, status, type, updated, source and assigned to me, each in a sheet that rises only as far as it needs.
+- Agents can reach the running app through `app_*` tools: panels, thread panes, composer staging, each thread's model, effort and access, worktrees, folders, notes and a set of settings. Raising a thread's access asks you first.
+- Agents can check which files other active threads in the project changed before editing.
+- A lead can end its turn while its subagents work: MonoCode sends it their results in one message once they have all finished.
+- `thread_wait` can watch several subagents at once, and a lead can give a subagent lower access, such as read-only.
+- Subagent status shows elapsed time, steps, current activity, changed files, files two subagents both changed, and a worktree subagent's folder. Starting one in a worktree also reports its branch.
+- Drafts run inside the thread on the phone, including a Mono's chat, at their place in the conversation, with the desktop's controls for comments, notes and handing back. Scrolling past a closed draft leaves it closed, a pill leads to a draft the agent is waiting on, and Android shows charts as static pictures.
+
+- The phone's Inbox can merge, squash or rebase a GitHub pull request, mark it ready or convert it to draft, close or reopen it, comment and reply on any item, copy its link or branch name, and mark a whole list as read.
+- The phone's Inbox can review a GitHub pull request: tap a line in a file to comment on it, then post the comments together as one review from the Code tab. Pending comments are shared with the desktop's diff, and a review never approves or requests changes.
+- The phone's item sheet has a clear Comments section, with a heading, a count, each comment in its own card with its file and line, and commits shown as slim activity rows.
+- The phone's Sessions page leads with a Working section for sessions running now, and ends with an Archived row (also in the filter menu) that opens the project's archive in place, with search and swipe to restore, rename or delete. Needs the updated desktop app.
+- The phone's Inbox drawer takes nearly the full width, and GitHub rows show whether an item is a pull request or an issue and its state, with an icon and a `PR #12` or `Issue #12` label, in shorter rows.
+
+### Changed
+
+- The phone's Inbox fetches from your sources each time it's opened, and on iOS its All, Needs me and Done switch is the system's segmented control.
+- The phone's sheets are Liquid Glass on iOS 26 and share one layout: grouped cards, a mark on each row, and lists that fade at their edges. The Inbox's filters show provider logos and project mascots, and long lists pull up to full height. Toasts are a small glass capsule.
+- The phone composer's model pill, Plan chip, file chips, reply pill, Send, Stop and finish-recording buttons are Liquid Glass on iOS 26, matching the add and mic buttons. The pills draw out of the add button as the card opens and tuck back when a recording starts.
+
+### Removed
+
+- The Chromium page engine and Settings › Visualizations. Drafts always run in WebKit, and a Chromium that was downloaded is deleted at the next launch.
+- Operator mode and `/operator`. Every chat now has the app tools. Sending to or deleting another thread stays with Monos.
+- Orchestrator mode and `/orchestrator`, on the desktop and the phone. Any chat can start subagents instead. Chats from earlier runs stay under their lead, but unfinished runs can't be resumed.
+
+### Fixed
+
+- A draft no longer turns up empty when you scroll back to it after a few minutes away, or after its page process stops. The card shows its placeholder while the page returns, and opens the page again if it doesn't.
+- A draft put to sleep while it was out of sight now keeps a picture of its page.
+- Pull requests and issues on the phone now show their images, including in comments and before-and-after tables, through the desktop so private repositories work. HTML comments no longer show as text, `<details>` sections fold, and checklists show real boxes.
+- Starting a subagent with a wrong model or setting now lists the valid choices.
+- A running `!` command now shows its thread as working in the sidebar, tabs, filters and on the phone, where Stop cancels it. It also keeps the Mac awake and blocks auto-archive and worktree cleanup until it ends.
+- A merged pull request now offers to archive its linked threads: the PR panel shows **Archive thread** in place of the merge button, and the GitHub activity card appears even when the thread itself did the merging. The panel also no longer shows a pull request as open after you merge it there.
+
 ## [0.16.0] - 2026-10-19
 
 ### Added

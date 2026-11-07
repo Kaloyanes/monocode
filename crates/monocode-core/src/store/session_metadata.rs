@@ -1,6 +1,6 @@
 //! Small sidebar metadata can be gathered before the UI constructs chat entities.
 use super::Store;
-use crate::{agent::AccessMode, orchestration, session_groups};
+use crate::{agent::AccessMode, session_groups, subagents};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
@@ -13,9 +13,7 @@ pub struct SessionSidebarMetadata {
     pub sidebar_hidden: HashSet<i64>,
     pub started_by: HashMap<i64, i64>,
     pub thread_parents: HashMap<i64, i64>,
-    pub orchestrations: HashMap<i64, orchestration::Summary>,
-    /// Each lead's recent runs, restored for resuming.
-    pub orchestration_runs: HashMap<i64, Vec<orchestration::Run>>,
+    pub agent_summaries: HashMap<i64, subagents::Summary>,
     pub groups: HashMap<String, session_groups::Groups>,
     pub reminders: Vec<super::Reminder>,
     /// When each archived session was archived, for the archive's order.
@@ -31,6 +29,8 @@ pub struct MobileSessionMetadata {
     pub worktree_cwd: Option<String>,
     pub worktree_removed: bool,
     pub access: AccessMode,
+    /// When its history last changed, so what was read from it can be kept.
+    pub updated_at: u64,
 }
 
 impl Store {
@@ -40,7 +40,7 @@ impl Store {
         let shared = self.shared.is_some();
         let query = if shared {
             format!(
-                "SELECT id,harness,substr(model,1,512),substr({},1,512),substr({},1,4096),coalesce({},0),coalesce({},'supervised') FROM sessions",
+                "SELECT id,harness,substr(model,1,512),substr({},1,512),substr({},1,4096),coalesce({},0),coalesce({},'supervised'),coalesce(updated_at,0) FROM sessions",
                 self.shared_field("branch", "NULL"),
                 self.shared_field("worktree_cwd", "NULL"),
                 self.shared_field("worktree_removed", "0"),
@@ -52,7 +52,8 @@ impl Store {
              NULL,
              CASE WHEN json_valid(s.value) THEN substr(json_extract(s.value,'$.worktree_cwd'),1,4096) END,
              CASE WHEN json_valid(s.value) THEN coalesce(json_extract(s.value,'$.worktree_removed'),0) ELSE 0 END,
-             CASE WHEN json_valid(s.value) THEN coalesce(json_extract(s.value,'$.access'),'supervised') ELSE 'supervised' END
+             CASE WHEN json_valid(s.value) THEN coalesce(json_extract(s.value,'$.access'),'supervised') ELSE 'supervised' END,
+             n.updated_at
              FROM native_sessions n LEFT JOIN native_settings s ON s.key='agent:'||n.id".into()
         };
         let mut statement = self.conn.prepare(&query).map_err(|e| e.to_string())?;
@@ -66,12 +67,13 @@ impl Store {
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, bool>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
         let mut result = HashMap::new();
         for row in rows {
-            let (id, provider, model, branch, worktree_cwd, worktree_removed, access) =
+            let (id, provider, model, branch, worktree_cwd, worktree_removed, access, updated_at) =
                 row.map_err(|e| e.to_string())?;
             let id = if shared {
                 self.shared_register(&id)?
@@ -88,6 +90,7 @@ impl Store {
                     worktree_cwd,
                     worktree_removed,
                     access: AccessMode::from_id(&access),
+                    updated_at: updated_at.max(0) as u64,
                 },
             );
         }
@@ -137,8 +140,7 @@ impl Store {
             },
             started_by: self.started_links().unwrap_or_default(),
             thread_parents: self.thread_parents().unwrap_or_default(),
-            orchestrations: self.orchestration_summaries().unwrap_or_default(),
-            orchestration_runs: self.orchestration_runs().unwrap_or_default(),
+            agent_summaries: self.agent_summaries().unwrap_or_default(),
             groups: projects
                 .iter()
                 .filter_map(|project| {
@@ -226,6 +228,32 @@ mod tests {
     }
 
     #[test]
+    fn mobile_metadata_says_when_a_session_last_changed() {
+        let changed = |store: &Store, id: i64| {
+            store.mobile_session_metadata().unwrap()[&id].updated_at
+        };
+        let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+        let session = store.create("claude", "/project").unwrap();
+        let id = store.persisted_session_id(session.id).unwrap();
+        store
+            .conn
+            .execute("UPDATE sessions SET updated_at=42 WHERE id=?1", [&id])
+            .unwrap();
+        assert_eq!(changed(&store, session.id), 42);
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let session = store.create("claude", "/project").unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE native_sessions SET updated_at=42 WHERE id=?1",
+                [session.id],
+            )
+            .unwrap();
+        assert_eq!(changed(&store, session.id), 42);
+    }
+
+    #[test]
     fn mobile_metadata_keeps_saved_branches_worktrees_models_and_access_without_decoding_history() {
         let store = Store::open_monocode(Path::new(":memory:")).unwrap();
         let session = store.create("claude", "/project").unwrap();
@@ -276,7 +304,13 @@ mod tests {
         assert_eq!(metadata[&first.id].worktree_cwd.as_deref(), Some("/linked"));
         assert_eq!(metadata[&first.id].access, AccessMode::Auto);
         assert!(metadata[&first.id].worktree_removed);
-        assert_eq!(metadata[&second.id], MobileSessionMetadata::default());
+        assert_eq!(
+            metadata[&second.id],
+            MobileSessionMetadata {
+                updated_at: second.updated_at,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

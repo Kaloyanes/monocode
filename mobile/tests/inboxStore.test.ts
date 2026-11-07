@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createFixtureClient } from "@/features/inbox/fixtures";
-import { createInboxStore, type InboxStorage } from "@/features/inbox/store";
+import { createInboxStore, FOLLOWED_POLL_MS, type InboxStorage } from "@/features/inbox/store";
 import {
   createInboxClient,
   type InboxClient,
   type InboxItem,
+  type InboxList,
   type InboxListParams,
 } from "@/features/inbox/protocol";
 
@@ -22,6 +23,52 @@ function fixture(overrides: Partial<ReturnType<typeof createFixtureClient>["cont
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
+
+describe("following the desktop's Inbox rev", () => {
+  const counted = () => {
+    const client = fixture();
+    const list = vi.spyOn(client, "list");
+    const store = createInboxStore({ client, storage: memory(), namespace: "d", pollMs: 5000 });
+    const stop = store.watch({ scope: "all", projectId: "p1" });
+    return { list, store, stop };
+  };
+
+  it("reads when the rev moves and otherwise leaves the radio alone", async () => {
+    const { list, store, stop } = counted();
+    store.follow("a");
+    await vi.advanceTimersByTimeAsync(0);
+    const reads = list.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(list.mock.calls.length).toBe(reads);
+    store.follow("a");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(list.mock.calls.length).toBe(reads);
+    store.follow("b");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(list.mock.calls.length).toBe(reads + 1);
+    stop();
+  });
+
+  it("still reads now and then, for what the rev can't see", async () => {
+    const { list, store, stop } = counted();
+    store.follow("a");
+    await vi.advanceTimersByTimeAsync(0);
+    const reads = list.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(FOLLOWED_POLL_MS);
+    expect(list.mock.calls.length).toBe(reads + 1);
+    stop();
+  });
+
+  it("polls as before on a desktop without one", async () => {
+    const { list, store, stop } = counted();
+    store.follow(null);
+    await vi.advanceTimersByTimeAsync(0);
+    const reads = list.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(list.mock.calls.length).toBe(reads + 2);
+    stop();
+  });
+});
 
 describe("the store", () => {
   it("reads a list, caches its first page and serves the cache to a new store", async () => {
@@ -42,6 +89,22 @@ describe("the store", () => {
     expect(cached.loaded).toBe(true);
     expect(cached.fromCache).toBe(true);
     expect(cached.items.map((item) => item.key)).toEqual(feed.items.map((item) => item.key));
+  });
+
+  it("asks the desktop for a filtered list and keeps it out of the cache", async () => {
+    const storage = memory();
+    const client = fixture();
+    const list = vi.spyOn(client, "list");
+    const store = createInboxStore({ client, storage, namespace: "desk" });
+    const query = { scope: "all" as const, facets: { kind: "issue" as const } };
+    await store.refresh(query);
+    expect(list.mock.calls[0][0]).toMatchObject({ kind: "issue" });
+    const feed = store.getFeed(query);
+    expect(feed.items.length).toBeGreaterThan(0);
+    expect(feed.items.every((item) => item.kind === "issue")).toBe(true);
+    expect(feed.options?.authors.length).toBeGreaterThan(0);
+    const again = createInboxStore({ client, storage, namespace: "desk" });
+    expect(again.getFeed(query).loaded).toBe(false);
   });
 
   it("keeps the cache per desktop", async () => {
@@ -133,6 +196,68 @@ describe("the store", () => {
   });
 });
 
+describe("a read that changes nothing", () => {
+  /** A desktop whose every reply arrives as new objects, as over the link. */
+  function linked() {
+    const client = fixture();
+    const list = client.list;
+    return {
+      ...client,
+      list: (params: InboxListParams) =>
+        list(params).then((page) => ({
+          ...(JSON.parse(JSON.stringify(page)) as InboxList),
+          fetchedAt: NOW,
+        })),
+    };
+  }
+  const query = { scope: "all" as const };
+
+  it("leaves the feed as the same object, during the read and after it", async () => {
+    const store = createInboxStore({ client: linked(), storage: memory(), namespace: "d" });
+    await store.refresh(query);
+    const feed = store.getFeed(query);
+    const reading = store.refresh(query);
+    expect(store.getFeed(query)).toBe(feed);
+    await reading;
+    expect(store.getFeed(query)).toBe(feed);
+  });
+
+  it("gives only the item that changed a new object", async () => {
+    const client = linked();
+    const store = createInboxStore({ client, storage: memory(), namespace: "d" });
+    await store.refresh(query);
+    const [one, two, ...rest] = store.getFeed(query).items;
+    const list = client.list;
+    client.list = (params) =>
+      list(params).then((page) => ({
+        ...page,
+        items: page.items.map((item) =>
+          item.key === one.key ? { ...item, title: "Renamed" } : item,
+        ),
+      }));
+    await store.refresh(query);
+    const items = store.getFeed(query).items;
+    expect(items[0]).not.toBe(one);
+    expect(items[0].title).toBe("Renamed");
+    expect(items[1]).toBe(two);
+    expect(items.slice(2)).toEqual(rest);
+    expect(items[2]).toBe(rest[0]);
+  });
+
+  it("doesn't tell the screens or write the phone's cache", async () => {
+    const storage = memory();
+    const set = vi.spyOn(storage, "set");
+    const store = createInboxStore({ client: linked(), storage, namespace: "d" });
+    await store.refresh(query);
+    const told = vi.fn();
+    store.subscribe(told);
+    set.mockClear();
+    await store.refresh(query);
+    expect(told).not.toHaveBeenCalled();
+    expect(set).not.toHaveBeenCalled();
+  });
+});
+
 describe("marks", () => {
   async function loaded(client: InboxClient = fixture()) {
     const store = createInboxStore({ client, storage: memory(), namespace: "d" });
@@ -205,6 +330,12 @@ describe("the client", () => {
     expect(transport).toHaveBeenLastCalledWith("inbox.mark", { key: "k", action: "snooze", until: 5 });
     await client.media("k", { avatarKey: "a" });
     expect(transport).toHaveBeenLastCalledWith("inbox.media", { key: "k", avatarKey: "a" });
+    await client.media("k", { commentId: "c1", commentIndex: 2 });
+    expect(transport).toHaveBeenLastCalledWith("inbox.media", {
+      key: "k",
+      commentId: "c1",
+      commentIndex: 2,
+    });
   });
 
   it("keeps one command id across a retried start and a fresh one after success", async () => {

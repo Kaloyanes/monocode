@@ -47,12 +47,23 @@ impl Shell {
     ) -> Result<Value, String> {
         let session = self.mobile_composer_session(params, cx)?;
         let text = params["text"].as_str().ok_or("Missing text")?;
+        let base = params["base"].as_u64().unwrap_or(0);
+        Ok(reply(&self.write_composer(session, text, base, cx)?))
+    }
+
+    /// Text for a thread's composer, based on revision `base`.
+    pub(in crate::shell) fn write_composer(
+        &mut self,
+        session: i64,
+        text: &str,
+        base: u64,
+        cx: &mut Context<Self>,
+    ) -> Result<ComposerWrite, String> {
         if text.len() > MAX_MESSAGE {
             return Err("Draft is too long".into());
         }
-        let base = params["base"].as_u64().unwrap_or(0);
-        let write = match self.sessions.get(&session).cloned() {
-            Some(view) => view.update(cx, |view, cx| view.mobile_composer_write(text, base, cx))?,
+        match self.sessions.get(&session).cloned() {
+            Some(view) => view.update(cx, |view, cx| view.mobile_composer_write(text, base, cx)),
             None => {
                 let store = locked(&self.store)?;
                 let write = store.write_composer_text(session, text, base)?;
@@ -63,10 +74,9 @@ impl Shell {
                     self.composer_draft_sessions.remove(&session);
                 }
                 cx.notify();
-                write
+                Ok(write)
             }
-        };
-        Ok(reply(&write))
+        }
     }
 
     fn mobile_composer_session(&self, params: &Value, cx: &App) -> Result<i64, String> {

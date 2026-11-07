@@ -4,6 +4,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::scm::shell::dirs_home;
+
+mod input;
+pub use input::{destination, name_issue, parse_input, provider_issue, ParsedServer};
 fn expand_home(path: &str) -> PathBuf {
     crate::scm::expand_home(Path::new(path))
 }
@@ -28,7 +31,7 @@ fn claude_desktop_config(home: &Path) -> PathBuf {
 
 fn server_from_json(provider: &str, name: &str, config: &str) -> Result<(String, Value), String> {
     let value: Value = serde_json::from_str(config).map_err(|e| format!("Invalid JSON: {e}"))?;
-    let (name, mut server) = if let Some(servers) = value.get("mcpServers") {
+    let (name, server) = if let Some(servers) = value.get("mcpServers") {
         let servers = servers.as_object().ok_or("mcpServers must be an object")?;
         if servers.len() != 1 {
             return Err("Add one server at a time".into());
@@ -41,6 +44,17 @@ fn server_from_json(provider: &str, name: &str, config: &str) -> Result<(String,
     } else {
         (name.trim().to_owned(), value)
     };
+    normalize_server(provider, &name, server)
+}
+
+/// Checks the name and the shape of a server for `provider` and applies its
+/// spelling (OpenCode writes the command as one array).
+fn normalize_server(
+    provider: &str,
+    name: &str,
+    mut server: Value,
+) -> Result<(String, Value), String> {
+    let name = name.trim().to_owned();
     if name.is_empty() || name.chars().any(char::is_control) {
         return Err("Server name cannot be empty or contain control characters".into());
     }
@@ -98,6 +112,34 @@ pub fn mcp_add(
     config: String,
 ) -> Result<(), String> {
     let (name, server) = server_from_json(&provider, &name, &config)?;
+    write_server(&cwd, &provider, &scope, &name, server)
+}
+
+/// Adds a server already read by [`parse_input`], under the name the user chose.
+pub fn mcp_add_server(
+    cwd: String,
+    provider: String,
+    scope: String,
+    name: String,
+    server: Value,
+) -> Result<(), String> {
+    let (name, server) = normalize_server(&provider, &name, server)?;
+    write_server(&cwd, &provider, &scope, &name, server)
+}
+
+fn write_server(
+    cwd: &str,
+    provider: &str,
+    scope: &str,
+    name: &str,
+    server: Value,
+) -> Result<(), String> {
+    let (cwd, provider, scope, name) = (
+        cwd.to_owned(),
+        provider.to_owned(),
+        scope.to_owned(),
+        name.to_owned(),
+    );
     let binary_path = crate::provider::resolve(crate::provider::Kind::from_id(&provider))
         .map(|p| p.to_string_lossy().into_owned());
     {
@@ -810,24 +852,10 @@ fn mcp_add_args(
     let object = config
         .as_object()
         .ok_or("Server configuration must be an object")?;
+    if let Some(issue) = input::codex_issue(config) {
+        return Err(issue);
+    }
     let remote = object.get("url").and_then(serde_json::Value::as_str);
-    let allowed: &[&str] = if remote.is_some() {
-        &["type", "url", "bearerTokenEnvVar"]
-    } else {
-        &["type", "command", "args", "env"]
-    };
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!(
-            "{provider} add cannot preserve '{key}'; edit its config file instead"
-        ));
-    }
-    let kind = object.get("type").and_then(serde_json::Value::as_str);
-    if remote.is_some() && !matches!(kind, None | Some("http") | Some("remote")) {
-        return Err(format!("{provider} CLI supports HTTP URLs only"));
-    }
-    if remote.is_none() && !matches!(kind, None | Some("stdio") | Some("local")) {
-        return Err("Local server type must be stdio".into());
-    }
     let mut args = vec!["mcp".into(), "add".into(), name.into()];
     if let Some(url) = remote {
         let parsed = url::Url::parse(url).map_err(|_| "Invalid server URL")?;

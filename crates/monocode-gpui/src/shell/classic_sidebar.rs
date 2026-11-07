@@ -277,11 +277,9 @@ impl Shell {
             self.classic_worktree_picker = None;
         }
         let sessions = self.classic_sidebar_tab == ClassicSidebarTab::Sessions;
-        let live_agents = if self.workspace.project_rail_open {
-            None
-        } else {
-            self.live_agents_preview(cx)
-        };
+        let dock = sessions
+            .then(|| self.sidebar_dock(!self.workspace.project_rail_open, cx))
+            .flatten();
         div()
             .id("monocode-sidebar")
             .debug_selector(|| "sidebar-content".into())
@@ -356,7 +354,10 @@ impl Shell {
             })
             .when(
                 sessions && !self.workspace.project.is_empty() && self.workspace.project != "~",
-                |d| d.child(self.classic_conversation_search(cx)),
+                |d| {
+                    d.children(self.archive_view_header(cx))
+                        .child(self.classic_conversation_search(cx))
+                },
             )
             .child(
                 div().flex_1().min_h_0().overflow_hidden().child(
@@ -373,7 +374,7 @@ impl Shell {
                         }),
                 ),
             )
-            .children(live_agents)
+            .children(dock)
             .when(!self.workspace.project_rail_open, |d| {
                 d.child(self.app_update_footer(cx))
             })
@@ -576,7 +577,7 @@ impl Shell {
             .into_any()
     }
 
-    fn classic_conversation_search(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn classic_conversation_search(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("classic-conversation-search")
             .debug_selector(|| "classic-conversation-search".into())

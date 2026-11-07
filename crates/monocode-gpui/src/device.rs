@@ -121,6 +121,16 @@ impl Focusable for DevicePanel {
 /// An iPhone's shape, until the first frame gives the real one.
 const DEFAULT_ASPECT: f32 = 1206. / 2622.;
 
+/// `device` as `list` has it. An emulator's id changes from its AVD name to a
+/// serial on boot.
+fn latest<'a>(list: &'a DeviceList, device: &Device) -> Option<&'a Device> {
+    list.find(&device.id).or_else(|| {
+        list.devices
+            .iter()
+            .find(|d| d.platform == device.platform && d.name == device.name)
+    })
+}
+
 impl DevicePanel {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         Self {
@@ -235,15 +245,10 @@ impl DevicePanel {
     }
 
     fn apply_list(&mut self, list: DeviceList, cx: &mut Context<Self>) {
-        let current = self.selected.as_ref().and_then(|selected| {
-            list.find(&selected.id).cloned().or_else(|| {
-                // An emulator's id changes from its AVD name to a serial on boot.
-                list.devices
-                    .iter()
-                    .find(|d| d.platform == selected.platform && d.name == selected.name)
-                    .cloned()
-            })
-        });
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|selected| latest(&list, selected).cloned());
         let pick = current.or_else(|| {
             (self.selected.is_none())
                 .then(|| list.devices.iter().find(|d| d.booted).cloned())
@@ -303,6 +308,35 @@ impl DevicePanel {
 
     pub(crate) fn selected(&self) -> Option<&Device> {
         self.selected.as_ref()
+    }
+
+    /// Goes back to the device a project last showed, leaving it off if it
+    /// has stopped: switching projects shouldn't boot anything. Hidden, the
+    /// stream waits for `activate`.
+    pub(crate) fn recall(&mut self, device: &Device, cx: &mut Context<Self>) {
+        let device = match &self.list {
+            Some(list) => latest(list, device).cloned(),
+            None => Some(device.clone()),
+        };
+        let Some(device) = device else {
+            return;
+        };
+        if self.selected.as_ref().is_some_and(|d| d.id == device.id) {
+            return;
+        }
+        self.disconnect();
+        #[cfg(target_os = "macos")]
+        if let Some(screen) = &self.screen {
+            screen.clear();
+        }
+        self.picking = false;
+        self.error = None;
+        let booted = device.booted;
+        self.selected = Some(device);
+        if self.shown && booted {
+            self.connect(cx);
+        }
+        cx.notify();
     }
 
     /// Shows a device an agent opened; it is booted already.
@@ -582,6 +616,11 @@ impl DevicePanel {
             );
         } else if self.recording_busy() {
             header = header.child(spinner("device-recording-saving", "loader", 12.));
+        } else if live && !self.picking && self.tools_available() {
+            header = header.child(
+                icon_action("device-record", "Record the screen", "record", true)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_recording(cx))),
+            );
         }
         if live && !self.picking {
             header = header

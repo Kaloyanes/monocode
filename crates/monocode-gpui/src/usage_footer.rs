@@ -1002,6 +1002,18 @@ impl Render for UsageFooter {
 }
 
 #[cfg(test)]
+impl UsageFooter {
+    pub(crate) fn details_open(&self) -> bool {
+        self.open
+    }
+
+    pub(crate) fn open_details(&mut self, cx: &mut Context<Self>) {
+        self.open = true;
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[gpui::test]

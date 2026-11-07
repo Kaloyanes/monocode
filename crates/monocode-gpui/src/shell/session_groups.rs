@@ -496,7 +496,12 @@ impl Shell {
         archived.sort_by_cached_key(|id| std::cmp::Reverse(self.archived_at(*id, cx)));
         // A folder with nothing live left leads the archive as one group.
         let archived_set: HashSet<i64> = archived.iter().copied().collect();
-        let listed: Vec<i64> = archived.iter().chain(&ids).copied().collect();
+        let mut listed: Vec<i64> = archived.iter().chain(&ids).copied().collect();
+        // The archive view lists only archived threads, but a folder that
+        // still has live ones isn't archived whole.
+        if self.archive_view_open() {
+            listed.extend(self.listed_sessions(false, cx));
+        }
         let mut archived_folders = self
             .project_groups()
             .archived_folders(&listed, |id| archived_set.contains(&id));
@@ -969,7 +974,7 @@ impl Shell {
             .filter(|id| {
                 self.sessions
                     .get(id)
-                    .is_some_and(|view| view.read(cx).responding())
+                    .is_some_and(|view| view.read(cx).working())
             })
             .count()
     }
@@ -1212,11 +1217,11 @@ impl Shell {
             self.session_preview = None;
             self.preview_close = None;
         }
-        self.forget_orchestration(id, cx);
+        self.forget_former_worker(id, cx);
         self.sessions.remove(&id);
         self.thread_parents.remove(&id);
         self.agent_summary_writes.remove(&id);
-        self.thread_waiters.remove(&id);
+        self.forget_thread(id);
         self.session_summaries.remove(&id);
         self.draft_sessions.remove(&id);
         self.usage_limits.remove(&id);
@@ -1532,6 +1537,10 @@ impl Shell {
                     cx.stop_propagation();
                     if event.modifiers().secondary() {
                         cx.open_url(&url);
+                    } else if this.session_summaries.get(&id).is_some_and(|summary| {
+                        monocode_core::inbox::ask::is_ask_title(&summary.title)
+                    }) {
+                        this.move_pr_ask_to_sidebar(id, window, cx);
                     } else {
                         this.open_work_link(&url, window, cx);
                     }
@@ -1788,10 +1797,10 @@ impl Shell {
             .any(|id| self.session_metadata(*id, cx).needs_approval());
         let busy = sessions
             .iter()
-            .any(|id| self.session_metadata(*id, cx).responding());
+            .any(|id| self.session_metadata(*id, cx).working());
         let busy_mark = sessions
             .iter()
-            .find(|id| self.session_metadata(**id, cx).responding())
+            .find(|id| self.session_metadata(**id, cx).working())
             .and_then(|id| self.session_marks.get(id))
             .cloned();
         let done = sessions.iter().any(|id| self.unseen_finished.contains(id));
@@ -2240,7 +2249,7 @@ mod tests {
                                 .as_solid()
                                 .is_some_and(|color| color == crate::theme::rail_color())
                     }),
-                    "the same spine as Operator rows connects folder members"
+                    "the same spine as started rows connects folder members"
                 );
             })
             .unwrap();
@@ -2834,7 +2843,7 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// Lets the archived rows finish sliding out so the list regroups them.
+    /// Lets the archived rows finish leaving so the list regroups them.
     fn settle_archive_exits(window: &WindowHandle<Shell>, cx: &mut TestAppContext) {
         let visual = &mut VisualTestContext::from_window((*window).into(), cx);
         window

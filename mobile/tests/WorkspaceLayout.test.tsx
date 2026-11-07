@@ -40,7 +40,16 @@ vi.mock("@/ui/theme", () => ({
   useColors: () => ({}),
   themedStyles: (factory: (colors: object) => object) => () => factory({}),
 }));
+vi.mock("expo-sqlite/kv-store", () => ({
+  default: { getItemSync: () => null, setItem: async () => {} },
+}));
 vi.mock("@/ui/Icon", () => ({ Icon: () => null }));
+vi.mock("@/features/inbox/InboxProvider", () => ({
+  useInboxBadge: () => 0,
+  useInboxSupported: () => false,
+}));
+vi.mock("@/features/workspace/UnreadDot", () => ({ UnreadDot: () => null }));
+vi.mock("@/features/sessions/composerDraft", () => ({ useDraftMark: () => false }));
 vi.mock("@/features/mascots/ProjectMascot", () => ({ ProjectMascot: () => null }));
 vi.mock("@/features/sessions/ProviderLogo", () => ({ ProviderLogo: () => null }));
 vi.mock("@/features/workspace/WorkspaceProvider", () => ({

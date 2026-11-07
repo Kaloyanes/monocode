@@ -19,6 +19,7 @@ import { useWorkspace } from "@/features/workspace/WorkspaceProvider";
 import { LiquidView } from "@/ui/LiquidView";
 import { ChoiceMenu } from "@/ui/ChoiceMenu";
 import { ACTION_SYMBOLS, useTerminalActions } from "@/features/terminal/terminalActions";
+import { useContentWidth } from "@/ui/ContentPane";
 import { themedStyles, useColors } from "@/ui/theme";
 
 import { confirmArchive } from "./archiveActions";
@@ -36,6 +37,9 @@ const HEADER_ITEMS = 210;
  *  width and the gap beside it. Less and iOS folds the changes button and the
  *  session menu into an overflow menu behind the terminal button. */
 const TERMINAL_ITEM = 60;
+// A toolbar custom view cannot shrink when UIKit shares the bar with the
+// system status controls. Keep long titles bounded even in a wide pane.
+const MAX_TITLE_WIDTH = 280;
 
 /**
  * A session's title on the left of the stack's header, beside the back button
@@ -45,10 +49,13 @@ const TERMINAL_ITEM = 60;
 export function SessionTitle({
   title,
   subtitle,
+  onClose,
   terminal,
 }: {
   title: string;
   subtitle: string;
+  /** Presented as a sheet: a close button before the title, in place of back. */
+  onClose?: () => void;
   /** Whether the toolbar has a terminal button, which the title leaves room for. */
   terminal?: boolean;
 }) {
@@ -59,7 +66,9 @@ export function SessionTitle({
     // Side controls already occupy the horizontal safe area. Reserve the
     // larger of that inset and the top-bar budget, rather than adding both.
     Math.min(
-      width - Math.max(insets.left + insets.right, HEADER_ITEMS),
+      width -
+        Math.max(insets.left + insets.right, HEADER_ITEMS) -
+        (terminal ? TERMINAL_ITEM : 0),
       MAX_TITLE_WIDTH,
     ),
     80,
@@ -85,17 +94,7 @@ export function SessionTitle({
         />
       ) : null}
       <Stack.Toolbar.View hidesSharedBackground>
-        <View
-          style={[
-            styles.title,
-            {
-              width: Math.max(
-                width - HEADER_ITEMS - (terminal ? TERMINAL_ITEM : 0),
-                80,
-              ),
-            },
-          ]}
-        >
+        <View style={[styles.title, { width: titleWidth }]}>
           <Text style={styles.name} numberOfLines={1}>
             {title}
           </Text>

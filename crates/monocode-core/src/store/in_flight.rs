@@ -14,10 +14,8 @@ pub struct InFlight {
     pub cwd: String,
     pub started_at: u64,
     pub plan: bool,
-    pub orchestrator: bool,
-    pub operator: bool,
     pub access: AccessMode,
-    /// False for automation runs, orchestration workers and Mono turns: their
+    /// False for automation runs, subagents and Mono turns: their
     /// owners have their own recovery, so a relaunch only settles the rows.
     pub resume: bool,
 }

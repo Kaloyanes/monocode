@@ -3,11 +3,13 @@
 mod avatar;
 mod diff;
 mod document;
+mod review;
 mod ui;
 pub(crate) use avatar::image as avatar_image;
 pub(crate) use ui::{provider_mark, relative_time};
 
 use crate::{
+    conversation::Conversation,
     diff_view::{DiffEvent, DiffView},
     input::{self, Input},
     popover::AnchorSlot,
@@ -61,15 +63,39 @@ impl gpui::Global for Catalog {}
 pub(crate) enum Event {
     Close,
     OpenSession(i64),
-    StartSession { item: Box<Item>, prompt: String },
+    StartSession {
+        item: Box<Item>,
+        prompt: String,
+    },
+    /// A reviewer's question about a pull request. The shell starts a
+    /// read-only chat that shows `question` and sends `prompt` to the model,
+    /// then hands the chat back with `attach_ask`.
+    /// The pane opened on a pull request with no chat yet: the shell attaches
+    /// an earlier one, if the session list has it.
+    FindAsk(Box<Item>),
+    AskPr {
+        item: Box<Item>,
+        question: String,
+        prompt: String,
+        title: String,
+    },
     ItemsChanged(Vec<Item>),
+    /// Archive these threads, offered once the pull request they link to is
+    /// merged.
+    ArchiveThreads(Vec<i64>),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Summary,
     Code,
     Checks,
+}
+
+/// The chat beside a pull request, started by asking about it.
+struct AskPane {
+    session: i64,
+    view: Entity<Conversation>,
 }
 
 /// Progress of a link that points at an item the list does not hold.
@@ -119,6 +145,26 @@ pub(crate) struct Inbox {
     comments: Vec<(model::Comment, Entity<document::InboxDocument>)>,
     diff: Option<Diff>,
     diff_view: Entity<DiffView>,
+    /// The "Ask about this PR" pane is open beside the detail.
+    ask_open: bool,
+    ask_input: Entity<Input>,
+    /// One chat per item, by key.
+    asks: std::collections::HashMap<String, AskPane>,
+    ask_starting: bool,
+    ask_error: Option<String>,
+    focus_ask: bool,
+    /// The files in the diff each chat was given, so a citation of one of them
+    /// jumps to the Code tab before that tab has loaded.
+    ask_paths: std::collections::HashMap<String, Vec<String>>,
+    /// A citation waiting for the Code tab's diff to load.
+    pending_cite: Option<(String, Option<u32>)>,
+    /// The reviewer's pending comments, by pull request.
+    review: std::collections::HashMap<String, Vec<model::review::PendingComment>>,
+    review_open: bool,
+    review_posting: bool,
+    review_error: Option<String>,
+    /// The URL of the review just posted.
+    review_posted: Option<String>,
     checks: Option<Checks>,
     tab: Tab,
     loading: bool,
@@ -193,7 +239,8 @@ fn poll_interval(active: bool) -> Duration {
 }
 
 /// How old the snapshot may get before a watching phone starts a fetch. The
-/// phone polls every few seconds, so this is the lag a new item can have.
+/// catalog is published every few seconds, so this is the lag a new item can
+/// have.
 const PHONE_REFRESH: Duration = Duration::from_secs(30);
 
 /// What a paired phone reads from the Inbox: the cached snapshot and the state
@@ -202,6 +249,7 @@ pub(crate) struct PhoneView<'a> {
     pub items: &'a [Item],
     pub errors: &'a std::collections::BTreeMap<String, String>,
     pub connections: &'a std::collections::BTreeMap<String, model::Status>,
+    pub viewers: &'a std::collections::BTreeMap<String, String>,
     pub seen: &'a model::Seen,
     pub triage: &'a model::Triage,
     /// ms, None before the first fetch ends.
@@ -312,7 +360,16 @@ impl Inbox {
         let connect_email = cx.new(|cx| Input::field("Email", "you@example.com", content(0.4), cx));
         let connect_token =
             cx.new(|cx| Input::field("API token", "Personal access token", content(0.4), cx));
-        let diff_view = cx.new(DiffView::new);
+        let diff_view = cx.new(|cx| {
+            let mut view = DiffView::new(cx);
+            view.can_ask = poll;
+            view
+        });
+        let ask_input = cx.new(|cx| {
+            let mut input = Input::new(cx);
+            input.set_placeholder("Ask about this pull request…", cx);
+            input
+        });
         let subscriptions = vec![
             cx.subscribe(&search, |_, _, _: &input::Changed, cx| cx.notify()),
             cx.subscribe(&comment, |this, _, _: &input::Changed, cx| {
@@ -324,8 +381,8 @@ impl Inbox {
             cx.subscribe(&comment, |this, _, _: &input::Submitted, cx| {
                 this.post_comment(cx)
             }),
-            cx.subscribe(&diff_view, |this, _, event: &DiffEvent, cx| {
-                if let DiffEvent::Comment(text) = event {
+            cx.subscribe(&diff_view, |this, _, event: &DiffEvent, cx| match event {
+                DiffEvent::Comment(text) => {
                     this.comment
                         .update(cx, |input, cx| input.set_text(text.clone(), cx));
                     this.tab = Tab::Summary;
@@ -333,6 +390,17 @@ impl Inbox {
                     this.focus_comment = true;
                     cx.notify();
                 }
+                DiffEvent::Ask(text) => this.ask_question(text.clone(), cx),
+                DiffEvent::Review {
+                    path,
+                    line,
+                    side,
+                    text,
+                } => this.add_review_comment(path.clone(), *line, *side, text.clone(), cx),
+                _ => {}
+            }),
+            cx.subscribe(&ask_input, |this, _, _: &input::Submitted, cx| {
+                this.submit_ask(cx)
             }),
         ];
         if poll {
@@ -405,6 +473,19 @@ impl Inbox {
             comments: vec![],
             diff: None,
             diff_view,
+            ask_open: false,
+            ask_input,
+            asks: Default::default(),
+            ask_starting: false,
+            ask_error: None,
+            focus_ask: false,
+            ask_paths: Default::default(),
+            pending_cite: None,
+            review: Default::default(),
+            review_open: false,
+            review_posting: false,
+            review_error: None,
+            review_posted: None,
             checks: None,
             tab: Tab::Summary,
             loading: false,
@@ -590,12 +671,25 @@ impl Inbox {
             items: &snapshot.items,
             errors: &snapshot.errors,
             connections: &snapshot.connections,
+            viewers: &snapshot.viewers,
             seen: &self.state.seen,
             triage: &self.state.triage,
             fetched_at,
             interval_ms: poll_interval(self.active).as_millis() as i64,
             service: &self.service,
         }
+    }
+
+    /// Names what a phone would read, so it reads again only when this moves.
+    pub(crate) fn phone_rev(&self) -> String {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let view = self.phone_view();
+        let content = serde_json::to_value((view.items, view.errors, view.seen, view.triage))
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
     }
 
     /// A phone looked at the list: refresh in the background when the last
@@ -721,6 +815,86 @@ impl Inbox {
         self.save();
         cx.notify();
         Ok(item)
+    }
+
+    /// Marks read what a phone's list shows, and says how many that was.
+    pub(crate) fn phone_read_all(
+        &mut self,
+        params: &monocode_core::mobile::inbox::ListParams,
+        projects: &[monocode_core::mobile::inbox::ProjectRef],
+        cx: &mut Context<Self>,
+    ) -> usize {
+        use monocode_core::mobile::inbox::{View, visible};
+        let unread: Vec<Item> = {
+            let snapshot = self.phone_source().0;
+            let view = View {
+                seen: &self.state.seen,
+                triage: &self.state.triage,
+                projects,
+                viewers: &snapshot.viewers,
+                now: monocode_core::time::now_ms() as i64,
+            };
+            visible(&snapshot.items, params, &view)
+                .into_iter()
+                .filter(|item| self.state.seen.unseen(item))
+                .cloned()
+                .collect()
+        };
+        for item in &unread {
+            self.state.seen.mark(item);
+        }
+        if !unread.is_empty() {
+            self.save();
+            cx.notify();
+        }
+        unread.len()
+    }
+
+    /// A phone's action changed an item at its provider. `updated` is the
+    /// provider's copy, which has no attention reason until the next fetch. The
+    /// item as it now stands, read because the user just acted on it.
+    pub(crate) fn phone_acted(
+        &mut self,
+        key: &str,
+        mut updated: Item,
+        cx: &mut Context<Self>,
+    ) -> Item {
+        if let Some(listed) = self
+            .phone_source()
+            .0
+            .items
+            .iter()
+            .find(|item| item.key() == key)
+        {
+            updated.attention_reason = listed.attention_reason.clone();
+        }
+        self.replace_item(key, updated.clone());
+        if let Some(old) = self
+            .phone
+            .snapshot
+            .iter_mut()
+            .flat_map(|snapshot| &mut snapshot.items)
+            .find(|item| item.key() == key)
+        {
+            *old = updated.clone();
+        }
+        self.state.seen.mark(&updated);
+        self.save();
+        self.phone_discussed(key, cx);
+        updated
+    }
+
+    /// Something a phone did at the provider shows in the next read: the
+    /// desktop's detail if it has the item open, and both lists.
+    pub(crate) fn phone_discussed(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(key) {
+            self.load_detail(false, cx);
+        }
+        self.refresh(cx);
+        if self.phone_separate() {
+            self.refresh_phone(cx);
+        }
+        cx.notify();
     }
 
     pub(crate) fn unread_count(&self) -> usize {
@@ -923,6 +1097,49 @@ impl Inbox {
                 .filter(|item| Some(item.key()) == self.selected))
             .cloned()
     }
+    /// Shows `item` as a followed link would, without looking it up.
+    #[cfg(test)]
+    pub(crate) fn pin_for_test(&mut self, item: Item) {
+        self.selected = Some(item.key());
+        self.pinned = Some(item);
+    }
+    /// A detail view's item is pinned, with no list row behind it.
+    fn replace_item(&mut self, key: &str, item: Item) {
+        if let Some(old) = self
+            .snapshot
+            .items
+            .iter_mut()
+            .chain(&mut self.pinned)
+            .find(|i| i.key() == key)
+        {
+            *old = item;
+        }
+    }
+    /// A detail view never polls, so the list refresh that fills `sessions`
+    /// would not run before it shows an item's threads.
+    fn load_sessions(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { locked(&store).and_then(|db| db.sessions()) });
+        cx.spawn(async move |this, cx| {
+            let Ok(sessions) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.sessions = sessions;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    fn archive_threads(&mut self, ids: Vec<i64>, cx: &mut Context<Self>) {
+        for session in &mut self.sessions {
+            session.archived |= ids.contains(&session.id);
+        }
+        cx.emit(Event::ArchiveThreads(ids));
+        cx.notify();
+    }
     /// A row picked from the rail starts a fresh trail of linked items.
     fn select(&mut self, key: String, cx: &mut Context<Self>) {
         if self.selected.as_ref() == Some(&key) {
@@ -949,6 +1166,9 @@ impl Inbox {
     /// GitHub and Linear items it does not hold are fetched and shown without
     /// joining the list. Returns false for links that belong to the browser.
     pub(crate) fn open_url(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
+        if self.detail_only {
+            self.load_sessions(cx);
+        }
         let target = model::link_target(url);
         let tab = match &target {
             Some(model::LinkTarget::GitHub(work)) if work.kind == "pr" => {
@@ -1048,6 +1268,7 @@ impl Inbox {
         self.link_notice = None;
         self.selected = Some(key);
         self.reset_detail(cx);
+        self.load_review(cx);
         if let Some(item) = self.item() {
             if self.active {
                 self.state.seen.mark(&item);
@@ -1077,6 +1298,7 @@ impl Inbox {
         self.focus_comment = false;
         self.tab = Tab::Summary;
         self.diff = None;
+        self.pending_cite = None;
         self.extra_request += 1;
         self.diff_view
             .update(cx, |view, cx| view.set_files(vec![], cx));
@@ -1263,6 +1485,10 @@ impl Inbox {
                                 view.set_files(files, cx);
                             });
                             this.diff = Some(diff);
+                            if let Some((path, line)) = this.pending_cite.take() {
+                                this.diff_view
+                                    .update(cx, |view, cx| view.reveal(&path, line, cx));
+                            }
                         }
                         if let Some(checks) = checks {
                             this.checks = Some(checks);
@@ -1318,6 +1544,180 @@ impl Inbox {
         })
         .detach();
         cx.notify();
+    }
+    /// The chat for the item on screen, when the pane is open.
+    fn ask_pane(&self) -> Option<&AskPane> {
+        let key = self.item()?.key();
+        self.asks.get(&key)
+    }
+    /// The chat the Inbox shows beside the detail, which the shell must keep
+    /// drawn.
+    pub(crate) fn ask_session(&self) -> Option<i64> {
+        self.ask_open
+            .then(|| self.ask_pane().map(|pane| pane.session))
+            .flatten()
+    }
+    fn open_ask(&mut self, cx: &mut Context<Self>) {
+        self.ask_open = true;
+        self.focus_ask = true;
+        if self.ask_pane().is_none() && !self.ask_starting {
+            if let Some(item) = self.item() {
+                cx.emit(Event::FindAsk(Box::new(item)));
+            }
+        }
+        cx.notify();
+    }
+    fn close_ask(&mut self, cx: &mut Context<Self>) {
+        self.ask_open = false;
+        cx.notify();
+    }
+    fn submit_ask(&mut self, cx: &mut Context<Self>) {
+        let text = self.ask_input.read(cx).content.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.ask_input
+            .update(cx, |input, cx| input.set_text(String::new(), cx));
+        self.ask_question(text, cx);
+    }
+    /// Sends `question` to the item's chat, starting it on the first one.
+    fn ask_question(&mut self, question: String, cx: &mut Context<Self>) {
+        let Some(mut item) = self.item() else {
+            return;
+        };
+        self.ask_open = true;
+        let key = item.key();
+        if let Some(pane) = self.asks.get(&key) {
+            pane.view
+                .update(cx, |chat, cx| chat.submit_follow_up(question, cx));
+            cx.notify();
+            return;
+        }
+        if self.ask_starting {
+            return;
+        }
+        self.ask_starting = true;
+        self.ask_error = None;
+        if item.project_path.is_empty() {
+            item.project_path = self.start_project.to_string_lossy().into_owned();
+        }
+        let details = self.details.clone();
+        let loaded = self.diff.clone();
+        let service = self.service.clone();
+        let task_item = item.clone();
+        let task = cx.background_executor().spawn(async move {
+            match loaded {
+                Some(diff) => Some(diff),
+                None => service.diff(&task_item).ok(),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let diff = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(diff) = &diff {
+                    this.ask_paths.insert(
+                        item.key(),
+                        diff.files.iter().map(|file| file.path.clone()).collect(),
+                    );
+                }
+                let prompt = model::ask::prompt(&item, details.as_ref(), diff.as_ref(), &question);
+                let title = model::ask::session_title(&item);
+                cx.emit(Event::AskPr {
+                    item: Box::new(item),
+                    question,
+                    prompt,
+                    title,
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    /// The shell started the chat for `key`.
+    pub(crate) fn attach_ask(
+        &mut self,
+        key: String,
+        session: i64,
+        view: Entity<Conversation>,
+        cx: &mut Context<Self>,
+    ) {
+        self.ask_starting = false;
+        let this = cx.entity().downgrade();
+        view.update(cx, |chat, cx| {
+            chat.set_link_intercept(
+                Some(std::rc::Rc::new(move |url, _, cx| {
+                    let url = url.to_owned();
+                    this.update(cx, |inbox, cx| inbox.cite(&url, cx))
+                        .unwrap_or(false)
+                })),
+                cx,
+            )
+        });
+        self.asks.insert(key, AskPane { session, view });
+        self.ask_open = true;
+        cx.notify();
+    }
+    /// Shows an existing chat beside the pull request on screen, and opens
+    /// the pane.
+    pub(crate) fn attach_selected_ask(
+        &mut self,
+        session: i64,
+        view: Entity<Conversation>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(key) = self.item().map(|item| item.key()) {
+            self.attach_ask(key, session, view, cx);
+            self.focus_ask = true;
+        }
+    }
+    pub(crate) fn ask_failed(&mut self, message: String, cx: &mut Context<Self>) {
+        self.ask_starting = false;
+        self.ask_error = Some(message);
+        cx.notify();
+    }
+    /// An answer cited `url`, a file and maybe a line. Jumps to it in the diff
+    /// when the pull request changed that file; false leaves the link to the
+    /// editor.
+    fn cite(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
+        let Some(key) = self.item().map(|item| item.key()) else {
+            return false;
+        };
+        let (path, location) = crate::file_editor::file_location(url, "");
+        let line = location.map(|(line, _)| line as u32);
+        let in_diff = match &self.diff {
+            Some(diff) => diff
+                .files
+                .iter()
+                .any(|file| model::ask::same_file(&path, &file.path)),
+            None => self
+                .ask_paths
+                .get(&key)
+                .is_some_and(|paths| paths.iter().any(|file| model::ask::same_file(&path, file))),
+        };
+        if !in_diff {
+            return false;
+        }
+        if self.diff.is_some() {
+            self.set_tab(Tab::Code, cx);
+            self.diff_view
+                .update(cx, |view, cx| view.reveal(&path, line, cx));
+        } else {
+            self.pending_cite = Some((path, line));
+            self.set_tab(Tab::Code, cx);
+        }
+        true
+    }
+    /// Moves the chat out of the pane into the main conversation.
+    fn open_ask_in_conversation(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.item().map(|item| item.key()) else {
+            return;
+        };
+        if let Some(pane) = self.asks.remove(&key) {
+            self.ask_open = false;
+            cx.emit(Event::OpenSession(pane.session));
+            cx.notify();
+        }
     }
     fn document_cwd(&self) -> PathBuf {
         self.item()
@@ -1445,9 +1845,7 @@ impl Inbox {
                         this.action_notice = (merging
                             && !item.state.eq_ignore_ascii_case("merged"))
                         .then(|| "Merge queued or auto-merge enabled.".into());
-                        if let Some(old) = this.snapshot.items.iter_mut().find(|i| i.key() == key) {
-                            *old = item;
-                        }
+                        this.replace_item(&key, item);
                         this.confirm_action = None;
                         this.load_detail(false, cx);
                         this.refresh(cx);

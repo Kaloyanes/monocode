@@ -26,6 +26,18 @@ impl Shell {
         side: f32,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        self.origin_tile_in("session-origin", id, side, cx)
+    }
+
+    /// The same tile under another element id, for a second place that shows
+    /// it at once, such as the title bar beside the sidebar.
+    pub(super) fn origin_tile_in(
+        &self,
+        place: &'static str,
+        id: i64,
+        side: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let origin = self.session_origin(id, cx)?;
         let label = if origin.deleted {
             format!("Started by {} (deleted)", origin.name)
@@ -50,8 +62,8 @@ impl Shell {
         let tip = label.clone();
         Some(
             div()
-                .id(("session-origin", id as usize))
-                .debug_selector(move || format!("session-origin-{id}"))
+                .id((place, id as usize))
+                .debug_selector(move || format!("{place}-{id}"))
                 .role(Role::Button)
                 .aria_label(label)
                 .size(px(side))
@@ -290,6 +302,47 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn the_open_session_shows_its_mono_beside_its_name(cx: &mut TestAppContext) {
+        let (window, a, b, mono) = setup(cx, false);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, window, cx| shell.open(a, window, cx))
+            .unwrap();
+        visual.run_until_parked();
+        assert!(tile(visual, a).is_some(), "the sidebar row keeps its tile");
+        let in_tab = |visual: &mut VisualTestContext, place: &str, id: i64| {
+            visual.refresh().unwrap();
+            visual.debug_bounds(name(format!("{place}-{id}")))
+        };
+        let tab = in_tab(visual, "tab-origin", a).expect("the tab carries the avatar");
+        let label = visual.debug_bounds(name(format!("title-tab-{a}"))).unwrap();
+        assert!(tab.left() >= label.left() && tab.right() <= label.right());
+        window
+            .update(visual, |shell, window, cx| shell.open(b, window, cx))
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            in_tab(visual, "tab-origin", b).is_none(),
+            "the user's own session has none"
+        );
+        window
+            .update(visual, |shell, window, cx| shell.open(a, window, cx))
+            .unwrap();
+        visual.run_until_parked();
+        let tab = in_tab(visual, "tab-origin", a).unwrap();
+        visual.simulate_click(tab.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(
+                    shell.mono_manager().read(cx).active.as_deref(),
+                    Some(mono.as_str())
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]

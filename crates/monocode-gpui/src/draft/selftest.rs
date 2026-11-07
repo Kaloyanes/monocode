@@ -8,7 +8,9 @@
 //! would, `{"debug":"message"}` queues a line as a page's mc.send would, `"expand"` and
 //! `"collapse"` open and close the full view, `"send"` sends it and `"send_later"` sends it a second from now. `{"debug":"away"}` draws an empty
 //! surface in the thread's place, as Settings does, `{"debug":"cover"}` opens a
-//! modal's scrim over the thread, and `{"debug":"back"}` undoes either. A click's `reference` written as
+//! modal's scrim over the thread, `{"debug":"float"}` floats two overlapping
+//! controls over the page as the thread's pills do, and `{"debug":"back"}`
+//! undoes any of them. A click's `reference` written as
 //! `@Name` means the control with that name in the latest snapshot. `_WIDTH`, `_HEIGHT` and `_APPEARANCE`
 //! shape the first step, `_URL` opens a dev server instead of the file,
 //! `_START=away` starts with the card out of sight, as when the agent opens a
@@ -39,6 +41,21 @@ impl Render for Root {
                         .inset_0()
                         .child(crate::modal::scrim("selftest-scrim")),
                 )
+            })
+            .when(self.2 == "float", |root| {
+                let control = |left: f32, color: u32| {
+                    div()
+                        .absolute()
+                        .top(px(300.))
+                        .left(px(left))
+                        .w(px(120.))
+                        .h(px(30.))
+                        .rounded_full()
+                        .bg(gpui::rgb(color))
+                        .child(crate::draft::float(px(15.)))
+                };
+                root.child(control(260., 0xff3b30))
+                    .child(control(320., 0x34c759))
             })
             .child(crate::draft::sentinel())
     }
@@ -180,7 +197,7 @@ pub(crate) fn run(path: OsString) {
                 drop(lease);
                 for (n, mut input) in all.into_iter().enumerate() {
                     let debug = input.get("debug").and_then(Value::as_str);
-                    let surface = ["away", "cover", "back"]
+                    let surface = ["away", "cover", "float", "back"]
                         .into_iter()
                         .find(|surface| debug == Some(surface));
                     let outcome = if let Some(what) = surface {
@@ -252,6 +269,9 @@ pub(crate) fn run(path: OsString) {
                         .ok()
                         .flatten()
                         .map_or(Value::Null, |frame| json!(frame));
+                    json["holes"] = weak
+                        .read_with(cx, |draft, _| draft.holes())
+                        .map_or(Value::Null, |holes| json!(holes));
                     let _ = std::fs::write(
                         format!("{}.{n}.json", path.to_string_lossy()),
                         json.to_string(),
@@ -273,8 +293,8 @@ pub(crate) fn run(path: OsString) {
 /// default), drawn the way the conversation draws its thread. After the pages
 /// show, it records for `_HOLD` seconds (8 by default) how long each frame
 /// took from the root's render to the end of its paint, how many frames were
-/// drawn, the app's CPU, and Chromium frames received, then how many pixels
-/// each kind of picture has for the points it is shown at. `_TICK` adds a
+/// drawn and the app's CPU, then how many pixels each kind of picture has for
+/// the points it is shown at. `_TICK` adds a
 /// view beside the thread that redraws every frame, as a caret or a working
 /// spinner does, to show what the thread costs when it is not what changed.
 /// `_WIDTH` gives the pages a width of their own and `_ZOOM` zooms the window.
@@ -293,7 +313,6 @@ mod perf {
         cell::{Cell, RefCell},
         ffi::OsString,
         rc::Rc,
-        sync::atomic::Ordering,
         time::{Duration, Instant},
     };
 
@@ -417,41 +436,21 @@ mod perf {
             .collect()
     }
 
-    /// The CPU, in percent of one core, of the Chromium host and its
-    /// helpers (this process's descendants) and of WebKit's processes that
-    /// started after `existing` was taken.
+    /// The CPU, in percent of one core, of WebKit's processes that started
+    /// after `existing` was taken.
     fn engine_cpu(
         before: &std::collections::HashMap<u32, (u32, f64, String)>,
         after: &std::collections::HashMap<u32, (u32, f64, String)>,
         existing: &std::collections::HashSet<u32>,
         seconds: f64,
     ) -> Value {
-        let me = std::process::id();
-        let descends = |mut pid: u32| {
-            for _ in 0..8 {
-                let Some((parent, _, _)) = after.get(&pid) else {
-                    return false;
-                };
-                if *parent == me {
-                    return true;
-                }
-                pid = *parent;
-            }
-            false
-        };
-        let (mut chromium, mut webkit) = (0., 0.);
+        let mut webkit = 0.;
         for (pid, (_, time, name)) in after {
-            let used = time - before.get(pid).map_or(0., |(_, time, _)| *time);
-            if descends(*pid) {
-                chromium += used;
-            } else if name.contains("com.apple.WebKit") && !existing.contains(pid) {
-                webkit += used;
+            if name.contains("com.apple.WebKit") && !existing.contains(pid) {
+                webkit += time - before.get(pid).map_or(0., |(_, time, _)| *time);
             }
         }
-        json!({
-            "chromiumPercent": chromium / seconds * 100.,
-            "webkitPercent": webkit / seconds * 100.,
-        })
+        json!({ "webkitPercent": webkit / seconds * 100. })
     }
 
     fn summary(mut durations: Vec<f64>, seconds: f64) -> Value {
@@ -613,8 +612,6 @@ mod perf {
                             .timer(Duration::from_millis(100))
                             .await;
                     }
-                    let cef_before = super::super::chrome::FRAMES_RECEIVED.load(Ordering::Relaxed);
-                    let stops_before = super::super::chrome::STREAM_STOPS.load(Ordering::Relaxed);
                     let cpu_before = cpu_seconds();
                     let engines_before = processes();
                     let started = Instant::now();
@@ -626,10 +623,6 @@ mod perf {
                     let seconds = started.elapsed().as_secs_f64();
                     let cpu = (cpu_seconds() - cpu_before) / seconds * 100.;
                     let engines = engine_cpu(&engines_before, &processes(), &existing, seconds);
-                    let cef =
-                        super::super::chrome::FRAMES_RECEIVED.load(Ordering::Relaxed) - cef_before;
-                    let stops =
-                        super::super::chrome::STREAM_STOPS.load(Ordering::Relaxed) - stops_before;
                     let (scale, zoom) = handle
                         .update(cx, |_, window, _| {
                             (window.scale_factor(), window.content_zoom())
@@ -663,8 +656,6 @@ mod perf {
                         "contentZoom": zoom,
                         "appCpuPercent": cpu,
                         "engineCpu": engines,
-                        "cefFramesPerSecond": cef as f64 / seconds,
-                        "cefStreamStops": stops,
                         "revise": revise,
                         "frameTime": summary(frames.durations.take(), seconds),
                         "pages": pages,

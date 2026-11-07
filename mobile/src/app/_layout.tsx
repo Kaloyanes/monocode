@@ -15,6 +15,7 @@ import {
 } from "@/features/connection/ConnectionProvider";
 import { WorkspaceGate } from "@/features/connection/WorkspaceGate";
 
+import { InboxProvider } from "@/features/inbox/InboxProvider";
 import { SessionLiveActivity } from "@/features/liveActivity/SessionLiveActivity";
 import { SessionNotifications } from "@/features/notifications/SessionNotifications";
 import { SessionActivity } from "@/features/sessions/SessionActivity";
@@ -180,39 +181,54 @@ function LinkedWorkspace() {
       <SessionNotifications />
       <SessionLiveActivity />
       <SessionActivity />
-      <ScenePagerHost drawer={<WorkspaceDrawer />}>
-        <Timed id="persistent frame">
-        <SessionFrame>
-          {/* A native stack: sessions push over their project, and the
-              code screens, Changes, settings, the model picker and the project
-              picker present
-              over the rest as native modals; everything else swaps in place,
-              as a plain slot did. */}
-          <Stack screenOptions={{ headerShown: false, animation: "none" }}>
-            <Stack.Screen name="file" options={screens.code} />
-            <Stack.Screen name="document" options={screens.code} />
-            <Stack.Screen name="diff" options={screens.code} />
-            <Stack.Screen
-              name="project/[projectId]/index"
-              options={screens.nativeHeader}
-            />
-            <Stack.Screen
-              name="project/[projectId]/session/[sessionId]"
-              options={screens.session}
-            />
-            <Stack.Screen name="session" options={screens.sessionSheet} />
-            <Stack.Screen name="projects" options={screens.modal} />
-            <Stack.Screen name="settings" options={screens.modal} />
-            <Stack.Screen name="mono-profile/[monoId]" options={screens.modal} />
-            <Stack.Screen name="models" options={screens.modal} />
-            <Stack.Screen name="agents" options={screens.modal} />
-            <Stack.Screen name="draft" options={screens.modal} />
-            <Stack.Screen name="changes" options={screens.changes} />
-            <Stack.Screen name="terminal" options={screens.changes} />
-          </Stack>
-        </SessionFrame>
-        </Timed>
-      </ScenePagerHost>
+      <WorkspaceLayout sidebar={!monoOnly}>
+        <ScenePagerHost drawer={monoOnly ? undefined : <WorkspaceDrawer />}>
+          <Timed id="persistent frame">
+            <SessionFrame standAside={monoOnly}>
+              {/* A native stack: sessions push over their project, and the
+                  code screens, Changes, settings, the model picker and the project
+                  picker present
+                  over the rest as native modals; everything else swaps in place,
+                  as a plain slot did. */}
+              <Stack screenOptions={{ headerShown: false, animation: "none" }}>
+                {/* Monos only, the list is under a native header too. Either
+                    way a chat pushes over the list as a session does over its
+                    project, its buttons morphing as it goes. */}
+                <Stack.Screen
+                  name="index"
+                  options={monoOnly ? screens.nativeHeader : {}}
+                />
+                <Stack.Screen name="mono/[monoId]" options={screens.session} />
+                <Stack.Screen name="file" options={screens.code} />
+                <Stack.Screen name="document" options={screens.code} />
+                <Stack.Screen name="diff" options={screens.code} />
+                <Stack.Screen
+                  name="project/[projectId]/index"
+                  options={screens.nativeHeader}
+                />
+                <Stack.Screen
+                  name="project/[projectId]/session/[sessionId]"
+                  options={screens.session}
+                />
+                <Stack.Screen name="session" options={screens.sessionSheet} />
+                <Stack.Screen name="projects" options={screens.modal} />
+                <Stack.Screen name="settings" options={screens.modal} />
+                <Stack.Screen name="mono-new" options={screens.page} />
+                <Stack.Screen name="mono-profile/[monoId]" options={screens.sheet} />
+                <Stack.Screen name="models" options={screens.modal} />
+                <Stack.Screen name="inbox-list" options={screens.session} />
+                <Stack.Screen name="inbox" options={screens.modal} />
+                <Stack.Screen name="changes" options={screens.changes} />
+                <Stack.Screen name="terminal" options={screens.changes} />
+                <Stack.Screen name="commit-plan" options={screens.changes} />
+              </Stack>
+            </SessionFrame>
+          </Timed>
+        </ScenePagerHost>
+      </WorkspaceLayout>
+      {covered ? (
+        <DitherLoading leaving={!changing} onGone={() => setCovered(false)} />
+      ) : null}
       </InboxProvider>
     </WorkspaceProvider>
   );

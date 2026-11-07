@@ -1,7 +1,9 @@
 //! Native Inbox services. Provider adapters preserve the Tauri API's requests,
 //! validation, response parsers and credential file formats.
+pub mod ask;
 mod avatar;
 mod media;
+pub mod review;
 pub use media::png as media_png;
 pub use media::{image_bytes as media_image_bytes, is_image_url, phone_image};
 pub mod azure_devops;
@@ -1139,6 +1141,26 @@ impl Service {
                 &reply_to,
             ),
         }
+    }
+    /// Posts `comments` as one review that only comments, and returns its URL.
+    pub fn submit_review(
+        &self,
+        item: &Item,
+        summary: &str,
+        comments: &[review::PendingComment],
+    ) -> Result<String, String> {
+        if comments.is_empty() && summary.trim().is_empty() {
+            return Err("There is nothing to submit".into());
+        }
+        if item.provider != "github" || item.kind != "pr" {
+            return Err("Reviews can be submitted on GitHub pull requests only".into());
+        }
+        github::git_github_submit_review_for(
+            self.project(item),
+            &item.repo,
+            item.number,
+            &review::github_payload(comments, summary),
+        )
     }
     pub fn diff(&self, item: &Item) -> Result<Diff, String> {
         self.diff_context(item, false)

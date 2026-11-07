@@ -3,8 +3,7 @@
 Text typed in a thread's composer and not sent belongs to the thread, not to
 the screen it was typed on. Typing in a thread on the desktop and then opening
 the same thread on the paired phone shows the same text in the phone's
-composer, and the other way round. This is the same rule as the shared page
-drafts in [phone-drafts-plan.md](phone-drafts-plan.md).
+composer, and the other way round.
 
 ## What travels
 
@@ -15,7 +14,7 @@ drafts in [phone-drafts-plan.md](phone-drafts-plan.md).
   Moving them would mean uploading every picked photo while it is still a
   draft. Each screen keeps its own files. When the phone changes or clears the
   text, the desktop composer's files stay where they are.
-- **Not the mode chip** (Plan, Operator, Orchestrator) or the model. On the
+- **Not the mode chip** (Plan) or the model. On the
   phone the mode goes with the next message only and the model is already a
   thread setting both screens share.
 - **Threads only.** A new session's composer has no thread yet, a worker
@@ -52,11 +51,20 @@ revision is still current; it keeps the row's attachments.
   the field loses focus, the screen goes away or the app goes to the
   background. The desktop already saves 150 ms after typing stops.
 
-Neither the session catalog nor the transcript watch carries the draft. The
+Neither the session catalog nor the transcript watch carries the text. The
 catalog goes to every screen of the phone and is rebuilt as a whole, which is
 too heavy to resend while someone types, and the watch frames feed the iOS
 native transcript, which has no use for composer text. One small long-poll per
 open thread keeps it separate.
+
+The catalog does carry a `draft` flag per session, for the Draft mark on the
+phone's session rows. It counts a saved draft or composer text, including the
+thread open on the desktop, because that thread isn't open on the phone. It
+trails a change by up to a publish and a poll, so while text here is unsent,
+and for 10 seconds after it last changed or was saved, the row follows the
+phone's own text (`localMark` in `composerDraft.ts`). That also marks text
+typed while the desktop is away. Like the desktop's mark, it gives way to
+Working.
 
 ## When both screens edit
 
@@ -76,7 +84,8 @@ open thread keeps it separate.
     phone draft never wipes a newer desktop one.
 - **The desktop is typing.** A phone write that arrives while the desktop
   composer was typed in during the last 2 seconds is refused the same way.
-- **Offline.** The phone keeps its text and unsent change per thread in memory
+- **Offline.** The field stays open and only Send and Stop wait for the
+  desktop. The phone keeps its text and unsent change per thread in memory
   while the app runs, so leaving the thread and coming back still shows it and
   retries the write. It is not saved to the phone's disk.
 

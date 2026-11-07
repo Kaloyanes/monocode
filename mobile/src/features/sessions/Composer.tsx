@@ -1,7 +1,9 @@
 import { ChoiceMenu } from "@/ui/ChoiceMenu";
 import { GlassMenuButton } from "@/ui/GlassMenuButton";
-import { Button } from "@expo/ui/swift-ui";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Button, Divider } from "@expo/ui/swift-ui";
+import { isLiquidGlassAvailable } from "expo-glass-effect";
+import { useNavigation } from "expo-router";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Alert, Platform, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import Animated, {
   Easing,
@@ -10,6 +12,7 @@ import Animated, {
   interpolate,
   useAnimatedStyle,
   useSharedValue,
+  withSpring,
   withTiming,
 } from "react-native-reanimated";
 
@@ -20,29 +23,32 @@ import { insert, prepend, rank, tokenAt, type SlashToken } from "@/features/skil
 import { useSlashCatalog, type SlashScope } from "@/features/skills/useSlashCatalog";
 import type { ComposerMode, Harness } from "@/features/workspace/types";
 import { FileTypeIcon } from "@/features/files/FileTypeIcon";
-import { Icon, type IconName } from "@/ui/Icon";
+import { GlassBacking } from "@/ui/GlassBacking";
+import { Icon } from "@/ui/Icon";
 import { LiquidView } from "@/ui/LiquidView";
-import { themedStyles, useColors, useScheme, type Scheme } from "@/ui/theme";
+import { themedStyles, useColors, useScheme } from "@/ui/theme";
 
 import {
   isImage,
   MAX_ATTACHMENTS,
   merge,
   pickFiles,
-  pickPhotos,
+  pickMedia,
   type Attachment,
 } from "./attachments";
+import { ComposerAction } from "./ComposerAction";
+import { ComposerPills, MODES } from "./ComposerPills";
 import { DictationBar } from "./DictationBar";
 import { cachedText } from "./composerDraft";
 import { canDictate, insertDictation } from "./dictation";
 import { TypingPostureFocus } from "./TypingPostureFocus";
-import { ProviderLogo } from "./ProviderLogo";
 import { COMPOSER_INPUT_ID } from "./SessionScreen";
 import { useComposerDraft } from "./useComposerDraft";
 
 export const COMPOSER_PLACEHOLDER = "Plan, ask, build…";
 /** Mid-turn the desktop steers with the message or queues it, as its setting says. */
 const BUSY_PLACEHOLDER = "Send a follow-up…";
+const OFFLINE_PLACEHOLDER = "Reconnecting to desktop…";
 
 const BUTTON = 36;
 /** Gap between the round buttons and the composer's edge. */
@@ -68,37 +74,12 @@ const MARGIN_COLLAPSED = 20;
 const MARGIN_EXPANDED = 12;
 const MORPH = { duration: 280, easing: Easing.out(Easing.cubic) };
 
-/** The desktop's + menu modes, in its order and with its words and hues. */
-const MODES: {
-  id: ComposerMode;
-  label: string;
-  hint: string;
-  systemImage: ComponentProps<typeof Button>["systemImage"];
-  tint: Record<Scheme, string>;
-}[] = [
-  {
-    id: "plan",
-    label: "Plan mode",
-    hint: "Review a plan before building",
-    systemImage: "lightbulb",
-    tint: { dark: "#fde047", light: "#a16207" },
-  },
-  {
-    id: "operator",
-    label: "Operator",
-    hint: "Give this thread access to MonoCode",
-    systemImage: "cursorarrow.rays",
-    tint: { dark: "#7dd3fc", light: "#0369a1" },
-  },
-  {
-    id: "orchestrator",
-    label: "Orchestrator",
-    hint: "Plan and coordinate agent work",
-    systemImage: "point.3.connected.trianglepath.dotted",
-    tint: { dark: "#f0abfc", light: "#a21caf" },
-  },
-];
 const DICTATION_FADE = { duration: 180, easing: Easing.out(Easing.cubic) };
+/** The mic drawing out into the recording's capsule, and the add button's turn to a cross. */
+const DICTATION_STRETCH = { duration: 380, dampingRatio: 0.8 };
+/** The capsule leads; what's in it follows, and leaves before it closes. */
+const DICTATION_CONTENT_DELAY = 90;
+const DICTATION_CONTENT_OUT = 70;
 /** A `/` suggestion's row, and how many show before the list scrolls. */
 const SUGGESTION_ROW = 48;
 const SUGGESTIONS_SHOWN = 3.5;
@@ -113,9 +94,9 @@ const SUGGESTIONS_SHOWN = 3.5;
  * While the desktop can't be reached, or the session's latest error stands,
  * the field gives way to a line saying so and nothing can be sent; a draft
  * waits under it.
- * With `modes`, the add menu also offers the desktop's Plan, Operator and
- * Orchestrator. The one picked shows as a chip by the model and goes with the
- * next message only, as on the desktop.
+ * With `modes`, the add menu also offers the desktop's Plan mode. Picked, it
+ * shows as a chip by the model and goes with the next message only, as on the
+ * desktop.
  * With `slash`, typing `/` or `$` suggests the chat's provider commands and
  * the project's skills above the field, and the add menu lists them all.
  * Either puts in `/name`, which the desktop reads as it does a typed one.
@@ -138,12 +119,15 @@ export function Composer({
   modes = false,
   onNewMono,
   slash,
+  active = true,
   compact = false,
   reply,
   onClearReply,
 }: {
   /** The thread whose composer text this shares with the desktop. */
   conversationId?: string;
+  /** Only the visible route may focus its composer in response to folding. */
+  active?: boolean;
   /** Where this runs: the project, or the mono. */
   context: string;
   branch: string;
@@ -185,8 +169,11 @@ export function Composer({
   const scheme = useScheme();
   const colors = useColors();
   const styles = useStyles();
+  const glass = isLiquidGlassAvailable();
   const offline = useOffline();
-  const blocked = offline ? "offline" : notice ? "error" : null;
+  // Losing the desktop holds back only what needs it, Send and Stop; the
+  // person can keep writing. An error waits until it's back.
+  const blocked = !offline && !!notice;
   const input = useRef<TextInput>(null);
   const [text, setText] = useState(() => cachedText(conversationId));
   const [sending, setSending] = useState(false);
@@ -281,17 +268,18 @@ export function Composer({
     height: interpolate(progress.get(), [0, 1], [COLLAPSED, expandedHeight]),
     marginHorizontal: interpolate(progress.get(), [0, 1], [MARGIN_COLLAPSED, marginExpanded]),
   }));
-  // The field slides from between the pill's buttons to its own band in the card.
+  // The field slides from between the pill's buttons to its own band in the
+  // card. In the pill it is exactly one line tall, so that line can't bounce.
   const inputStyle = useAnimatedStyle(() => {
     const p = progress.get();
     return {
       left: interpolate(p, [0, 1], [EDGE + BUTTON + 8, 18]),
       right: interpolate(p, [0, 1], [EDGE + BUTTON + 8, 18]),
       top: interpolate(p, [0, 1], [EDGE - 1, topRow + replyRow + strip + suggest]),
-      bottom: interpolate(p, [0, 1], [EDGE, BOTTOM_ROW]),
+      bottom: interpolate(p, [0, 1], [EDGE - 1, BOTTOM_ROW]),
     };
   });
-  // Dictation takes over the bottom row: its buttons, and the pill's field.
+  // Dictation takes over the bottom row: the model, and the pill's field.
   const dictation = useSharedValue(0);
   // Android still hit-tests transparent views. These absolute rows overlap the
   // collapsed input, so only their children may receive touches once the card
@@ -306,15 +294,11 @@ export function Composer({
         : "none" as const,
     } : {}),
   }));
+  const stretch = useSharedValue(0);
   useEffect(() => {
     dictation.set(withTiming(dictating ? 1 : 0, DICTATION_FADE));
-  }, [dictating, dictation]);
-  const undictated = useAnimatedStyle(() => ({
-    opacity: 1 - dictation.get(),
-    ...(Platform.OS === "android" ? {
-      pointerEvents: dictation.get() === 0 && !blocked ? "auto" as const : "none" as const,
-    } : {}),
-  }));
+    stretch.set(withSpring(dictating ? 1 : 0, DICTATION_STRETCH));
+  }, [dictating, dictation, stretch]);
   const fieldShown = useAnimatedStyle(() => ({
     opacity: 1 - dictation.get() * (1 - progress.get()),
   }));
@@ -414,7 +398,7 @@ export function Composer({
   // message, as a messaging app; a session's card lets go of it.
   const send = async () => {
     // The draft stays put until the desktop can take it.
-    if (!canSend || blocked) return;
+    if (!canSend || blocked || offline) return;
     const message = text.trim();
     const files = attachments;
     const sentMode = mode;
@@ -469,7 +453,10 @@ export function Composer({
       ) : null}
 
       {reply ? (
-        <Animated.View style={[styles.reply, { top: topRow - 2 }, expandedOnly]}>
+        <Animated.View
+          style={[styles.reply, !glass && styles.replyOutline, { top: topRow - 2 }, expandedOnly]}
+        >
+          {glass ? <GlassBacking /> : null}
           <Text style={styles.replyText} numberOfLines={1}>
             {reply.replace(/\s+/g, " ").trim()}
           </Text>
@@ -554,32 +541,20 @@ export function Composer({
               ),
             )
           }
-          placeholder={busy ? BUSY_PLACEHOLDER : COMPOSER_PLACEHOLDER}
+          placeholder={
+            offline ? OFFLINE_PLACEHOLDER : busy ? BUSY_PLACEHOLDER : COMPOSER_PLACEHOLDER
+          }
           placeholderTextColor={colors.muted}
+          // Leave scrolling on. A UITextView that can't scroll reports its frame
+          // as its content size, so onContentSizeChange would grow the card in
+          // a loop. Nothing scrolls until a draft passes INPUT_MAX anyway.
           multiline
-          // The pill's field is a point shorter than its one line, so it would
-          // bounce; only a draft taller than the card scrolls.
-          scrollEnabled={inputHeight >= INPUT_MAX}
           keyboardAppearance={scheme}
           cursorColor={colors.accent}
           selectionColor={colors.accent}
           style={[styles.input, blocked && styles.hidden]}
         />
-        {blocked === "offline" ? (
-          <Animated.View
-            key="offline"
-            entering={FadeIn.duration(DICTATION_FADE.duration)}
-            exiting={FadeOut.duration(DICTATION_FADE.duration)}
-            accessibilityRole="text"
-            accessibilityLabel="Reconnecting to your desktop. Messages can't be sent until it's back."
-            style={styles.status}
-          >
-            <PulsingDot />
-            <Text style={styles.statusLabel} numberOfLines={1}>
-              Reconnecting to desktop
-            </Text>
-          </Animated.View>
-        ) : blocked === "error" && notice ? (
+        {blocked && notice ? (
           <Animated.View
             key="error"
             entering={FadeIn.duration(DICTATION_FADE.duration)}
@@ -602,18 +577,38 @@ export function Composer({
         ) : null}
       </Animated.View>
 
+      {compact ? null : (
+        <ComposerPills
+          progress={progress}
+          dictation={dictation}
+          written={expandedOnly}
+          size={BUTTON}
+          edge={EDGE}
+          model={model}
+          effort={effort}
+          harness={harness}
+          mode={mode}
+          onModelPress={onModelPress}
+          onClearMode={() => setMode(null)}
+        />
+      )}
+
       {/* Bottom row, shared by both layouts: the buttons stay put as the card grows. */}
       <Animated.View
+        // Under a recording this is the cancel area's cross, which speaks for itself.
+        accessibilityElementsHidden={dictating}
+        importantForAccessibility={dictating ? "no-hide-descendants" : "auto"}
         pointerEvents={blocked ? "none" : "auto"}
-        style={[styles.button, styles.leading, undictated, blocked && styles.disabled]}
+        style={[styles.button, styles.leading, blocked && styles.disabled]}
       >
         <AddMenu
-          onPhotos={() => void attach(pickPhotos)}
+          onPhotos={() => void attach(pickMedia)}
           onFiles={() => void attach(pickFiles)}
           mode={mode}
           onMode={modes ? toggleMode : undefined}
           onNewMono={onNewMono}
           onSkills={slash ? openSkills : undefined}
+          turned={dictating}
         />
       </Animated.View>
 
@@ -629,48 +624,50 @@ export function Composer({
         </Text>
       ) : null}
 
-      {compact ? null : (
-      <Animated.View
-        style={[styles.modelChip, expandedOnly]}
-      >
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={`Model: ${model || "Desktop default"}${effort ? `, ${effort} effort` : ""}`}
-          accessibilityHint="Choose the model, account, effort and permissions"
-          onPress={onModelPress}
-          style={({ pressed }) => [styles.modelPill, pressed && styles.pressed]}
+      <View pointerEvents="box-none" style={styles.actionLane}>
+        <ComposerAction
+          // A draft mid-turn sends; without one the button stops the turn.
+          primary={
+            dictating
+              ? null
+              : canSend
+                ? {
+                    kind: "send",
+                    label: "Send",
+                    hint: offline ? "Available once your desktop reconnects" : undefined,
+                    disabled: offline,
+                    onPress: () => void send(),
+                  }
+                : busy && onStop
+                  ? {
+                      kind: "stop",
+                      label: "Stop",
+                      disabled: offline,
+                      onPress: () => {
+                        void onStop().catch((reason) => Alert.alert("Could not stop", String(reason)));
+                      },
+                    }
+                  : null
+          }
+          dictating={dictating}
+          stretch={stretch}
+          blocked={blocked}
+          size={BUTTON}
+          onDictate={dictate}
         >
-          {harness ? <ProviderLogo harness={harness} size={16} color={colors.content} /> : null}
-          <Text style={styles.model} numberOfLines={1}>
-            {model || "Desktop default"}
-            {effort ? <Text style={styles.effort}> {effort}</Text> : null}
-          </Text>
-          <Icon name="chevronDown" size={14} color={colors.muted} />
-        </Pressable>
-        {mode ? <ModeChip mode={mode} onClear={() => setMode(null)} /> : null}
-      </Animated.View>
-      )}
-
-      <Animated.View
-        pointerEvents={blocked ? "none" : "auto"}
-        style={[styles.button, styles.trailing, undictated, blocked && styles.disabled]}
-      >
-        {/* A draft mid-turn sends; without one the button stops the turn. */}
-        {canSend ? (
-          <RoundButton icon="send" label="Send" onPress={() => void send()} primary />
-        ) : busy && onStop ? (
-          <RoundButton label="Stop" onPress={() => { void onStop().catch(reason => Alert.alert("Could not stop", String(reason))); }} primary>
-            <View style={styles.stop} />
-          </RoundButton>
-        ) : (
-          <RoundButton icon="mic" label="Dictate" onPress={dictate} />
-        )}
-      </Animated.View>
+          {/* The placeholder says why until there's a draft over it. */}
+          {offline && canSend ? (
+            <View pointerEvents="none" style={styles.sendStatus}>
+              <PulsingDot />
+            </View>
+          ) : null}
+        </ComposerAction>
+      </View>
 
       {dictating ? (
         <Animated.View
-          entering={FadeIn.duration(DICTATION_FADE.duration)}
-          exiting={FadeOut.duration(DICTATION_FADE.duration)}
+          entering={FadeIn.delay(DICTATION_CONTENT_DELAY).duration(DICTATION_FADE.duration)}
+          exiting={FadeOut.duration(DICTATION_CONTENT_OUT)}
           style={styles.dictation}
         >
           <DictationBar onClose={endDictation} />
@@ -690,8 +687,10 @@ export function Composer({
 }
 
 /**
- * The add button: a native menu to attach photos or files. The menu grows
- * out of the button (see GlassMenuButton).
+ * The add button: a native menu to attach photos or files, with `onSkills`
+ * to list skills and commands, with `onMode` to pick a mode and with
+ * `onNewMono` to make a Mono. The menu grows out of the button (see
+ * GlassMenuButton).
  */
 function AddMenu({
   onPhotos,
@@ -700,6 +699,7 @@ function AddMenu({
   onMode,
   onNewMono,
   onSkills,
+  turned,
 }: {
   onPhotos: () => void;
   onFiles: () => void;
@@ -707,14 +707,16 @@ function AddMenu({
   onMode?: (mode: ComposerMode) => void;
   onNewMono?: () => void;
   onSkills?: () => void;
+  /** Dictating: the plus turns into the recording's cross. */
+  turned: boolean;
 }) {
   const styles = useStyles();
   const colors = useColors();
   const label = onMode ? "Add files or pick a mode" : "Add photos or files";
   if (Platform.OS === "android") return (
     <ChoiceMenu label={label} actions={[
-      { label: "Photo Library", onPress: onPhotos },
-      { label: "Files", onPress: onFiles },
+      { label: "Photo Library", icon: "image", onPress: onPhotos },
+      { label: "Files", icon: "folder", onPress: onFiles },
       ...(onSkills ? [{ label: "Skills and commands", onPress: onSkills }] : []),
       ...(onMode
         ? MODES.map((entry) => ({
@@ -725,38 +727,33 @@ function AddMenu({
         : []),
       ...(onNewMono ? [{ label: "New Mono", onPress: onNewMono }] : []),
     ]}>
-      <View style={styles.round}><Icon name="add" size={18} color={colors.content} /></View>
+      <LiquidView borderRadius={BUTTON / 2} innerStyle={styles.addSurface}>
+        <Icon name="add" size={18} color={colors.content} />
+      </LiquidView>
     </ChoiceMenu>
   );
   return (
-    <GlassMenuButton icon="add" symbol="plus" label="Add photos or files" size={BUTTON}>
+    <GlassMenuButton icon="add" symbol="plus" label={label} size={BUTTON} turned={turned}>
       <Button label="Photo Library" systemImage="photo.on.rectangle" onPress={onPhotos} />
       <Button label="Files" systemImage="folder" onPress={onFiles} />
+      {onSkills ? (
+        <Button label="Skills and commands" systemImage="sparkles" onPress={onSkills} />
+      ) : null}
+      {onMode ? <Divider /> : null}
+      {onMode
+        ? MODES.map((entry) => (
+            <Button
+              key={entry.id}
+              label={entry.label}
+              // A tick marks the mode that's on, as a menu's checked item.
+              systemImage={entry.id === mode ? "checkmark" : entry.systemImage}
+              onPress={() => onMode(entry.id)}
+            />
+          ))
+        : null}
+      {onNewMono ? <Divider /> : null}
+      {onNewMono ? <Button label="New Mono" systemImage="plus" onPress={onNewMono} /> : null}
     </GlassMenuButton>
-  );
-}
-
-/** The mode the next message goes in, by the model; tapping it turns it off. */
-function ModeChip({ mode, onClear }: { mode: ComposerMode; onClear: () => void }) {
-  const styles = useStyles();
-  const colors = useColors();
-  const scheme = useScheme();
-  const entry = MODES.find((candidate) => candidate.id === mode)!;
-  return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={`${entry.label}, on`}
-      accessibilityHint="Turns it off for this message"
-      hitSlop={4}
-      onPress={onClear}
-      style={({ pressed }) => [styles.modePill, pressed && styles.pressed]}
-    >
-      <Icon name={mode} size={16} color={entry.tint[scheme]} />
-      <Text style={styles.modeLabel} numberOfLines={1}>
-        {entry.label.replace(" mode", "")}
-      </Text>
-      <Icon name="close" size={12} color={colors.muted} />
-    </Pressable>
   );
 }
 
@@ -771,8 +768,10 @@ function AttachmentChip({
   const styles = useStyles();
   const colors = useColors();
   const image = isImage(attachment);
+  const glass = isLiquidGlassAvailable();
   return (
-    <View style={image ? styles.thumb : styles.fileChip}>
+    <View style={image ? styles.thumb : [styles.fileChip, !glass && styles.fileFill]}>
+      {!image && glass ? <GlassBacking radius={10} /> : null}
       {image ? (
         <Image source={{ uri: attachment.uri }} style={styles.thumbImage} resizeMode="cover" />
       ) : (
@@ -788,56 +787,20 @@ function AttachmentChip({
         accessibilityLabel={`Remove ${attachment.name}`}
         hitSlop={8}
         onPress={onRemove}
-        style={({ pressed }) => [styles.remove, pressed && styles.pressed]}
+        style={({ pressed }) => [
+          styles.remove,
+          !glass && styles.removeFill,
+          pressed && styles.pressed,
+        ]}
       >
+        {glass ? <GlassBacking round /> : null}
         <Icon name="close" size={10} color={colors.content} />
       </Pressable>
     </View>
   );
 }
 
-function RoundButton({
-  icon,
-  label,
-  onPress,
-  primary = false,
-  children,
-}: {
-  icon?: IconName;
-  label: string;
-  onPress?: () => void;
-  primary?: boolean;
-  children?: ReactNode;
-}) {
-  const colors = useColors();
-  const styles = useStyles();
-  return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      hitSlop={4}
-      onPress={onPress}
-      style={({ pressed }) => [
-        styles.round,
-        primary && styles.roundPrimary,
-        pressed && styles.pressed,
-      ]}
-    >
-      {children ??
-        (icon ? (
-          <Icon name={icon} size={18} color={primary ? colors.inverse : colors.content} />
-        ) : null)}
-    </Pressable>
-  );
-}
-
 const useStyles = themedStyles((colors) => ({
-  stop: {
-    width: 12,
-    height: 12,
-    borderRadius: 3,
-    backgroundColor: colors.inverse,
-  },
   contextRow: {
     position: "absolute",
     top: 12,
@@ -884,6 +847,8 @@ const useStyles = themedStyles((colors) => ({
     paddingRight: 14,
     borderRadius: (REPLY_ROW - 8) / 2,
     borderCurve: "continuous",
+  },
+  replyOutline: {
     borderWidth: StyleSheet.hairlineWidth * 2,
     borderColor: colors.stroke,
   },
@@ -922,6 +887,8 @@ const useStyles = themedStyles((colors) => ({
     paddingLeft: 10,
     paddingRight: 14,
     borderRadius: 10,
+  },
+  fileFill: {
     backgroundColor: colors.fill,
   },
   fileName: {
@@ -939,6 +906,8 @@ const useStyles = themedStyles((colors) => ({
     borderRadius: 9,
     alignItems: "center",
     justifyContent: "center",
+  },
+  removeFill: {
     backgroundColor: colors.surfaceRaised,
   },
   input: {
@@ -965,8 +934,13 @@ const useStyles = themedStyles((colors) => ({
   leading: {
     left: EDGE,
   },
-  trailing: {
+  // From past the add button to the composer's end: where the mic can reach.
+  actionLane: {
+    position: "absolute",
+    left: EDGE + BUTTON + 8,
     right: EDGE,
+    bottom: EDGE,
+    height: BUTTON,
   },
   // Over the bottom row, edge to edge between the pill's ends.
   dictation: {
@@ -976,65 +950,20 @@ const useStyles = themedStyles((colors) => ({
     bottom: EDGE,
     height: BUTTON,
   },
-  modelChip: {
-    position: "absolute",
-    bottom: EDGE,
-    left: EDGE + BUTTON + 8,
-    right: EDGE + BUTTON + 8,
-    flexDirection: "row",
-  },
-  // Shaped like the round buttons beside it: their height, tint and full rounding.
-  modelPill: {
-    flexShrink: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    height: BUTTON,
-    paddingHorizontal: 12,
-    borderRadius: BUTTON / 2,
-    backgroundColor: colors.fill,
-  },
-  modePill: {
-    flexShrink: 0,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    height: BUTTON,
-    marginLeft: 6,
-    paddingHorizontal: 12,
-    borderRadius: BUTTON / 2,
-    backgroundColor: colors.fill,
-  },
-  modeLabel: {
-    color: colors.content,
-    fontSize: 15,
-    fontWeight: "500",
-  },
-  model: {
-    flexShrink: 1,
-    color: colors.content,
-    fontSize: 15,
-    fontWeight: "500",
-  },
-  effort: {
-    color: colors.muted,
-    fontWeight: "400",
-  },
-  round: {
+  addSurface: {
     width: BUTTON,
     height: BUTTON,
-    borderRadius: BUTTON / 2,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: colors.fill,
-  },
-  roundPrimary: {
-    backgroundColor: colors.inverseSurface,
   },
   pressed: {
     opacity: 0.6,
   },
-  // In the field's place while nothing can be sent.
+  // On the corner of a Send that's waiting for the desktop.
+  sendStatus: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+  },
+  // In the field's place until an error is tapped away.
   status: {
     ...StyleSheet.absoluteFill,
     flexDirection: "row",

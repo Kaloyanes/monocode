@@ -46,15 +46,15 @@ const strip = (props: { height?: number; color?: string } = {}) => (
   <GradualBlur edge="bottom" height={props.height ?? 100} color={props.color ?? "#000000"} />
 );
 
-it("stacks six live blur layers by default, as it always looked", async () => {
+it("stacks four live blur layers by default, as six miss frames", async () => {
   await act(async () => root.render(strip()));
-  expect(counts.masks).toBe(6);
-  expect(counts.blurs).toBe(6);
+  expect(counts.masks).toBe(4);
+  expect(counts.blurs).toBe(4);
 });
 
 it("tints each layer with the original 50% of the background", async () => {
   await act(async () => root.render(strip({ color: "#123456" })));
-  expect(counts.tints).toEqual(Array(6).fill("#123456:0.5"));
+  expect(counts.tints).toEqual(Array(4).fill("#123456:0.5"));
 });
 
 it("does not render again when its parent does", async () => {
@@ -73,7 +73,7 @@ it("does not render again when its parent does", async () => {
   expect(counts.blurs).toBe(first.blurs);
 });
 
-it("keeps its six layers untouched while only its height changes", async () => {
+it("keeps its layers untouched while only its height changes", async () => {
   await act(async () => root.render(strip({ height: 100 })));
   const first = counts.masks;
   for (let height = 101; height <= 160; height++)
@@ -85,5 +85,5 @@ it("keeps its six layers untouched while only its height changes", async () => {
 it("rebuilds the layers once when the background changes", async () => {
   await act(async () => root.render(strip({ color: "#000000" })));
   await act(async () => root.render(strip({ color: "#ffffff" })));
-  expect(counts.masks).toBe(12);
+  expect(counts.masks).toBe(8);
 });

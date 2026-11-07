@@ -35,8 +35,11 @@ export function useSceneKey() {
 }
 
 /** Screens drawn under the stack's own native header, rather than the
- *  frame's: a project and its sessions. */
-export const hasNativeHeader = (pathname: string) => pathname.startsWith("/project/");
+ *  frame's: a project and its sessions, a Mono's chat, and the Inbox. */
+export const hasNativeHeader = (pathname: string) =>
+  pathname.startsWith("/project/") ||
+  pathname.startsWith("/mono/") ||
+  pathname === "/inbox-list";
 
 /** Routes the stack presents over the screen as native modals, which leave
  *  the screen under them as it was. */
@@ -49,6 +52,7 @@ const MODAL_ROUTES = [
   "/file",
   "/diff",
   "/mono-new",
+  "/inbox",
 ];
 export const isModalRoute = (pathname: string) =>
   MODAL_ROUTES.some((route) => pathname === route || pathname.startsWith(`${route}/`));

@@ -5,7 +5,8 @@ import ReanimatedSwipeable, {
 } from "react-native-gesture-handler/ReanimatedSwipeable";
 import Animated, { type EntryOrExitLayoutType, type SharedValue } from "react-native-reanimated";
 
-import { AgentDots } from "@/features/orchestration/AgentDots";
+import { PixelMascot } from "@/features/mascots/PixelMascot";
+import { useDraftMark } from "@/features/sessions/composerDraft";
 import { relativeTime } from "@/features/workspace/relativeTime";
 import type { SessionSummary } from "@/features/workspace/types";
 import { Icon } from "@/ui/Icon";
@@ -35,6 +36,7 @@ export function SessionCard({
   onRename,
   onDelete,
   onArchive,
+  archived = false,
   origin,
   onOpenOrigin,
   onOriginLongPress,
@@ -51,6 +53,8 @@ export function SessionCard({
   onDelete?: () => void;
   /** Archives it; the swipe offers the button only with this. */
   onArchive?: () => void;
+  /** It is in the archive, so `onArchive` takes it out again. */
+  archived?: boolean;
   /** Who started it, when a Mono did: a chip under the title. */
   origin?: SessionOrigin | null;
   /** The chip was tapped; the Mono's chat opens. */
@@ -70,18 +74,25 @@ export function SessionCard({
   const styles = useStyles();
   const swipeable = useRef<SwipeableMethods>(null);
   const opened = useRef(false);
+  const draft = useDraftMark(session);
 
   const row = (
     <Pressable
       accessibilityRole="button"
       accessibilityState={{ selected: active, busy: !!session.busy }}
-      accessibilityLabel={session.busy ? `${session.title}, working` : session.title}
+      accessibilityLabel={
+        session.busy
+          ? `${session.title}, working`
+          : draft
+            ? `${session.title}, draft`
+            : session.title
+      }
       // A tap on a row with its actions out puts them away instead.
       onPress={() => (opened.current ? swipeable.current?.close() : onPress())}
       onLongPress={onLongPress}
       accessibilityActions={[
         ...(onLongPress ? [{ name: "longpress", label: "Rename or delete" }] : []),
-        ...(onArchive ? [{ name: "archive", label: "Archive" }] : []),
+        ...(onArchive ? [{ name: "archive", label: archived ? "Unarchive" : "Archive" }] : []),
       ]}
       onAccessibilityAction={({ nativeEvent }) => {
         if (nativeEvent.actionName === "longpress") onLongPress?.();
@@ -96,6 +107,7 @@ export function SessionCard({
       {detailed ? (
         <SessionDetails
           session={session}
+          draft={draft}
           origin={origin}
           onOpenOrigin={onOpenOrigin}
           onOriginLongPress={onOriginLongPress}
@@ -112,7 +124,6 @@ export function SessionCard({
           <Text style={styles.title} numberOfLines={1}>
             {session.title}
           </Text>
-          {session.orchestration ? <AgentDots run={session.orchestration} /> : null}
         </>
       )}
     </Pressable>
@@ -148,6 +159,7 @@ export function SessionCard({
             onRename={act(onRename)}
             onDelete={act(onDelete)}
             onArchive={onArchive ? act(onArchive) : undefined}
+            archived={archived}
           />
         )}
       >
@@ -165,10 +177,12 @@ export function SessionCard({
  */
 function SessionDetails({
   session,
+  draft,
   origin,
   onOpenOrigin,
   onOriginLongPress,
 }: {
+  draft: boolean;
   session: SessionSummary;
   origin?: SessionOrigin | null;
   onOpenOrigin?: () => void;
@@ -183,11 +197,15 @@ function SessionDetails({
         <Text style={styles.cardTitle} numberOfLines={1}>
           {session.title}
         </Text>
-        {session.orchestration ? <AgentDots run={session.orchestration} /> : null}
         {session.busy ? (
           <View style={styles.status}>
             <TerminalSpinner style={styles.statusLabel} />
             <Text style={styles.statusLabel}>Working...</Text>
+          </View>
+        ) : draft ? (
+          <View style={styles.status}>
+            <Icon name="draft" size={14} color={colors.faint} />
+            <Text style={styles.time}>Draft</Text>
           </View>
         ) : (
           <Text style={styles.time}>{relativeTime(session.updatedAt)}</Text>
@@ -200,6 +218,19 @@ function SessionDetails({
             {session.branch || "No branch"}
           </Text>
         </View>
+        {session.workItem ? (
+          <View
+            style={styles.workItem}
+            accessibilityLabel={`${session.workItem.kind === "pr" ? "Pull request" : "Issue"} ${session.workItem.number}`}
+          >
+            <Icon
+              name={session.workItem.kind === "pr" ? "pullRequest" : "circle"}
+              size={13}
+              color={colors.accent}
+            />
+            <Text style={styles.workItemLabel}>#{session.workItem.number}</Text>
+          </View>
+        ) : null}
         <View style={styles.model}>
           {model ? (
             <Text style={styles.meta} numberOfLines={1}>
@@ -273,11 +304,13 @@ function RowActions({
   onRename,
   onDelete,
   onArchive,
+  archived,
 }: {
   progress: SharedValue<number>;
   onRename: () => void;
   onDelete: () => void;
   onArchive?: () => void;
+  archived: boolean;
 }) {
   const colors = useColors();
   return (
@@ -304,8 +337,8 @@ function RowActions({
         <SwipeAction
           progress={progress}
           from={0}
-          icon="archive"
-          label="Archive"
+          icon={archived ? "undo" : "archive"}
+          label={archived ? "Unarchive" : "Archive"}
           color={colors.accent}
           background={withAlpha(colors.accent, 0.16)}
           onPress={onArchive}
@@ -384,6 +417,16 @@ const useStyles = themedStyles((colors) => ({
     flexDirection: "row",
     alignItems: "center",
     gap: 5,
+  },
+  workItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+  },
+  workItemLabel: {
+    color: colors.accent,
+    fontSize: 13,
+    fontVariant: ["tabular-nums"],
   },
   model: {
     flexShrink: 1,

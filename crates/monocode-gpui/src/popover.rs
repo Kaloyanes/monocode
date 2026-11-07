@@ -309,6 +309,9 @@ fn entrance_offset(side: Side, progress: f32) -> Point<Pixels> {
 /// component; the whole card fades and slides from the anchored edge.
 /// Pressing outside it (and outside its anchor)
 /// dismisses it, and that press reaches nothing else.
+/// The layer popovers draw in. Within it, later in the tree draws on top.
+pub(crate) const POPOVER_LAYER: usize = 40;
+
 #[derive(IntoElement)]
 pub(crate) struct Popover {
     id: ElementId,
@@ -332,7 +335,7 @@ pub(crate) fn popover(id: impl Into<ElementId>, anchor: Anchor) -> Popover {
         anchor,
         options: Options::default(),
         padding: 0.,
-        priority: 40,
+        priority: POPOVER_LAYER,
         track: Vec::new(),
         ignore: Vec::new(),
         on_dismiss: None,
@@ -813,6 +816,15 @@ pub(crate) struct MenuAction {
     pub keep_open: bool,
     pub submenu: Vec<MenuAction>,
     pub flyout: Option<Flyout>,
+    /// A small icon button at the row's right edge that picks its own id,
+    /// shown while the row is highlighted.
+    pub trailing: Option<TrailingButton>,
+}
+#[derive(Clone)]
+pub(crate) struct TrailingButton {
+    pub id: SharedString,
+    pub icon: &'static str,
+    pub label: SharedString,
 }
 impl MenuAction {
     pub(crate) fn new(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
@@ -889,6 +901,19 @@ impl MenuAction {
         self.flyout = Some(flyout);
         self
     }
+    pub(crate) fn trailing(
+        mut self,
+        id: impl Into<SharedString>,
+        icon: &'static str,
+        label: impl Into<SharedString>,
+    ) -> Self {
+        self.trailing = Some(TrailingButton {
+            id: id.into(),
+            icon,
+            label: label.into(),
+        });
+        self
+    }
     fn opens(&self) -> bool {
         !self.disabled && (!self.submenu.is_empty() || self.flyout.is_some())
     }
@@ -936,6 +961,7 @@ pub(crate) struct Menu {
     width: f32,
     row_metrics: Option<(f32, f32)>,
     search_navigation: bool,
+    keep_search_focus: bool,
     submenu_width: Option<f32>,
     active: Option<usize>,
     submenu: Option<usize>,
@@ -990,6 +1016,7 @@ impl Menu {
             width: MENU_WIDTH,
             row_metrics: None,
             search_navigation: false,
+            keep_search_focus: false,
             submenu_width: None,
             active,
             submenu: None,
@@ -1012,6 +1039,26 @@ impl Menu {
     pub(crate) fn search_navigation(mut self) -> Self {
         self.search_navigation = true;
         self
+    }
+    /// Arrow keys move the highlight while typing continues in the field.
+    pub(crate) fn keep_search_focus(mut self) -> Self {
+        self.keep_search_focus = true;
+        self
+    }
+    /// Highlight the first selectable row, as after a new search.
+    pub(crate) fn highlight_first(&mut self, cx: &mut Context<Self>) {
+        self.active =
+            (0..self.items.len()).find(|&ix| self.action(ix).is_some_and(|a| !a.disabled));
+        cx.notify();
+    }
+    /// Highlight the checked row, falling back to the first.
+    pub(crate) fn highlight_checked(&mut self, cx: &mut Context<Self>) {
+        self.active = (0..self.items.len())
+            .find(|&ix| self.action(ix).is_some_and(|a| !a.disabled && a.checked));
+        if self.active.is_none() {
+            self.highlight_first(cx);
+        }
+        cx.notify();
     }
     pub(crate) fn submenu_width(mut self, width: f32) -> Self {
         self.submenu_width = Some(width);
@@ -1162,6 +1209,12 @@ impl Menu {
                 self.finish(MenuEvent::Picked(id, row), window, cx);
             }
         }
+    }
+    fn pick_trailing(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(button) = self.action(ix).and_then(|a| a.trailing.clone()) else {
+            return;
+        };
+        self.finish(MenuEvent::Picked(button.id, None), window, cx);
     }
     fn pick_sub(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(action) = self.submenu_items().get(ix) else {
@@ -1429,6 +1482,34 @@ impl Menu {
                     d
                 }
             })
+            .when_some(
+                action.trailing.clone().filter(|_| !in_submenu),
+                |d, button| {
+                    d.child(
+                        div()
+                            .id(("menu-trailing", ix))
+                            .role(Role::Button)
+                            .aria_label(button.label)
+                            .flex_shrink_0()
+                            .size(px(22.))
+                            .rounded(px(6.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(content(0.55))
+                            .when(!highlighted, |d| d.opacity(0.))
+                            .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                            .child(icon(button.icon, 14.))
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation()
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.pick_trailing(ix, window, cx);
+                            })),
+                    )
+                },
+            )
             .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
                 if !*hovered {
                     return;
@@ -1498,7 +1579,7 @@ impl Menu {
             .flex_1()
             .min_w_0()
             .child(match &action.badge {
-                // The Orchestrator row's "v1" pill beside its title.
+                // A short pill beside the row's title.
                 Some(badge) => div()
                     .flex()
                     .items_center()
@@ -1626,7 +1707,9 @@ impl Render for Menu {
                     return;
                 }
                 this.step(-1, cx);
-                window.focus(&this.focus, cx);
+                if !this.keep_search_focus {
+                    window.focus(&this.focus, cx);
+                }
                 cx.stop_propagation();
             }))
             .capture_action(cx.listener(|this, _: &crate::input::Down, window, cx| {
@@ -1635,7 +1718,9 @@ impl Render for Menu {
                     return;
                 }
                 this.step(1, cx);
-                window.focus(&this.focus, cx);
+                if !this.keep_search_focus {
+                    window.focus(&this.focus, cx);
+                }
                 cx.stop_propagation();
             }))
             .capture_action(cx.listener(|this, _: &crate::input::Submit, window, cx| {

@@ -103,6 +103,8 @@ pub(crate) struct Workspace {
     pub sidebar_activity_visible: bool,
     /// The activity card shows only its "Working" header row.
     pub sidebar_activity_collapsed: bool,
+    /// The Monos section shows only its heading.
+    pub sidebar_monos_collapsed: bool,
     /// The inset right panel: open state, tab, width and tab order.
     pub right_panel_open: bool,
     pub right_panel_tab: crate::right_panel::RightTab,
@@ -334,6 +336,7 @@ impl Default for Workspace {
             sidebar_inbox_visible: true,
             sidebar_activity_visible: true,
             sidebar_activity_collapsed: false,
+            sidebar_monos_collapsed: false,
             right_panel_open: false,
             right_panel_tab: Default::default(),
             right_panel_width: crate::right_panel::WIDTH_DEFAULT,

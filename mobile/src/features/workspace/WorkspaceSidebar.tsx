@@ -2,16 +2,47 @@ import { router, useGlobalSearchParams } from "expo-router";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { useInboxBadge, useInboxSupported } from "@/features/inbox/InboxProvider";
+import { inboxListRoute } from "@/features/inbox/routing";
 import { ProjectMascot } from "@/features/mascots/ProjectMascot";
+import { useDraftMark } from "@/features/sessions/composerDraft";
 import { ProviderLogo } from "@/features/sessions/ProviderLogo";
 import { Icon } from "@/ui/Icon";
 import { themedStyles, useColors } from "@/ui/theme";
 
 import { relativeTime } from "./relativeTime";
 import { projectForRoute } from "./routing";
+import { UnreadDot } from "./UnreadDot";
+import type { SessionSummary } from "./types";
 import { useWorkspace } from "./WorkspaceProvider";
 
 const RECENT_LIMIT = 20;
+
+function SessionState({ session }: { session: SessionSummary }) {
+  const draft = useDraftMark(session);
+  if (session.waiting) return "Needs attention";
+  if (session.busy) return "Working";
+  return draft ? "Draft" : relativeTime(session.updatedAt);
+}
+
+/** The Inbox, beside settings. Reads its own count, so a new one doesn't
+ *  re-render the sidebar. */
+function InboxButton({ projectId }: { projectId: string | undefined }) {
+  const styles = useStyles();
+  const colors = useColors();
+  const unread = useInboxBadge();
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={unread ? `Inbox, ${unread} unread` : "Inbox"}
+      onPress={() => router.navigate(inboxListRoute(projectId))}
+      style={styles.button}
+    >
+      <Icon name="inbox" size={20} color={colors.muted} />
+      {unread ? <UnreadDot /> : null}
+    </Pressable>
+  );
+}
 
 /** Reuses the workspace catalog; opening the sidebar never starts a second watch. */
 export function WorkspaceSidebar() {
@@ -19,6 +50,7 @@ export function WorkspaceSidebar() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
   const { projects, sessions, monos } = useWorkspace();
+  const inboxOn = useInboxSupported();
   const params = useGlobalSearchParams<{ projectId?: string; sessionId?: string; monoId?: string }>();
   const selected = projectForRoute(projects, params.projectId);
   const recent = sessions
@@ -33,6 +65,7 @@ export function WorkspaceSidebar() {
     >
       <View style={styles.header}>
         <Text accessibilityRole="header" style={styles.heading}>Projects</Text>
+        {inboxOn ? <InboxButton projectId={selected?.id} /> : null}
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Settings"
@@ -102,7 +135,7 @@ export function WorkspaceSidebar() {
               <Text numberOfLines={2} style={styles.sessionTitle}>{session.title || "Untitled session"}</Text>
               <Text numberOfLines={1} style={styles.meta}>
                 {projects.find((project) => project.id === session.projectId)?.name}
-                {" · "}{session.waiting ? "Needs attention" : session.busy ? "Working" : relativeTime(session.updatedAt)}
+                {" · "}<SessionState session={session} />
               </Text>
             </View>
             {session.busy || session.waiting ? (

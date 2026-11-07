@@ -325,6 +325,20 @@ impl SettingsView {
                 )],
             ),
             self.row(
+                Some("sidebar-sections"),
+                false,
+                "Working and Archived",
+                Some("In the list puts Working at the top and opens Archived as its own view. Docked keeps both at the bottom of the sidebar and opens them in place.".into()),
+                vec![self.segmented(
+                    "sidebar-sections",
+                    "Working and Archived",
+                    if p.docked_sections { "docked" } else { "list" },
+                    &[("list", "In the list"), ("docked", "Docked")],
+                    cx,
+                    |this, v, cx| this.update(cx, |p| p.docked_sections = v == "docked"),
+                )],
+            ),
+            self.row(
                 Some("show-excluded-files"),
                 false,
                 "Show excluded files",

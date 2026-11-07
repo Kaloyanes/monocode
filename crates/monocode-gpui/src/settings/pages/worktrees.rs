@@ -7,7 +7,7 @@ use crate::{
     },
     theme::*,
 };
-use gpui::{AnyElement, Context, SharedString, Stateful, Div, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, SharedString, Stateful, div, prelude::*, px};
 
 /// A 16px box that shows a tick when `on`; `disabled` dims it and ignores clicks.
 fn checkbox(
@@ -46,8 +46,8 @@ impl SettingsView {
         let project = self.project_picker(cx);
         // The list stays up while Git re-reads it, so only Create waits.
         let loading = self.worktrees_loading;
-        let ready = self.discovery.worktrees.error.is_none()
-            && !self.discovery.worktrees.main.is_empty();
+        let ready =
+            self.discovery.worktrees.error.is_none() && !self.discovery.worktrees.main.is_empty();
         let mut page=vec![div().relative().child(self.reveal_probe("project-worktrees")).flex().items_center().gap_1().child(project).child(secondary_button("create-settings-worktree","Create worktree",false,!ready||loading).child(icon("plus",12.)).child("Create worktree").on_click(cx.listener(move|this,_,window,cx|{if ready&&!this.worktrees_loading{this.open_management(Target::Worktree,window,cx);}}))).into_any_element(),div().mt_4().flex().items_center().justify_between().gap_3().child(div().min_w_0().flex_1().text_size(px(12.)).line_height(px(18.)).text_color(content(0.5)).child("Sessions can share a worktree. Deleting one keeps its sessions by default and discards uncommitted changes. Its branch and commits are kept.")).child(self.refresh_button("refresh-settings-worktrees","Refresh",cx)).into_any_element()];
         if self.selected_project.is_empty() {
             page.push(note("Add a project to manage its worktrees."));
@@ -122,20 +122,21 @@ impl SettingsView {
                         .items_center()
                         .justify_between()
                         .gap_3()
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(content(0.5))
-                                .child(if count == 0 {
-                                    format!(
-                                        "{} clean {} can be deleted together.",
-                                        clean.len(),
-                                        if clean.len() == 1 { "worktree" } else { "worktrees" }
-                                    )
-                                } else {
-                                    format!("{count} selected")
-                                }),
-                        )
+                        .child(div().text_size(px(12.)).text_color(content(0.5)).child(
+                            if count == 0 {
+                                format!(
+                                    "{} clean {} can be deleted together.",
+                                    clean.len(),
+                                    if clean.len() == 1 {
+                                        "worktree"
+                                    } else {
+                                        "worktrees"
+                                    }
+                                )
+                            } else {
+                                format!("{count} selected")
+                            },
+                        ))
                         .child(
                             div()
                                 .flex()
@@ -144,19 +145,30 @@ impl SettingsView {
                                 .child(
                                     secondary_button(
                                         "select-clean-worktrees",
-                                        if all { "Clear selection" } else { "Select all clean" },
+                                        if all {
+                                            "Clear selection"
+                                        } else {
+                                            "Select all clean"
+                                        },
                                         false,
                                         false,
                                     )
-                                    .child(if all { "Clear selection" } else { "Select all clean" })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if all {
-                                            this.selected_trees.clear();
-                                        } else {
-                                            this.selected_trees = clean.iter().cloned().collect();
-                                        }
-                                        cx.notify();
-                                    })),
+                                    .child(if all {
+                                        "Clear selection"
+                                    } else {
+                                        "Select all clean"
+                                    })
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if all {
+                                                this.selected_trees.clear();
+                                            } else {
+                                                this.selected_trees =
+                                                    clean.iter().cloned().collect();
+                                            }
+                                            cx.notify();
+                                        },
+                                    )),
                                 )
                                 .child(
                                     secondary_button(
@@ -171,15 +183,17 @@ impl SettingsView {
                                     } else {
                                         format!("Delete selected ({count})")
                                     })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        if !chosen.is_empty() {
-                                            this.open_management(
-                                                Target::DeleteTrees(chosen.clone()),
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                    })),
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            if !chosen.is_empty() {
+                                                this.open_management(
+                                                    Target::DeleteTrees(chosen.clone()),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        },
+                                    )),
                                 ),
                         )
                         .into_any_element(),
@@ -309,7 +323,10 @@ impl SettingsView {
                             .child(
                                 secondary_button(
                                     SharedString::from(format!("new-session-tree-{ix}")),
-                                    format!("New session in {}", t.branch.as_deref().unwrap_or("worktree")),
+                                    format!(
+                                        "New session in {}",
+                                        t.branch.as_deref().unwrap_or("worktree")
+                                    ),
                                     false,
                                     t.missing,
                                 )

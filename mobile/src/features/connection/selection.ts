@@ -3,6 +3,9 @@
  * come with their projects. `monoIds` stays in the stored shape so a
  * selection saved before that still loads; nothing reads it.
  */
+/** Monos are on: every desktop's phone offers them. */
+export const MONOS_ENABLED = true;
+
 export type MobileSelection = { projectIds: string[]; monoIds: string[] };
 
 export function normalizeSelection(value: unknown): MobileSelection | null {

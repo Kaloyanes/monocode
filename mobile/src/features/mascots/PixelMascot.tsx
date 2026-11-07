@@ -1,6 +1,8 @@
 import { memo } from "react";
 import { StyleSheet, View } from "react-native";
+import Animated, { useAnimatedStyle } from "react-native-reanimated";
 
+import { createBeat, useBeat } from "@/ui/beat";
 import { withAlpha, themedStyles } from "@/ui/theme";
 
 import {
@@ -11,7 +13,12 @@ import {
   type PixelLayers,
   type PixelRect,
 } from "./pixelMascots";
-import { useFrameToggle } from "./useFrameToggle";
+
+// Matches the desktop's 600ms rest/talk cycle (300ms per frame).
+const FRAME_MS = 300;
+
+// One clock for every mascot at work, and none while none is shown.
+const beat = createBeat(FRAME_MS, 2);
 
 /** What a mascot's agent is doing, as on desktop. */
 export type MascotStatus = "idle" | "working" | "needs-you";
@@ -52,11 +59,26 @@ const Figure = memo(function Figure({ layers, unit }: { layers: PixelLayers; uni
   );
 });
 
+/** Both frames mounted, the beat flipping which one shows (see `beat`). */
+function Talking({ rest, talk, unit }: { rest: PixelLayers; talk: PixelLayers; unit: number }) {
+  const talking = useBeat(beat);
+  const resting = useAnimatedStyle(() => ({ opacity: talking.get() === 0 ? 1 : 0 }));
+  const speaking = useAnimatedStyle(() => ({ opacity: talking.get() === 0 ? 0 : 1 }));
+  return (
+    <>
+      <Animated.View collapsable={false} style={[styles.frame, resting]}>
+        <Figure layers={rest} unit={unit} />
+      </Animated.View>
+      <Animated.View collapsable={false} style={[styles.frame, speaking]}>
+        <Figure layers={talk} unit={unit} />
+      </Animated.View>
+    </>
+  );
+}
+
 /**
  * Shaded pixel mascot used for monos, the native take on the desktop PixelMascot.
- * Drawn with Views from the same rects, so there is no SVG dependency. While
- * working it keeps both frames mounted and flips which one shows, so the shared
- * clock changes two styles rather than rebuilding hundreds of Views. Shows the
+ * Drawn with Views from the same rects, so there is no SVG dependency. Shows the
  * bulb when the mono needs you.
  */
 export function PixelMascot({
@@ -73,7 +95,6 @@ export function PixelMascot({
   /** Centres the figure itself in its square, as a picker's tiles want. */
   centered?: boolean;
 }) {
-  const talking = useFrameToggle(status === "working");
   const rest = pixelLayers(name, color, false);
   const talk = status === "working" ? pixelLayers(name, color, true) : null;
   const unit = size / PIXEL_GRID;
@@ -83,14 +104,7 @@ export function PixelMascot({
     <View style={{ width: size, height: size }} accessibilityElementsHidden>
       <View style={{ position: "absolute", left: offset.x * unit, top: offset.y * unit, width: size, height: size }}>
         {talk ? (
-          <>
-            <View style={talking ? styles.off : styles.frame}>
-              <Figure layers={rest} unit={unit} />
-            </View>
-            <View style={talking ? styles.frame : styles.off}>
-              <Figure layers={talk} unit={unit} />
-            </View>
-          </>
+          <Talking rest={rest} talk={talk} unit={unit} />
         ) : (
           <Figure layers={rest} unit={unit} />
         )}
@@ -134,9 +148,11 @@ export function MonoMascot({
   );
 }
 
+// A flip must only change a prop. `display: "none"` unmounts the frame's native
+// views, and a frame left collapsable is flattened whenever it is visible, so
+// either way every pixel View is rebuilt or moved on each flip.
 const styles = StyleSheet.create({
   frame: { ...StyleSheet.absoluteFill },
-  off: { ...StyleSheet.absoluteFill, display: "none" },
 });
 
 const useStyles = themedStyles((colors) => ({
