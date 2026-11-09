@@ -11,6 +11,10 @@ vi.mock("expo-image-picker", () => ({
   VideoExportPreset: { H264_960x540: 5 },
 }));
 vi.mock("expo-image-manipulator", () => ({ ImageManipulator: {}, SaveFormat: {} }));
+vi.mock("expo-clipboard", () => ({ ContentType: { IMAGE: "image" } }));
+vi.mock("react-native", () => ({
+  AppState: { addEventListener: () => ({ remove: () => {} }) },
+}));
 vi.mock("expo-file-system", () => ({
   File: class {
     uri: string;

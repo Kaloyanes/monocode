@@ -26,6 +26,7 @@ vi.mock("react-native", () => ({
   },
   View: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
 }));
+vi.mock("expo-clipboard", () => ({ setStringAsync: async () => true }));
 vi.mock("@/features/files/FileTypeIcon", () => ({ FileTypeIcon: () => null }));
 vi.mock("@/ui/Icon", () => ({ Icon: () => null }));
 vi.mock("@/ui/theme", () => ({

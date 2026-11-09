@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Starting a subagent with a wrong model or setting now lists the valid choices.
 - A running `!` command now shows its thread as working in the sidebar, tabs, filters and on the phone, where Stop cancels it. It also keeps the Mac awake and blocks auto-archive and worktree cleanup until it ends.
 - A merged pull request now offers to archive its linked threads: the PR panel shows **Archive thread** in place of the merge button, and the GitHub activity card appears even when the thread itself did the merging. The panel also no longer shows a pull request as open after you merge it there.
+- A Mono's completion report for a delegated session now carries that session's final answer from its latest turn, instead of every progress message and earlier report with the answer cut off. A long answer keeps its ending and says how to read the rest.
+- `sessions.read` can page through a long message with `charOffset`, following the `nextCharOffset` it returns.
 
 ## [0.16.0] - 2026-10-19
 

@@ -1179,6 +1179,14 @@ impl QuickComposer {
             &model_name(self.kind, self.model.as_deref()),
         );
         let can_submit = self.can_submit(cx);
+        // As the effort footer: only for a model that offers fast mode.
+        let fast = self.fast
+            && self.models.as_ref().is_some_and(|models| {
+                models
+                    .read(cx)
+                    .catalog_model(self.kind, self.model.as_deref())
+                    .is_some_and(|model| model.fast)
+            });
         div()
             .flex_shrink_0()
             .flex()
@@ -1222,6 +1230,7 @@ impl QuickComposer {
                 .py_1()
                 .child(provider_icon(self.kind.id(), 14.))
                 .child(div().truncate().child(name))
+                .when(fast, |d| d.child(crate::conversation::fast_bolt()))
                 .child(chevron(
                     "quick-model-chevron",
                     self.picker == Some(Picker::Model),

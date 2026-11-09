@@ -16,6 +16,9 @@ const runtime = vi.hoisted(() => ({
   values: [] as { get: () => unknown; set: (value: unknown) => void }[],
   photos: vi.fn(async () => []),
   files: vi.fn(async () => []),
+  paste: vi.fn(async () => [] as object[]),
+  merge: vi.fn((existing: object[], added: object[]) => [...existing, ...added]),
+  clipboard: null as ((hasImage: boolean) => void) | null,
 }));
 vi.mock("react-native", () => {
   const View = ({
@@ -213,7 +216,14 @@ vi.mock("@/features/sessions/attachments", () => ({
   MAX_ATTACHMENTS: 10,
   pickMedia: runtime.photos,
   pickFiles: runtime.files,
-  merge: vi.fn(),
+  pasteImage: runtime.paste,
+  watchClipboardImage: (onChange: (hasImage: boolean) => void) => {
+    runtime.clipboard = onChange;
+    return () => {
+      runtime.clipboard = null;
+    };
+  },
+  merge: runtime.merge,
   isImage: () => false,
 }));
 vi.mock("@/ui/Icon", () => ({ Icon: () => null }));
@@ -571,4 +581,31 @@ it("keeps the mic round at rest, however wide the composer is", () => {
   const { width, minWidth } = button("Dictate").parentElement!.style;
   expect(width).toBe("0%");
   expect(minWidth).toBe("36px");
+});
+
+it("offers to paste a copied image and holds it as a picked photo", async () => {
+  const pasted = { id: "p", name: "Pasted image.png", mimeType: "image/png", size: 3, uri: "file:///p.png", data: "AAA" };
+  runtime.paste.mockResolvedValueOnce([pasted]);
+  render();
+  const menuItems = () => [...container.querySelectorAll("button")].map((item) => item.textContent);
+  await act(async () => button("Add photos or files").click());
+  expect(menuItems()).not.toContain("Paste Image");
+  await act(async () => button("Add photos or files").click());
+
+  act(() => runtime.clipboard!(true));
+  await act(async () => button("Add photos or files").click());
+  expect(menuItems()).toContain("Paste Image");
+  await act(async () =>
+    [...container.querySelectorAll("button")].find((item) => item.textContent === "Paste Image")!.click(),
+  );
+  expect(runtime.paste).toHaveBeenCalledWith(10);
+  expect(runtime.merge).toHaveBeenCalledWith([], [pasted]);
+  // The same strip as a picked photo, removable the same way, and sent with the message.
+  expect(button("Remove Pasted image.png")).toBeTruthy();
+  await act(async () => button("Send").click());
+  expect(send).toHaveBeenCalledWith("", [pasted], undefined, undefined);
+
+  act(() => runtime.clipboard!(false));
+  await act(async () => button("Add photos or files").click());
+  expect(menuItems()).not.toContain("Paste Image");
 });

@@ -32,8 +32,10 @@ import {
   isImage,
   MAX_ATTACHMENTS,
   merge,
+  pasteImage,
   pickFiles,
   pickMedia,
+  watchClipboardImage,
   type Attachment,
 } from "./attachments";
 import { ComposerAction } from "./ComposerAction";
@@ -181,6 +183,10 @@ export function Composer({
   const [mode, setMode] = useState<ComposerMode | null>(null);
   const [inputHeight, setInputHeight] = useState(INPUT_MIN);
   const [dictating, setDictating] = useState(false);
+  // A copied screenshot or photo: the add menu offers to paste it, as
+  // React Native's field pastes only text.
+  const [clipboardImage, setClipboardImage] = useState(false);
+  useEffect(() => watchClipboardImage(setClipboardImage), []);
   // Where dictated words go: the cursor, or the selection they replace.
   const selection = useRef({ start: 0, end: 0 });
   // The field's text as of its last change, ahead of the render that shows it,
@@ -602,6 +608,7 @@ export function Composer({
         style={[styles.button, styles.leading, blocked && styles.disabled]}
       >
         <AddMenu
+          onPaste={clipboardImage ? () => void attach(pasteImage) : undefined}
           onPhotos={() => void attach(pickMedia)}
           onFiles={() => void attach(pickFiles)}
           mode={mode}
@@ -687,12 +694,13 @@ export function Composer({
 }
 
 /**
- * The add button: a native menu to attach photos or files, with `onSkills`
- * to list skills and commands, with `onMode` to pick a mode and with
- * `onNewMono` to make a Mono. The menu grows out of the button (see
- * GlassMenuButton).
+ * The add button: a native menu to attach photos or files, or the
+ * clipboard's image when it holds one, with `onSkills` to list skills and
+ * commands, with `onMode` to pick a mode and with `onNewMono` to make a
+ * Mono. The menu grows out of the button (see GlassMenuButton).
  */
 function AddMenu({
+  onPaste,
   onPhotos,
   onFiles,
   mode,
@@ -701,6 +709,7 @@ function AddMenu({
   onSkills,
   turned,
 }: {
+  onPaste?: () => void;
   onPhotos: () => void;
   onFiles: () => void;
   mode: ComposerMode | null;
@@ -715,6 +724,7 @@ function AddMenu({
   const label = onMode ? "Add files or pick a mode" : "Add photos or files";
   if (Platform.OS === "android") return (
     <ChoiceMenu label={label} actions={[
+      ...(onPaste ? [{ label: "Paste Image", icon: "copy" as const, onPress: onPaste }] : []),
       { label: "Photo Library", icon: "image", onPress: onPhotos },
       { label: "Files", icon: "folder", onPress: onFiles },
       ...(onSkills ? [{ label: "Skills and commands", onPress: onSkills }] : []),
@@ -734,6 +744,9 @@ function AddMenu({
   );
   return (
     <GlassMenuButton icon="add" symbol="plus" label={label} size={BUTTON} turned={turned}>
+      {onPaste ? (
+        <Button label="Paste Image" systemImage="doc.on.clipboard" onPress={onPaste} />
+      ) : null}
       <Button label="Photo Library" systemImage="photo.on.rectangle" onPress={onPhotos} />
       <Button label="Files" systemImage="folder" onPress={onFiles} />
       {onSkills ? (

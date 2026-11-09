@@ -88,6 +88,7 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         "workspace::FocusPaneUp" => "Pane: Focus Up",
         "workspace::FocusPaneDown" => "Pane: Focus Down",
         "workspace::NewTerminal" => "Terminal: New",
+        "workspace::SplitTerminal" => "Terminal: Split Right",
         "workspace::ToggleTerminal" => "Terminal: Toggle Dock",
         "workspace::ToggleDevice" => "View: Toggle Device",
         "file_editor::Find" => "Editor: Find",
