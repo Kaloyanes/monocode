@@ -120,6 +120,7 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
             MenuItem::action("Device", ToggleDevice),
             MenuItem::action("Switch Model…", SwitchModel),
             MenuItem::action("Change Effort…", ChangeEffort),
+            MenuItem::action("Focus Composer", FocusComposer),
             MenuItem::separator(),
             MenuItem::action("Previous Session", PreviousSession),
             MenuItem::action("Next Session", NextSession),

@@ -134,6 +134,7 @@ actions!(
         PreviousTab,
         ToggleSidebar,
         FocusSearch,
+        FocusComposer,
         SearchFiles,
         FocusNext,
         FocusPrevious,
@@ -259,6 +260,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", DismissMenu, context),
         KeyBinding::new(&format!("{modifier}-b"), ToggleSidebar, context),
         KeyBinding::new(&format!("{modifier}-k"), FocusSearch, context),
+        KeyBinding::new(&format!("{modifier}-l"), FocusComposer, context),
         KeyBinding::new(&format!("{modifier}-shift-f"), SearchFiles, context),
         KeyBinding::new(
             &format!("{modifier}-f"),
@@ -4945,6 +4947,42 @@ impl Shell {
     }
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_app_search(window, cx);
+    }
+    /// `Composer: Focus` (Cmd+L): the visible conversation's composer. A
+    /// terminal or file pane hands off to its chat when that chat shares the
+    /// tab; a review that hid its chat shows it again.
+    fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.app_search.is_some() || self.app_view_open() {
+            return;
+        }
+        if let Some(monos) = self.monos.clone().filter(|m| m.read(cx).active.is_some()) {
+            monos.update(cx, |m, cx| m.focus_active(window, cx));
+            return;
+        }
+        if self.focus_mono_pane(window, cx) {
+            return;
+        }
+        let Some(pane) = self.workspace.active else {
+            return;
+        };
+        let id = self.workspace.session_for_pane(pane);
+        if id != pane {
+            if self.workspace.tab_of(id).is_none()
+                || self.workspace.tab_of(id) != self.workspace.tab_of(pane)
+            {
+                return;
+            }
+            self.review_focused = false;
+            self.focus_pane(id, window, cx);
+        }
+        let Some(view) = self.sessions.get(&id) else {
+            return;
+        };
+        let input = view.read(cx).input.focus_handle(cx);
+        self.chat_hidden_off(id, cx);
+        self.review_focused = false;
+        window.focus(&input, cx);
+        cx.notify();
     }
 
     pub(super) fn select_project(
@@ -10075,6 +10113,9 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &FocusSearch, window, cx| this.focus_search(window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &FocusComposer, window, cx| this.focus_composer(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 // Title bar terminals open a new tab each time.
                 if this.terminal_in_title() {
@@ -11563,6 +11604,36 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn focus_composer_shortcut_focuses_the_active_composer(cx: &mut TestAppContext) {
+        let (window, _, active) = window(cx);
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            bind_keys(cx);
+            crate::input::bind(cx);
+        });
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(shell.workspace.active, Some(active));
+                w.focus(&shell.focus, cx);
+                assert!(!shell.sessions[&active].read(cx).composer_focused(w, cx));
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let m = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(window.into(), &format!("{m}-l"));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, w, cx| {
+                assert!(shell.sessions[&active].read(cx).composer_focused(w, cx));
+            })
+            .unwrap();
     }
 
     #[gpui::test]

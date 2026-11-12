@@ -86,6 +86,12 @@ pub(crate) const BINDINGS: &[Binding] = &[
         fixed: false,
     },
     Binding {
+        command: "Composer: Focus",
+        keys: "⌘L",
+        when: "Always",
+        fixed: false,
+    },
+    Binding {
         command: "Composer: Toggle Workspace",
         keys: "⌘⇧G",
         when: "Draft session composer",
