@@ -5,7 +5,6 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let bytes:&'static [u8]=match path{
    "pencil-edit-02"=>include_bytes!("../assets/hugeicons/pencil-edit-02.svg"),
-   "quote-down"=>include_bytes!("../assets/hugeicons/quote-down.svg"),
    "login-01"=>include_bytes!("../assets/hugeicons/login-01.svg"),
    "logout-01"=>include_bytes!("../assets/hugeicons/logout-01.svg"),
    "smart-phone"=>include_bytes!("../assets/hugeicons/smart-phone.svg"),
