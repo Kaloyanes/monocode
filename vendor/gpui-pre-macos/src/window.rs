@@ -783,7 +783,7 @@ struct MacWindowState {
     close_callback: Option<Box<dyn FnOnce()>>,
     appearance_changed_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
-    last_key_equivalent: Option<KeyDownEvent>,
+    key_equivalent_echo: KeyEquivalentEcho,
     last_left_mouse_down_event: Option<Retained<Objc2Object>>,
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
@@ -1411,7 +1411,7 @@ impl MacWindow {
                 close_callback: None,
                 appearance_changed_callback: None,
                 input_handler: None,
-                last_key_equivalent: None,
+                key_equivalent_echo: KeyEquivalentEcho::default(),
                 last_left_mouse_down_event: None,
                 synthetic_drag_counter: 0,
                 traffic_light_position: titlebar
@@ -2958,7 +2958,42 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
 }
 
 extern "C" fn handle_key_equivalent(this: &Object, _: Sel, native_event: id) -> BOOL {
-    handle_key_event(this, native_event, true)
+    let handled = handle_key_event(this, native_event, true);
+    let window_state = unsafe { get_window_state(this) };
+    window_state
+        .as_ref()
+        .lock()
+        .key_equivalent_echo
+        .settled(handled == YES);
+    handled
+}
+
+/// AppKit offers some keystrokes to `performKeyEquivalent:` first and, only
+/// when that declines, sends the same event again as `keyDown:`. That second
+/// delivery is skipped so the key is not handled twice.
+///
+/// A handled key equivalent has no echo. The same event can still arrive as a
+/// `keyDown:` afterwards when the app itself offered it, for example a monitor
+/// forwarding shortcuts while a native subview is first responder, and that
+/// subview then passes the key up the responder chain. That delivery is the
+/// only one that reaches the focused element, so it must not be dropped.
+#[derive(Default)]
+struct KeyEquivalentEcho(Option<KeyDownEvent>);
+
+impl KeyEquivalentEcho {
+    fn offered(&mut self, event: &KeyDownEvent) {
+        self.0 = Some(event.clone());
+    }
+
+    fn settled(&mut self, handled: bool) {
+        if handled {
+            self.0 = None;
+        }
+    }
+
+    fn is_echo(&mut self, event: &KeyDownEvent) -> bool {
+        self.0.take().as_ref() == Some(event)
+    }
 }
 
 extern "C" fn handle_key_down(this: &Object, _: Sel, native_event: id) {
@@ -3062,8 +3097,8 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
             // makes no distinction between these two types of events, so we need to ignore
             // the "key down" event if we've already just processed its "key equivalent" version.
             if key_equivalent {
-                lock.last_key_equivalent = Some(key_down_event.clone());
-            } else if lock.last_key_equivalent.take().as_ref() == Some(&key_down_event) {
+                lock.key_equivalent_echo.offered(&key_down_event);
+            } else if lock.key_equivalent_echo.is_echo(&key_down_event) {
                 return NO;
             }
 
@@ -4571,6 +4606,45 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_down(keystroke: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke::parse(keystroke).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    #[test]
+    fn a_declined_key_equivalent_skips_its_key_down() {
+        let mut echo = KeyEquivalentEcho::default();
+        let key = key_down("ctrl-a");
+        echo.offered(&key);
+        echo.settled(false);
+        assert!(echo.is_echo(&key));
+        // The next press is new input.
+        assert!(!echo.is_echo(&key));
+    }
+
+    #[test]
+    fn a_handled_key_equivalent_leaves_the_next_key_down_alone() {
+        // A native subview is first responder: the shortcut monitor offers
+        // alt-backspace to GPUI, which declines to act for the subview, then the
+        // subview passes the same keyDown up to GPUI's view.
+        let mut echo = KeyEquivalentEcho::default();
+        let key = key_down("alt-backspace");
+        echo.offered(&key);
+        echo.settled(true);
+        assert!(!echo.is_echo(&key));
+    }
+
+    #[test]
+    fn a_different_key_down_is_never_an_echo() {
+        let mut echo = KeyEquivalentEcho::default();
+        echo.offered(&key_down("ctrl-a"));
+        echo.settled(false);
+        assert!(!echo.is_echo(&key_down("alt-backspace")));
+    }
 
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
