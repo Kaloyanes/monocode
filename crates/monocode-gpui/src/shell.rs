@@ -25,6 +25,7 @@ mod keep_awake_shots;
 mod layout;
 mod list_cascade;
 mod live_agents;
+mod scratch_sweep;
 mod sidebar_sections;
 mod mobile_host;
 pub(crate) mod mobile_terminal;
@@ -749,6 +750,8 @@ pub(crate) struct Shell {
     archiving: HashSet<i64>,
     /// When the last auto-archive sweep ran; `None` until the next one.
     auto_archive_swept: Option<std::time::Instant>,
+    /// When Claude's leftover temp folders were last swept; `None` until the first tick.
+    scratch_swept: Option<std::time::Instant>,
     archive_exits: archive_motion::ArchiveExits,
     archive_shortcut_held: bool,
     /// Editors offered by a project's "Open in editor"; `None` while scanning.
@@ -1050,6 +1053,7 @@ impl Shell {
                     .update(cx, |this, cx| {
                         this.poll_reminders(cx);
                         this.poll_auto_archive(cx);
+                        this.poll_scratch_sweep(cx);
                         this.poll_automations(cx);
                         this.update_chat_visibility(cx);
                         if this.workspace.sidebar_visible {
@@ -1208,6 +1212,7 @@ impl Shell {
             unseen_finished: HashSet::new(),
             archiving: HashSet::new(),
             auto_archive_swept: None,
+            scratch_swept: None,
             archive_exits: Default::default(),
             archive_shortcut_held: false,
             external_editors: None,

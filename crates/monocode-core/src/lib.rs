@@ -31,6 +31,7 @@ pub mod remote;
 pub mod resources;
 pub mod response;
 pub mod scm;
+pub mod scratch;
 pub mod session_filters;
 pub mod session_groups;
 pub mod session_title;
