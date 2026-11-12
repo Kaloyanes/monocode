@@ -1429,7 +1429,11 @@ impl DevicePanel {
                     "Liquid Glass",
                     segmented(
                         "device-glass",
-                        &[("clear", "Clear"), ("default", "Default"), ("tinted", "Tinted")],
+                        &[
+                            ("clear", "Clear"),
+                            ("default", "Default"),
+                            ("tinted", "Tinted"),
+                        ],
                         &glass,
                         cx,
                         |this, value, cx| this.set_setting(Setting::LiquidGlass, value, false, cx),
@@ -2078,7 +2082,7 @@ fn switch(id: impl Into<gpui::ElementId>, label: &'static str, on: bool) -> Stat
         )
 }
 
-fn segmented(
+pub(super) fn segmented(
     id: &'static str,
     options: &[(&'static str, &'static str)],
     current: &str,

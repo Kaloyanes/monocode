@@ -10,23 +10,27 @@
 //!
 //! Input is read by the view itself and sent to the stream's input thread,
 //! so touches don't wait on GPUI's event loop either.
-use super::stream::{Input, InputSender, Sink};
+use super::stream::{Input, InputSender, Queued, Sink};
 use crate::draft::{Overlay, Painted, mark_painted, track_overlay};
 use gpui::{Window, canvas, prelude::*};
-use monocode_core::device::protocol::{Modifiers, ParameterSets, Phase};
+use monocode_core::device::protocol::{Modifiers, ParameterSets, Phase, Rotation};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained, runtime::AnyObject, sel,
 };
-use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventPhase, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{
+    NSEvent, NSEventModifierFlags, NSEventPhase, NSView, NSWindowOcclusionState,
+    NSWindowOrderingMode,
+};
 use objc2_av_foundation::{AVLayerVideoGravityResize, AVSampleBufferDisplayLayer};
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFMutableDictionary, CFRetained, kCFBooleanTrue,
+    CFBoolean, CFDictionary, CFMutableDictionary, CFRetained, CGAffineTransform, CGPoint, CGRect,
+    CGSize, kCFBooleanTrue,
 };
 use objc2_core_media::{
     CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
     CMVideoFormatDescriptionCreateFromH264ParameterSets, CMVideoFormatDescriptionGetDimensions,
-    kCMBlockBufferAssureMemoryNowFlag, kCMSampleAttachmentKey_DisplayImmediately,
+    kCMSampleAttachmentKey_DisplayImmediately,
 };
 use objc2_core_video::{
     CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
@@ -35,13 +39,17 @@ use objc2_core_video::{
     kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
+use objc2_quartz_core::{CALayer, CATransaction};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
     ptr::NonNull,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 /// The layer and the format of the stream it is showing. Fed from the
@@ -53,7 +61,19 @@ pub(crate) struct Renderer {
     /// 14), which can hand back the frame on screen; the layer otherwise.
     target: Retained<AnyObject>,
     format: Mutex<Option<CFRetained<CMFormatDescription>>>,
+    /// Whether anyone can see the layer; set by its view on the main thread.
+    showing: Arc<AtomicBool>,
+    /// Samples given to the layer that it still holds, counted down as
+    /// CoreMedia frees each one's data (`free_block`).
+    held: Arc<AtomicUsize>,
 }
+
+/// The most samples the layer may hold before frames are dropped. A layer
+/// that keeps up lets each go once it decodes, so this is a backlog: the
+/// layer takes everything it is given and `isReadyForMoreMediaData` stays
+/// true (measured: 240 queued at once), and its queue's upkeep grows with
+/// its length, so a backlog left alone only grows.
+const MAX_HELD: usize = 30;
 
 // SAFETY: the layer is created on the main thread and only its sample-buffer
 // methods, which AVFoundation allows off the main thread, are called elsewhere.
@@ -79,11 +99,13 @@ impl Renderer {
             layer,
             target,
             format: Mutex::new(None),
+            showing: Arc::new(AtomicBool::new(false)),
+            held: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// The frame on screen, for a still while a popover covers the view.
-    fn displayed(&self) -> Option<CFRetained<CVPixelBuffer>> {
+    pub(super) fn displayed(&self) -> Option<CFRetained<CVPixelBuffer>> {
         let responds: bool =
             unsafe { msg_send![&*self.target, respondsToSelector: sel!(copyDisplayedPixelBuffer)] };
         if !responds {
@@ -128,10 +150,16 @@ impl Sink for Renderer {
         ))
     }
 
-    fn frame(&self, avcc: &[u8]) -> bool {
+    fn frame(&self, avcc: &[u8]) -> Queued {
         let status: isize = unsafe { msg_send![&*self.target, status] };
         if status == STATUS_FAILED {
-            return false;
+            return Queued::Failed;
+        }
+        // The layer queues whatever it is given; past this it isn't keeping
+        // up, and every frame more is memory it holds.
+        let ready: bool = unsafe { msg_send![&*self.target, isReadyForMoreMediaData] };
+        if !ready || self.held.load(Ordering::Relaxed) >= MAX_HELD {
+            return Queued::Full;
         }
         let format = self
             .format
@@ -139,19 +167,23 @@ impl Sink for Renderer {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let Some(format) = format else {
-            return false;
+            return Queued::Failed;
         };
-        let Some(sample) = (unsafe { sample(&format, avcc) }) else {
-            return false;
+        let Some(sample) = (unsafe { sample(&format, avcc, &self.held, None) }) else {
+            return Queued::Failed;
         };
         let _: () = unsafe { msg_send![&*self.target, enqueueSampleBuffer: &*sample] };
         #[cfg(debug_assertions)]
         super::counters::count(&super::counters::FRAMES_QUEUED);
-        true
+        Queued::Yes
     }
 
     fn flush(&self) {
         let _: () = unsafe { msg_send![&*self.target, flush] };
+    }
+
+    fn showing(&self) -> bool {
+        self.showing.load(Ordering::Relaxed)
     }
 }
 
@@ -170,6 +202,18 @@ unsafe extern "C" {
         destination: *const CVPixelBuffer,
     ) -> i32;
     fn VTPixelTransferSessionInvalidate(session: *mut c_void);
+    fn VTPixelRotationSessionCreate(allocator: *const c_void, session: *mut *mut c_void) -> i32;
+    fn VTPixelRotationSessionRotateImage(
+        session: *mut c_void,
+        source: *const CVPixelBuffer,
+        destination: *const CVPixelBuffer,
+    ) -> i32;
+    fn VTPixelRotationSessionInvalidate(session: *mut c_void);
+    fn VTSessionSetProperty(session: *mut c_void, key: *const c_void, value: *const c_void) -> i32;
+    static kVTPixelRotationPropertyKey_Rotation: *const c_void;
+    static kVTRotation_CW90: *const c_void;
+    static kVTRotation_180: *const c_void;
+    static kVTRotation_CCW90: *const c_void;
 }
 
 unsafe extern "C" {
@@ -183,10 +227,69 @@ fn paintable_frame(frame: CFRetained<CVPixelBuffer>) -> Option<CFRetained<CVPixe
     if paintable(CVPixelBufferGetPixelFormatType(&frame)) {
         return Some(frame);
     }
-    let (width, height) = (
+    let converted = bgra_buffer(
+        CVPixelBufferGetWidth(&frame),
+        CVPixelBufferGetHeight(&frame),
+    )?;
+    unsafe {
+        let mut session: *mut c_void = std::ptr::null_mut();
+        if VTPixelTransferSessionCreate(std::ptr::null(), &mut session) != 0 || session.is_null() {
+            return None;
+        }
+        let status = VTPixelTransferSessionTransferImage(
+            session,
+            CFRetained::as_ptr(&frame).as_ptr(),
+            CFRetained::as_ptr(&converted).as_ptr(),
+        );
+        VTPixelTransferSessionInvalidate(session);
+        CFRelease(session);
+        (status == 0).then_some(converted)
+    }
+}
+
+/// `frame` turned by `rotation`, for a still of a turned picture: GPUI
+/// paints a surface only upright. `frame` is BGRA, as `paintable_frame`
+/// leaves it.
+fn turned_frame(
+    frame: CFRetained<CVPixelBuffer>,
+    rotation: Rotation,
+) -> Option<CFRetained<CVPixelBuffer>> {
+    let angle = unsafe {
+        match rotation {
+            Rotation::None => return Some(frame),
+            Rotation::Clockwise => kVTRotation_CW90,
+            Rotation::Half => kVTRotation_180,
+            Rotation::CounterClockwise => kVTRotation_CCW90,
+        }
+    };
+    let (width, height) = rotation.turned(
         CVPixelBufferGetWidth(&frame),
         CVPixelBufferGetHeight(&frame),
     );
+    let turned = bgra_buffer(width, height)?;
+    unsafe {
+        let mut session: *mut c_void = std::ptr::null_mut();
+        if VTPixelRotationSessionCreate(std::ptr::null(), &mut session) != 0 || session.is_null() {
+            return None;
+        }
+        let status =
+            if VTSessionSetProperty(session, kVTPixelRotationPropertyKey_Rotation, angle) == 0 {
+                VTPixelRotationSessionRotateImage(
+                    session,
+                    CFRetained::as_ptr(&frame).as_ptr(),
+                    CFRetained::as_ptr(&turned).as_ptr(),
+                )
+            } else {
+                -1
+            };
+        VTPixelRotationSessionInvalidate(session);
+        CFRelease(session);
+        (status == 0).then_some(turned)
+    }
+}
+
+/// An empty BGRA buffer GPUI can paint.
+pub(super) fn bgra_buffer(width: usize, height: usize) -> Option<CFRetained<CVPixelBuffer>> {
     // GPUI makes a Metal texture of it, which needs IOSurface backing.
     let surface =
         CFDictionary::<objc2_core_foundation::CFString, objc2_core_foundation::CFType>::empty();
@@ -211,52 +314,62 @@ fn paintable_frame(frame: CFRetained<CVPixelBuffer>) -> Option<CFRetained<CVPixe
         )
     };
     // SAFETY: a `Create` function returns a reference the caller owns.
-    let converted = unsafe {
+    Some(unsafe {
         CFRetained::from_raw(NonNull::new(converted).filter(|_| status == kCVReturnSuccess)?)
-    };
+    })
+}
+
+/// Frees a sample's data once CoreMedia lets go of it, and counts it off
+/// the renderer's `held`, whose `Arc` it was given as `refcon`.
+unsafe extern "C-unwind" fn free_block(refcon: *mut c_void, memory: NonNull<c_void>, _: usize) {
     unsafe {
-        let mut session: *mut c_void = std::ptr::null_mut();
-        if VTPixelTransferSessionCreate(std::ptr::null(), &mut session) != 0 || session.is_null() {
-            return None;
-        }
-        let status = VTPixelTransferSessionTransferImage(
-            session,
-            CFRetained::as_ptr(&frame).as_ptr(),
-            CFRetained::as_ptr(&converted).as_ptr(),
-        );
-        VTPixelTransferSessionInvalidate(session);
-        CFRelease(session);
-        (status == 0).then_some(converted)
+        libc::free(memory.as_ptr());
+        let held = Arc::from_raw(refcon.cast_const().cast::<AtomicUsize>());
+        held.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 /// One access unit as a sample marked to show the moment it decodes: no
 /// timebase, no buffering, so a frame waits only for the next display
-/// refresh.
-unsafe fn sample(format: &CMFormatDescription, data: &[u8]) -> Option<CFRetained<CMSampleBuffer>> {
+/// refresh. `held` counts it until CoreMedia frees it. `timing` is for
+/// measuring the queue only.
+unsafe fn sample(
+    format: &CMFormatDescription,
+    data: &[u8],
+    held: &Arc<AtomicUsize>,
+    timing: Option<objc2_core_media::CMSampleTimingInfo>,
+) -> Option<CFRetained<CMSampleBuffer>> {
     unsafe {
+        let memory = libc::malloc(data.len().max(1));
+        let memory = NonNull::new(memory)?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), memory.as_ptr().cast::<u8>(), data.len());
+        let refcon = Arc::into_raw(held.clone());
+        let source = objc2_core_media::CMBlockBufferCustomBlockSource {
+            version: 0,
+            AllocateBlock: None,
+            FreeBlock: Some(free_block),
+            refCon: refcon.cast_mut().cast(),
+        };
         let mut block: *mut CMBlockBuffer = std::ptr::null_mut();
         let status = CMBlockBuffer::create_with_memory_block(
             None,
-            std::ptr::null_mut(),
+            memory.as_ptr(),
             data.len(),
             None,
-            std::ptr::null(),
+            &source,
             0,
             data.len(),
-            kCMBlockBufferAssureMemoryNowFlag,
+            0,
             NonNull::from(&mut block),
         );
-        let block = CFRetained::from_raw(NonNull::new(block).filter(|_| status == 0)?);
-        if CMBlockBuffer::replace_data_bytes(
-            NonNull::new(data.as_ptr().cast_mut().cast::<c_void>())?,
-            &block,
-            0,
-            data.len(),
-        ) != 0
-        {
+        let Some(block) = NonNull::new(block).filter(|_| status == 0) else {
+            // CoreMedia took nothing; the data and the count are still ours.
+            libc::free(memory.as_ptr());
+            drop(Arc::from_raw(refcon));
             return None;
-        }
+        };
+        held.fetch_add(1, Ordering::Relaxed);
+        let block = CFRetained::from_raw(block);
         let size = data.len();
         let mut sample: *mut CMSampleBuffer = std::ptr::null_mut();
         let status = CMSampleBuffer::create_ready(
@@ -264,8 +377,8 @@ unsafe fn sample(format: &CMFormatDescription, data: &[u8]) -> Option<CFRetained
             Some(&block),
             Some(format),
             1,
-            0,
-            std::ptr::null(),
+            timing.is_some() as _,
+            timing.as_ref().map_or(std::ptr::null(), |t| t as *const _),
             1,
             &size,
             NonNull::from(&mut sample),
@@ -297,6 +410,30 @@ pub(crate) struct ViewState {
     input: RefCell<Option<InputSender>>,
     /// Where the current trackpad scroll's drag has got to, 0–1.
     scroll: Cell<Option<(f64, f64)>>,
+    /// The renderer's: placed, unhidden, in a window that is on a lit
+    /// screen.
+    showing: Arc<AtomicBool>,
+    /// Whether the view's window can be seen at all, as last told to the
+    /// panel.
+    window_seen: Cell<Option<bool>>,
+    seen: async_channel::Sender<bool>,
+}
+
+/// Every display is asleep. AppKit may not mark a window occluded for it.
+static SCREENS_ASLEEP: AtomicBool = AtomicBool::new(false);
+
+const OCCLUSION_CHANGED: &str = "NSWindowDidChangeOcclusionStateNotification";
+const SCREENS_SLEPT: &str = "NSWorkspaceScreensDidSleepNotification";
+const SCREENS_WOKE: &str = "NSWorkspaceScreensDidWakeNotification";
+
+fn notification_center() -> Retained<AnyObject> {
+    unsafe { msg_send![objc2::class!(NSNotificationCenter), defaultCenter] }
+}
+
+fn workspace_center() -> Retained<AnyObject> {
+    let workspace: Retained<AnyObject> =
+        unsafe { msg_send![objc2::class!(NSWorkspace), sharedWorkspace] };
+    unsafe { msg_send![&*workspace, notificationCenter] }
 }
 
 define_class!(
@@ -314,6 +451,47 @@ define_class!(
         #[unsafe(method(acceptsFirstResponder))]
         fn accepts_first_responder(&self) -> bool {
             true
+        }
+        /// Follows the window's occlusion: minimised, covered, on another
+        /// Space or with the app hidden, nothing composites the picture.
+        #[unsafe(method(viewDidMoveToWindow))]
+        fn did_move_to_window(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidMoveToWindow] };
+            let center = notification_center();
+            let name = objc2_foundation::NSString::from_str(OCCLUSION_CHANGED);
+            let none: Option<&AnyObject> = None;
+            let _: () =
+                unsafe { msg_send![&*center, removeObserver: self, name: &*name, object: none] };
+            if let Some(window) = self.window() {
+                let _: () = unsafe {
+                    msg_send![&*center, addObserver: self, selector: sel!(monocodeSeenChanged:), name: &*name, object: &*window]
+                };
+            }
+            self.refresh_seen();
+        }
+        #[unsafe(method(viewDidHide))]
+        fn did_hide(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidHide] };
+            self.refresh_seen();
+        }
+        #[unsafe(method(viewDidUnhide))]
+        fn did_unhide(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidUnhide] };
+            self.refresh_seen();
+        }
+        #[unsafe(method(monocodeSeenChanged:))]
+        fn seen_changed(&self, _notification: &AnyObject) {
+            self.refresh_seen();
+        }
+        #[unsafe(method(monocodeScreensSlept:))]
+        fn screens_slept(&self, _notification: &AnyObject) {
+            SCREENS_ASLEEP.store(true, Ordering::Relaxed);
+            self.refresh_seen();
+        }
+        #[unsafe(method(monocodeScreensWoke:))]
+        fn screens_woke(&self, _notification: &AnyObject) {
+            SCREENS_ASLEEP.store(false, Ordering::Relaxed);
+            self.refresh_seen();
         }
         /// A click in an inactive window still reaches the device.
         #[unsafe(method(acceptsFirstMouse:))]
@@ -382,6 +560,34 @@ fn clipboard_text() -> Option<String> {
 }
 
 impl ScreenView {
+    /// Whether the window is on a lit screen and not occluded.
+    fn window_seen(&self) -> bool {
+        !SCREENS_ASLEEP.load(Ordering::Relaxed)
+            && self.window().is_some_and(|window| {
+                window
+                    .occlusionState()
+                    .contains(NSWindowOcclusionState::Visible)
+            })
+    }
+    /// Tells the renderer whether anyone can see the picture, and the panel
+    /// whether anyone can see the window. Coming into view asks the stream
+    /// for a keyframe if it dropped frames meanwhile.
+    fn refresh_seen(&self) {
+        let state = self.ivars();
+        let window = self.window().is_some().then(|| self.window_seen());
+        if let Some(window) = window
+            && state.window_seen.replace(Some(window)) != Some(window)
+        {
+            let _ = state.seen.try_send(window);
+        }
+        let showing = window == Some(true) && !self.isHiddenOrHasHiddenAncestor();
+        if state.showing.swap(showing, Ordering::Relaxed) != showing
+            && showing
+            && let Some(input) = state.input.borrow().as_ref()
+        {
+            input.resync();
+        }
+    }
     fn send(&self, input: Input) {
         if let Some(sender) = self.ivars().input.borrow().as_ref() {
             sender.send(input);
@@ -475,14 +681,20 @@ impl ScreenView {
 /// The view, its layer and the bookkeeping that places it.
 pub(crate) struct Screen {
     view: Retained<ScreenView>,
+    /// The view's own layer, clipped to the picture's rounded rect; the
+    /// video layer sits inside it, turned when the device's interface is
+    /// turned against its framebuffer.
+    container: Retained<CALayer>,
     renderer: Arc<Renderer>,
     painted: Painted,
-    /// Frame and corner radius as last applied, so an unchanged paint
+    /// Frame, corner radius and turn as last applied, so an unchanged paint
     /// touches nothing native.
-    placed: Cell<[f64; 5]>,
+    placed: Cell<[f64; 6]>,
     /// The frame painted in the view's place while something covers it,
     /// taken once when the cover starts.
     still: RefCell<Option<CFRetained<CVPixelBuffer>>>,
+    /// Whether the window can be seen, each time that changes.
+    seen: async_channel::Receiver<bool>,
 }
 
 impl Overlay for Screen {
@@ -497,24 +709,43 @@ impl Screen {
     pub(crate) fn new() -> Option<Rc<Self>> {
         let mtm = MainThreadMarker::new()?;
         let renderer = Arc::new(Renderer::new(mtm));
+        let (seen_tx, seen) = async_channel::unbounded();
         let view = ScreenView::alloc(mtm).set_ivars(ViewState {
             input: RefCell::new(None),
             scroll: Cell::new(None),
+            showing: renderer.showing.clone(),
+            window_seen: Cell::new(None),
+            seen: seen_tx,
         });
         let view: Retained<ScreenView> = unsafe {
             msg_send![super(view), initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(1., 1.))]
         };
-        // A layer-hosting view: the video layer is the view's own layer.
-        let _: () = unsafe { msg_send![&*view, setLayer: &*renderer.layer] };
+        // A layer-hosting view: the container is the view's own layer.
+        let container = CALayer::new();
+        container.setMasksToBounds(true);
+        container.addSublayer(&renderer.layer);
+        let _: () = unsafe { msg_send![&*view, setLayer: &*container] };
         view.setWantsLayer(true);
-        renderer.layer.setMasksToBounds(true);
         view.setHidden(true);
+        let workspace = workspace_center();
+        let none: Option<&AnyObject> = None;
+        for (name, selector) in [
+            (SCREENS_SLEPT, sel!(monocodeScreensSlept:)),
+            (SCREENS_WOKE, sel!(monocodeScreensWoke:)),
+        ] {
+            let name = objc2_foundation::NSString::from_str(name);
+            let _: () = unsafe {
+                msg_send![&*workspace, addObserver: &*view, selector: selector, name: &*name, object: none]
+            };
+        }
         let screen = Rc::new(Self {
             view,
+            container,
             renderer,
             painted: Default::default(),
-            placed: Cell::new([f64::NAN; 5]),
+            placed: Cell::new([f64::NAN; 6]),
             still: RefCell::new(None),
+            seen,
         });
         let overlay: Rc<dyn Overlay> = screen.clone();
         track_overlay(&overlay, &screen.painted);
@@ -523,8 +754,39 @@ impl Screen {
     pub(crate) fn sink(&self) -> Arc<dyn Sink> {
         self.renderer.clone()
     }
+    /// The layer's renderer, for the 3D model to take frames from.
+    pub(super) fn renderer(&self) -> Arc<Renderer> {
+        self.renderer.clone()
+    }
+    pub(super) fn view(&self) -> &NSView {
+        &self.view
+    }
+    /// Places the view at `bounds` under whatever covers it there, as the
+    /// 3D model does, so its layer keeps showing frames. False while the
+    /// view would be clipped, when it steps aside.
+    pub(super) fn place_beneath(
+        &self,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        rotation: Rotation,
+        window: &mut Window,
+    ) -> bool {
+        self.still.take();
+        self.place(bounds, 0., rotation, window)
+    }
     pub(crate) fn set_input(&self, sender: Option<InputSender>) {
         *self.view.ivars().input.borrow_mut() = sender;
+    }
+    /// Whether the window can be seen, each time that changes: minimised,
+    /// covered, on another Space, with the app hidden or the display asleep,
+    /// it can't.
+    pub(crate) fn window_seen(&self) -> async_channel::Receiver<bool> {
+        self.seen.clone()
+    }
+    /// The stream stopped: lets go of the frames the layer still holds,
+    /// keeping the one on screen.
+    pub(crate) fn release(&self) {
+        self.set_input(None);
+        self.renderer.flush();
     }
     /// Clears the picture, as when the device changes.
     pub(crate) fn clear(&self) {
@@ -535,14 +797,16 @@ impl Screen {
         }
     }
 
-    /// Fills its parent with the largest `aspect` (width over height) rect
-    /// that fits, paints `backdrop` there for while no frame has arrived,
-    /// and places the device's view over it. While a popover covers it, the
-    /// view steps aside and the frame it was showing is painted instead.
-    /// `live` false keeps the view aside, as while the device is off.
+    /// Fills its parent with the largest `aspect` (width over height, as
+    /// shown) rect that fits, paints `backdrop` there for while no frame has
+    /// arrived, and places the device's view over it, its picture turned by
+    /// `rotation`. While a popover covers it, the view steps aside and the
+    /// frame it was showing is painted instead. `live` false keeps the view
+    /// aside, as while the device is off.
     pub(crate) fn element(
         self: &Rc<Self>,
         aspect: f32,
+        rotation: Rotation,
         corner: f32,
         backdrop: gpui::Hsla,
         live: bool,
@@ -570,7 +834,11 @@ impl Screen {
                     screen.step_aside();
                     let mut still = screen.still.borrow_mut();
                     if still.is_none() {
-                        *still = screen.renderer.displayed().and_then(paintable_frame);
+                        *still = screen
+                            .renderer
+                            .displayed()
+                            .and_then(paintable_frame)
+                            .and_then(|frame| turned_frame(frame, rotation));
                     }
                     if let Some(still) = still.clone() {
                         window.paint_surface(fitted, still);
@@ -578,19 +846,25 @@ impl Screen {
                     return;
                 }
                 screen.still.take();
-                screen.place(fitted, corner, window);
+                screen.place(fitted, corner, rotation, window);
             },
         )
         .size_full()
         .into_any_element()
     }
 
-    fn place(&self, bounds: gpui::Bounds<gpui::Pixels>, corner: f32, window: &mut Window) {
+    fn place(
+        &self,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        corner: f32,
+        rotation: Rotation,
+        window: &mut Window,
+    ) -> bool {
         let Ok(handle) = HasWindowHandle::window_handle(window) else {
-            return;
+            return false;
         };
         let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-            return;
+            return false;
         };
         // GPUI keeps its AppKit content view alive throughout paint.
         let parent = unsafe { &*handle.ns_view.as_ptr().cast::<NSView>() };
@@ -603,7 +877,7 @@ impl Screen {
             || visible.size.height < bounds.size.height - gpui::px(0.5)
         {
             self.step_aside();
-            return;
+            return false;
         }
         let bounds = bounds.map(|v| v * zoom);
         let (x, y, width, height) = (
@@ -622,16 +896,58 @@ impl Screen {
         if !attached {
             parent.addSubview_positioned_relativeTo(&self.view, NSWindowOrderingMode::Above, None);
         }
-        let placed = [x, y, width, height, f64::from(corner * zoom)];
+        let placed = [
+            x,
+            y,
+            width,
+            height,
+            f64::from(corner * zoom),
+            rotation.radians(),
+        ];
         if self.placed.get() != placed {
             self.view
                 .setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)));
-            self.renderer.layer.setCornerRadius(placed[4]);
+            // The video layer is a sublayer, which Core Animation would
+            // animate into place.
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            self.container.setCornerRadius(placed[4]);
+            let (video_width, video_height) = rotation.turned(width, height);
+            let video = &self.renderer.layer;
+            video.setBounds(CGRect::new(
+                CGPoint::new(0., 0.),
+                CGSize::new(video_width, video_height),
+            ));
+            video.setPosition(CGPoint::new(width / 2., height / 2.));
+            video.setAffineTransform(turn(rotation, self.container.contentsAreFlipped()));
+            CATransaction::commit();
             self.placed.set(placed);
         }
         if self.view.isHidden() {
             self.view.setHidden(false);
         }
+        true
+    }
+}
+
+/// `rotation`, clockwise as seen, in a layer space that is `flipped` (y
+/// down) or not (y up, where a positive angle turns counterclockwise).
+fn turn(rotation: Rotation, flipped: bool) -> CGAffineTransform {
+    let angle = if flipped {
+        rotation.radians()
+    } else {
+        -rotation.radians()
+    };
+    let (sin, cos) = angle.sin_cos();
+    // Exact quarter turns, so the picture lands on whole pixels.
+    let (sin, cos) = (sin.round(), cos.round());
+    CGAffineTransform {
+        a: cos,
+        b: sin,
+        c: -sin,
+        d: cos,
+        tx: 0.,
+        ty: 0.,
     }
 }
 
@@ -658,7 +974,10 @@ pub(crate) fn fit(bounds: gpui::Bounds<gpui::Pixels>, aspect: f32) -> gpui::Boun
 impl Drop for Screen {
     fn drop(&mut self) {
         self.set_input(None);
+        let _: () = unsafe { msg_send![&*workspace_center(), removeObserver: &*self.view] };
+        let _: () = unsafe { msg_send![&*notification_center(), removeObserver: &*self.view] };
         self.view.removeFromSuperview();
+        self.renderer.flush();
     }
 }
 
@@ -746,6 +1065,356 @@ mod still_tests {
         let [b, g, r, _] = first_pixel(&paintable_frame(video_range_frame(16, 128)).unwrap());
         assert!(b <= 3 && g <= 3 && r <= 3, "{:?}", [b, g, r]);
     }
+
+    /// The BGRA pixel at `(x, y)`, top-left first.
+    fn pixel_at(frame: &CVPixelBuffer, x: usize, y: usize) -> [u8; 4] {
+        unsafe {
+            CVPixelBufferLockBaseAddress(frame, CVPixelBufferLockFlags::ReadOnly);
+            let base = CVPixelBufferGetBaseAddress(frame).cast::<u8>();
+            let at = base.add(CVPixelBufferGetBytesPerRow(frame) * y + x * 4);
+            let pixel = [*at, *at.add(1), *at.add(2), *at.add(3)];
+            CVPixelBufferUnlockBaseAddress(frame, CVPixelBufferLockFlags::ReadOnly);
+            pixel
+        }
+    }
+
+    /// A still of a turned picture is turned the way the live layer is: a
+    /// clockwise turn puts the raw frame's top-left corner at the top right.
+    #[test]
+    fn stills_turn_with_the_picture() {
+        let (width, height) = (8, 4);
+        let frame = bgra_buffer(width, height).unwrap();
+        unsafe {
+            CVPixelBufferLockBaseAddress(&frame, CVPixelBufferLockFlags::empty());
+            let base = CVPixelBufferGetBaseAddress(&frame).cast::<u8>();
+            let row = CVPixelBufferGetBytesPerRow(&frame);
+            std::ptr::write_bytes(base, 0, row * height);
+            // A red top-left pixel.
+            std::ptr::copy_nonoverlapping([0u8, 0, 255, 255].as_ptr(), base, 4);
+            CVPixelBufferUnlockBaseAddress(&frame, CVPixelBufferLockFlags::empty());
+        }
+        let red = [0, 0, 255, 255];
+        for (rotation, size, corner) in [
+            (Rotation::Clockwise, (4, 8), (3, 0)),
+            (Rotation::CounterClockwise, (4, 8), (0, 7)),
+            (Rotation::Half, (8, 4), (7, 3)),
+            (Rotation::None, (8, 4), (0, 0)),
+        ] {
+            let turned = turned_frame(frame.clone(), rotation).expect("turned");
+            assert_eq!(
+                (
+                    CVPixelBufferGetWidth(&turned),
+                    CVPixelBufferGetHeight(&turned)
+                ),
+                size,
+                "{rotation:?}"
+            );
+            assert_eq!(pixel_at(&turned, corner.0, corner.1), red, "{rotation:?}");
+        }
+    }
+
+    #[test]
+    fn turns_are_exact_quarter_turns_either_way_up() {
+        let t = turn(Rotation::Clockwise, true);
+        assert_eq!((t.a, t.b, t.c, t.d), (0., 1., -1., 0.));
+        // In y-up space the same on-screen turn is the opposite angle.
+        let t = turn(Rotation::Clockwise, false);
+        assert_eq!((t.a, t.b, t.c, t.d), (0., -1., 1., 0.));
+        let t = turn(Rotation::Half, false);
+        assert_eq!((t.a, t.b, t.c, t.d), (-1., 0., 0., -1.));
+    }
+}
+
+/// What the video layer does with frames when nothing composites it, with
+/// real H.264 from VideoToolbox's encoder: no hub or device needed.
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use objc2_core_media::CMTime;
+    use objc2_core_video::{
+        CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferLockBaseAddress,
+        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    };
+
+    #[link(name = "VideoToolbox", kind = "framework")]
+    unsafe extern "C" {
+        fn VTCompressionSessionCreate(
+            allocator: *const c_void,
+            width: i32,
+            height: i32,
+            codec: u32,
+            specification: *const c_void,
+            attributes: *const c_void,
+            data_allocator: *const c_void,
+            callback: extern "C" fn(*mut c_void, *mut c_void, i32, u32, *mut CMSampleBuffer),
+            refcon: *mut c_void,
+            session: *mut *mut c_void,
+        ) -> i32;
+        fn VTCompressionSessionEncodeFrame(
+            session: *mut c_void,
+            image: *const CVPixelBuffer,
+            pts: CMTime,
+            duration: CMTime,
+            properties: *const c_void,
+            refcon: *mut c_void,
+            flags: *mut u32,
+        ) -> i32;
+        fn VTCompressionSessionCompleteFrames(session: *mut c_void, until: CMTime) -> i32;
+        fn VTCompressionSessionInvalidate(session: *mut c_void);
+    }
+    #[link(name = "CoreMedia", kind = "framework")]
+    unsafe extern "C" {
+        fn CMSampleBufferGetFormatDescription(sample: *mut CMSampleBuffer) -> *const c_void;
+        fn CMSampleBufferGetDataBuffer(sample: *mut CMSampleBuffer) -> *const c_void;
+        fn CMBlockBufferGetDataLength(block: *const c_void) -> usize;
+        fn CMBlockBufferCopyDataBytes(
+            block: *const c_void,
+            offset: usize,
+            length: usize,
+            destination: *mut c_void,
+        ) -> i32;
+        fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            format: *const c_void,
+            index: usize,
+            pointer: *mut *const u8,
+            size: *mut usize,
+            count: *mut usize,
+            header: *mut i32,
+        ) -> i32;
+    }
+    struct Encoded {
+        sets: Option<ParameterSets>,
+        units: Vec<Vec<u8>>,
+    }
+
+    extern "C" fn encoded(
+        refcon: *mut c_void,
+        _: *mut c_void,
+        status: i32,
+        _: u32,
+        sample: *mut CMSampleBuffer,
+    ) {
+        if status != 0 || sample.is_null() {
+            return;
+        }
+        let out = unsafe { &*(refcon as *const Mutex<Encoded>) };
+        let mut out = out.lock().unwrap();
+        unsafe {
+            if out.sets.is_none() {
+                let format = CMSampleBufferGetFormatDescription(sample);
+                let mut sets = ParameterSets {
+                    sps: Vec::new(),
+                    pps: Vec::new(),
+                };
+                let mut count = 0;
+                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    format,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut count,
+                    std::ptr::null_mut(),
+                );
+                for index in 0..count {
+                    let (mut pointer, mut size) = (std::ptr::null(), 0);
+                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                        format,
+                        index,
+                        &mut pointer,
+                        &mut size,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                    let unit = std::slice::from_raw_parts(pointer, size).to_vec();
+                    if unit.first().is_some_and(|b| b & 0x1f == 7) {
+                        sets.sps.push(unit);
+                    } else {
+                        sets.pps.push(unit);
+                    }
+                }
+                out.sets = Some(sets);
+            }
+            let block = CMSampleBufferGetDataBuffer(sample);
+            let length = CMBlockBufferGetDataLength(block);
+            let mut unit = vec![0u8; length];
+            CMBlockBufferCopyDataBytes(block, 0, length, unit.as_mut_ptr().cast());
+            out.units.push(unit);
+        }
+    }
+
+    /// `count` frames of a picture that changes every frame, as AVCC access
+    /// units (the first a keyframe), with their parameter sets.
+    pub(super) fn h264(count: usize) -> (ParameterSets, Vec<Vec<u8>>) {
+        let (width, height) = (320, 640);
+        let out = Box::new(Mutex::new(Encoded {
+            sets: None,
+            units: Vec::new(),
+        }));
+        unsafe {
+            let mut session = std::ptr::null_mut();
+            let status = VTCompressionSessionCreate(
+                std::ptr::null(),
+                width,
+                height,
+                u32::from_be_bytes(*b"avc1"),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                encoded,
+                (&*out as *const Mutex<Encoded>).cast_mut().cast(),
+                &mut session,
+            );
+            assert_eq!(status, 0, "an H.264 encoder");
+            for frame in 0..count {
+                let buffer = bgra_buffer(width as usize, height as usize).unwrap();
+                CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
+                let base = CVPixelBufferGetBaseAddress(&buffer).cast::<u8>();
+                let row = CVPixelBufferGetBytesPerRow(&buffer);
+                for y in 0..height as usize {
+                    // A band that moves down a row each frame.
+                    let value = if (y + frame) % 64 < 8 { 230 } else { 30 };
+                    std::ptr::write_bytes(base.add(row * y), value, row);
+                }
+                CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
+                let pts = CMTime {
+                    value: frame as i64,
+                    timescale: 60,
+                    flags: objc2_core_media::CMTimeFlags::Valid,
+                    epoch: 0,
+                };
+                let status = VTCompressionSessionEncodeFrame(
+                    session,
+                    CFRetained::as_ptr(&buffer).as_ptr(),
+                    pts,
+                    objc2_core_media::kCMTimeInvalid,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(status, 0);
+            }
+            VTCompressionSessionCompleteFrames(session, objc2_core_media::kCMTimeInvalid);
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+        }
+        let out = out.into_inner().unwrap();
+        (out.sets.expect("parameter sets"), out.units)
+    }
+
+    fn ready(renderer: &Renderer) -> bool {
+        unsafe { msg_send![&*renderer.target, isReadyForMoreMediaData] }
+    }
+
+    fn held(renderer: &Renderer) -> usize {
+        renderer.held.load(Ordering::Relaxed)
+    }
+
+    /// Waits up to `limit` for the layer to let go of everything.
+    fn drained(renderer: &Renderer, limit: std::time::Duration) -> Option<std::time::Duration> {
+        let started = std::time::Instant::now();
+        while held(renderer) > 0 {
+            if started.elapsed() > limit {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Some(started.elapsed())
+    }
+
+    /// The layer holds each sample only until it decodes; a burst it can't
+    /// keep up with is refused past `MAX_HELD`, and a flush lets go of what
+    /// it holds.
+    #[test]
+    fn the_layer_holds_a_bounded_backlog_and_flush_lets_it_go() {
+        let (sets, units) = h264(240);
+        // SAFETY: the layer is made here and never put in a window.
+        let renderer = Renderer::new(unsafe { MainThreadMarker::new_unchecked() });
+        renderer.configure(&sets).unwrap();
+        let (mut queued, mut full, mut most) = (0, 0, 0);
+        for unit in &units {
+            match renderer.frame(unit) {
+                Queued::Yes => queued += 1,
+                Queued::Full => full += 1,
+                Queued::Failed => panic!("the stream decodes"),
+            }
+            most = most.max(held(&renderer));
+        }
+        let drain = drained(&renderer, std::time::Duration::from_secs(5));
+        eprintln!(
+            "{} frames in a burst: {queued} queued, {full} refused, at most {most} held, drained in {drain:?}, ready {}",
+            units.len(),
+            ready(&renderer)
+        );
+        assert!(most <= MAX_HELD, "never more than the cap: {most}");
+        assert!(queued >= MAX_HELD.min(units.len()));
+        assert!(drain.is_some(), "an unseen layer still decodes and lets go");
+        // A keyframe and deltas, then a flush before they decode.
+        for unit in &units[..MAX_HELD] {
+            renderer.frame(unit);
+        }
+        renderer.flush();
+        let drain = drained(&renderer, std::time::Duration::from_secs(2));
+        eprintln!("after flush: drained in {drain:?}");
+        assert!(drain.is_some(), "flush lets go of what is queued");
+    }
+
+    /// Measures how long the layer takes to work through a backlog, as the
+    /// 1.2 million samples found on 2026-11-11 were: if each sample's upkeep
+    /// grows with the queue, a layer that falls behind never catches up.
+    /// `cargo test --profile native-dev --bins backlog_drain -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement; encodes several thousand frames"]
+    fn backlog_drain_times() {
+        let most = std::env::var("BACKLOG_MAX")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(4000);
+        let (sets, units) = h264(most);
+        for timed in [false, true] {
+            let mut size = 250;
+            while size <= units.len() {
+                // SAFETY: the layer is made here and never put in a window.
+                let renderer = Renderer::new(unsafe { MainThreadMarker::new_unchecked() });
+                renderer.configure(&sets).unwrap();
+                let format = renderer.format.lock().unwrap().clone().unwrap();
+                let started = std::time::Instant::now();
+                for (index, unit) in units[..size].iter().enumerate() {
+                    let timing = timed.then(|| objc2_core_media::CMSampleTimingInfo {
+                        duration: CMTime {
+                            value: 1,
+                            timescale: 60,
+                            flags: objc2_core_media::CMTimeFlags::Valid,
+                            epoch: 0,
+                        },
+                        presentationTimeStamp: CMTime {
+                            value: index as i64,
+                            timescale: 60,
+                            flags: objc2_core_media::CMTimeFlags::Valid,
+                            epoch: 0,
+                        },
+                        decodeTimeStamp: unsafe { objc2_core_media::kCMTimeInvalid },
+                    });
+                    let sample = unsafe { sample(&format, unit, &renderer.held, timing) }.unwrap();
+                    let _: () =
+                        unsafe { msg_send![&*renderer.target, enqueueSampleBuffer: &*sample] };
+                }
+                let enqueued = started.elapsed();
+                let ready_after = ready(&renderer);
+                let drain = drained(&renderer, std::time::Duration::from_secs(120));
+                let status: isize = unsafe { msg_send![&*renderer.target, status] };
+                eprintln!(
+                    "timed {timed:5} backlog {size:5}: enqueue {:7.1} ms, drain {:?} ({:.3} ms a frame), status {status}, ready with the backlog queued {ready_after}, left {}",
+                    enqueued.as_secs_f64() * 1000.,
+                    drain,
+                    drain.map_or(f64::NAN, |d| d.as_secs_f64() * 1000. / size as f64),
+                    held(&renderer)
+                );
+                renderer.flush();
+                drained(&renderer, std::time::Duration::from_secs(10));
+                size *= 2;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -778,7 +1447,7 @@ mod tests {
             }
             self.renderer.configure(sets)
         }
-        fn frame(&self, avcc: &[u8]) -> bool {
+        fn frame(&self, avcc: &[u8]) -> Queued {
             let mut file = self.file.lock().unwrap();
             let mut rest = avcc;
             while rest.len() >= 4 {
@@ -789,13 +1458,21 @@ mod tests {
             }
             self.bytes.fetch_add(avcc.len(), Ordering::Relaxed);
             self.times.lock().unwrap().push(Instant::now());
-            let shown = self.renderer.frame(avcc);
-            let counter = if shown { &self.frames } else { &self.refused };
+            let queued = self.renderer.frame(avcc);
+            let counter = if queued == Queued::Yes {
+                &self.frames
+            } else {
+                &self.refused
+            };
             counter.fetch_add(1, Ordering::Relaxed);
-            shown
+            queued
         }
         fn flush(&self) {
             self.renderer.flush()
+        }
+        /// Never on screen, but every frame is checked.
+        fn showing(&self) -> bool {
+            true
         }
     }
 

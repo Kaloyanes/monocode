@@ -7,7 +7,8 @@ use monocode_core::device::{
     Platform,
     hub::{self, Endpoint},
     protocol::{
-        self, Button, Chunk, Message, Modifiers, Orientation, ParameterSets, Phase, ScreenConfig,
+        self, Button, Chunk, HingeResult, Message, Modifiers, Orientation, ParameterSets, Phase,
+        Pose, ScreenConfig,
     },
 };
 use std::{
@@ -25,11 +26,25 @@ use tungstenite::{Message as WsMessage, WebSocket, client::IntoClientRequest};
 pub(crate) trait Sink: Send + Sync + 'static {
     /// New parameter sets; returns the picture's size in pixels.
     fn configure(&self, sets: &ParameterSets) -> Result<(u32, u32), String>;
-    /// Queues one access unit to be shown as soon as it decodes. `false`
-    /// when the decoder failed and needs a keyframe.
-    fn frame(&self, avcc: &[u8]) -> bool;
-    /// Drops queued frames after a failure or a new stream.
+    /// Queues one access unit to be shown as soon as it decodes.
+    fn frame(&self, avcc: &[u8]) -> Queued;
+    /// Drops queued frames after a failure, a pause or a new stream.
     fn flush(&self);
+    /// Whether anyone can see the picture. A video layer that nothing
+    /// composites keeps every frame it is given (1.2 million of them, 1.4 GB,
+    /// measured on 2026-11-11), so while this is false frames are dropped
+    /// before they reach it.
+    fn showing(&self) -> bool;
+}
+
+/// What the sink did with an access unit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Queued {
+    Yes,
+    /// The decoder failed; it needs a keyframe.
+    Failed,
+    /// Dropped: the layer holds all it will take, so it isn't keeping up.
+    Full,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +55,15 @@ pub(crate) enum Event {
     Size(u32, u32),
     /// Whether touches and keys reach the device, and why not.
     Input(bool, Option<String>),
+    /// What serve-sim says about the screen: its orientation, which turns
+    /// the picture, and a foldable's hinge.
+    Screen(ScreenConfig),
+    /// The device refused a fold.
+    FoldFailed(String),
+    /// The hub this stream talks to stopped or was replaced: its port and
+    /// token are gone, so the panel connects again through `hub::ensure`,
+    /// which waits for a restart.
+    HubChanged,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +78,10 @@ pub(crate) enum Input {
     },
     Text(String),
     Rotate,
+    /// A foldable's pose; iOS only.
+    Fold(Pose),
+    /// A foldable's hinge opened to this many degrees; iOS only.
+    FoldAngle(f64),
 }
 
 /// Wakes a socket thread's `poll` when input is queued or the stream stops.
@@ -116,6 +144,12 @@ impl Wake {
 
 struct Shared {
     stop: AtomicBool,
+    /// Frames were dropped while nobody could see the picture, so it is out
+    /// of date until a keyframe comes.
+    dropped: AtomicBool,
+    /// Asked for a keyframe from outside the stream threads, as when the
+    /// picture comes back into view.
+    resync: AtomicBool,
     wake: Wake,
     closers: Mutex<Vec<http::Closer>>,
     events: async_channel::Sender<Event>,
@@ -172,6 +206,27 @@ impl InputSender {
             self.shared.wake.ring();
         }
     }
+    /// The picture is in view again. If frames were dropped while it wasn't,
+    /// asks the device for a keyframe, so a screen that has since gone still
+    /// isn't left showing what it showed before. An Android stream asks over
+    /// its socket; serve-sim sends one to each new video connection, so an
+    /// iOS stream's video is closed and reopened.
+    pub(crate) fn resync(&self) {
+        if !self.shared.dropped.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        self.shared.resync.store(true, Ordering::Relaxed);
+        self.shared.wake.ring();
+        for closer in self
+            .shared
+            .closers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            closer.close();
+        }
+    }
 }
 
 impl Drop for Stream {
@@ -197,8 +252,11 @@ pub(crate) fn start(
     sink: Arc<dyn Sink>,
 ) -> Result<Stream, String> {
     let (events_tx, events) = async_channel::bounded(64);
+    let viewer = hub::Viewer::new(&device);
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
+        dropped: AtomicBool::new(false),
+        resync: AtomicBool::new(false),
         wake: Wake::new().map_err(|e| e.to_string())?,
         closers: Mutex::new(Vec::new()),
         events: events_tx,
@@ -227,29 +285,67 @@ pub(crate) fn start(
                 .map_err(|e| e.to_string())?;
         }
     }
+    let watch = shared.clone();
+    let generation = hub::generation();
+    std::thread::Builder::new()
+        .name("device-hub-watch".into())
+        .spawn(move || watch_hub(&watch, generation))
+        .map_err(|e| e.to_string())?;
     Ok(Stream {
         shared,
         input,
         events,
-        _viewer: hub::Viewer::new(),
+        _viewer: viewer,
     })
+}
+
+/// Tells the panel once the hub run this stream started on is over.
+/// Asking for the state is what notices a hub that exited, when its output
+/// is held open by a helper it started.
+fn watch_hub(shared: &Shared, generation: u64) {
+    while !shared.stopped() {
+        shared.pause(Duration::from_millis(500));
+        let _ = hub::state();
+        if hub::generation() != generation {
+            while !shared.stopped() && shared.events.try_send(Event::HubChanged).is_err() {
+                shared.pause(Duration::from_millis(100));
+            }
+            return;
+        }
+    }
 }
 
 /// Turns access units into frames on screen, asking for a keyframe when the
 /// decoder has none to start from.
+///
+/// H.264 frames build on the ones before, so once one is dropped nothing is
+/// queued again until a keyframe. A frame is dropped when the layer is full
+/// (it isn't keeping up) or nobody can see the picture; the layer is flushed
+/// then, so what it held is let go.
 struct Feed<'a> {
     sink: &'a dyn Sink,
     sets: Option<ParameterSets>,
     size: Option<(u32, u32)>,
     awaiting_key: bool,
     streaming: bool,
+    /// Dropping frames because nobody can see the picture.
+    paused: bool,
+    /// A keyframe is wanted now, not whenever one comes: frames were dropped
+    /// mid-stream, so the picture is out of date.
+    resync: bool,
 }
 
+#[derive(Debug, PartialEq)]
 enum Fed {
     Shown,
     Skipped,
-    /// The decoder failed; a fresh keyframe is needed.
-    NeedKey,
+    /// No keyframe has come yet to start from.
+    Waiting,
+    /// The picture needs a keyframe now: the decoder failed or fell behind,
+    /// or frames were dropped while the picture was out of view.
+    Resync,
+    /// Dropped: nobody can see the picture.
+    Paused,
 }
 
 impl<'a> Feed<'a> {
@@ -261,6 +357,15 @@ impl<'a> Feed<'a> {
             size: None,
             awaiting_key: true,
             streaming: false,
+            paused: false,
+            resync: false,
+        }
+    }
+    fn need_key(&self) -> Fed {
+        if self.resync || self.streaming {
+            Fed::Resync
+        } else {
+            Fed::Waiting
         }
     }
     fn configure(&mut self, shared: &Shared, sets: ParameterSets) -> Result<(), String> {
@@ -277,19 +382,46 @@ impl<'a> Feed<'a> {
         Ok(())
     }
     fn frame(&mut self, shared: &Shared, avcc: &[u8], key: bool) -> Fed {
+        // A stopped stream's last reads must not reach a layer that may
+        // already show the next device.
+        if shared.stopped() {
+            return Fed::Skipped;
+        }
+        if !self.sink.showing() {
+            if !self.paused {
+                self.paused = true;
+                self.sink.flush();
+            }
+            self.awaiting_key = true;
+            self.resync = true;
+            shared.dropped.store(true, Ordering::Relaxed);
+            return Fed::Paused;
+        }
+        self.paused = false;
         if self.sets.is_none() || (self.awaiting_key && !key) || avcc.is_empty() {
             return if self.sets.is_none() || self.awaiting_key {
-                Fed::NeedKey
+                self.need_key()
             } else {
                 Fed::Skipped
             };
         }
-        if !self.sink.frame(avcc) {
-            self.sink.flush();
-            self.awaiting_key = true;
-            return Fed::NeedKey;
+        match self.sink.frame(avcc) {
+            Queued::Yes => {}
+            Queued::Failed => {
+                self.sink.flush();
+                self.awaiting_key = true;
+                return self.need_key();
+            }
+            Queued::Full => {
+                self.sink.flush();
+                self.awaiting_key = true;
+                self.resync = true;
+                return Fed::Resync;
+            }
         }
         self.awaiting_key = false;
+        self.resync = false;
+        shared.dropped.store(false, Ordering::Relaxed);
         if !self.streaming {
             self.streaming = true;
             shared.emit(Event::Streaming);
@@ -311,9 +443,18 @@ fn ios_video(shared: &Shared, endpoint: &Endpoint, device: &str, sink: &dyn Sink
     // Set when the helper seems gone: attaches are remembered per hub run,
     // and a helper that died needs starting again.
     let mut reattach = false;
+    // The last connection closed only to get a keyframe.
+    let mut resyncing = false;
     while !shared.stopped() {
+        // Only the one reconnect after a keyframe close comes quickly; a
+        // failure on the way retries at the usual pace.
+        let quick = std::mem::take(&mut resyncing);
         if !first {
-            shared.pause(Duration::from_secs(1));
+            shared.pause(if quick {
+                RESYNC_GAP
+            } else {
+                Duration::from_secs(1)
+            });
             if shared.stopped() {
                 break;
             }
@@ -348,6 +489,8 @@ fn ios_video(shared: &Shared, endpoint: &Endpoint, device: &str, sink: &dyn Sink
             closer.close();
             break;
         }
+        // A new connection starts with a keyframe.
+        shared.resync.store(false, Ordering::Relaxed);
         let mut demuxer = protocol::AvccDemuxer::default();
         let mut feed = Feed::new(sink);
         let mut buf = vec![0u8; 256 * 1024];
@@ -358,6 +501,7 @@ fn ios_video(shared: &Shared, endpoint: &Endpoint, device: &str, sink: &dyn Sink
                 Err(error) => break 'read format!("Video: {error}"),
             };
             hub::touch();
+            hub::touch_device(device);
             let chunks = match demuxer.push(&buf[..read]) {
                 Ok(chunks) => chunks,
                 Err(error) => break 'read error,
@@ -378,10 +522,9 @@ fn ios_video(shared: &Shared, endpoint: &Endpoint, device: &str, sink: &dyn Sink
                     }
                     Chunk::Keyframe(unit) | Chunk::Delta(unit) => {
                         let key = matches!(chunk_kind, Kind::Key);
-                        if let Fed::NeedKey = feed.frame(shared, &unit, key)
-                            && feed.streaming
-                        {
+                        if let Fed::Resync = feed.frame(shared, &unit, key) {
                             // Reconnecting is how serve-sim sends a keyframe.
+                            shared.resync.store(true, Ordering::Relaxed);
                             break 'read "Video decoder needed a keyframe.".into();
                         }
                     }
@@ -395,6 +538,14 @@ fn ios_video(shared: &Shared, endpoint: &Endpoint, device: &str, sink: &dyn Sink
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|other| !other.same(&closer));
+        // Closed for a keyframe: the picture stays up and nothing is
+        // reported, and the reconnect comes at once. One that showed nothing
+        // after the last such reconnect is a fault, retried as any other.
+        let wanted = shared.resync.swap(false, Ordering::Relaxed);
+        resyncing = wanted && (feed.streaming || !quick);
+        if resyncing {
+            continue;
+        }
         // Ending before any frame showed is a missing helper, not the
         // reconnect that asks serve-sim for a keyframe.
         reattach = !feed.streaming;
@@ -403,6 +554,10 @@ fn ios_video(shared: &Shared, endpoint: &Endpoint, device: &str, sink: &dyn Sink
         }
     }
 }
+
+/// How soon video reconnects for a keyframe; a decoder that keeps failing
+/// still can't spin.
+const RESYNC_GAP: Duration = Duration::from_millis(100);
 
 enum Kind {
     Key,
@@ -513,6 +668,7 @@ fn ios_input(shared: &Shared, endpoint: &Endpoint, device: &str, inputs: &mpsc::
         };
         let mut admitted = false;
         let mut screen: Option<ScreenConfig> = None;
+        let mut requests = 0u64;
         let reason = loop {
             shared.wake.wait(socket.get_ref(), Duration::from_secs(1));
             shared.wake.drain();
@@ -526,7 +682,7 @@ fn ios_input(shared: &Shared, endpoint: &Endpoint, device: &str, inputs: &mpsc::
                 if !admitted {
                     continue;
                 }
-                for message in ios_messages(input, screen.as_ref()) {
+                for message in ios_messages(input, screen.as_ref(), &mut requests) {
                     if let Err(error) = send(&mut socket, message) {
                         failed = Some(error);
                     }
@@ -546,12 +702,22 @@ fn ios_input(shared: &Shared, endpoint: &Endpoint, device: &str, inputs: &mpsc::
                         protocol::ios::SCREEN_CONFIG => {
                             if let Some(config) = ScreenConfig::parse(&bytes[1..]) {
                                 screen = Some(config);
+                                shared.emit(Event::Screen(config));
                                 shared.emit(Event::Input(
                                     admitted && !config.input_unavailable,
                                     config
                                         .input_unavailable
                                         .then(|| "Simulator input is unavailable".into()),
                                 ));
+                            }
+                        }
+                        protocol::ios::HINGE_RESULT => {
+                            if let Some(result) = HingeResult::parse(&bytes[1..])
+                                && !result.ok
+                            {
+                                shared.emit(Event::FoldFailed(result.error.unwrap_or_else(|| {
+                                    "The simulator could not change its pose.".into()
+                                })));
                             }
                         }
                         _ => {}
@@ -572,7 +738,7 @@ fn ios_input(shared: &Shared, endpoint: &Endpoint, device: &str, inputs: &mpsc::
     }
 }
 
-fn ios_messages(input: Input, screen: Option<&ScreenConfig>) -> Vec<Message> {
+fn ios_messages(input: Input, screen: Option<&ScreenConfig>, requests: &mut u64) -> Vec<Message> {
     match input {
         Input::Touch(phase, x, y) => vec![protocol::touch(Platform::Ios, screen, phase, x, y)],
         Input::Button(button) => protocol::button(Platform::Ios, button)
@@ -600,6 +766,14 @@ fn ios_messages(input: Input, screen: Option<&ScreenConfig>) -> Vec<Message> {
                 .map_or(Orientation::Portrait, |s| s.orientation)
                 .next(),
         )],
+        Input::Fold(pose) => {
+            *requests += 1;
+            vec![protocol::hinge(*requests, pose)]
+        }
+        Input::FoldAngle(degrees) => {
+            *requests += 1;
+            vec![protocol::hinge_angle(*requests, degrees)]
+        }
     }
 }
 
@@ -648,6 +822,11 @@ fn android(
                 let _ = socket.close(None);
                 return;
             }
+            if shared.resync.swap(false, Ordering::Relaxed)
+                && let Err(error) = ask(&mut socket)
+            {
+                break 'session error;
+            }
             while let Ok(input) = inputs.try_recv() {
                 let messages = match input {
                     Input::Touch(phase, x, y) => {
@@ -667,7 +846,7 @@ fn android(
                         modifiers,
                     ),
                     Input::Text(text) => protocol::text_messages(&text),
-                    Input::Rotate => Vec::new(),
+                    Input::Rotate | Input::Fold(_) | Input::FoldAngle(_) => Vec::new(),
                 };
                 for message in messages {
                     if let Err(error) = send(&mut socket, message) {
@@ -679,6 +858,7 @@ fn android(
                 match socket.read() {
                     Ok(WsMessage::Binary(bytes)) => {
                         hub::touch();
+                        hub::touch_device(device);
                         let packet = protocol::semu(&bytes);
                         let unit = protocol::annexb_access_unit(packet.data);
                         if unit.sets.is_complete()
@@ -687,7 +867,7 @@ fn android(
                             break 'session error;
                         }
                         let key = packet.key.unwrap_or(unit.key) || unit.key;
-                        if let Fed::NeedKey = feed.frame(shared, &unit.avcc, key)
+                        if let Fed::Waiting | Fed::Resync = feed.frame(shared, &unit.avcc, key)
                             && let Err(error) = ask(&mut socket)
                         {
                             break 'session error;
@@ -726,20 +906,57 @@ fn android(
 mod tests {
     use super::*;
 
-    #[derive(Default)]
+    /// A layer that takes what it is given, as many as `room` frames until
+    /// flushed, and can be out of view.
     struct Recorder {
         frames: Mutex<Vec<usize>>,
         fail: AtomicBool,
+        hidden: AtomicBool,
+        room: Mutex<Option<usize>>,
+        queued: Mutex<usize>,
+        flushes: Mutex<usize>,
+    }
+    impl Default for Recorder {
+        fn default() -> Self {
+            Self {
+                frames: Mutex::default(),
+                fail: AtomicBool::new(false),
+                hidden: AtomicBool::new(false),
+                room: Mutex::new(None),
+                queued: Mutex::new(0),
+                flushes: Mutex::new(0),
+            }
+        }
     }
     impl Sink for Recorder {
         fn configure(&self, _: &ParameterSets) -> Result<(u32, u32), String> {
             Ok((1206, 2622))
         }
-        fn frame(&self, avcc: &[u8]) -> bool {
+        fn frame(&self, avcc: &[u8]) -> Queued {
+            if self.fail.load(Ordering::Relaxed) {
+                self.frames.lock().unwrap().push(avcc.len());
+                return Queued::Failed;
+            }
+            let mut queued = self.queued.lock().unwrap();
+            if self
+                .room
+                .lock()
+                .unwrap()
+                .is_some_and(|room| *queued >= room)
+            {
+                return Queued::Full;
+            }
+            *queued += 1;
             self.frames.lock().unwrap().push(avcc.len());
-            !self.fail.load(Ordering::Relaxed)
+            Queued::Yes
         }
-        fn flush(&self) {}
+        fn flush(&self) {
+            *self.queued.lock().unwrap() = 0;
+            *self.flushes.lock().unwrap() += 1;
+        }
+        fn showing(&self) -> bool {
+            !self.hidden.load(Ordering::Relaxed)
+        }
     }
 
     fn shared() -> (Shared, async_channel::Receiver<Event>) {
@@ -747,6 +964,8 @@ mod tests {
         (
             Shared {
                 stop: AtomicBool::new(false),
+                dropped: AtomicBool::new(false),
+                resync: AtomicBool::new(false),
                 wake: Wake::new().unwrap(),
                 closers: Mutex::new(Vec::new()),
                 events,
@@ -755,45 +974,132 @@ mod tests {
         )
     }
 
+    fn sets() -> ParameterSets {
+        ParameterSets {
+            sps: vec![vec![0x67]],
+            pps: vec![vec![0x68]],
+        }
+    }
+    const KEY: &[u8] = &[0, 0, 0, 1, 0x65];
+    const DELTA: &[u8] = &[0, 0, 0, 1, 0x41];
+
     #[test]
     fn frames_wait_for_sets_and_a_keyframe_and_report_once() {
         let (shared, events) = shared();
         let sink = Recorder::default();
         let mut feed = Feed::new(&sink);
-        assert!(matches!(
-            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
-            Fed::NeedKey
-        ));
-        let sets = ParameterSets {
-            sps: vec![vec![0x67]],
-            pps: vec![vec![0x68]],
-        };
-        feed.configure(&shared, sets.clone()).unwrap();
-        feed.configure(&shared, sets).unwrap();
-        assert!(matches!(
-            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
-            Fed::NeedKey
-        ));
-        assert!(matches!(
-            feed.frame(&shared, &[0, 0, 0, 1, 0x65], true),
-            Fed::Shown
-        ));
-        assert!(matches!(
-            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
-            Fed::Shown
-        ));
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Waiting);
+        feed.configure(&shared, sets()).unwrap();
+        feed.configure(&shared, sets()).unwrap();
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Waiting);
+        assert_eq!(feed.frame(&shared, KEY, true), Fed::Shown);
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Shown);
         sink.fail.store(true, Ordering::Relaxed);
-        assert!(matches!(
-            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
-            Fed::NeedKey
-        ));
-        assert!(matches!(
-            feed.frame(&shared, &[0, 0, 0, 1, 0x41], false),
-            Fed::NeedKey
-        ));
+        // A decoder failing mid-stream wants a keyframe now.
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Resync);
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Resync);
         let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
         assert_eq!(seen, [Event::Size(1206, 2622), Event::Streaming]);
         assert_eq!(sink.frames.lock().unwrap().len(), 3);
+    }
+
+    /// A layer that isn't keeping up drops the frame, lets go of what it
+    /// holds, and takes nothing more until a keyframe: a delta after a
+    /// dropped one would decode to garbage.
+    #[test]
+    fn a_full_layer_drops_and_starts_again_at_a_keyframe() {
+        let (shared, _) = shared();
+        let sink = Recorder::default();
+        *sink.room.lock().unwrap() = Some(2);
+        let mut feed = Feed::new(&sink);
+        feed.configure(&shared, sets()).unwrap();
+        let flushes = *sink.flushes.lock().unwrap();
+        assert_eq!(feed.frame(&shared, KEY, true), Fed::Shown);
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Shown);
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Resync);
+        assert_eq!(*sink.flushes.lock().unwrap(), flushes + 1, "flushed");
+        assert_eq!(*sink.queued.lock().unwrap(), 0, "what it held is let go");
+        // Deltas are not queued until a keyframe comes.
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Resync);
+        assert_eq!(*sink.queued.lock().unwrap(), 0);
+        assert_eq!(feed.frame(&shared, KEY, true), Fed::Shown);
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Shown);
+        assert_eq!(sink.frames.lock().unwrap().len(), 4);
+    }
+
+    /// Out of view, nothing reaches the layer and it is flushed once; back in
+    /// view, the stream asks for a keyframe and starts again from it.
+    #[test]
+    fn an_unseen_picture_takes_no_frames_and_resyncs_when_seen() {
+        let (shared, _) = shared();
+        let sink = Recorder::default();
+        let mut feed = Feed::new(&sink);
+        feed.configure(&shared, sets()).unwrap();
+        assert_eq!(feed.frame(&shared, KEY, true), Fed::Shown);
+        let flushes = *sink.flushes.lock().unwrap();
+        sink.hidden.store(true, Ordering::Relaxed);
+        for _ in 0..100 {
+            assert_eq!(feed.frame(&shared, DELTA, false), Fed::Paused);
+        }
+        assert_eq!(feed.frame(&shared, KEY, true), Fed::Paused);
+        assert_eq!(*sink.flushes.lock().unwrap(), flushes + 1, "flushed once");
+        assert_eq!(
+            sink.frames.lock().unwrap().len(),
+            1,
+            "nothing queued unseen"
+        );
+        assert!(shared.dropped.load(Ordering::Relaxed));
+        sink.hidden.store(false, Ordering::Relaxed);
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Resync);
+        assert_eq!(feed.frame(&shared, KEY, true), Fed::Shown);
+        assert!(!shared.dropped.load(Ordering::Relaxed));
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Shown);
+    }
+
+    /// A stream that opened while out of view never streamed, but the
+    /// keyframe it dropped is still wanted once it is seen.
+    #[test]
+    fn a_stream_opened_unseen_resyncs_when_seen() {
+        let (shared, _) = shared();
+        let sink = Recorder::default();
+        sink.hidden.store(true, Ordering::Relaxed);
+        let mut feed = Feed::new(&sink);
+        feed.configure(&shared, sets()).unwrap();
+        assert_eq!(feed.frame(&shared, KEY, true), Fed::Paused);
+        sink.hidden.store(false, Ordering::Relaxed);
+        assert_eq!(feed.frame(&shared, DELTA, false), Fed::Resync);
+    }
+
+    /// Coming back into view asks for a keyframe only when frames were
+    /// dropped meanwhile; an iOS stream does it by closing its video.
+    #[test]
+    fn resync_asks_only_after_frames_were_dropped() {
+        let (shared, _) = shared();
+        let sender = InputSender {
+            input: mpsc::channel().0,
+            shared: Arc::new(shared),
+        };
+        sender.resync();
+        assert!(!sender.shared.resync.load(Ordering::Relaxed));
+        sender.shared.dropped.store(true, Ordering::Relaxed);
+        sender.resync();
+        assert!(sender.shared.resync.load(Ordering::Relaxed));
+        assert!(!sender.shared.dropped.load(Ordering::Relaxed));
+    }
+
+    /// A stopped stream's late reads never touch the layer, which may be
+    /// showing the next device already.
+    #[test]
+    fn a_stopped_stream_leaves_the_layer_alone() {
+        let (shared, _) = shared();
+        let sink = Recorder::default();
+        let mut feed = Feed::new(&sink);
+        feed.configure(&shared, sets()).unwrap();
+        shared.stop.store(true, Ordering::Relaxed);
+        let flushes = *sink.flushes.lock().unwrap();
+        assert_eq!(feed.frame(&shared, KEY, true), Fed::Skipped);
+        assert!(sink.frames.lock().unwrap().is_empty());
+        assert_eq!(*sink.flushes.lock().unwrap(), flushes);
     }
 
     #[test]
@@ -809,7 +1115,7 @@ mod tests {
 
     #[test]
     fn ios_text_is_typed_with_shift_for_capitals() {
-        let messages = ios_messages(Input::Text("Hi".into()), None);
+        let messages = ios_messages(Input::Text("Hi".into()), None, &mut 0);
         // Shift down, H down, H up, shift up, then i down and up.
         assert_eq!(messages.len(), 6);
     }

@@ -5,6 +5,7 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let bytes:&'static [u8]=match path{
    "pencil-edit-02"=>include_bytes!("../assets/hugeicons/pencil-edit-02.svg"),
+   "quote-down"=>include_bytes!("../assets/hugeicons/quote-down.svg"),
    "login-01"=>include_bytes!("../assets/hugeicons/login-01.svg"),
    "logout-01"=>include_bytes!("../assets/hugeicons/logout-01.svg"),
    "smart-phone"=>include_bytes!("../assets/hugeicons/smart-phone.svg"),
@@ -148,6 +149,12 @@ impl AssetSource for Assets {
    "external-link"=>include_bytes!("../assets/hugeicons/external-link.svg"),
    "folder-add"=>include_bytes!("../assets/hugeicons/folder-add.svg"),
    "fold-vertical"=>include_bytes!("../assets/hugeicons/fold-vertical.svg"),
+   "fold-open"=>include_bytes!("../assets/hugeicons/fold-open.svg"),
+   "fold-book"=>include_bytes!("../assets/hugeicons/fold-book.svg"),
+   "fold-laptop"=>include_bytes!("../assets/hugeicons/fold-laptop.svg"),
+   "fold-tent"=>include_bytes!("../assets/hugeicons/fold-tent.svg"),
+   "fold-closed"=>include_bytes!("../assets/hugeicons/fold-closed.svg"),
+   "hinge-angle"=>include_bytes!("../assets/hugeicons/hinge-angle.svg"),
    "git-branch-2"=>include_bytes!("../assets/hugeicons/git-branch-2.svg"),
    "git-branch-hi"=>include_bytes!("../assets/hugeicons/git-branch-hi.svg"),
    "git-branch-dot"=>include_bytes!("../assets/hugeicons/git-branch-dot.svg"),

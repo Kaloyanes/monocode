@@ -117,8 +117,19 @@ impl SettingsView {
             .iter()
             .enumerate()
             .map(|(index, &tool)| {
+                let fallback = (tool == Tool::Hub)
+                    .then(monocode_core::device::hub::fallback)
+                    .flatten();
                 let description: SharedString = if installing == Some(tool) {
                     format!("Installing version {}…", tool.version()).into()
+                } else if let Some(fallback) = fallback {
+                    let reason = fallback.reason.lines().next().unwrap_or_default();
+                    format!(
+                        "Version {} is running: {} would not start. {reason}",
+                        fallback.version,
+                        tool.version()
+                    )
+                    .into()
                 } else if tool.installed() {
                     format!("Version {}.", tool.version()).into()
                 } else {

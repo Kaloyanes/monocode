@@ -369,8 +369,11 @@ pub mod ios {
     pub const BUTTON: u8 = 0x04;
     pub const KEY: u8 = 0x06;
     pub const ORIENTATION: u8 = 0x07;
+    /// A foldable's pose, answered by [`HINGE_RESULT`].
+    pub const HINGE: u8 = 0x10;
     pub const SCREEN_CONFIG: u8 = 0x82;
     pub const INPUT_ADMITTED: u8 = 0x83;
+    pub const HINGE_RESULT: u8 = 0x90;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -419,6 +422,86 @@ impl Orientation {
     }
 }
 
+/// A foldable's pose, as serve-sim names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pose {
+    Closed,
+    Book,
+    Open,
+    Laptop,
+    Tent,
+}
+
+impl Pose {
+    pub const ALL: [Self; 5] = [
+        Self::Open,
+        Self::Book,
+        Self::Laptop,
+        Self::Tent,
+        Self::Closed,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Book => "book",
+            Self::Open => "open",
+            Self::Laptop => "laptop",
+            Self::Tent => "tent",
+        }
+    }
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|pose| pose.name() == name)
+    }
+    /// As the Simulator's Device menu words it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "Fully folded",
+            Self::Book => "Partially open",
+            Self::Open => "Fully open",
+            Self::Laptop => "Laptop",
+            Self::Tent => "Tent",
+        }
+    }
+}
+
+fn lenient_pose<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Pose>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.and_then(|name| Pose::from_name(&name)))
+}
+
+/// How far the picture turns to stand upright, clockwise as seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Rotation {
+    #[default]
+    None,
+    Clockwise,
+    Half,
+    CounterClockwise,
+}
+
+impl Rotation {
+    pub fn quarter_turn(self) -> bool {
+        matches!(self, Self::Clockwise | Self::CounterClockwise)
+    }
+    /// Radians, clockwise as seen.
+    pub fn radians(self) -> f64 {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        match self {
+            Self::None => 0.,
+            Self::Clockwise => FRAC_PI_2,
+            Self::Half => PI,
+            Self::CounterClockwise => -FRAC_PI_2,
+        }
+    }
+    /// A `width`×`height` picture's size once turned.
+    pub fn turned<T>(self, width: T, height: T) -> (T, T) {
+        if self.quarter_turn() {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
+}
+
 /// What serve-sim reports about the screen it is streaming.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -428,6 +511,16 @@ pub struct ScreenConfig {
     pub orientation: Orientation,
     #[serde(default)]
     pub input_unavailable: bool,
+    /// Which of a foldable's displays is streaming: the iPhone Duo's cover
+    /// screen while folded, its inner one otherwise.
+    #[serde(default)]
+    pub screen_id: Option<u32>,
+    #[serde(default)]
+    pub supports_hinge_angle: bool,
+    #[serde(default)]
+    pub hinge_angle: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_pose")]
+    pub hinge_pose: Option<Pose>,
 }
 
 impl ScreenConfig {
@@ -435,17 +528,81 @@ impl ScreenConfig {
         let config: Self = serde_json::from_slice(payload).ok()?;
         (config.width > 0. && config.height > 0.).then_some(config)
     }
-    /// serve-sim streams the raw framebuffer, so a rotated device's input is
-    /// mapped back into that raw space.
-    pub fn raw_point(&self, x: f64, y: f64) -> (f64, f64) {
-        if self.width > self.height {
-            return (x, y);
-        }
+    /// serve-sim streams the raw framebuffer. When the interface is turned
+    /// against it (upside down, or on its side while the framebuffer is
+    /// tall, as an unfolded iPhone Duo always is) the picture is turned to
+    /// match. As the hub's own viewer does (`streamGeometry`).
+    pub fn rotation(&self) -> Rotation {
+        let wide = self.width > self.height;
         match self.orientation {
-            Orientation::LandscapeLeft => (y, 1. - x),
-            Orientation::LandscapeRight => (1. - y, x),
-            Orientation::PortraitUpsideDown => (1. - x, 1. - y),
-            Orientation::Portrait => (x, y),
+            Orientation::Portrait => Rotation::None,
+            Orientation::PortraitUpsideDown => Rotation::Half,
+            Orientation::LandscapeLeft if !wide => Rotation::Clockwise,
+            Orientation::LandscapeRight if !wide => Rotation::CounterClockwise,
+            Orientation::LandscapeLeft | Orientation::LandscapeRight => Rotation::None,
+        }
+    }
+    /// A point 0–1 across the picture as shown, in the raw framebuffer's
+    /// space that serve-sim's input takes.
+    pub fn raw_point(&self, x: f64, y: f64) -> (f64, f64) {
+        match self.rotation() {
+            Rotation::None => (x, y),
+            Rotation::Clockwise => (y, 1. - x),
+            Rotation::CounterClockwise => (1. - y, x),
+            Rotation::Half => (1. - x, 1. - y),
+        }
+    }
+}
+
+/// serve-sim's answer to a [`hinge`] request.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HingeResult {
+    pub request_id: u64,
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl HingeResult {
+    pub fn parse(payload: &[u8]) -> Option<Self> {
+        serde_json::from_slice(payload).ok()
+    }
+}
+
+/// Folds or opens a foldable. `request_id` must be positive; the answer
+/// carries it back.
+pub fn hinge(request_id: u64, pose: Pose) -> Message {
+    Message::Binary(tagged(
+        ios::HINGE,
+        json!({"requestId": request_id.max(1), "command": {"control": "pose", "value": pose.name()}}),
+    ))
+}
+
+/// Opens a foldable's hinge to `degrees`, 0 (folded) to 180 (flat). The
+/// hub refuses an angle between 54 and 55, where it can't tell which screen
+/// is meant, so one there is taken to 55.
+pub fn hinge_angle(request_id: u64, degrees: f64) -> Message {
+    let degrees = degrees.clamp(0., 180.);
+    let degrees = if degrees > 54. && degrees < 55. {
+        55.
+    } else {
+        degrees.round()
+    };
+    Message::Binary(tagged(
+        ios::HINGE,
+        json!({"requestId": request_id.max(1), "command": {"control": "angle", "value": degrees}}),
+    ))
+}
+
+/// The angle the hub gives each pose, as its `poses` table has it.
+impl Pose {
+    pub fn angle(self) -> f64 {
+        match self {
+            Self::Closed => 0.,
+            Self::Book | Self::Laptop => 90.,
+            Self::Tent => 80.,
+            Self::Open => 180.,
         }
     }
 }
@@ -806,13 +963,133 @@ mod tests {
         assert_eq!(with_reorder_limits(&baseline), baseline);
     }
 
+    /// The table the hub's viewer (`streamGeometry`) follows: turn when
+    /// upside down, or on its side over a tall framebuffer.
+    #[test]
+    fn rotation_follows_the_hubs_viewer() {
+        let config = |width, height, orientation| ScreenConfig {
+            width,
+            height,
+            orientation,
+            ..Default::default()
+        };
+        use Orientation::*;
+        for (width, height, orientation, rotation) in [
+            (1206., 2622., Portrait, Rotation::None),
+            (1206., 2622., LandscapeLeft, Rotation::Clockwise),
+            (1206., 2622., LandscapeRight, Rotation::CounterClockwise),
+            (1206., 2622., PortraitUpsideDown, Rotation::Half),
+            // A framebuffer already wide is shown as it comes.
+            (2622., 1206., LandscapeLeft, Rotation::None),
+            (2622., 1206., LandscapeRight, Rotation::None),
+            (2622., 1206., PortraitUpsideDown, Rotation::Half),
+        ] {
+            assert_eq!(
+                config(width, height, orientation).rotation(),
+                rotation,
+                "{width}x{height} {orientation:?}"
+            );
+        }
+        assert_eq!(Rotation::Clockwise.turned(2007, 2853), (2853, 2007));
+        assert_eq!(Rotation::Half.turned(2007, 2853), (2007, 2853));
+    }
+
+    /// A point tapped on the turned picture lands on the raw pixel that the
+    /// turn put there.
+    #[test]
+    fn raw_point_undoes_the_turn_the_picture_was_given() {
+        // Where a raw 0–1 point appears once the picture is turned.
+        let shown = |rotation: Rotation, (x, y): (f64, f64)| match rotation {
+            Rotation::None => (x, y),
+            Rotation::Clockwise => (1. - y, x),
+            Rotation::CounterClockwise => (y, 1. - x),
+            Rotation::Half => (1. - x, 1. - y),
+        };
+        for orientation in [
+            Orientation::Portrait,
+            Orientation::LandscapeLeft,
+            Orientation::LandscapeRight,
+            Orientation::PortraitUpsideDown,
+        ] {
+            let config = ScreenConfig {
+                width: 2007.,
+                height: 2853.,
+                orientation,
+                ..Default::default()
+            };
+            for raw in [(0.1, 0.2), (0.9, 0.05), (0.5, 0.5), (0., 1.)] {
+                let (x, y) = shown(config.rotation(), raw);
+                let back = config.raw_point(x, y);
+                assert!(
+                    (back.0 - raw.0).abs() < 1e-9 && (back.1 - raw.1).abs() < 1e-9,
+                    "{orientation:?} {raw:?} -> {back:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foldable_screen_config_and_hinge_messages() {
+        // As serve-sim reports an unfolded iPhone Duo.
+        let config = ScreenConfig::parse(
+            br#"{"width":2007,"height":2853,"orientation":"landscape_left","inputUnavailable":false,
+                "screenId":3,"supportsPhysicalOrientation":true,"supportsHingeAngle":true,
+                "supportsHingeStateReadback":true,"hingeAngle":180,"hingePose":"open",
+                "tableModeAvailable":false,"physicalOrientation":"portrait"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.screen_id, Some(3));
+        assert!(config.supports_hinge_angle);
+        assert_eq!(config.hinge_pose, Some(Pose::Open));
+        assert_eq!(config.rotation(), Rotation::Clockwise);
+        // An unknown or missing pose is not a broken config.
+        let config = ScreenConfig::parse(
+            br#"{"width":10,"height":20,"orientation":"portrait","hingePose":"origami"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.hinge_pose, None);
+        assert!(!config.supports_hinge_angle);
+
+        let Message::Binary(bytes) = hinge(7, Pose::Closed) else {
+            panic!("hinge requests are binary");
+        };
+        assert_eq!(bytes[0], ios::HINGE);
+        let value: serde_json::Value = serde_json::from_slice(&bytes[1..]).unwrap();
+        assert_eq!(
+            value,
+            json!({"requestId": 7, "command": {"control": "pose", "value": "closed"}})
+        );
+        for (asked, sent) in [(54.4, 55.), (54., 54.), (120.4, 120.), (-3., 0.), (200., 180.)] {
+            let Message::Binary(bytes) = hinge_angle(8, asked) else {
+                panic!("hinge requests are binary");
+            };
+            let value: serde_json::Value = serde_json::from_slice(&bytes[1..]).unwrap();
+            assert_eq!(
+                value,
+                json!({"requestId": 8, "command": {"control": "angle", "value": sent}}),
+                "{asked}"
+            );
+        }
+        assert_eq!(
+            HingeResult::parse(br#"{"requestId":7,"ok":false,"error":"nope"}"#),
+            Some(HingeResult {
+                request_id: 7,
+                ok: false,
+                error: Some("nope".into())
+            })
+        );
+        for pose in Pose::ALL {
+            assert_eq!(Pose::from_name(pose.name()), Some(pose));
+        }
+    }
+
     #[test]
     fn input_encodes_per_platform() {
         let screen = ScreenConfig {
             width: 1206.,
             height: 2622.,
             orientation: Orientation::LandscapeLeft,
-            input_unavailable: false,
+            ..Default::default()
         };
         let Message::Binary(touch_bytes) =
             touch(Platform::Ios, Some(&screen), Phase::Begin, 0.25, 0.5)

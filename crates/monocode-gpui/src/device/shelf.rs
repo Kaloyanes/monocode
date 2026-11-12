@@ -97,7 +97,7 @@ fn phone(platform: Platform, on: bool) -> gpui::Div {
         )
 }
 
-fn menu_row(
+pub(super) fn menu_row(
     id: &'static str,
     path: &'static str,
     label: &'static str,

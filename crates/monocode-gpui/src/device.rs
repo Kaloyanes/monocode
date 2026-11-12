@@ -5,7 +5,10 @@
 //! view does no work per video frame: frames go from `stream`'s threads to
 //! `screen`'s video layer, and this entity re-renders only when something it
 //! shows changes (the device, its state, the picture's size).
+mod fold;
 mod http;
+#[cfg(target_os = "macos")]
+mod model;
 #[cfg(target_os = "macos")]
 mod screen;
 #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -38,7 +41,7 @@ use gpui::{
 };
 use monocode_core::device::{
     self, Device, DeviceList, Platform, hub,
-    protocol::Button,
+    protocol::{Button, Pose, Rotation, ScreenConfig},
     toolchain::{self, Tool},
 };
 use stream::{Event, Input};
@@ -67,7 +70,22 @@ struct Live {
     /// Why the picture is not up, while reconnecting.
     connecting: Option<String>,
     input: Option<String>,
+    /// What serve-sim last said about the screen (iOS only).
+    screen: Option<ScreenConfig>,
+    /// Why the last fold was refused, until the next one.
+    fold_error: Option<String>,
     _events: Task<()>,
+}
+
+impl Live {
+    /// How far the picture turns to stand upright.
+    fn rotation(&self) -> Rotation {
+        self.screen.map(|s| s.rotation()).unwrap_or_default()
+    }
+    /// A foldable's hinge, when the device has one.
+    fn foldable(&self) -> bool {
+        self.screen.is_some_and(|s| s.supports_hinge_angle)
+    }
 }
 
 pub(crate) struct DevicePanel {
@@ -85,6 +103,11 @@ pub(crate) struct DevicePanel {
     live: Option<Live>,
     #[cfg(target_os = "macos")]
     screen: Option<std::rc::Rc<screen::Screen>>,
+    /// A foldable's 3D model, made the first time it is shown.
+    #[cfg(target_os = "macos")]
+    model: Option<std::rc::Rc<model::Model>>,
+    /// A foldable's view, poses and hinge slider.
+    fold: fold::Fold,
     /// Bumped by each connect, so a late result for an older one is dropped.
     epoch: u64,
     /// What new devices can be made, once asked.
@@ -97,11 +120,24 @@ pub(crate) struct DevicePanel {
     deleting: Vec<String>,
     menu: Option<shelf::TileMenu>,
     menu_anchor: crate::popover::AnchorSlot,
+    /// A foldable's pose menu, open under its header button.
+    fold_menu: bool,
+    fold_anchor: crate::popover::AnchorSlot,
     /// A failed create, delete or shutdown, shown above the shelf.
     notice: Option<String>,
     /// Closes the stream a while after the panel hides; dropped when it
     /// shows again first.
     hide: Option<Task<()>>,
+    /// Whether the panel's window can be seen: minimised, covered, on
+    /// another Space, with the app hidden or the display asleep, nobody sees
+    /// the device. While it can't, frames stop reaching the decoder at once
+    /// (`stream::Sink::showing`), and after `KEEP_HIDDEN` the stream closes.
+    window_seen: bool,
+    /// Closes the stream a while after the window stops being seen.
+    unseen: Option<Task<()>>,
+    /// Follows the screen's window as it is seen and not.
+    #[cfg(target_os = "macos")]
+    _watch_window: Option<Task<()>>,
     /// The tool rail beside an iOS Simulator.
     tools: tools::Tools,
 }
@@ -146,6 +182,9 @@ impl DevicePanel {
             live: None,
             #[cfg(target_os = "macos")]
             screen: None,
+            #[cfg(target_os = "macos")]
+            model: None,
+            fold: Default::default(),
             epoch: 0,
             options: None,
             loading_options: false,
@@ -154,8 +193,14 @@ impl DevicePanel {
             deleting: Vec::new(),
             menu: None,
             menu_anchor: Default::default(),
+            fold_menu: false,
+            fold_anchor: Default::default(),
             notice: None,
             hide: None,
+            window_seen: true,
+            unseen: None,
+            #[cfg(target_os = "macos")]
+            _watch_window: None,
             tools: tools::Tools::default(),
         }
     }
@@ -183,6 +228,63 @@ impl DevicePanel {
         cx.notify();
     }
 
+    /// The window came into view or left it. Leaving, the stream closes
+    /// after `KEEP_HIDDEN`, as for a hidden panel; coming back, it opens
+    /// again, and a quick return finds it still open.
+    fn set_window_seen(&mut self, seen: bool, cx: &mut Context<Self>) {
+        if self.window_seen == seen {
+            return;
+        }
+        self.window_seen = seen;
+        if seen {
+            self.unseen = None;
+            if self.shown {
+                self.activate(cx);
+            }
+        } else if self.live.is_some() {
+            self.unseen = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(KEEP_HIDDEN).await;
+                let _ = this.update(cx, |this, cx| {
+                    if !this.window_seen {
+                        this.disconnect();
+                        cx.notify();
+                    }
+                });
+            }));
+        }
+        cx.notify();
+    }
+
+    /// The device's screen, made on first use, with its window watched.
+    #[cfg(target_os = "macos")]
+    fn screen(&mut self, cx: &mut Context<Self>) -> Option<std::rc::Rc<screen::Screen>> {
+        if self.screen.is_none() {
+            let screen = screen::Screen::new()?;
+            let seen = screen.window_seen();
+            self._watch_window = Some(cx.spawn(async move |this, cx| {
+                while let Ok(visible) = seen.recv().await {
+                    if this
+                        .update(cx, |this, cx| this.set_window_seen(visible, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+            self.screen = Some(screen);
+        }
+        self.screen.clone()
+    }
+
+    /// The 3D model, made on first use.
+    #[cfg(target_os = "macos")]
+    fn model(&mut self) -> Option<std::rc::Rc<model::Model>> {
+        if self.model.is_none() {
+            self.model = model::Model::new(self.screen.as_deref()?);
+        }
+        self.model.clone()
+    }
+
     fn activate(&mut self, cx: &mut Context<Self>) {
         if !device::enabled() {
             return;
@@ -202,10 +304,13 @@ impl DevicePanel {
 
     fn disconnect(&mut self) {
         self.live = None;
+        self.unseen = None;
+        self.fold_menu = false;
+        self.fold.failed();
         self.epoch += 1;
         #[cfg(target_os = "macos")]
         if let Some(screen) = &self.screen {
-            screen.set_input(None);
+            screen.release();
         }
     }
 
@@ -388,7 +493,7 @@ impl DevicePanel {
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
-        if !self.shown || !device::enabled() {
+        if !self.shown || !self.window_seen || !device::enabled() {
             return;
         }
         let Some(device) = self.selected.clone().filter(|d| d.booted) else {
@@ -400,8 +505,14 @@ impl DevicePanel {
             let device = device.clone();
             async move {
                 let endpoint = hub::ensure()?;
-                if device.platform == Platform::Ios {
-                    hub::attach(&endpoint, &device.id)?;
+                match device.platform {
+                    Platform::Ios => hub::attach(&endpoint, &device.id)?,
+                    // Best effort: a failure leaves the hub's rate, and the
+                    // next connect tries again.
+                    Platform::Android if !device.physical => {
+                        let _ = hub::android_rate(&endpoint, &device.id);
+                    }
+                    Platform::Android => {}
                 }
                 Ok::<_, String>(endpoint)
             }
@@ -409,7 +520,7 @@ impl DevicePanel {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
-                if this.epoch != epoch || !this.shown {
+                if this.epoch != epoch || !this.shown || !this.window_seen {
                     return;
                 }
                 match result {
@@ -432,10 +543,7 @@ impl DevicePanel {
         device: Device,
         cx: &mut Context<Self>,
     ) {
-        if self.screen.is_none() {
-            self.screen = screen::Screen::new();
-        }
-        let Some(screen) = self.screen.clone() else {
+        let Some(screen) = self.screen(cx) else {
             self.error = Some("The device screen could not be created.".into());
             return;
         };
@@ -471,6 +579,8 @@ impl DevicePanel {
             streaming: false,
             connecting: None,
             input: None,
+            screen: None,
+            fold_error: None,
             _events: task,
         });
     }
@@ -481,6 +591,14 @@ impl DevicePanel {
     }
 
     fn apply_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        if matches!(event, Event::HubChanged) {
+            if self.live.is_some() {
+                self.disconnect();
+                self.connect(cx);
+                cx.notify();
+            }
+            return;
+        }
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -502,6 +620,21 @@ impl DevicePanel {
                     .then(|| reason.unwrap_or_default())
                     .filter(|r| !r.is_empty())
             }
+            Event::Screen(config) => {
+                if live.screen == Some(config) {
+                    return;
+                }
+                live.screen = Some(config);
+                if !config.supports_hinge_angle {
+                    self.fold_menu = false;
+                }
+                self.fold.reported(config.hinge_angle);
+            }
+            Event::FoldFailed(reason) => {
+                live.fold_error = Some(reason);
+                self.fold.failed();
+            }
+            Event::HubChanged => {}
         }
         if attach {
             self.tools_attach(cx);
@@ -657,6 +790,17 @@ impl DevicePanel {
                             .on_click(cx.listener(|this, _, _, _| this.send(Input::Rotate))),
                     )
                 })
+                .when(self.live.as_ref().is_some_and(Live::foldable), |h| {
+                    let mark = self.hinge().1.map_or("fold-book", fold::pose_icon);
+                    h.child(
+                        icon_action("device-fold", "Pose", mark, true)
+                            .when(self.fold_menu, |d| d.child(self.fold_anchor.probe()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.fold_menu = !this.fold_menu;
+                                cx.notify();
+                            })),
+                    )
+                })
                 .when(!self.selected.as_ref().is_some_and(|d| d.physical), |h| {
                     h.child(
                         icon_action("device-shutdown", "Shut down", "power", true)
@@ -670,6 +814,55 @@ impl DevicePanel {
             );
         }
         header.into_any_element()
+    }
+
+    /// A foldable's poses, the current one checked.
+    fn fold_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let live = self
+            .live
+            .as_ref()
+            .filter(|_| self.fold_menu && !self.picking)?;
+        if !live.foldable() {
+            return None;
+        }
+        let current = self.hinge().1;
+        let this = cx.entity().downgrade();
+        let rows = Pose::ALL.into_iter().map(|pose| {
+            let id = match pose {
+                Pose::Open => "device-fold-open",
+                Pose::Book => "device-fold-book",
+                Pose::Laptop => "device-fold-laptop",
+                Pose::Tent => "device-fold-tent",
+                Pose::Closed => "device-fold-closed",
+            };
+            shelf::menu_row(id, fold::pose_icon(pose), pose.label(), false)
+                .aria_selected(current == Some(pose))
+                .child(div().flex_1())
+                .when(current == Some(pose), |row| {
+                    row.child(crate::theme::icon("check", 12.).text_color(content(0.7)))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.fold_menu = false;
+                    this.fold_to(pose, cx);
+                }))
+        });
+        Some(
+            crate::popover::popover(
+                "device-fold-menu",
+                crate::popover::Anchor::Slot(self.fold_anchor.clone()),
+            )
+            .width(176.)
+            .padding(4.)
+            .gap(4.)
+            .on_dismiss(move |_, cx| {
+                let _ = this.update(cx, |panel, cx| {
+                    panel.fold_menu = false;
+                    cx.notify();
+                });
+            })
+            .child(div().flex().flex_col().children(rows))
+            .into_any_element(),
+        )
     }
 
     fn message(
@@ -719,13 +912,35 @@ impl DevicePanel {
 
     #[cfg(target_os = "macos")]
     fn screen_area(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.screen.is_none() {
-            self.screen = screen::Screen::new();
-        }
+        self.screen(cx);
+        let foldable = self.live.as_ref().is_some_and(Live::foldable);
+        let model = if foldable
+            && self.fold.three_d
+            && self.live.as_ref().is_some_and(|live| live.streaming)
+        {
+            self.model()
+        } else {
+            None
+        };
+        let (angle, pose) = self.hinge();
+        let target = model::Target {
+            angle,
+            pose,
+            screen: self
+                .live
+                .as_ref()
+                .and_then(|live| live.screen)
+                .and_then(|s| s.screen_id),
+            dragging: self.fold.dragging(),
+        };
         let live = self.live.as_ref();
+        let rotation = live.map(Live::rotation).unwrap_or_default();
         let aspect = live
             .and_then(|live| live.size)
-            .map(|(w, h)| w as f32 / h.max(1) as f32)
+            .map(|(w, h)| {
+                let (w, h) = rotation.turned(w, h);
+                w as f32 / h.max(1) as f32
+            })
             .unwrap_or(DEFAULT_ASPECT);
         let status: Option<SharedString> = if let Some(busy) = &self.busy {
             Some(busy.clone())
@@ -743,7 +958,7 @@ impl DevicePanel {
             Some("Connecting…".into())
         };
         let streaming = live.is_some_and(|live| live.streaming);
-        let note = live.and_then(|live| live.input.clone());
+        let note = live.and_then(|live| live.input.clone().or_else(|| live.fold_error.clone()));
         let screen = self.screen.clone();
         let picture = div()
             .relative()
@@ -757,8 +972,17 @@ impl DevicePanel {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .when_some(screen, |d, screen| {
-                        d.child(screen.element(aspect, 22., content(0.06), self.live.is_some()))
+                    .when_some(screen, |d, screen| match model {
+                        Some(model) => {
+                            d.child(model.element(screen, aspect, rotation, 22., stage(), target))
+                        }
+                        None => d.child(screen.element(
+                            aspect,
+                            rotation,
+                            22.,
+                            content(0.06),
+                            self.live.is_some(),
+                        )),
                     })
                     .when_some(status.filter(|_| !streaming), |d, status| {
                         d.child(
@@ -806,6 +1030,14 @@ impl DevicePanel {
                     )
                 },
             );
+        let controls = foldable.then(|| self.fold_controls(cx));
+        let picture = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(picture)
+            .children(controls);
         if !self.tools_available() {
             return picture.into_any_element();
         }
@@ -885,6 +1117,19 @@ impl gpui::Render for DevicePanel {
             .id("device-panel")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event, window, cx| this.tool_key(event, window, cx)))
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                this.fold_drag(
+                    event.position.x,
+                    event.pressed_button == Some(gpui::MouseButton::Left),
+                    cx,
+                )
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    this.fold_release(event.position.x, cx)
+                }),
+            )
             .relative()
             .size_full()
             .min_h_0()
@@ -894,7 +1139,18 @@ impl gpui::Render for DevicePanel {
             .child(self.header(cx))
             .child(body)
             .children(flyout)
+            .children(self.fold_popover(cx))
             .child(div().h(px(1.)).bg(stroke()).flex_shrink_0().opacity(0.))
+    }
+}
+
+/// The 3D model's backdrop: opaque, since the video view sits beneath it.
+#[cfg(target_os = "macos")]
+fn stage() -> gpui::Hsla {
+    if is_light() {
+        gpui::hsla(240. / 360., 0.06, 0.93, 1.)
+    } else {
+        gpui::hsla(240. / 360., 0.05, 0.12, 1.)
     }
 }
 

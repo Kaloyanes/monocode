@@ -7,6 +7,10 @@
 //! with the app, and stops after it has gone unused for a while. It requires a
 //! token: serve-sim can run shell commands, so nothing else on this machine
 //! gets to drive it.
+mod idle;
+
+pub use idle::{touch_device, IDLE_DEVICE};
+
 use super::{toolchain, Device, DeviceList, Platform};
 use serde_json::{json, Value};
 use std::{
@@ -23,7 +27,14 @@ use std::{
 /// encoder paced at exactly 60 beats against them and drops a frame in four;
 /// at 120 it takes each one as it comes (measured: median gap 21 → 16.5 ms).
 /// It encodes only changed frames, so a still screen costs nothing more.
+/// The one flag sets Android's scrcpy `max_fps` too; `android_rate` lowers
+/// that per emulator.
 pub const VIDEO_FPS: u32 = 120;
+/// scrcpy's frame cap for an emulator, whose display draws at 60. Its
+/// encoder runs on the emulator's own CPUs, and its frame dropper allows
+/// frames up to a tenth early, so 60 doesn't beat the way serve-sim's timer
+/// does.
+pub const ANDROID_FPS: u32 = 60;
 /// Taller than a phone in the panel is drawn on a Retina display. Larger
 /// costs Android's software encoder its frame rate (32 fps at 2048, 40 at
 /// 1600) for detail the panel cannot show.
@@ -123,7 +134,23 @@ struct Running {
 struct Supervisor {
     running: Option<Running>,
     state: State,
+    /// When the hub last exited by itself, for the restart budget.
+    crashes: Vec<Instant>,
+    /// A restart is waiting out its delay. `stop` and `ensure` clear it, so
+    /// the delayed restart never races a hub they start.
+    restarting: bool,
 }
+
+/// A hub that exits by itself is restarted this many times a minute; past
+/// that it cannot run here, and the panel shows why.
+const RESTARTS: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
+/// A crash counts as in use, and is restarted, when the hub was used this
+/// recently; otherwise the next use starts it.
+const RESTART_IF_USED: Duration = Duration::from_secs(2 * 60);
+/// How long a pin that would not start is skipped for its fallback. The
+/// next start after that, usually once the hub has idled out, tries it again.
+const PIN_RETRY: Duration = Duration::from_secs(10 * 60);
 
 fn supervisor() -> &'static (Mutex<Supervisor>, Condvar) {
     static HUB: OnceLock<(Mutex<Supervisor>, Condvar)> = OnceLock::new();
@@ -136,6 +163,8 @@ fn supervisor() -> &'static (Mutex<Supervisor>, Condvar) {
             Mutex::new(Supervisor {
                 running: None,
                 state: State::Stopped,
+                crashes: Vec::new(),
+                restarting: false,
             }),
             Condvar::new(),
         )
@@ -156,30 +185,94 @@ pub fn touch() {
     LAST_USE.store(epoch().elapsed().as_secs(), Ordering::Relaxed);
 }
 
-/// Held while a viewer streams; the hub never idles out from under one.
-pub struct Viewer(());
+/// Held while a viewer streams a device; neither the hub nor the device
+/// idles out from under one.
+pub struct Viewer(String);
 impl Viewer {
-    pub fn new() -> Self {
+    pub fn new(device: &str) -> Self {
         VIEWERS.fetch_add(1, Ordering::Relaxed);
         touch();
-        Self(())
-    }
-}
-impl Default for Viewer {
-    fn default() -> Self {
-        Self::new()
+        idle::viewer(device, true);
+        Self(device.to_owned())
     }
 }
 impl Drop for Viewer {
     fn drop(&mut self) {
         VIEWERS.fetch_sub(1, Ordering::Relaxed);
         touch();
+        idle::viewer(&self.0, false);
     }
+}
+
+/// The process group of this app's hub, whose own processes name the
+/// devices they stream.
+fn hub_group() -> Option<u32> {
+    let (lock, _) = supervisor();
+    let hub = lock.lock().unwrap_or_else(|e| e.into_inner());
+    hub.running.as_ref().map(|running| running.child.id())
+}
+
+/// Shuts down a device the idle check retired: through the hub when it runs,
+/// so serve-sim closes its capture too, and directly otherwise, so a stopped
+/// hub isn't started just for this.
+fn shut_idle(started: &idle::Started) -> Result<(), String> {
+    let device = Device {
+        id: started.id.clone(),
+        name: started.name.clone(),
+        version: String::new(),
+        platform: started.platform,
+        booted: true,
+        physical: false,
+        supported: true,
+    };
+    let result = if running().is_some() {
+        shutdown(&device)
+    } else {
+        let mut command = match device.platform {
+            Platform::Ios => {
+                let mut command = Command::new("/usr/bin/xcrun");
+                command.args(["simctl", "shutdown", &device.id]);
+                command
+            }
+            Platform::Android => {
+                let adb = toolchain::android_sdk()
+                    .map(|sdk| sdk.join("platform-tools/adb"))
+                    .ok_or("The Android SDK was not found.")?;
+                let mut command = Command::new(adb);
+                command.args(["-s", &device.id, "emu", "kill"]);
+                command
+            }
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match command.status() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!(
+                "{} could not be shut down ({status}).",
+                device.name
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    if result.is_ok() {
+        forget_attached(&device.id);
+        if let Some(list) = LAST_LIST.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            for entry in list.devices.iter_mut().filter(|d| d.id == device.id) {
+                entry.booted = false;
+            }
+        }
+    }
+    result
 }
 
 fn idle_watch() {
     loop {
         std::thread::sleep(Duration::from_secs(30));
+        if super::enabled() {
+            idle::retire(hub_group(), shut_idle);
+        }
         let idle = epoch()
             .elapsed()
             .as_secs()
@@ -201,21 +294,108 @@ fn idle_watch() {
 pub fn state() -> State {
     let (lock, _) = supervisor();
     let mut hub = lock.lock().unwrap_or_else(|e| e.into_inner());
-    // A hub that exited by itself is reported, not silently restarted.
-    let exited = hub.running.as_mut().and_then(|running| {
-        let status = running.child.try_wait().ok().flatten()?;
-        let log = running
-            .log
-            .lock()
-            .map(|log| log.join("\n"))
-            .unwrap_or_default();
-        Some(exit_message(status, &log))
-    });
-    if let Some(message) = exited {
-        hub.running = None;
+    check_exit(&mut hub, None);
+    hub.state.clone()
+}
+
+/// Notices a hub that exited by itself (only the one with `pid`, when
+/// given). Returns whether it had.
+fn check_exit(hub: &mut Supervisor, pid: Option<u32>) -> bool {
+    let Some(running) = hub.running.as_mut() else {
+        return false;
+    };
+    if pid.is_some_and(|pid| pid != running.child.id()) {
+        return false;
+    }
+    let Ok(Some(status)) = running.child.try_wait() else {
+        return false;
+    };
+    let log = running
+        .log
+        .lock()
+        .map(|log| log.join("\n"))
+        .unwrap_or_default();
+    exited(hub, exit_message(status, &log));
+    true
+}
+
+/// A hub that exited by itself: viewers are told (the generation moves),
+/// and while it is in use it is restarted after 1, 2, then 4 seconds. A
+/// fourth exit within a minute is reported instead.
+fn exited(hub: &mut Supervisor, message: String) {
+    hub.running = None;
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    let _ = std::fs::remove_file(state_file());
+    let idle = epoch()
+        .elapsed()
+        .as_secs()
+        .saturating_sub(LAST_USE.load(Ordering::Relaxed));
+    let in_use = VIEWERS.load(Ordering::Relaxed) > 0 || idle < RESTART_IF_USED.as_secs();
+    if !super::enabled() || !in_use {
+        hub.state = State::Stopped;
+        return;
+    }
+    let Some(delay) = next_restart(&mut hub.crashes, Instant::now()) else {
+        hub.state = State::Failed(format!(
+            "The Device Hub kept stopping, {RESTARTS} times within a minute.\n{message}"
+        ));
+        return;
+    };
+    hub.state = State::Starting;
+    hub.restarting = true;
+    let spawned = std::thread::Builder::new()
+        .name("device-hub-restart".into())
+        .spawn(move || {
+            std::thread::sleep(delay);
+            let (lock, ready) = supervisor();
+            {
+                let mut hub = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if !std::mem::take(&mut hub.restarting) {
+                    return;
+                }
+                if !super::enabled() {
+                    hub.state = State::Stopped;
+                    ready.notify_all();
+                    return;
+                }
+            }
+            let _ = finish(start());
+        });
+    if spawned.is_err() {
+        hub.restarting = false;
         hub.state = State::Failed(message);
     }
-    hub.state.clone()
+}
+
+/// How long to wait before restarting after a crash at `now`, which it
+/// records: 1, 2, then 4 seconds. None once the minute's budget is spent.
+fn next_restart(crashes: &mut Vec<Instant>, now: Instant) -> Option<Duration> {
+    crashes.retain(|at| now.duration_since(*at) < RESTART_WINDOW);
+    if crashes.len() >= RESTARTS {
+        return None;
+    }
+    let delay = Duration::from_secs(1 << crashes.len());
+    crashes.push(now);
+    Some(delay)
+}
+
+/// Waits for the hub with `pid` to exit after its output closed, then
+/// handles it. Gives up when it doesn't: only the pipe closed.
+fn watch_exit(pid: u32) {
+    for _ in 0..30 {
+        {
+            let (lock, ready) = supervisor();
+            let mut hub = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if hub.running.as_ref().is_none_or(|r| r.child.id() != pid) {
+                return;
+            }
+            if check_exit(&mut hub, Some(pid)) {
+                ready.notify_all();
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Bumped whenever the hub starts or stops, so viewers reconnect.
@@ -249,23 +429,41 @@ pub fn ensure() -> Result<Arc<Endpoint>, String> {
     let (lock, ready) = supervisor();
     let mut hub = lock.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(running) = hub.running.as_mut() {
-            match running.child.try_wait() {
-                Ok(None) => return Ok(running.endpoint.clone()),
-                _ => hub.running = None,
+        if !check_exit(&mut hub, None) {
+            if let Some(running) = hub.running.as_mut() {
+                match running.child.try_wait() {
+                    Ok(None) => return Ok(running.endpoint.clone()),
+                    _ => hub.running = None,
+                }
             }
         }
         if hub.state != State::Starting {
             break;
         }
-        // Another caller is starting it; wait for that rather than racing.
+        // Another caller, or a restart, is starting it; wait for that
+        // rather than racing.
         hub = ready.wait(hub).unwrap_or_else(|e| e.into_inner());
     }
+    if !super::enabled() {
+        return Err("Devices are turned off. Turn them on in Settings › Devices.".into());
+    }
     hub.state = State::Starting;
+    hub.restarting = false;
     drop(hub);
-    let started = start();
+    finish(start())
+}
+
+/// Records a start's result and wakes whoever waits on it. A hub that was
+/// stopped while it started is stopped again.
+fn finish(started: Result<Running, String>) -> Result<Arc<Endpoint>, String> {
+    let (lock, ready) = supervisor();
     let mut hub = lock.lock().unwrap_or_else(|e| e.into_inner());
     let result = match started {
+        Ok(mut running) if hub.state != State::Starting => {
+            terminate(&mut running.child);
+            let _ = std::fs::remove_file(state_file());
+            Err("The Device Hub was stopped while it started.".into())
+        }
         Ok(running) => {
             let endpoint = running.endpoint.clone();
             hub.running = Some(running);
@@ -288,6 +486,7 @@ pub fn stop() {
     let running = {
         let mut hub = lock.lock().unwrap_or_else(|e| e.into_inner());
         hub.state = State::Stopped;
+        hub.restarting = false;
         hub.running.take()
     };
     if let Some(mut running) = running {
@@ -295,6 +494,8 @@ pub fn stop() {
         GENERATION.fetch_add(1, Ordering::Relaxed);
         let _ = std::fs::remove_file(state_file());
     }
+    // Wakes callers waiting out a restart that is now cancelled.
+    supervisor().1.notify_all();
 }
 
 fn terminate(child: &mut Child) {
@@ -344,7 +545,9 @@ pub fn reap_orphan() {
             return;
         };
         let command = String::from_utf8_lossy(&output.stdout);
-        if command.contains(&*toolchain::Tool::Hub.entry_path().to_string_lossy()) {
+        // Any version's: the orphan may run one this build has no pin for.
+        let versions = toolchain::Tool::Hub.versions_dir();
+        if command.contains(&format!("{}/", versions.to_string_lossy())) {
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGTERM);
             }
@@ -417,9 +620,74 @@ fn free_port() -> Result<u16, String> {
     Ok(listener.local_addr().map_err(|e| e.to_string())?.port())
 }
 
+/// The version this run fell back to, and why the pin didn't start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fallback {
+    pub version: String,
+    pub reason: String,
+}
+
+static FALLBACK: Mutex<Option<Fallback>> = Mutex::new(None);
+/// When the pin last failed to start, while a fallback runs instead.
+static PIN_FAILED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The older hub running because the pinned one would not start, if any.
+pub fn fallback() -> Option<Fallback> {
+    FALLBACK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Starts the pinned hub, installing it if need be. A pin that won't
+/// install or start falls back to the version an older MonoCode ran, so an
+/// update never leaves the Device tab broken; the pin is tried again after
+/// `PIN_RETRY`. The pin's first good start removes the older versions.
 fn start() -> Result<Running, String> {
+    use toolchain::Tool;
     reap_orphan();
-    let entry = toolchain::install(toolchain::Tool::Hub)?;
+    let pinned = Tool::Hub.version();
+    let fallback = toolchain::fallback(Tool::Hub);
+    let skip_pin = fallback.is_some()
+        && PIN_FAILED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|at| at.elapsed() < PIN_RETRY);
+    let mut error = None;
+    if !skip_pin {
+        let started = toolchain::install(Tool::Hub).and_then(|entry| {
+            // Listing once proves this version speaks our protocol; one
+            // that ran here before is trusted.
+            run(&entry, !toolchain::verified(Tool::Hub, &pinned))
+        });
+        match started {
+            Ok(running) => {
+                *PIN_FAILED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *FALLBACK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                toolchain::settle(Tool::Hub, &pinned);
+                return Ok(running);
+            }
+            Err(failed) => error = Some(failed),
+        }
+    }
+    let Some(old) = fallback else {
+        return Err(error.unwrap_or_default());
+    };
+    match run(&Tool::Hub.entry_for(&old), false) {
+        Ok(running) => {
+            if let Some(reason) = error {
+                *PIN_FAILED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                *FALLBACK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Fallback {
+                    version: old,
+                    reason,
+                });
+            }
+            Ok(running)
+        }
+        Err(old_error) => Err(error.unwrap_or(old_error)),
+    }
+}
+
+/// Runs the hub at `entry` until it is ready. With `check`, it must also
+/// list devices in the form `DeviceList` reads.
+fn run(entry: &std::path::Path, check: bool) -> Result<Running, String> {
     // Only the paths: the full doctor check spawns two processes.
     let node = toolchain::node().ok_or("MonoCode needs Node.js to run the Device Hub.")?;
     let android_sdk = toolchain::android_sdk();
@@ -428,7 +696,7 @@ fn start() -> Result<Running, String> {
     std::fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
     let mut command = Command::new(&node);
     command
-        .args(arguments(&entry, port))
+        .args(arguments(entry, port))
         .current_dir(toolchain::root())
         .env("PATH", toolchain::search_path())
         .env("EXPO_DEVICE_HUB_STATE_DIR", &state_dir)
@@ -452,10 +720,14 @@ fn start() -> Result<Running, String> {
         .map_err(|e| format!("Could not start the Device Hub: {e}"))?;
     let log = Arc::new(Mutex::new(Vec::new()));
     let (banner_tx, banner_rx) = std::sync::mpsc::channel();
+    let pid = child.id();
     let forward = |stream: Box<dyn Read + Send>,
                    banner: Option<std::sync::mpsc::Sender<(u16, String)>>| {
         let log = log.clone();
         std::thread::spawn(move || {
+            // Output closes when the hub exits: stdout's end is the moment
+            // to notice a crash, rather than the next caller.
+            let notice = banner.is_some();
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
                 if let Some(found) = banner.as_ref().and(parse_banner(&line)) {
                     let banner = banner.as_ref().expect("checked above");
@@ -472,6 +744,9 @@ fn start() -> Result<Running, String> {
                     }
                     log.push(line);
                 }
+            }
+            if notice {
+                watch_exit(pid);
             }
         });
     };
@@ -529,6 +804,19 @@ fn start() -> Result<Running, String> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    if check {
+        let listed = endpoint
+            .get("/api/devices", Duration::from_secs(20))
+            .and_then(|response| response.into_string().map_err(|e| e.to_string()))
+            .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()))
+            .and_then(|value| DeviceList::from_hub(&value));
+        if let Err(error) = listed {
+            return Err(fail(
+                &mut child,
+                format!("The Device Hub's device list could not be read: {error}"),
+            ));
+        }
+    }
     let _ = std::fs::write(
         state_file(),
         json!({"pid": child.id(), "owner": std::process::id(), "port": port}).to_string(),
@@ -559,7 +847,8 @@ pub fn cached_list() -> Option<DeviceList> {
     LAST_LIST.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Blocking, once per run: when a simulator or emulator is already running,
+/// Blocking, once per run: installs updated tools (`toolchain::refresh`).
+/// Then, when a simulator or emulator is already running,
 /// starts the hub and readies booted simulators' streams, so the Device tab
 /// and agents' device tools find them ready instead of spending seconds on
 /// it. With nothing running it starts nothing; the hub still stops after its
@@ -569,6 +858,8 @@ pub fn prewarm() {
     if !super::enabled() || STARTED.swap(true, Ordering::Relaxed) {
         return;
     }
+    // A pin a MonoCode update moved installs now, not on first use.
+    toolchain::refresh(super::agents_enabled());
     if !toolchain::Tool::Hub.installed() || !anything_booted() {
         return;
     }
@@ -656,6 +947,7 @@ pub fn boot(device: &Device) -> Result<String, String> {
     }
     device.ensure_virtual("start")?;
     let endpoint = ensure()?;
+    let before = idle::Processes::read();
     let body = json!({"platform": device.platform, "id": device.id, "name": device.name});
     let value = checked(
         endpoint.post("/api/devices/boot", body, Duration::from_secs(180))?,
@@ -666,6 +958,7 @@ pub fn boot(device: &Device) -> Result<String, String> {
         .or_else(|| value["id"].as_str())
         .unwrap_or(&device.id)
         .to_owned();
+    idle::booted(device.platform, &id, &device.name, before.as_ref());
     if device.platform == Platform::Ios {
         attach(&endpoint, &id)?;
     }
@@ -677,6 +970,7 @@ pub fn boot(device: &Device) -> Result<String, String> {
 /// more even then, so each simulator is attached once per hub run, until
 /// `forget_attached` says its helper is gone.
 pub fn attach(endpoint: &Endpoint, udid: &str) -> Result<(), String> {
+    touch_device(udid);
     let generation = generation();
     let known = |attached: &(u64, Vec<String>)| {
         attached.0 == generation && attached.1.iter().any(|id| id == udid)
@@ -714,6 +1008,43 @@ pub fn forget_attached(udid: &str) {
         .1
         .retain(|id| id != udid);
 }
+
+/// Blocking: caps an emulator's stream at `ANDROID_FPS`, once per hub run.
+/// serve-emu keeps an emulator's capture until the emulator or the hub
+/// stops, so the setting lasts as long as the capture; changing it restarts
+/// the capture, which is why the rate isn't switched with the panel's focus.
+pub fn android_rate(endpoint: &Endpoint, serial: &str) -> Result<(), String> {
+    let generation = generation();
+    let known =
+        |done: &(u64, Vec<String>)| done.0 == generation && done.1.iter().any(|s| s == serial);
+    if known(&RATED.lock().unwrap_or_else(|e| e.into_inner())) {
+        return Ok(());
+    }
+    touch_device(serial);
+    let path = vendor_path(
+        Platform::Android,
+        &format!("/api/stream-settings?device={}", encode(serial)),
+    );
+    let response = response(
+        ureq::request("PATCH", &endpoint.url(&path))
+            .set("Authorization", &endpoint.authorization())
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(30))
+            .send_string(&json!({"h264Fps": ANDROID_FPS}).to_string()),
+    )?;
+    checked(response, "set the frame rate of")?;
+    let mut done = RATED.lock().unwrap_or_else(|e| e.into_inner());
+    if done.0 != generation {
+        *done = (generation, Vec::new());
+    }
+    if !known(&done) {
+        done.1.push(serial.to_owned());
+    }
+    Ok(())
+}
+
+/// The emulators whose rate was set in the hub run of the given generation.
+static RATED: Mutex<(u64, Vec<String>)> = Mutex::new((0, Vec::new()));
 
 /// Blocking: shuts a device down. serve-sim's own shutdown also closes its
 /// capture session, which the hub's generic one can leave cached.
@@ -939,6 +1270,7 @@ pub fn create(
         return Err("Give the device a name.".into());
     }
     let endpoint = ensure()?;
+    let before = idle::Processes::read();
     let body =
         json!({"platform": platform, "name": name, "runtime": runtime.id, "deviceType": model});
     // Creating an emulator includes its first boot, which can take minutes.
@@ -952,6 +1284,7 @@ pub fn create(
         .or_else(|| value["id"].as_str())
         .map(str::to_owned)
         .ok_or("The Device Hub did not say which device it made.")?;
+    idle::booted(platform, &id, &name, before.as_ref());
     if platform == Platform::Ios {
         attach(&endpoint, &id)?;
     }
@@ -1042,6 +1375,7 @@ pub fn remove(device: &Device) -> Result<(), String> {
 
 /// Blocking: a PNG of the device's screen.
 pub fn screenshot(platform: Platform, id: &str) -> Result<Vec<u8>, String> {
+    touch_device(id);
     let endpoint = ensure()?;
     let path = vendor_path(platform, &format!("/api/screenshot?device={}", encode(id)));
     let response = endpoint.post_empty(&path, Duration::from_secs(20))?;
@@ -1073,6 +1407,10 @@ pub fn serve_sim_cli(args: &[&str]) -> Result<String, String> {
         return Err("The Device Hub is not installed.".into());
     }
     touch();
+    // serve-sim takes the simulator as `-d UDID`.
+    if let Some(pair) = args.windows(2).find(|pair| pair[0] == "-d") {
+        touch_device(pair[1]);
+    }
     let mut command = Command::new(&node);
     command
         .arg(&script)
@@ -1353,6 +1691,29 @@ mod tests {
     }
 
     #[test]
+    fn crashes_restart_three_times_a_minute_with_growing_delays() {
+        let start = Instant::now();
+        let mut crashes = Vec::new();
+        let delays: Vec<_> = (0..4)
+            .map(|i| next_restart(&mut crashes, start + Duration::from_secs(i)))
+            .collect();
+        assert_eq!(
+            delays,
+            [
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(4)),
+                None
+            ]
+        );
+        // A minute on, the first two have left the window; the third stays.
+        assert_eq!(
+            next_restart(&mut crashes, start + Duration::from_secs(61)),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
     fn the_banner_gives_port_and_token() {
         assert_eq!(
             parse_banner("  Local:   http://localhost:3412/?token=abc-DEF_1"),
@@ -1370,6 +1731,7 @@ mod tests {
         assert!(has("--encoder", "hardware"));
         assert!(has("--stream-source", "scrcpy"));
         assert!(has("--video-fps", "120"));
+        assert!(ANDROID_FPS <= 60, "an emulator draws at 60");
         assert!(has("--max-dimension", "1600"));
         assert!(has("--host", "127.0.0.1"));
         assert!(args.contains(&"--require-token".to_string()));
